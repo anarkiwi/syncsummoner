@@ -17,7 +17,7 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
     && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" \
-        "pyvmancer>=0.1"
+        "pyvmancer>=0.2"
 
 # The seam check (design SS2.7): only the aesthetics extra, no device stack.
 FROM base AS deps-aesthetics

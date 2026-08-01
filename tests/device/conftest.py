@@ -81,6 +81,15 @@ class FakeShell:
     def video_status(self):
         return {"input": {"source": "analog", "locked": True}, "timing": "720p60"}
 
+    def video_state(self):
+        from pyvmancer.video import VideoStatus
+
+        return VideoStatus.from_json(self.video_status())
+
+    def resync(self, **kwargs):
+        self.calls.append(("resync", tuple(sorted(kwargs))))
+        return True
+
     def set_video_timing(self, timing):
         self.calls.append(("video_timing", timing))
 
