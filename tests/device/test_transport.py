@@ -197,3 +197,19 @@ def test_video_status_top_level_wins_over_nested_substatus():
     assert status.locked is True
     assert status.timing == "PAL"
     assert status.input_source == "analog"
+
+
+def test_source_locked_follows_the_selected_input():
+    """An unattended sweep must not record a dead link as measurements."""
+    live = tr.VideoStatus.from_json(
+        {"source": "hdmi", "locked": True, "hdmi": {"locked": True}, "analog": {"locked": False}}
+    )
+    assert live.source_locked
+
+    dead = tr.VideoStatus.from_json(
+        {"source": "hdmi", "locked": True, "hdmi": {"locked": False}, "analog": {"locked": True}}
+    )
+    assert not dead.source_locked
+
+    assert not tr.VideoStatus.from_json({"source": "hdmi", "locked": False}).source_locked
+    assert tr.VideoStatus.from_json({"source": "analog", "locked": True}).source_locked

@@ -116,6 +116,18 @@ class VideoStatus:
     locked: bool
     raw: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def source_locked(self) -> bool:
+        """True when the selected input is genuinely carrying a signal.
+
+        The firmware can report the selected source locked while the input's own
+        sub-status says otherwise; an unattended sweep must not record that as data.
+        """
+        sub = self.raw.get(str(self.input_source))
+        if isinstance(sub, Mapping) and not sub.get("locked", True):
+            return False
+        return bool(self.locked)
+
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "VideoStatus":
         """Parse a ``video status`` payload, tolerating firmware key drift."""

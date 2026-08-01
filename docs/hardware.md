@@ -193,6 +193,28 @@ subcarrier, which needs a comb filter and quadrature demodulation. The external
 encoder is a required part of the chain for colour work, not an accessory.
 Whether a device setting also selects the analog input format is unresolved.
 
+## The HDMI input drops into a bad state, and only a power cycle clears it
+
+Observed repeatedly on `1.0.0-rc.37`: the input stops passing video while the
+device still reports `hdmi.locked: true`, usually with `hdmi.connected: false`,
+and sometimes with the top-level `locked` false while the sub-status disagrees.
+The front-panel HDMI input light stays lit, and the source keeps driving a valid
+mode, so it is a firmware state rather than a cable fault.
+
+| Recovery attempt | Result |
+| --- | --- |
+| `program load <name>` | no effect |
+| `video input analog` then `hdmi` | recovered once, not reliably |
+| Power cycle | works every time |
+
+There is no soft-reset verb. `reboot` is rejected bare and with any argument
+other than `bootloader`, which enters the firmware-flashing state rather than
+restarting, so it is not a recovery path.
+
+`VideoStatus.source_locked` exists because of this: it cross-checks the selected
+input's own sub-status against the top-level flag, so an unattended sweep fails
+loudly instead of recording hours of black frames as measurements.
+
 ## `settings export` and `settings get` hang the serial shell
 
 On `1.0.0-rc.37` both verbs return no response and leave the command processor
