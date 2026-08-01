@@ -118,7 +118,7 @@ def _collect(capture, expected, *, bits, strip_px, frames_per_point, max_wait_fr
         frame = capture.read()
         if frame is None or capture.is_no_signal(frame):
             continue
-        index = patterns.read_state_index(frame, bits=bits, strip_px=strip_px)
+        index = None if allow_untagged else patterns.read_state_index(frame, bits=bits, strip_px=strip_px)
         if index is None and not allow_untagged:
             continue
         if index is not None and index != expected:
