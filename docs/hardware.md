@@ -207,9 +207,38 @@ mode, so it is a firmware state rather than a cable fault.
 | `video input analog` then `hdmi` | recovered once, not reliably |
 | Power cycle | works every time |
 
-There is no soft-reset verb. `reboot` is rejected bare and with any argument
-other than `bootloader`, which enters the firmware-flashing state rather than
-restarting, so it is not a recovery path.
+There is no reboot verb short of the bootloader: `reboot` is rejected bare and
+with any argument other than `bootloader`, which enters the firmware-flashing
+state rather than restarting.
+
+The strongest reset the serial interface does offer is a **timing bounce**, and
+it is what `Transport.resync()` performs. Measured against a live signal:
+
+| Verb | Disturbs the pipeline | Recovers |
+| --- | --- | --- |
+| `modulation reset` | no | - |
+| `video input <same>` | no | - |
+| `video timing <native>` | no | - |
+| `fpga preferred-variant <v>` | rejected; query-only | - |
+| `program load <different>` | yes | yes |
+| `video timing <other>` | yes | **no**, output dies |
+| `video timing <other>` then `<native>` | yes | yes |
+
+Forcing a timing the genlocked source cannot satisfy kills the output; restoring
+the native timing brings it back, re-initialising the output raster on the way.
+A timing change also drops the input selection, so `resync()` reasserts it.
+
+Two consequences of the bounce. It leaves `overridden: true`, so the device no
+longer follows a source format change; that is harmless while format is a
+session constant. And the top-level `locked` flag tracks **genlock**, so it
+reads false whenever timing is overridden even though the input is fine. The
+selected input's own sub-status is the authoritative field, which is what
+`VideoStatus.source_locked` reads.
+
+Every one of these flags is advisory. The firmware reports `hdmi.connected:
+false` while passing video perfectly, and reports a locked input while passing
+nothing at all. Only a capture proves frames are arriving, so anything that
+records must check the frames themselves.
 
 `VideoStatus.source_locked` exists because of this: it cross-checks the selected
 input's own sub-status against the top-level flag, so an unattended sweep fails

@@ -7,12 +7,16 @@ speaks ``ParamSpec`` / ``ProgramInfo`` / numpy, never raw shell JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+import time
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pyvmancer as vm
 
 from .profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+
+#: Timings the resync bounce uses; one must differ from whatever is genlocked.
+RESYNC_ALTERNATE, RESYNC_FALLBACK = "720p60", "1080p30"
 
 #: Native ranges no wider than a default OAT sweep are enumerable, not swept.
 DEFAULT_SAMPLE_STEPS = 32
@@ -118,14 +122,16 @@ class VideoStatus:
 
     @property
     def source_locked(self) -> bool:
-        """True when the selected input is genuinely carrying a signal.
+        """True when the selected input is carrying a signal, per its own sub-status.
 
-        The firmware can report the selected source locked while the input's own
-        sub-status says otherwise; an unattended sweep must not record that as data.
+        The top-level flag tracks genlock, so forcing a timing clears it while the
+        input is still fine. The selected input's sub-status is authoritative in
+        both directions; the top-level flag is only a fallback. Advisory either
+        way: only a capture can prove frames are arriving.
         """
         sub = self.raw.get(str(self.input_source))
-        if isinstance(sub, Mapping) and not sub.get("locked", True):
-            return False
+        if isinstance(sub, Mapping) and "locked" in sub:
+            return bool(sub["locked"])
         return bool(self.locked)
 
     @classmethod
@@ -224,6 +230,41 @@ class Transport:
     def set_video_timing(self, timing: str) -> None:
         """Force an output timing standard, overriding genlock to the source."""
         self._shell.set_video_timing(timing)
+
+    def set_video_input(self, source: str) -> None:
+        """Select the input the processor reads from."""
+        self._shell.set_video_input(source)
+
+    def resync(
+        self,
+        *,
+        settle_s: float = 3.5,
+        attempts: int = 4,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> bool:
+        """Force the output pipeline to re-initialise, and report whether it came back.
+
+        Bouncing the timing to a standard the genlocked source cannot satisfy and
+        back is the strongest reset the serial interface offers; there is no
+        reboot verb short of the bootloader. Timing changes also drop the input
+        selection, so it is restored afterwards, then polled because the lock
+        flags lag the actual signal.
+        """
+        status = self.video_status()
+        native, source = status.timing, status.input_source
+        if not native:
+            return False
+        self.set_video_timing(RESYNC_ALTERNATE if native != RESYNC_ALTERNATE else RESYNC_FALLBACK)
+        sleep(settle_s)
+        self.set_video_timing(native)
+        sleep(settle_s)
+        if source:
+            self.set_video_input(source)
+        for _ in range(max(1, attempts)):
+            sleep(settle_s)
+            if self.video_status().source_locked:
+                return True
+        return False
 
     def transport_play(self) -> None:
         """Start playback; oscillators run from the current timecode."""

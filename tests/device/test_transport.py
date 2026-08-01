@@ -2,6 +2,8 @@
 
 # pylint: disable=missing-function-docstring
 
+import types
+
 import numpy as np
 import pytest
 
@@ -211,5 +213,49 @@ def test_source_locked_follows_the_selected_input():
     )
     assert not dead.source_locked
 
+    forced = tr.VideoStatus.from_json(
+        {"source": "hdmi", "locked": False, "overridden": True, "hdmi": {"locked": True}}
+    )
+    assert forced.source_locked, "top-level tracks genlock; a forced timing must not read as dead"
+
     assert not tr.VideoStatus.from_json({"source": "hdmi", "locked": False}).source_locked
     assert tr.VideoStatus.from_json({"source": "analog", "locked": True}).source_locked
+
+
+def test_resync_bounces_timing_and_restores_input(monkeypatch):
+    """The timing bounce is the strongest reset serial offers; no reboot verb exists."""
+    calls = []
+
+    class Shell:
+        def video_status(self):
+            return {"source": "hdmi", "timing": "1080p30", "locked": True, "hdmi": {"locked": True}}
+
+        def set_video_timing(self, timing):
+            calls.append(("timing", timing))
+
+        def set_video_input(self, source):
+            calls.append(("input", source))
+
+    port = types.SimpleNamespace(shell=Shell())
+    transport = tr.Transport(port)
+    assert transport.resync(sleep=lambda _s: calls.append(("sleep", None)))
+    assert [c for c in calls if c[0] != "sleep"] == [
+        ("timing", "720p60"),
+        ("timing", "1080p30"),
+        ("input", "hdmi"),
+    ]
+
+
+def test_resync_reports_failure_when_the_input_stays_dead():
+    class Shell:
+        def video_status(self):
+            return {"source": "hdmi", "timing": "1080p30", "locked": True, "hdmi": {"locked": False}}
+
+        def set_video_timing(self, timing):
+            pass
+
+        def set_video_input(self, source):
+            pass
+
+    transport = tr.Transport(types.SimpleNamespace(shell=Shell()))
+    assert not transport.resync(sleep=lambda _s: None)
