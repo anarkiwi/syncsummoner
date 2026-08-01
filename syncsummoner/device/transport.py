@@ -7,46 +7,29 @@ speaks ``ParamSpec`` / ``ProgramInfo`` / numpy, never raw shell JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import time
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pyvmancer as vm
 
-from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+from pyvmancer.const import ParamRole, classify_param
+from pyvmancer.video import VideoStatus
 
-#: Timings the resync bounce uses; one must differ from whatever is genlocked.
-RESYNC_ALTERNATE, RESYNC_FALLBACK = "720p60", "1080p30"
+from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
 
 #: Native ranges no wider than a default OAT sweep are enumerable, not swept.
 DEFAULT_SAMPLE_STEPS = 32
-#: ``program info`` names an unassigned slot ``-`` or ``Null <n>``.
-UNUSED_NAMES = frozenset({"-", "", "null", "none"})
+#: pyvmancer classifies a slot; this maps its vocabulary onto the profile schema.
+ROLE_TO_KIND = {
+    ParamRole.CONTINUOUS: ParamKind.CONTINUOUS,
+    ParamRole.BOOLEAN: ParamKind.BOOLEAN,
+    ParamRole.QUANTIZED: ParamKind.QUANTIZED,
+    ParamRole.UNASSIGNED: ParamKind.UNUSED,
+}
 #: Combined (Manual + Modulation + MIDI) output keys, in order of preference.
 COMBINED_KEYS = ("o", "out", "output", "combined")
 #: Stored manual value keys.
 MANUAL_KEYS = ("m", "manual")
-TIMING_KEYS = ("timing", "output_timing", "out_timing", "format")
-INPUT_KEYS = ("input", "source", "input_source")
-LOCK_KEYS = ("locked", "lock", "input_locked", "detected")
-
-
-def _is_unused(name: str) -> bool:
-    """True when ``program info`` reports the slot as unassigned."""
-    text = name.strip().lower()
-    return text in UNUSED_NAMES or (text.startswith("null") and text[4:].strip().isdigit())
-
-
-def _classify(name: str, low: float, high: float, steps: int) -> tuple[ParamKind, int | None]:
-    """Derive a parameter kind and step count from its name and native range."""
-    if _is_unused(name) or high <= low:
-        return ParamKind.UNUSED, None
-    if (low, high) == (0.0, 1.0):
-        return ParamKind.BOOLEAN, 2
-    span = high - low
-    if span.is_integer() and low.is_integer() and span + 1 <= steps:
-        return ParamKind.QUANTIZED, int(span) + 1
-    return ParamKind.CONTINUOUS, None
 
 
 def _first(data: Mapping[str, Any], keys: Sequence[str], default: Any = None) -> Any:
@@ -92,7 +75,8 @@ class ProgramInfo:
         for index, entry in enumerate(data.get("parameters", ()), start=1):
             name = str(entry.get("name", ""))
             low, high = float(entry.get("min", 0)), float(entry.get("max", 0))
-            kind, count = _classify(name, low, high, steps)
+            role, count = classify_param(name, low, high, sweep_steps=steps)
+            kind = ROLE_TO_KIND[role]
             params.append(
                 ParamSpec(
                     index=index,
@@ -122,45 +106,6 @@ class ProgramInfo:
             if p.kind in (ParamKind.CONTINUOUS, ParamKind.QUANTIZED) and p.index not in skip
         ]
         return out if count is None else out[:count]
-
-
-@dataclass(frozen=True)
-class VideoStatus:
-    """Video input/output state as reported by ``video status``."""
-
-    timing: str | None
-    input_source: str | None
-    locked: bool
-    raw: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def source_locked(self) -> bool:
-        """True when the selected input is carrying a signal, per its own sub-status.
-
-        The top-level flag tracks genlock, so forcing a timing clears it while the
-        input is still fine. The selected input's sub-status is authoritative in
-        both directions; the top-level flag is only a fallback. Advisory either
-        way: only a capture can prove frames are arriving.
-        """
-        sub = self.raw.get(str(self.input_source))
-        if isinstance(sub, Mapping) and "locked" in sub:
-            return bool(sub["locked"])
-        return bool(self.locked)
-
-    @classmethod
-    def from_json(cls, data: Mapping[str, Any]) -> "VideoStatus":
-        """Parse a ``video status`` payload, tolerating firmware key drift."""
-        flat: dict[str, Any] = {}
-        for value in data.values():
-            if isinstance(value, Mapping):
-                flat.update(value)
-        flat.update({k: v for k, v in data.items() if not isinstance(v, Mapping)})
-        return cls(
-            timing=_first(flat, TIMING_KEYS),
-            input_source=_first(flat, INPUT_KEYS),
-            locked=bool(_first(flat, LOCK_KEYS, False)),
-            raw=dict(data),
-        )
 
 
 class Transport:
@@ -248,6 +193,21 @@ class Transport:
         """Every modulation operator the firmware exposes, keyed by name."""
         return dict(self._shell.operators())
 
+    def program_manifest(self) -> Any:
+        """Installed program library, or None when the device carries no manifest.
+
+        Coverage is partial: firmware built-ins never appear, so a caller must
+        fall back to measurement for anything the manifest does not describe.
+        """
+        try:
+            return self._shell.program_manifest()
+        except Exception:
+            return None
+
+    def file_hash(self, path: str) -> str:
+        """Device-computed digest of a file, the cache key for derived measurements."""
+        return str(self._shell.hash_file(path))
+
     def program_state(self) -> np.ndarray:
         """Combined 0..1023 value of every parameter (Manual + Modulation + MIDI)."""
         combined = _vector(self._shell.modulation_status(), COMBINED_KEYS)
@@ -259,7 +219,11 @@ class Transport:
 
     def video_status(self) -> VideoStatus:
         """Video input source, timing and lock state."""
-        return VideoStatus.from_json(self._shell.video_status())
+        return self._shell.video_state()
+
+    def resync(self, **kwargs: Any) -> bool:
+        """Re-initialise the output raster; see pyvmancer for the timing bounce."""
+        return bool(self._shell.resync(**kwargs))
 
     def set_video_timing(self, timing: str) -> None:
         """Force an output timing standard, overriding genlock to the source."""
@@ -268,37 +232,6 @@ class Transport:
     def set_video_input(self, source: str) -> None:
         """Select the input the processor reads from."""
         self._shell.set_video_input(source)
-
-    def resync(
-        self,
-        *,
-        settle_s: float = 3.5,
-        attempts: int = 4,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> bool:
-        """Force the output pipeline to re-initialise, and report whether it came back.
-
-        Bouncing the timing to a standard the genlocked source cannot satisfy and
-        back is the strongest reset the serial interface offers; there is no
-        reboot verb short of the bootloader. Timing changes also drop the input
-        selection, so it is restored afterwards, then polled because the lock
-        flags lag the actual signal.
-        """
-        status = self.video_status()
-        native, source = status.timing, status.input_source
-        if not native:
-            return False
-        self.set_video_timing(RESYNC_ALTERNATE if native != RESYNC_ALTERNATE else RESYNC_FALLBACK)
-        sleep(settle_s)
-        self.set_video_timing(native)
-        sleep(settle_s)
-        if source:
-            self.set_video_input(source)
-        for _ in range(max(1, attempts)):
-            sleep(settle_s)
-            if self.video_status().source_locked:
-                return True
-        return False
 
     def transport_play(self) -> None:
         """Start playback; oscillators run from the current timecode."""

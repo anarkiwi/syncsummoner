@@ -2,8 +2,6 @@
 
 # pylint: disable=missing-function-docstring
 
-import types
-
 import numpy as np
 import pytest
 
@@ -210,20 +208,11 @@ def test_open_uses_pyvmancer(monkeypatch):
     assert port.program_info().name == COLORBARS_INFO["name"]
 
 
-def test_video_status_top_level_wins_over_nested_substatus():
-    """Real rc.37 payload: nested hdmi.locked=false must not clobber locked=true."""
-    payload = {
-        "source": "analog",
-        "timing": "PAL",
-        "locked": True,
-        "analog": {"locked": True, "timing": "PAL"},
-        "hdmi": {"locked": False, "connected": True, "timing": "NTSC"},
-        "output": {"timing": "PAL", "hdmi_connected": True},
-    }
-    status = tr.VideoStatus.from_json(payload)
-    assert status.locked is True
-    assert status.timing == "PAL"
-    assert status.input_source == "analog"
+def test_resync_delegates_to_the_device_library():
+    """The timing bounce is device protocol; pyvmancer owns and tests it."""
+    device = FakeDevice()
+    assert tr.Transport(device).resync() is True
+    assert any(c[0] == "resync" for c in device.shell.calls)
 
 
 def test_source_locked_follows_the_selected_input():
@@ -245,46 +234,3 @@ def test_source_locked_follows_the_selected_input():
 
     assert not tr.VideoStatus.from_json({"source": "hdmi", "locked": False}).source_locked
     assert tr.VideoStatus.from_json({"source": "analog", "locked": True}).source_locked
-
-
-def test_resync_bounces_timing_and_restores_input():
-    """The timing bounce is the strongest reset serial offers; no reboot verb exists."""
-    calls = []
-
-    class Shell:
-        """Records the verbs resync issues."""
-
-        def video_status(self):
-            return {"source": "hdmi", "timing": "1080p30", "locked": True, "hdmi": {"locked": True}}
-
-        def set_video_timing(self, timing):
-            calls.append(("timing", timing))
-
-        def set_video_input(self, source):
-            calls.append(("input", source))
-
-    port = types.SimpleNamespace(shell=Shell())
-    transport = tr.Transport(port)
-    assert transport.resync(sleep=lambda _s: calls.append(("sleep", None)))
-    assert [c for c in calls if c[0] != "sleep"] == [
-        ("timing", "720p60"),
-        ("timing", "1080p30"),
-        ("input", "hdmi"),
-    ]
-
-
-def test_resync_reports_failure_when_the_input_stays_dead():
-    class Shell:
-        """Reports an input that never comes back."""
-
-        def video_status(self):
-            return {"source": "hdmi", "timing": "1080p30", "locked": True, "hdmi": {"locked": False}}
-
-        def set_video_timing(self, timing):
-            pass
-
-        def set_video_input(self, source):
-            pass
-
-    transport = tr.Transport(types.SimpleNamespace(shell=Shell()))
-    assert not transport.resync(sleep=lambda _s: None)
