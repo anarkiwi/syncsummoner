@@ -121,6 +121,30 @@ class Capture:
                 return False
             self._sleep(poll_s)
 
+    def wait_for_content(self, timeout_s: float = 15.0, *, run: int = 10, min_motion: float = 1e-4) -> bool:
+        """Block until frames are both past the splash and actually moving.
+
+        A program change blacks the output out and the card needs seconds to
+        re-lock, so a fixed dwell samples the splash. The drop this rig is prone
+        to freezes the output instead, which only the motion test catches.
+        """
+        self.open()
+        deadline = self._clock() + timeout_s
+        recent: list[np.ndarray] = []
+        while True:
+            frame = self.read()
+            if frame is None or self.is_no_signal(frame):
+                recent.clear()
+            else:
+                recent.append(frame)
+                if len(recent) >= run:
+                    moving = np.abs(np.diff(np.stack(recent[-run:]), axis=0)).mean()
+                    if moving > min_motion:
+                        return True
+                    recent = recent[-(run - 1) :]
+            if self._clock() >= deadline:
+                return False
+
     def close(self) -> None:
         """Release the capture device."""
         if self._cap is not None:

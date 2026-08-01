@@ -164,3 +164,37 @@ def test_wait_for_lock_times_out(opened):
 
 def test_luma_weights_sum_to_one():
     assert cap.LUMA.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+def _stream(target, frames):
+    """Drive a fake capture from a fixed frame sequence."""
+    it = iter(frames)
+    target.read = lambda: next(it, None)
+    return target
+
+
+def test_wait_for_content_requires_motion_not_just_a_signal():
+    """The rig's drop freezes the output; a splash test alone would pass it."""
+    rng = np.random.default_rng(0)
+    frozen = np.full((8, 8, 3), 0.4, np.float32)
+    port = Capture()
+    port.open = lambda: None
+    port.is_no_signal = lambda _f: False
+    _stream(port, [frozen] * 40)
+    assert not port.wait_for_content(timeout_s=0.0, run=4)
+
+    moving = [rng.random((8, 8, 3)).astype(np.float32) for _ in range(40)]
+    _stream(port, moving)
+    assert port.wait_for_content(timeout_s=5.0, run=4)
+
+
+def test_wait_for_content_resets_the_run_on_a_splash():
+    """A splash mid-run must not count toward the required streak."""
+    rng = np.random.default_rng(1)
+    good = [rng.random((8, 8, 3)).astype(np.float32) for _ in range(20)]
+    blank = np.zeros((8, 8, 3), np.float32)
+    port = Capture()
+    port.open = lambda: None
+    port.is_no_signal = lambda frame: frame is blank
+    _stream(port, good[:3] + [blank] + good)
+    assert port.wait_for_content(timeout_s=5.0, run=5)

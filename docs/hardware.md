@@ -244,6 +244,21 @@ records must check the frames themselves.
 input's own sub-status against the top-level flag, so an unattended sweep fails
 loudly instead of recording hours of black frames as measurements.
 
+## Program change costs more than the load blackout
+
+Loading a program blacks the output out, and the capture card then falls back to
+its placard and needs seconds to re-lock. A fixed dwell after `program load`
+therefore samples the placard, not the program: a 48-program survey silently
+skipped nine consecutive entries that way, including two that measure fine once
+the wait polls for real content instead of guessing a duration.
+
+Poll until frames are both non-placard and moving. The drop this rig is prone to
+presents as **frozen output, not the placard**, so a placard test alone passes
+dead frames straight through into the data; only the motion check catches both.
+
+`Transport.resync()` clears it: measured against a live failure, output motion
+went from 0.00000 to 0.02802 with no power cycle.
+
 ## `settings export` and `settings get` hang the serial shell
 
 On `1.0.0-rc.37` both verbs return no response and leave the command processor
