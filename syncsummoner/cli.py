@@ -68,11 +68,10 @@ def _probe_cmd(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
+    specs_by_program: dict[str, list] = {}
     if args.probe_cmd == "sim":
         specs = []
-        records = sim.run_plan_sim(
-            plans.oat(specs), program=args.program, analyzer=aesthetics.__version__, rng=rng
-        )
+        records = sim.run_plan_sim(plans.oat(specs), program=args.program, analyzer=aesthetics, rng=rng)
     else:
         dev = Transport.open(serial=args.serial)
         try:
@@ -84,6 +83,7 @@ def _probe_cmd(args: argparse.Namespace) -> int:
                 for name in names:
                     session.load_program(name)
                     specs = dev.program_info().params
+                    specs_by_program[name] = specs
                     for plan_name in args.plan.split(","):
                         plan = _make_plan(plans, plan_name, specs, rng)
                         records += runner.run_plan(
@@ -91,7 +91,7 @@ def _probe_cmd(args: argparse.Namespace) -> int:
                             capture,
                             plan,
                             program=name,
-                            analyzer=aesthetics.__version__,
+                            analyzer=aesthetics,
                             firmware=dev.firmware(),
                             allow_untagged=args.allow_untagged,
                         )
@@ -102,7 +102,7 @@ def _probe_cmd(args: argparse.Namespace) -> int:
     for program in sorted({r.program for r in records}):
         subset = [r for r in records if r.program == program]
         path = out / f"{program}.yaml"
-        save_profile(fit_profile(subset), path)
+        save_profile(fit_profile(subset, specs=specs_by_program.get(program)), path)
         save_measurements(subset, out / f"{program}.parquet")
         written.append(str(path))
     print(json.dumps(written, indent=2))

@@ -296,3 +296,21 @@ def test_raw_params_encodes_booleans_at_the_rails():
         PARAM_MAX,
         0,
     )
+
+
+def test_allow_untagged_ignores_a_spuriously_decoded_index():
+    """Untagged playout has no strip, so any decoded index is noise, not a mismatch."""
+    rng = np.random.default_rng(4)
+    shape = (24, 32, 3)
+    frames = [rng.random(shape).astype(np.float32) for _ in range(40)]
+    # Top rows carry ordinary content that happens to decode as some index.
+    for frame in frames:
+        frame[:8] = np.tile(np.array([1.0, 0.0], np.float32).repeat(16)[:32], (8, 1))[:, :, None]
+
+    capture = FakeCapture(frames)
+    session = FakeSession()
+    setpoints = [{1: 0.0}, {1: 0.5}, {1: 1.0}]
+    records = runner.run_plan(
+        session, capture, setpoints, program="P", analyzer=FakeAnalyzer(), allow_untagged=True
+    )
+    assert len(records) == len(setpoints), "every setpoint must yield a record when untagged"
