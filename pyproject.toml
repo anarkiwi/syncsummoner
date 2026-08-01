@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syncsummoner"
+version = "0.1.0"
+description = "Automated characterization of the LZX Videomancer and generative offline video rendering"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Josh Bailey", email = "josh@overlyspecific.com" }]
+keywords = ["lzx", "videomancer", "video-synthesis", "generative", "midi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "opencv-python-headless>=4.9",
+    "pyvmancer>=0.1",
+    "pyyaml>=6.0",
+    "pyarrow>=15.0",
+]
+
+[project.optional-dependencies]
+# Standalone dependency set for the extraction seam: `pip install syncsummoner[aesthetics]`
+# must be enough to run `python -m syncsummoner.aesthetics` and tests/aesthetics/.
+aesthetics = ["numpy>=1.24", "scipy>=1.11", "opencv-python-headless>=4.9"]
+audio = ["librosa>=0.10", "soundfile>=0.12"]
+
+[project.urls]
+Homepage = "https://github.com/anarkiwi/syncsummoner"
+Issues = "https://github.com/anarkiwi/syncsummoner/issues"
+
+[project.scripts]
+syncsummoner = "syncsummoner.cli:main"
+
+[dependency-groups]
+dev = [
+    "black>=24",
+    "pylint>=3.2",
+    "pytest>=8",
+    "pytest-cov>=5",
+    "pytest-xdist>=3.6",
+    "import-linter>=2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["syncsummoner*"]
+
+[tool.setuptools.package-data]
+"syncsummoner.aesthetics" = ["py.typed"]
+
+[tool.black]
+line-length = 110
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+addopts = "-n auto --cov=syncsummoner --cov-report=term-missing --cov-fail-under=85"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+omit = ["syncsummoner/cli.py"]
+
+[tool.pylint.main]
+jobs = 0
+extension-pkg-allow-list = ["cv2"]
+disable = [
+    "duplicate-code",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-instance-attributes",
+    "too-many-public-methods",
+    "too-many-locals",
+    "import-outside-toplevel",
+    "broad-exception-caught",
+]
+
+[tool.pylint.format]
+max-line-length = 110
+
+# The extraction seam (design SS2.1): aesthetics must never import the rest of the project.
+# CI failing here is the early warning that the seam has leaked.
+[tool.importlinter]
+root_package = "syncsummoner"
+
+[[tool.importlinter.contracts]]
+name = "aesthetics is independent of syncsummoner"
+type = "forbidden"
+source_modules = ["syncsummoner.aesthetics"]
+forbidden_modules = [
+    "syncsummoner.device",
+    "syncsummoner.probe",
+    "syncsummoner.compose",
+    "syncsummoner.cli",
+]
