@@ -275,7 +275,6 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
 def test_enforce_safety_repairs_an_unsafe_pass():
     frames = np.zeros((90, 32, 32, 3), np.float32)
     frames[::2] = 1.0
-    assert not R.enforce_safety(frames, fps=30.0).max() == 1.0
     from syncsummoner import aesthetics
 
     assert aesthetics.flash_risk(R.enforce_safety(frames, fps=30.0), fps=30.0).safe

@@ -5,6 +5,7 @@ FROM python:${PYTHON_VERSION}-slim AS base
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 libasound2t64 \
+        build-essential gfortran pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
@@ -42,5 +43,5 @@ CMD ["/venv/bin/pytest"]
 FROM deps-aesthetics AS test-aesthetics
 COPY . .
 RUN /venv/bin/pip install --no-deps -e .
-CMD ["/venv/bin/pytest", "tests/aesthetics", "-n", "auto", \
+CMD ["/venv/bin/pytest", "tests/aesthetics", "-o", "addopts=", "-n", "auto", \
      "--cov=syncsummoner.aesthetics", "--cov-report=term-missing", "--cov-fail-under=85"]

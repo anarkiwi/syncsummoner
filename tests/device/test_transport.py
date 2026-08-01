@@ -222,11 +222,13 @@ def test_source_locked_follows_the_selected_input():
     assert tr.VideoStatus.from_json({"source": "analog", "locked": True}).source_locked
 
 
-def test_resync_bounces_timing_and_restores_input(monkeypatch):
+def test_resync_bounces_timing_and_restores_input():
     """The timing bounce is the strongest reset serial offers; no reboot verb exists."""
     calls = []
 
     class Shell:
+        """Records the verbs resync issues."""
+
         def video_status(self):
             return {"source": "hdmi", "timing": "1080p30", "locked": True, "hdmi": {"locked": True}}
 
@@ -248,6 +250,8 @@ def test_resync_bounces_timing_and_restores_input(monkeypatch):
 
 def test_resync_reports_failure_when_the_input_stays_dead():
     class Shell:
+        """Reports an input that never comes back."""
+
         def video_status(self):
             return {"source": "hdmi", "timing": "1080p30", "locked": True, "hdmi": {"locked": False}}
 

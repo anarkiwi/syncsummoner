@@ -1,5 +1,7 @@
 """Safety vetoes: flash risk, dead output, mitigation."""
 
+# pylint: disable=missing-function-docstring
+
 import numpy as np
 import pytest
 
@@ -32,7 +34,7 @@ def test_relative_luminance_matches_wcag_anchors():
 
 def test_static_clip_is_safe():
     risk = safety.flash_risk(solid(0.5, 60), fps=FPS)
-    assert risk.safe and risk.flashes_per_s == 0.0 and risk.windows == ()
+    assert risk.safe and risk.flashes_per_s == 0.0 and not risk.windows
 
 
 def test_slow_flash_is_safe():
