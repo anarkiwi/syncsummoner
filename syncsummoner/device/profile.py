@@ -16,6 +16,8 @@ import numpy as np
 PARAM_COUNT = 12
 PARAM_MAX = 1023
 BOOL_THRESHOLD = 512
+#: The crossfader; it gates output even where `program info` names it `Null 12`.
+CROSSFADER_INDEX = 12
 
 
 class ParamKind(enum.Enum):
@@ -72,6 +74,8 @@ class ParamSpec:
     steps: int | None = None
     response: list[float] = field(default_factory=list)
     values: list[int] = field(default_factory=list)
+    #: Effect on the driving metric in units of measurement noise; below 1 the
+    #: parameter moves that metric less than the rig's own repeatability.
     sensitivity: float = 0.0
     monotonic: bool = False
     dead_zone: tuple[int, int] | None = None

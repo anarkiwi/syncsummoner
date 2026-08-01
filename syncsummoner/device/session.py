@@ -7,18 +7,18 @@ manual value, so absolute addressing only exists relative to a parked reference.
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .profile import PARAM_COUNT, PARAM_MAX
+from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind
 
 #: Parking every manual value at zero makes the additive sum equal the MIDI offset.
 PARK_REFERENCE = 0
 #: Readback slack, in device units, for park and addressing verification.
 DEFAULT_TOLERANCE = 8
-#: The crossfader; it gates output even where `program info` names it `Null 12`.
-CROSSFADER_INDEX = 12
+#: The operator name that means no modulation.
+DISABLED_OPERATOR = "Disabled"
 
 
 def default_park() -> np.ndarray:
@@ -171,6 +171,77 @@ class Session:
                 f"apparent offset {got - want} from park {int(self._park[int(index) - 1])}"
             )
         return got
+
+    def working_point(self, info: Any, *, exclude: Iterable[int] = ()) -> dict[int, float | bool]:
+        """A mid-scale operating point with the output open, excluding driven slots.
+
+        Parking is the right measurement reference but renders a degenerate
+        image, so a sweep needs somewhere sane to sit around it.
+        """
+        skip = set(exclude)
+        values: dict[int, float | bool] = {}
+        for spec in info.params:
+            if spec.kind is ParamKind.UNUSED or spec.index in skip:
+                continue
+            if spec.kind is ParamKind.BOOLEAN:
+                values[spec.index] = False
+            elif spec.index == CROSSFADER_INDEX or "mix" in spec.name.lower():
+                values[spec.index] = 1.0
+            else:
+                values[spec.index] = 0.5
+        return values
+
+    def arm_modulation(
+        self,
+        info: Any,
+        operators: Sequence[str],
+        rng: np.random.Generator,
+        *,
+        exclude: Iterable[int] = (),
+        count: int = 5,
+        depth: tuple[int, int] = (500, 900),
+    ) -> list[str]:
+        """Bind on-board operators to unused continuous slots; returns what was bound.
+
+        Operators run on the FPGA at field rate, which no CC stream can match;
+        without them a program only moves when a parameter write arrives.
+        """
+        skip = set(exclude)
+        armed = []
+        for spec in info.params:
+            if len(armed) >= count:
+                break
+            if spec.kind is not ParamKind.CONTINUOUS or spec.index in skip:
+                continue
+            operator = operators[int(rng.integers(len(operators)))]
+            self.transport.set_modulation_source(spec.index, operator)
+            self.transport.set_manual(
+                spec.index, PARAM_MAX // 2, time_=int(rng.integers(*depth)), space=512, slope=512
+            )
+            armed.append(f"{spec.name}<-{operator}")
+        return armed
+
+    def disarm_modulation(self) -> None:
+        """Return every slot to Disabled so the next program starts clean."""
+        for index in range(1, PARAM_COUNT + 1):
+            self.transport.set_modulation_source(index, DISABLED_OPERATOR)
+
+    def ensure_live(
+        self, capture: Any, *, timeout_s: float = 20.0, attempts: int = 1, require_motion: bool = True
+    ) -> None:
+        """Block until the capture is carrying content, resyncing if it is not.
+
+        ``require_motion`` distinguishes the two callers: playing a clip, a frozen
+        frame means the output died; probing a still stimulus, no motion is
+        correct and only the splash indicates failure.
+        """
+        wait = capture.wait_for_content if require_motion else capture.wait_for_lock
+        for _ in range(max(1, attempts) + 1):
+            if wait(timeout_s=timeout_s):
+                return
+            if not self.transport.resync():
+                break
+        raise DeviceError("capture is not carrying content; power-cycle the device")
 
     def load_program(self, name: str, *, park: bool = True) -> None:
         """Load a program, absorb the multi-second output blackout, and re-park."""

@@ -14,6 +14,11 @@ from syncsummoner.probe import patterns
 
 __all__ = ["run_plan", "frame_metrics", "settle_frames", "raw_params", "STABILITY_ORDER"]
 
+#: Analysis width; Gabor and optical flow on full 1080p cost far more for no gain.
+ANALYSIS_WIDTH = 480
+#: Setpoints re-measured per plan, so the noise floor is measured not assumed.
+DEFAULT_REPLICATES = 6
+
 STABILITY_ORDER = ("static", "periodic", "quasiperiodic", "chaotic")
 
 
@@ -51,12 +56,41 @@ def settle_frames(frames, *, plateau_frac=0.1):
     return int(active[-1] + 1) if active.size else 0
 
 
-def frame_metrics(frames, analyzer, *, fps=60.0, reference=None, min_dynamics_frames=8):
+def _with_replicates(vectors, replicates, rng):
+    """Append repeats of a few setpoints so ``fit`` can estimate measurement noise.
+
+    Without replicated vectors the noise floor falls back to a constant, and a
+    sensitivity or a cliff has no resolution limit to be judged against.
+    """
+    if replicates <= 0 or len(vectors) < 2:
+        return vectors
+    generator = rng if rng is not None else np.random.default_rng(0)
+    picks = generator.choice(len(vectors), size=min(replicates, len(vectors)), replace=False)
+    return vectors + [vectors[int(i)] for i in picks]
+
+
+def downscale(frames, max_width):
+    """Shrink frames before analysis; the metrics are areal, the cost is not."""
+    if not max_width or frames[0].shape[1] <= max_width:
+        return frames
+    import cv2  # pylint: disable=import-outside-toplevel,no-member
+
+    scale = max_width / frames[0].shape[1]
+    size = (max_width, max(1, int(round(frames[0].shape[0] * scale))))
+    return [cv2.resize(f, size, interpolation=cv2.INTER_AREA) for f in frames]  # pylint: disable=no-member
+
+
+def frame_metrics(
+    frames, analyzer, *, fps=60.0, reference=None, min_dynamics_frames=8, analysis_width=ANALYSIS_WIDTH
+):
     """Per-sample metric vector for one parameter setpoint, all via ``aesthetics``.
 
     ``stability`` is stored as an ordinal into :data:`STABILITY_ORDER` so the row
     stays Parquet-friendly.
     """
+    frames = downscale(frames, analysis_width)
+    if reference is not None and analysis_width and reference.shape[1] > analysis_width:
+        reference = downscale([reference], analysis_width)[0]
     last = frames[-1]
     metrics = {}
     channels = analyzer.gabor_energy(last)
@@ -150,6 +184,9 @@ def run_plan(
     max_wait_frames=None,
     reference=None,
     allow_untagged=False,
+    analysis_width=ANALYSIS_WIDTH,
+    replicates=DEFAULT_REPLICATES,
+    rng=None,
 ):
     """Run ``plan`` on a live session and capture, returning measurement records.
 
@@ -161,6 +198,7 @@ def run_plan(
     capacity = patterns.state_index_capacity(bits)
     max_wait_frames = max_wait_frames or 8 * frames_per_point
     records = []
+    plan = _with_replicates(list(plan), replicates, rng)
     for step, vector in enumerate(plan):
         state = step % capacity
         session.set_params(vector)
@@ -186,7 +224,9 @@ def run_plan(
                 params=raw_params(vector),
                 state_index=state,
                 stimulus=stimulus,
-                metrics=frame_metrics(frames, analyzer, fps=fps, reference=reference),
+                metrics=frame_metrics(
+                    frames, analyzer, fps=fps, reference=reference, analysis_width=analysis_width
+                ),
                 settle_frames=settle_frames(frames),
             )
         )

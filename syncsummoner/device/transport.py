@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pyvmancer as vm
 
-from .profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
 
 #: Timings the resync bounce uses; one must differ from whatever is genlocked.
 RESYNC_ALTERNATE, RESYNC_FALLBACK = "720p60", "1080p30"
@@ -109,6 +109,19 @@ class ProgramInfo:
     def used(self) -> list[ParamSpec]:
         """Parameters this program actually assigns."""
         return [p for p in self.params if p.kind is not ParamKind.UNUSED]
+
+    def sweepable(self, count: int | None = None, *, exclude: Iterable[int] = ()) -> list[ParamSpec]:
+        """Parameters worth sweeping: continuous or quantized, never the crossfader.
+
+        The crossfader gates the output, so sweeping it black-holes the sample.
+        """
+        skip = set(exclude) | {CROSSFADER_INDEX}
+        out = [
+            p
+            for p in self.params
+            if p.kind in (ParamKind.CONTINUOUS, ParamKind.QUANTIZED) and p.index not in skip
+        ]
+        return out if count is None else out[:count]
 
 
 @dataclass(frozen=True)
@@ -210,9 +223,30 @@ class Transport:
         """Send a MIDI CC for one parameter; the device adds it to the manual value."""
         self._device.set_param(_check_index(index), value)
 
-    def set_manual(self, index: int, value: int) -> None:
-        """Set a slot's stored manual value over serial, which is absolute."""
-        self._shell.set_modulation(_check_index(index) - 1, int(np.clip(value, 0, PARAM_MAX)))
+    def set_manual(
+        self,
+        index: int,
+        value: int,
+        *,
+        time_: int | None = None,
+        space: int | None = None,
+        slope: int | None = None,
+    ) -> None:
+        """Set a slot's manual value, and optionally its Time/Space/Slope macros.
+
+        The serial verb is absolute, unlike a CC, which is an offset onto it.
+        """
+        self._shell.set_modulation(
+            _check_index(index) - 1, int(np.clip(value, 0, PARAM_MAX)), time_, space, slope
+        )
+
+    def set_modulation_source(self, index: int, source: str) -> None:
+        """Bind a modulation operator to a slot; operators run at field rate."""
+        self._shell.set_source(_check_index(index) - 1, source)
+
+    def operators(self) -> dict[str, Any]:
+        """Every modulation operator the firmware exposes, keyed by name."""
+        return dict(self._shell.operators())
 
     def program_state(self) -> np.ndarray:
         """Combined 0..1023 value of every parameter (Manual + Modulation + MIDI)."""

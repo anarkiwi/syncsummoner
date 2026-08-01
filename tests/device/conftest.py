@@ -32,6 +32,7 @@ class FakeShell:
 
     def __init__(self, manual=None, info=None):
         self.manual = np.zeros(PARAM_COUNT, dtype=int) if manual is None else np.asarray(manual, dtype=int)
+        self.sources = {}
         self.midi = np.zeros(PARAM_COUNT, dtype=int)
         self.info = COLORBARS_INFO if info is None else info
         self.calls = []
@@ -66,9 +67,16 @@ class FakeShell:
             return {"o": ["x"] * PARAM_COUNT, "mods": [{"z": 1}] * PARAM_COUNT, "combined": [3] * PARAM_COUNT}
         return {}
 
-    def set_modulation(self, index, manual):
-        self.calls.append(("set_modulation", index, manual))
+    def set_modulation(self, index, manual, time_=None, space=None, slope=None):
+        self.calls.append(("set_modulation", index, manual, time_, space, slope))
         self.manual[index] = manual
+
+    def set_source(self, index, source):
+        self.calls.append(("set_source", index, source))
+        self.sources[index] = source
+
+    def operators(self):
+        return {"Sync LFO": {"id": 7}, "Disabled": {"id": 0}, "Pendulum": {"id": 10}}
 
     def video_status(self):
         return {"input": {"source": "analog", "locked": True}, "timing": "720p60"}
@@ -130,12 +138,23 @@ class FakeTransport:
         self.bias = bias
         self.calls = []
         self.loaded = None
+        self.sources = {}
+        self.resyncs = 0
 
     def set_param(self, index, value):
         self.calls.append(("cc", index, int(value)))
         self.midi[index - 1] = int(value)
 
-    def set_manual(self, index, value):
+    def set_modulation_source(self, index, source):
+        self.calls.append(("source", index, source))
+        self.sources[index] = source
+
+    def resync(self, **_kw):
+        self.resyncs += 1
+        return True
+
+    def set_manual(self, index, value, *, time_=None, space=None, slope=None):
+        del time_, space, slope
         self.calls.append(("manual", index, int(value)))
         self.manual[index - 1] = int(value)
 
