@@ -2,11 +2,13 @@
 
 # pylint: disable=missing-function-docstring
 
+import types
+
 import numpy as np
 import pytest
 
 from syncsummoner.device import session as sess_mod
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
 from syncsummoner.device.session import (
     AddressingError,
     ParkError,
@@ -204,3 +206,70 @@ def test_park_values_property_is_a_copy():
     values = session.park_values
     values[0] = 999
     assert session.park_values[0] == 5
+
+
+def _info(specs):
+    return types.SimpleNamespace(params=specs)
+
+
+def _spec(index, name, kind):
+    return ParamSpec(index=index, name=name, native_min=0, native_max=100, kind=kind)
+
+
+def test_working_point_opens_the_output_and_skips_driven_slots():
+    info = _info(
+        [
+            _spec(1, "Posterize", ParamKind.CONTINUOUS),
+            _spec(2, "Flag", ParamKind.BOOLEAN),
+            _spec(3, "-", ParamKind.UNUSED),
+            _spec(12, "Null 12", ParamKind.CONTINUOUS),
+        ]
+    )
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    point = session.working_point(info, exclude=[1])
+    assert 1 not in point and 3 not in point
+    assert point[2] is False
+    assert point[sess_mod.CROSSFADER_INDEX] == 1.0
+
+
+def test_arm_modulation_binds_operators_and_disarm_clears_them():
+    info = _info([_spec(i, f"P{i}", ParamKind.CONTINUOUS) for i in range(1, 6)])
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    armed = session.arm_modulation(info, ["Sync LFO"], np.random.default_rng(0), exclude=[1, 2], count=2)
+    assert armed == ["P3<-Sync LFO", "P4<-Sync LFO"]
+    assert port.sources[3] == "Sync LFO"
+    session.disarm_modulation()
+    assert set(port.sources.values()) == {sess_mod.DISABLED_OPERATOR}
+
+
+def test_ensure_live_resyncs_once_then_raises():
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    capture = types.SimpleNamespace(wait_for_content=lambda **_kw: False, wait_for_lock=lambda **_kw: False)
+    with pytest.raises(sess_mod.DeviceError, match="power-cycle"):
+        session.ensure_live(capture)
+    assert port.resyncs >= 1
+
+
+def test_ensure_live_without_motion_accepts_a_still_stimulus():
+    """A probe drives a still pattern; no motion is correct, only the splash is failure."""
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    capture = types.SimpleNamespace(wait_for_content=lambda **_kw: False, wait_for_lock=lambda **_kw: True)
+    session.ensure_live(capture, require_motion=False)
+    assert port.resyncs == 0
+
+
+def test_ensure_live_returns_once_content_arrives():
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    seen = {"n": 0}
+
+    def content(**_kw):
+        seen["n"] += 1
+        return seen["n"] > 1
+
+    session.ensure_live(types.SimpleNamespace(wait_for_content=content))
+    assert port.resyncs == 1

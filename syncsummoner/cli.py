@@ -79,9 +79,9 @@ def _probe_cmd(args: argparse.Namespace) -> int:
             records = []
             session = Session(dev)
             with Capture(device=args.capture) as capture:
-                capture.wait_for_lock()
                 for name in names:
                     session.load_program(name)
+                    session.ensure_live(capture, require_motion=False)
                     specs = dev.program_info().params
                     specs_by_program[name] = specs
                     for plan_name in args.plan.split(","):

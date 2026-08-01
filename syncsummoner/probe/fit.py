@@ -177,14 +177,19 @@ def _hysteresis(order, values, metric, floor):
 
 
 def _fit_param(index, spec, values, metrics, names, span, noise, *, monotonic_rho, cliff_iqr):
-    """Fill one ``ParamSpec`` from its one-at-a-time subset; returns the driving metric."""
+    """Fill one ``ParamSpec`` from its one-at-a-time subset; returns the driving metric.
+
+    Sensitivity is a signal-to-noise ratio, not a fraction of the metric's span:
+    normalising by span pins every parameter that solely owns a metric at exactly
+    1.0, so the field cannot rank the parameters that matter.
+    """
     unique, curve = _curve(values, metrics)
     effect = np.ptp(curve, axis=0)
-    driver = int(np.argmax(effect / span))
+    driver = int(np.argmax(effect / noise))
     response = curve[:, driver]
     spec.index = index
     spec.values = [int(v) for v in unique]
-    spec.sensitivity = float(np.clip(effect[driver] / span[driver], 0.0, 1.0))
+    spec.sensitivity = float(effect[driver] / noise[driver])
     spread = np.ptp(response)
     spec.response = [float(v) for v in ((response - response.min()) / (spread or 1.0))]
     moving = np.concatenate(([True], np.abs(np.diff(response)) > noise[driver]))

@@ -118,6 +118,7 @@ def run(capture, vectors, **kwargs):
         program="bitcrush_displace",
         analyzer=FakeAnalyzer(),
         frames_per_point=kwargs.pop("frames_per_point", 2),
+        replicates=kwargs.pop("replicates", 0),
         **kwargs,
     )
     return session, records
@@ -311,6 +312,29 @@ def test_allow_untagged_ignores_a_spuriously_decoded_index():
     session = FakeSession()
     setpoints = [{1: 0.0}, {1: 0.5}, {1: 1.0}]
     records = runner.run_plan(
-        session, capture, setpoints, program="P", analyzer=FakeAnalyzer(), allow_untagged=True
+        session,
+        capture,
+        setpoints,
+        program="P",
+        analyzer=FakeAnalyzer(),
+        allow_untagged=True,
+        replicates=0,
     )
     assert len(records) == len(setpoints), "every setpoint must yield a record when untagged"
+
+
+def test_replicates_repeat_setpoints_so_noise_can_be_measured():
+    """Without repeated vectors the noise floor is a constant, and cliffs have no scale."""
+    frames = [tagged(state % 8, seed=state) for state in range(40) for _ in range(2)]
+    _, records = run(FakeCapture(frames), plan(4), replicates=2, allow_untagged=True)
+    vectors = [r.params for r in records]
+    assert len(records) == 6, "four setpoints plus two replicates"
+    assert len(set(vectors)) == 4, "replicates must repeat existing vectors, not invent new ones"
+
+
+def test_downscale_shrinks_only_when_wider_than_the_analysis_width():
+    """Analysis width bounds the cost; Gabor and flow on full 1080p buy nothing."""
+    wide = [np.zeros((90, 320, 3), np.float32)]
+    assert runner.downscale(wide, 160)[0].shape[:2] == (45, 160)
+    assert runner.downscale(wide, 640)[0] is wide[0]
+    assert runner.downscale(wide, None)[0] is wide[0]

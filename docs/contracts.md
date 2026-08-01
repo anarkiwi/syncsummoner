@@ -125,6 +125,10 @@ class Session:                       # settle timing, CC rate limiting, state ca
     def set_params(self, values: Mapping[int, float | bool]) -> None: ...  # rate limited, cached
     def park(self) -> None: ...      # drive every parameter to a known reference
     def load_program(self, name) -> None: ...   # absorbs the load blackout
+    def working_point(self, info, *, exclude=()) -> dict[int, float | bool]: ...
+    def arm_modulation(self, info, operators, rng, *, exclude=(), count=5) -> list[str]: ...
+    def disarm_modulation(self) -> None: ...
+    def ensure_live(self, capture, *, require_motion=True) -> None: ...  # resyncs, then raises
 
 class Capture:                       # long-lived; never reopened per sample
     def __init__(self, device="/dev/video0", *, width=720, height=576, fps=50): ...
@@ -132,6 +136,7 @@ class Capture:                       # long-lived; never reopened per sample
     def read(self) -> np.ndarray | None      # RGB float32 (H, W, 3)
     def wait_for_lock(self, timeout_s=10.0) -> bool
     def is_no_signal(self, frame) -> bool    # capture card synthesizes a splash; see docs/hardware.md
+    def wait_for_content(self, timeout_s=15.0) -> bool   # past the splash AND moving
 ```
 
 `ParamSpec` / `ProgramProfile` and the measurement record schema live in

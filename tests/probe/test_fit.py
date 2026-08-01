@@ -64,12 +64,19 @@ def test_profile_carries_provenance(profile):
 
 
 def test_response_curve_and_sensitivity(profile):
-    """Response curve and sensitivity."""
+    """Sensitivity is a signal-to-noise ratio, so live parameters clear 1 and inert ones do not."""
     spec = param(profile, 1)
     assert len(spec.response) == len(GRID) == len(spec.values)
     assert spec.response[0] == pytest.approx(0.0) and spec.response[-1] == pytest.approx(1.0)
-    assert spec.sensitivity == pytest.approx(1.0)
+    assert spec.sensitivity > 1.0
     assert param(profile, 7).sensitivity == 0.0
+
+
+def test_sensitivity_ranks_parameters_instead_of_saturating(profile):
+    """Span-normalising pinned every sole owner of a metric at exactly 1.0."""
+    live = [s.sensitivity for s in profile.params if s.sensitivity > 0]
+    assert len(live) >= 3
+    assert len(set(round(v, 6) for v in live)) > 1, "sensitivities must not all tie"
 
 
 def test_monotonicity_uses_rank_correlation(profile):
