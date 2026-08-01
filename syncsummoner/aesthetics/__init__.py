@@ -28,6 +28,7 @@ from syncsummoner.aesthetics.score import (
     score_clip,
 )
 from syncsummoner.aesthetics.spectrum import SpectralStats, spectral_stats
+from syncsummoner.aesthetics.structure import PointwiseFit, pointwise_fit, pointwise_r2
 from syncsummoner.aesthetics.surprisal import (
     SurprisalModel,
     entropy_rate,
@@ -44,6 +45,7 @@ __all__ = [
     "FlashRisk",
     "LevelStats",
     "MotionStats",
+    "PointwiseFit",
     "ScoreWeights",
     "SpectralStats",
     "StabilityClass",
@@ -62,6 +64,8 @@ __all__ = [
     "mitigate_flashes",
     "motion_stats",
     "passthrough_distance",
+    "pointwise_fit",
+    "pointwise_r2",
     "relative_luminance",
     "score_clip",
     "spectral_stats",

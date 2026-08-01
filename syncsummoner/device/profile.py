@@ -42,6 +42,19 @@ class Axis(enum.Enum):
     UNASSIGNED = "unassigned"
 
 
+class ProgramStyle(enum.Enum):
+    """Whether a program remaps values in place or re-addresses the picture.
+
+    Analog-style effects are pointwise, so their parameters can only flicker
+    when cycled; digital-style effects displace, so cycling them reads as motion.
+    """
+
+    ANALOG = "analog"
+    DIGITAL = "digital"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
 class Source(enum.Enum):
     """Where a measurement came from. The planner discounts simulated entries."""
 
@@ -173,6 +186,9 @@ class ProgramProfile:
     stability_by_region: list[dict[str, Any]] = field(default_factory=list)
     settle_frames: dict[int, int] = field(default_factory=dict)
     non_settling: bool = False
+    style: ProgramStyle = ProgramStyle.UNKNOWN
+    pointwise: float = 0.0
+    binary_hash: str = ""
 
     def by_axis(self, axis: Axis) -> list[ParamSpec]:
         """Parameters assigned to a canonical axis, so gestures stay program-agnostic."""
@@ -201,6 +217,9 @@ class ProgramProfile:
             stability_by_region=list(data.get("stability_by_region", ())),
             settle_frames={int(k): int(v) for k, v in data.get("settle_frames", {}).items()},
             non_settling=bool(data.get("non_settling", False)),
+            style=ProgramStyle(data.get("style", "unknown")),
+            pointwise=float(data.get("pointwise", 0.0)),
+            binary_hash=str(data.get("binary_hash", "")),
         )
 
 
