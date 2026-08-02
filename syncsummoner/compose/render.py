@@ -120,11 +120,17 @@ def align(captured: Mapping[int, np.ndarray], n_frames: int, shape: tuple[int, .
 def play_pass(
     rig: Rig, frames: np.ndarray, auto: Automation, *, program: str, config: RenderConfig
 ) -> np.ndarray:
-    """Run one real-time pass: load the program once, play out, drive CC, capture and align."""
+    """Run one real-time pass: load the program once, play out, drive CC, capture and place.
+
+    A frame whose strip does not decode is still a frame the instrument made, so
+    it is placed by arrival less the capture lag rather than discarded: a program
+    that eats its own timecode used to render as nothing at all.
+    """
     rig.session.load_program(program, link=rig.link)
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
-    captured: dict[int, np.ndarray] = {}
+    arrived: dict[int, np.ndarray] = {}
+    stamps: dict[int, int] = {}
     cursor = 0
     shape: tuple[int, ...] = (max(1, frames.shape[1] - config.strip_px),) + tuple(frames.shape[2:])
     for i in range(frames.shape[0]):
@@ -138,11 +144,31 @@ def play_pass(
         got = rig.capture.read()
         if got is None:
             continue
+        arrived[i] = crop_strip(got, strip_px=config.strip_px)
+        shape = arrived[i].shape
         tc = read_timecode(got, bits=config.bits, strip_px=config.strip_px)
         if tc is not None and 0 <= tc < frames.shape[0]:
-            captured[tc] = crop_strip(got, strip_px=config.strip_px)
-            shape = captured[tc].shape
-    return align(captured, frames.shape[0], shape)
+            stamps[i] = tc
+    return align(_placed(arrived, stamps, frames.shape[0]), frames.shape[0], shape)
+
+
+def _placed(
+    arrived: Mapping[int, np.ndarray], stamps: Mapping[int, int], n_frames: int
+) -> dict[int, np.ndarray]:
+    """Index every captured frame, by its own stamp where it has one and by arrival otherwise.
+
+    The lag between showing a frame and capturing it is measured from the frames
+    that did decode, so an undecodable strip costs alignment accuracy rather than
+    the whole take.
+    """
+    lags = [arrival - stamp for arrival, stamp in stamps.items()]
+    lag = int(round(float(np.median(lags)))) if lags else 0
+    placed: dict[int, np.ndarray] = {}
+    for arrival, frame in arrived.items():
+        index = stamps.get(arrival, arrival - lag)
+        if 0 <= index < n_frames:
+            placed[index] = frame
+    return placed
 
 
 def composite(passes: Sequence[np.ndarray], *, mode: str = "screen") -> np.ndarray:

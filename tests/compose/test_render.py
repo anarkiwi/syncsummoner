@@ -436,3 +436,55 @@ def test_the_rig_session_is_a_named_format():
     """Playout writes the Pi framebuffer, which is 1920x1080: a 720p session showed nothing."""
     rig = R.RenderConfig.for_format("1080p30")
     assert (rig.width, rig.height, rig.fps) == (1920, 1080, 30.0)
+
+
+def test_a_frame_whose_strip_will_not_decode_is_still_kept():
+    """Kaledos decoded 4 of 40 strips; discarding the rest rendered the take as black."""
+    frames = {i: np.full((4, 4, 3), i / 10.0, np.float32) for i in range(10)}
+    stamps = {4: 2, 6: 4, 8: 6}  # a lag of two, measured from the three that decoded
+    placed = R._placed(frames, stamps, 10)
+    assert placed[2] is frames[4] and placed[6] is frames[8], "a stamp wins where it exists"
+    assert placed[0] is frames[2] and placed[7] is frames[9], "the rest land by arrival less the lag"
+    assert len(placed) == 8, "the two that predate the lag fall off the front"
+
+
+def test_placing_with_no_decoded_stamp_at_all_keeps_arrival_order():
+    frames = {i: np.full((2, 2, 3), i, np.float32) for i in range(4)}
+    placed = R._placed(frames, {}, 4)
+    assert [int(placed[i][0, 0, 0]) for i in sorted(placed)] == [0, 1, 2, 3]
+
+
+def test_a_pass_that_decodes_nothing_still_returns_the_pictures(monkeypatch):
+    """The captured stream is the performance; naming its frames is what alignment adds."""
+    monkeypatch.setattr(R, "read_timecode", lambda *a, **k: None)
+    shown, grabbed = [], []
+
+    class Playout:
+        """Playout stand-in."""
+
+        def show(self, frame):
+            """Show."""
+            shown.append(frame)
+
+    class Capture:
+        """Capture handing back a distinguishable frame each grab."""
+
+        def read(self):
+            """Read."""
+            got = np.full((8, 8, 3), 0.1 * (len(grabbed) + 1), np.float32)
+            grabbed.append(got)
+            return got
+
+    class Session:
+        """Session stand-in."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+
+        def set_params(self, values):
+            """Set params."""
+
+    rig = R.Rig(session=Session(), capture=Capture(), playout=Playout())
+    source = np.zeros((5, 8, 8, 3), np.float32)
+    out = R.play_pass(rig, source, Automation.empty(), program="Kaledos", config=CONFIG)
+    assert out.shape[0] == 5 and float(out.max()) > 0, "the take survives an unreadable strip"
