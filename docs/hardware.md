@@ -311,6 +311,13 @@ was dark and the run continues; black back means the device is faulted and the
 run stops. Both faults need a power cycle, and the report keeps them apart
 (`wedged` against `blacked`) because the diagnosis differs.
 
+The fault recurs on a schedule of loads, not of time. On `1.0.0-rc.40` a run that
+started from a freshly power-cycled device archived **14 programs in 17.8 minutes**
+and then went black, with the passthrough canary dark; a power cycle cleared it and
+the next run resumed normally. A 49-program archive therefore costs roughly **four
+power cycles**, which is why the run commits per program and resumes from what is
+stored rather than restarting.
+
 The same fault frame also opens an otherwise healthy program. Scanned across a
 complete 49-program archive (2026-08-02, firmware `1.0.0-rc.40`), that frame is
 byte-identical everywhere it appears and held **33 of 1506 setpoints across 12

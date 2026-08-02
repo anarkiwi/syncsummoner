@@ -189,6 +189,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         FrameArchive(args.archive, ffmpeg=args.ffmpeg),
         analyzer=aesthetics,
         programs=programs,
+        jobs=args.jobs,
         log=lambda message: print(message, flush=True),
     )
     written = []
@@ -359,6 +360,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     refit.add_argument("--archive", default="archive/")
     refit.add_argument("--out", default="profiles/")
     refit.add_argument("--ffmpeg", default="ffmpeg", help="decoder to read the archive with")
+    refit.add_argument("--jobs", type=int, default=1, help="programs to read at once")
     refit.set_defaults(func=_refit_cmd)
 
     collect = probe_sub.add_parser("archive", help="archive native frames for every program")

@@ -129,3 +129,12 @@ def test_the_blanking_frame_is_found_across_the_run_not_the_subset():
     out = R.replay(archive, analyzer=FakeAnalyzer(), programs=["a"], log=notes.append)
     assert sorted(out) == ["a"] and len(out["a"]) == 1, "the blanked setpoint is still dropped"
     assert any(R.digest(blank) in n for n in notes)
+
+
+def test_replay_reads_several_programs_at_once():
+    """Decoding dominates and releases the lock, so the work overlaps."""
+    archive = Archive(
+        {name: Reader([native(90), native(95)], setpoints=[0, 0]) for name in ("a", "b", "c", "d")}
+    )
+    out = R.replay(archive, analyzer=FakeAnalyzer(), jobs=4)
+    assert sorted(out) == ["a", "b", "c", "d"] and all(len(v) == 1 for v in out.values())
