@@ -197,6 +197,9 @@ class ClipPlayer(Playout):
     CLIP_PATH = "/dev/shm/syncsummoner-clip.mkv"
     PID_PATH = "/dev/shm/syncsummoner-clip.pid"
 
+    def __init__(self, host: str = DEFAULT_HOST, *, ssh_timeout_s: float = UPLOAD_TIMEOUT, **kwargs):
+        super().__init__(host, ssh_timeout_s=ssh_timeout_s, **kwargs)
+
     def upload(self, path: str) -> int:
         """Send the clip into tmpfs; returns the bytes put on the wire."""
         data = Path(path).read_bytes()
