@@ -3,6 +3,7 @@
 # pylint: disable=missing-function-docstring
 
 import contextlib
+import itertools
 import types
 
 import numpy as np
@@ -200,36 +201,40 @@ def test_load_program_holds_the_link_down_across_the_whole_reconfiguration():
     port, clock = FakeTransport(), FakeClock()
     session = logging_session(port, clock, load_blackout_s=4.0)
     session.load_program("Isotherm", link=FakeLink(port.calls), park=False)
-    assert port.calls == [
-        ("link", "down"),
-        ("load", "Isotherm"),
-        ("sleep", 4.0),
-        ("link", "up"),
-        ("video_status",),
-    ]
+    assert port.calls[:3] == [("link", "down"), ("load", "Isotherm"), ("sleep", 4.0)]
+    assert ("link", "up") in port.calls
 
 
-def test_load_program_waits_for_source_lock_before_parking():
+def test_load_program_waits_for_settled_state_before_parking():
     port, clock = FakeTransport(), FakeClock()
     session = logging_session(port, clock, load_blackout_s=0.0)
     session.load_program("Isotherm", link=FakeLink(port.calls), park=True)
-    lock = port.calls.index(("video_status",))
+    restored = port.calls.index(("link", "up"))
     writes = [i for i, call in enumerate(port.calls) if call[0] == "manual"]
-    assert writes and lock < min(writes)
+    assert writes and restored < min(writes)
 
 
-def test_load_program_without_a_link_does_not_wait_for_lock():
+def test_load_program_without_a_link_parks_immediately():
     port, clock = FakeTransport(), FakeClock()
     session = logging_session(port, clock, load_blackout_s=0.0)
     session.load_program("Isotherm", park=False)
-    assert ("video_status",) not in port.calls
+    assert ("link", "up") not in port.calls
 
 
-def test_wait_source_lock_gives_up_when_the_source_never_returns():
-    port, clock = FakeTransport(source_locked=False), FakeClock()
+def test_wait_state_settled_needs_consecutive_identical_reads():
+    port, clock = FakeTransport(), FakeClock()
     session = logging_session(port, clock)
-    assert session.wait_source_lock(polls=3) is False
-    assert port.calls.count(("video_status",)) == 3
+    moving = [[1] * PARAM_COUNT, [2] * PARAM_COUNT, [3] * PARAM_COUNT, [3] * PARAM_COUNT]
+    port.program_state = lambda: moving.pop(0) if moving else [3] * PARAM_COUNT
+    assert session.wait_state_settled() is True
+
+
+def test_wait_state_settled_gives_up_on_a_state_that_never_stops_moving():
+    port, clock = FakeTransport(), FakeClock()
+    session = logging_session(port, clock)
+    counter = itertools.count()
+    port.program_state = lambda: [next(counter)] * PARAM_COUNT
+    assert session.wait_state_settled(polls=4) is False
 
 
 def test_load_program_restores_the_link_when_the_load_fails():

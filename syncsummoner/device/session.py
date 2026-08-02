@@ -21,9 +21,10 @@ DEFAULT_TOLERANCE = 8
 #: The operator name that means no modulation.
 DISABLED_OPERATOR = "Disabled"
 
-#: The source returns before the device re-locks to it; writes are lost until it has.
+#: A freshly loaded program keeps applying its defaults after the source returns.
 LOCK_POLLS = 40
 LOCK_POLL_S = 0.25
+STABLE_READS = 2
 
 
 def default_park() -> np.ndarray:
@@ -293,22 +294,29 @@ class Session:
             self._sleep(self.load_blackout_s)
         self._sent.clear()
         if link is not None:
-            self.wait_source_lock()
+            self.wait_state_settled()
         if park:
             self.park()
 
-    def wait_source_lock(self, *, polls: int = LOCK_POLLS, poll_s: float = LOCK_POLL_S) -> bool:
-        """Wait for the device to regain lock on its source, reporting whether it did.
+    def wait_state_settled(
+        self, *, polls: int = LOCK_POLLS, poll_s: float = LOCK_POLL_S, stable: int = STABLE_READS
+    ) -> bool:
+        """Wait until the device stops applying a freshly loaded program's defaults.
 
-        The source returns before the device has re-locked to it, and parameter
-        writes are lost until the FPGA has its recovered clock back.
+        The source returns before the device has finished initialising, and lock is
+        already reported by then, so parameter state settling is the usable signal.
         """
+        previous: tuple[int, ...] | None = None
+        runs = 0
         for _ in range(int(polls)):
             try:
-                if bool(self.transport.video_status().source_locked):
-                    return True
+                state: tuple[int, ...] | None = tuple(int(v) for v in self.transport.program_state())
             except Exception:  # pylint: disable=broad-except
-                pass
+                state = None
+            runs = runs + 1 if state is not None and state == previous else 0
+            if runs >= int(stable):
+                return True
+            previous = state
             self._sleep(poll_s)
         return False
 
