@@ -204,10 +204,33 @@ def _source_frames(source: Any, config: RenderConfig, *, seconds: float | None =
             if budget is not None and len(frames) >= budget:
                 break
         stack = np.stack(frames).astype(np.float32) if frames else np.zeros((0, 1, 1, 3), np.float32)
-    if not stack.shape[0] or fps <= 0 or abs(fps - config.fps) < 1e-6:
+    if stack.shape[0] and fps > 0 and abs(fps - config.fps) >= 1e-6:
+        wanted = max(1, int(round(stack.shape[0] * config.fps / fps)))
+        stack = stack[np.minimum((np.arange(wanted) * fps / config.fps).astype(int), stack.shape[0] - 1)]
+    return _conform(stack, config)
+
+
+def _conform(stack: np.ndarray, config: RenderConfig) -> np.ndarray:
+    """Fit the source into the session raster, padding rather than stretching it.
+
+    Playout takes the session geometry and nothing else, and the aspect a source
+    was shot at is not the rig's to change: it is centred, and the rest is black.
+    """
+    # pylint: disable=no-member
+    import cv2
+
+    if not stack.shape[0] or stack.shape[1:3] == (config.height, config.width):
         return stack
-    wanted = max(1, int(round(stack.shape[0] * config.fps / fps)))
-    return stack[np.minimum((np.arange(wanted) * fps / config.fps).astype(int), stack.shape[0] - 1)]
+    height, width = stack.shape[1:3]
+    scale = min(config.width / width, config.height / height)
+    fit = (max(1, round(width * scale)), max(1, round(height * scale)))
+    left, top = (config.width - fit[0]) // 2, (config.height - fit[1]) // 2
+    out = np.zeros((stack.shape[0], config.height, config.width, stack.shape[3]), dtype=np.float32)
+    for i, frame in enumerate(stack):
+        out[i, top : top + fit[1], left : left + fit[0]] = cv2.resize(
+            frame, fit, interpolation=cv2.INTER_AREA
+        )
+    return out
 
 
 def _passes(

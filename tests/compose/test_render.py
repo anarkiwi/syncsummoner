@@ -234,7 +234,7 @@ def test_config_formats_and_source_loading(monkeypatch):
         "syncsummoner.compose.features.read_frames",
         lambda p, max_frames=None: iter([(CONFIG.fps, np.zeros((4, 4, 3), np.float32))] * 2),
     )
-    assert R._source_frames("clip.mp4", CONFIG).shape == (2, 4, 4, 3)
+    assert R._source_frames("clip.mp4", CONFIG).shape == (2, CONFIG.height, CONFIG.width, 3)
 
 
 def test_write_video_uses_the_bgr_boundary(monkeypatch, tmp_path):
@@ -325,7 +325,8 @@ def test_source_frames_are_resampled_to_the_session_rate(monkeypatch):
     config = R.RenderConfig(fps=50.0)
     got = R._source_frames("clip.mkv", config)
     assert got.shape[0] == 10, "half the rate means every frame is held twice"
-    assert [float(f[0, 0, 0]) for f in got] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+    middle = (got.shape[1] // 2, got.shape[2] // 2)
+    assert [round(float(f[middle][0])) for f in got] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
 
 
 def test_source_frames_decode_only_the_span_the_pass_uses(monkeypatch):
@@ -346,3 +347,26 @@ def test_source_frames_decode_only_the_span_the_pass_uses(monkeypatch):
 def test_source_frames_of_an_empty_clip(monkeypatch):
     monkeypatch.setattr("syncsummoner.compose.features.read_frames", lambda p, max_frames=None: iter([]))
     assert R._source_frames("clip.mkv", CONFIG).shape[0] == 0
+
+
+def test_source_frames_are_fitted_into_the_session_raster(monkeypatch):
+    """Playout takes the session geometry and nothing else; a 694x576 clip failed at the pipe."""
+    clip = [np.full((576, 694, 3), 0.5, np.float32)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames", lambda p, max_frames=None: iter([(10.0, clip[0])])
+    )
+    got = R._source_frames("clip.mkv", CONFIG)
+    assert got.shape == (1, CONFIG.height, CONFIG.width, 3)
+    filled = got[0].any(axis=2)
+    assert filled.all(axis=0).any(), "a full column of picture, so the height is filled"
+    assert not filled[:, 0].any() and not filled[:, -1].any(), "pillarboxed, not stretched"
+
+
+def test_a_source_already_at_the_session_raster_is_untouched(monkeypatch):
+    frames = [np.full((CONFIG.height, CONFIG.width, 3), 0.25, np.float32)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, frames[0])]),
+    )
+    got = R._source_frames("clip.mkv", CONFIG)
+    assert got.shape == (1, CONFIG.height, CONFIG.width, 3) and float(got.min()) == 0.25
