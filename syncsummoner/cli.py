@@ -174,6 +174,33 @@ def _probe_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refit_cmd(args: argparse.Namespace) -> int:
+    """Fit profiles from an archived run, with no device and no rig time."""
+    from syncsummoner import aesthetics
+    from syncsummoner.probe.archive import FrameArchive
+    from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
+    from syncsummoner.probe.replay import replay
+    from syncsummoner.probe.store import slug
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    programs = None if args.program == "all" else args.program.split(",")
+    measured = replay(
+        FrameArchive(args.archive),
+        analyzer=aesthetics,
+        programs=programs,
+        log=lambda message: print(message, flush=True),
+    )
+    written = []
+    for program, records in sorted(measured.items()):
+        path = out / f"{slug(program)}.yaml"
+        save_profile(fit_profile(records), path)
+        save_measurements(records, out / f"{slug(program)}.parquet")
+        written.append(str(path))
+    print(f"{len(written)} profiles in {out}")
+    return 0 if written else 1
+
+
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
     from syncsummoner.device.capture import Capture, PixelMode
@@ -326,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     simulate.add_argument("--seed", type=int, default=0)
     simulate.add_argument("--out", default="profiles/")
     probe.set_defaults(func=_probe_cmd)
+
+    refit = probe_sub.add_parser("refit", help="fit profiles from an archived run, with no device")
+    refit.add_argument("--program", default="all")
+    refit.add_argument("--archive", default="archive/")
+    refit.add_argument("--out", default="profiles/")
+    refit.set_defaults(func=_refit_cmd)
 
     collect = probe_sub.add_parser("archive", help="archive native frames for every program")
     collect.add_argument("--program", default="all")

@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -443,3 +444,60 @@ def test_an_archive_tagged_with_the_advertised_order_is_refused(tmp_path):
     meta_path.write_text(json.dumps(meta | {"schema_version": 1, "pix_fmt": "yuyv422"}), encoding="utf-8")
     assert archive.meta("bitcrush") is None
     assert archive.reader("bitcrush") is None
+
+
+class FakeStreamer:
+    """``Popen`` stand-in serving the fake archive's frames in order on stdout."""
+
+    def __init__(self, size=SIZE, *, truncate=False):
+        self.nbytes = size[0] * size[1] * CHANNELS
+        self.truncate = truncate
+        self.calls = []
+
+    def __call__(self, argv, stdout=None, stderr=None):
+        del stdout, stderr
+        import io
+
+        start = round(float(argv[argv.index("-ss") + 1]) * 25 + 0.5)
+        want = int(argv[argv.index("-frames:v") + 1])
+        self.calls.append((start, want))
+        with open(argv[argv.index("-i") + 1], "rb") as handle:
+            data = handle.read()[start * self.nbytes :][: want * self.nbytes]
+        return SimpleNamespace(stdout=io.BytesIO(data[:-1] if self.truncate else data), wait=lambda: 0)
+
+
+def test_stream_reads_the_archive_in_order_from_one_decoder(tmp_path):
+    """A per-frame seek costs a process each time; recomputing metrics reads in order."""
+    archive, _, made = write_archive(tmp_path, count=6)
+    streamer = FakeStreamer()
+    reader = archive.reader("bitcrush")
+    reader._popen = streamer  # pylint: disable=protected-access
+    got = list(reader.stream())
+    assert len(got) == 6 and streamer.calls == [(0, 6)]
+    assert all(np.array_equal(a, b) for a, b in zip(got, made)), "bit exact, in order"
+
+
+def test_stream_takes_a_slice_of_the_archive(tmp_path):
+    """Only the setpoint being measured need be decoded."""
+    archive, _, made = write_archive(tmp_path, count=6)
+    reader = archive.reader("bitcrush")
+    reader._popen = FakeStreamer()  # pylint: disable=protected-access
+    got = list(reader.stream(start=2, count=3))
+    assert [f.mean() for f in got] == [f.mean() for f in made[2:5]]
+
+
+def test_stream_of_an_empty_range_runs_no_decoder(tmp_path):
+    """A range past the end costs no process at all."""
+    archive, _, _ = write_archive(tmp_path, count=2)
+    streamer = FakeStreamer()
+    reader = archive.reader("bitcrush")
+    reader._popen = streamer  # pylint: disable=protected-access
+    assert not list(reader.stream(start=5)) and not streamer.calls
+
+
+def test_stream_stops_when_the_decoder_ends_early(tmp_path):
+    """A short read ends the stream rather than reshaping a partial frame."""
+    archive, _, _ = write_archive(tmp_path, count=4)
+    reader = archive.reader("bitcrush")
+    reader._popen = FakeStreamer(truncate=True)  # pylint: disable=protected-access
+    assert len(list(reader.stream())) == 3, "a short read ends the stream rather than reshaping it"

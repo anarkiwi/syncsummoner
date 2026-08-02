@@ -171,6 +171,10 @@ fit.fit_profile(records, *, specs=None) -> ProgramProfile
 
 archive.FrameArchive(directory).writer(program, key, *, width, height) -> FrameWriter
 FrameWriter.write(native, *, params, setpoint, loop_index=None) -> int   # native is (H, W, 2) uint8
+FrameReader.stream(*, start=0, count=None) -> Iterator[native]           # one decoder, in order
+
+replay.replay(archive, *, analyzer, programs=None) -> dict[str, list[MeasurementRecord]]
+replay.blank_digest(archive, programs) -> str | None    # the frame the device emits while blanked
 
 harvest.harvest(archive, *, open_transport, open_capture, player=None, link=None,
                 programs=None, config=HarvestConfig(), session_factory=Session) -> HarvestReport
