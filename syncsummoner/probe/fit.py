@@ -132,11 +132,21 @@ def _infer_kind(column, *, max_steps=16):
 
 
 def _signature_weights(names, signature):
+    """Metric weights for one axis, a wildcard weighing as one family and not one each.
+
+    ``ch_*`` names the channel bank, so its weight is shared across the twenty
+    channels: undivided, the broadest signature wins on density alone.
+    """
     weights = np.zeros(len(names))
-    for i, name in enumerate(names):
-        for key, weight in signature.items():
-            if name == key or (key.endswith("*") and name.startswith(key[:-1])):
-                weights[i] = max(weights[i], weight)
+    for key, weight in signature.items():
+        matched = [
+            i
+            for i, name in enumerate(names)
+            if name == key or (key.endswith("*") and name.startswith(key[:-1]))
+        ]
+        share = weight / np.sqrt(len(matched)) if matched else weight
+        for i in matched:
+            weights[i] = max(weights[i], share)
     return weights
 
 
