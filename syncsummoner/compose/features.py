@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 from scipy import ndimage, signal
@@ -328,38 +328,90 @@ def analyze_audio(
     )
 
 
-def analyze_frames(frames: np.ndarray, *, fps: float, shot_sigma: float = 3.0) -> VideoFeatures:
-    """Shot boundaries, motion energy and level statistics from an RGB float32 frame stack."""
-    x = np.asarray(frames, dtype=np.float32)
-    luma = x.mean(axis=3)
-    diff = np.abs(np.diff(luma, axis=0)).mean(axis=(1, 2)) if x.shape[0] > 1 else np.zeros(0)
+def _video_features(
+    diff: np.ndarray, *, fps: float, n_frames: int, luma: np.ndarray, chroma: np.ndarray, shot_sigma: float
+) -> VideoFeatures:
+    """Assemble features from per-frame series, so a stack and a stream agree exactly."""
     peaks, _ = signal.find_peaks(diff, prominence=shot_sigma * (diff.std() + EPS)) if diff.size else ([], {})
     return VideoFeatures(
         fps=float(fps),
-        n_frames=int(x.shape[0]),
+        n_frames=int(n_frames),
         shot_boundaries=np.asarray(peaks, dtype=np.int64) + 1,
-        motion_energy=np.concatenate((diff[:1], diff)) if diff.size else np.zeros(x.shape[0]),
-        luma=luma.mean(axis=(1, 2)),
-        chroma=x.std(axis=3).mean(axis=(1, 2)),
+        motion_energy=np.concatenate((diff[:1], diff)) if diff.size else np.zeros(n_frames),
+        luma=luma,
+        chroma=chroma,
     )
 
 
-def read_video(path: str | Path, *, max_frames: int | None = None) -> tuple[np.ndarray, float]:
-    """Decode a video to an RGB float32 frame stack in ``[0, 1]``; OpenCV's BGR stops at this boundary."""
+def analyze_frames(frames: np.ndarray, *, fps: float, shot_sigma: float = 3.0) -> VideoFeatures:
+    """Shot boundaries, motion energy and level statistics from an RGB float32 frame stack."""
+    x = np.asarray(frames, dtype=np.float32)
+    plane = x.mean(axis=3)
+    diff = np.abs(np.diff(plane, axis=0)).mean(axis=(1, 2)) if x.shape[0] > 1 else np.zeros(0)
+    return _video_features(
+        diff,
+        fps=fps,
+        n_frames=x.shape[0],
+        luma=plane.mean(axis=(1, 2)),
+        chroma=x.std(axis=3).mean(axis=(1, 2)),
+        shot_sigma=shot_sigma,
+    )
+
+
+def read_frames(path: str | Path, *, max_frames: int | None = None) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield ``(fps, rgb)`` per frame as float32 in ``[0, 1]``; OpenCV's BGR stops at this boundary."""
     # pylint: disable=no-member
     import cv2
 
     cap = cv2.VideoCapture(str(path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames = []
-    while max_frames is None or len(frames) < max_frames:
-        ok, bgr = cap.read()
-        if not ok:
-            break
-        frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0)
-    cap.release()
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    sent = 0
+    try:
+        while max_frames is None or sent < max_frames:
+            ok, bgr = cap.read()
+            if not ok:
+                return
+            sent += 1
+            yield fps, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    finally:
+        cap.release()
+
+
+def read_video(path: str | Path, *, max_frames: int | None = None) -> tuple[np.ndarray, float]:
+    """Decode a whole video to an RGB float32 frame stack, holding every frame at once."""
+    fps, frames = 30.0, []
+    for fps, frame in read_frames(path, max_frames=max_frames):
+        frames.append(frame)
     stack = np.stack(frames) if frames else np.zeros((0, 1, 1, 3), np.float32)
     return stack, float(fps)
+
+
+def analyze_video(
+    path: str | Path, *, max_frames: int | None = None, shot_sigma: float = 3.0
+) -> VideoFeatures:
+    """Stream a clip into :class:`VideoFeatures`, holding one frame rather than the clip.
+
+    Every feature is a per-frame scalar or a difference against the frame before
+    it, so a stack is never needed: 180s of 576p costs 21GB as one and 1.5MB here.
+    """
+    fps, count, prev = 30.0, 0, None
+    luma, chroma, diff = [], [], []
+    for fps, frame in read_frames(path, max_frames=max_frames):
+        count += 1
+        plane = frame.mean(axis=2)
+        luma.append(plane.mean())
+        chroma.append(frame.std(axis=2).mean())
+        if prev is not None:
+            diff.append(np.abs(plane - prev).mean())
+        prev = plane
+    return _video_features(
+        np.asarray(diff, np.float32),
+        fps=fps,
+        n_frames=count,
+        luma=np.asarray(luma, np.float32),
+        chroma=np.asarray(chroma, np.float32),
+        shot_sigma=shot_sigma,
+    )
 
 
 def analyze(
@@ -378,6 +430,5 @@ def analyze(
         audio = analyze_audio(y, out_sr, rng=rng, **audio_kw)
     video = None
     if video_path is not None:
-        frames, fps = read_video(video_path, max_frames=max_frames)
-        video = analyze_frames(frames, fps=fps)
+        video = analyze_video(video_path, max_frames=max_frames)
     return Features(audio=audio, video=video)

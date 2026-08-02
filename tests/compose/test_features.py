@@ -172,7 +172,9 @@ def test_analyze_end_to_end(tmp_path, monkeypatch):
     path = tmp_path / "t.wav"
     wavfile.write(path, sr, (y * 20000).astype(np.int16))
     monkeypatch.setattr(
-        F, "read_video", lambda p, max_frames=None: (np.zeros((4, 8, 8, 3), np.float32), 30.0)
+        F,
+        "read_frames",
+        lambda p, max_frames=None: iter([(30.0, np.zeros((8, 8, 3), np.float32))] * 4),
     )
     feats = F.analyze("clip.mp4", path, rng=np.random.default_rng(1), sr=sr, **SEGMENT_KW)
     assert feats.audio.duration == pytest.approx(3.0, rel=0.01)
@@ -198,3 +200,62 @@ def test_bar_duration_falls_back_to_tempo():
         sections=(),
     )
     assert audio.bar_duration == pytest.approx(2.0)
+
+
+def test_streaming_video_analysis_matches_the_whole_stack(monkeypatch):
+    """A 3 minute 576p clip costs 21GB as one stack, so the streamed path must agree exactly."""
+    import cv2
+
+    rng = np.random.default_rng(3)
+    frames = [(rng.random((6, 8, 3)) * 255).astype(np.uint8) for _ in range(5)]
+    frames[3] = np.full((6, 8, 3), 250, np.uint8)
+
+    class FakeCap:
+        """Minimal cv2.VideoCapture stand-in."""
+
+        def __init__(self, _path):
+            self.i = 0
+
+        def get(self, _prop):
+            return 25.0
+
+        def read(self):
+            if self.i >= len(frames):
+                return False, None
+            self.i += 1
+            return True, frames[self.i - 1]
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", FakeCap)
+    stack, fps = F.read_video("fake.mkv")
+    want = F.analyze_frames(stack, fps=fps)
+    got = F.analyze_video("fake.mkv")
+    assert got.n_frames == want.n_frames and got.fps == want.fps
+    for name in ("motion_energy", "luma", "chroma", "shot_boundaries"):
+        assert np.allclose(getattr(got, name), getattr(want, name)), name
+
+
+def test_streaming_video_analysis_of_an_empty_clip(monkeypatch):
+    import cv2
+
+    class EmptyCap:
+        """Capture that decodes nothing."""
+
+        def __init__(self, _path):
+            pass
+
+        def get(self, _prop):
+            return 0.0
+
+        def read(self):
+            """Read."""
+            return False, None
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", EmptyCap)
+    vf = F.analyze_video("fake.mkv")
+    assert vf.n_frames == 0 and vf.fps == 30.0 and vf.motion_energy.size == 0
