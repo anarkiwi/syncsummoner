@@ -514,6 +514,7 @@ def test_a_dark_verdict_survives_a_restart_and_is_keyed(tmp_path):
 
 
 def test_a_dark_verdict_does_not_make_the_program_look_archived(tmp_path):
+    """Nothing downstream may mistake a black program for measured frames."""
     archive = archive_at(tmp_path, popen=FakeFfmpeg())
     archive.mark_dark("bitcrush", KEY, 0.0)
     assert not archive.has("bitcrush", KEY) and archive.reader("bitcrush") is None
