@@ -208,7 +208,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         log=lambda message: print(message, flush=True),
     )
     print(f"{report.frames} frames from {len(report.results)} programs in {report.seconds / 60:.1f} min")
-    return 1 if report.wedged else 0
+    return 1 if report.stopped else 0
 
 
 def _make_plan(plans, name: str, specs, rng):
