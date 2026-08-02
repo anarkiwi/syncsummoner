@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Iterator
 
 import numpy as np
@@ -109,18 +110,27 @@ def replay(
     analyzer: Any,
     programs: Iterable[str] | None = None,
     log: Any = None,
+    jobs: int = 1,
     **kwargs: Any,
 ) -> dict[str, list[MeasurementRecord]]:
-    """Measurements for every committed program, keyed by program name."""
+    """Measurements for every committed program, keyed by program name.
+
+    ``jobs`` reads that many programs at once: the cost is a decoder subprocess
+    and array work that both drop the lock, so threads are enough to overlap them.
+    """
     committed = sorted(archive.committed())
     names = committed if programs is None else list(programs)
     note = log if log is not None else lambda _message: None
     blank = blank_digest(archive, committed)
     note(f"blanking frame {blank}" if blank else "no blanking frame shared between programs")
+
+    def measure(name: str) -> tuple[str, list[MeasurementRecord]]:
+        return name, program_records(archive, name, analyzer=analyzer, blank=blank, **kwargs)
+
     out = {}
-    for name in names:
-        records = program_records(archive, name, analyzer=analyzer, blank=blank, **kwargs)
-        if records:
-            out[name] = records
-        note(f"{name}: {len(records)} setpoints measured")
+    with ThreadPoolExecutor(max_workers=max(1, int(jobs))) as pool:
+        for name, records in pool.map(measure, names):
+            if records:
+                out[name] = records
+            note(f"{name}: {len(records)} setpoints measured")
     return out
