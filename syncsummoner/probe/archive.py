@@ -25,6 +25,7 @@ from syncsummoner.probe.store import ProgramKey, atomic_write, slug, temp_siblin
 
 __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
+    "DARK_SUFFIX",
     "ArchiveError",
     "FrameArchive",
     "FrameReader",
@@ -38,6 +39,8 @@ ARCHIVE_SCHEMA_VERSION = 2
 ARCHIVE_FPS = 25
 CONTAINER = "matroska"
 VIDEO_SUFFIX = ".mkv"
+#: Marks a program measured black on a healthy rig, so a resume does not re-probe it.
+DARK_SUFFIX = ".dark.json"
 #: What crosses the pipe in both directions: the card's measured byte order, packed 4:2:2.
 PIPE_PIX_FMT = "yvyu422"
 #: Planar 4:2:2 is the same samples deinterleaved into the canonical plane order.
@@ -448,6 +451,36 @@ class FrameArchive:
         """True when a committed archive for ``program`` was keyed on ``key``."""
         meta = self.meta(program)
         return meta is not None and meta.get("key_digest") == key.digest
+
+    def dark_path(self, program: str) -> Path:
+        """Where a program's dark verdict is recorded."""
+        return self.directory / f"{slug(program)}{DARK_SUFFIX}"
+
+    def mark_dark(self, program: str, key: ProgramKey, luma: float) -> None:
+        """Record that ``program`` is itself black on a rig that still carries the source.
+
+        A dark program has no archive to resume from, so without this a resume
+        re-probes it every time, and loads are the scarce resource on this device.
+        """
+        payload = json.dumps(
+            {
+                "program": program,
+                "key_digest": key.digest,
+                "luma": float(luma),
+                "created": datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        self.directory.mkdir(parents=True, exist_ok=True)
+        atomic_write(self.dark_path(program), lambda tmp: tmp.write_text(payload, encoding="utf-8"))
+
+    def dark(self, program: str, key: ProgramKey) -> bool:
+        """True when ``program`` was measured dark under ``key``, so it need not run again."""
+        try:
+            verdict = json.loads(self.dark_path(program).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return str(verdict.get("key_digest")) == key.digest
 
     def committed(self) -> dict[str, dict[str, Any]]:
         """Metadata of every complete archive, keyed by program name."""

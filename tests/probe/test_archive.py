@@ -501,3 +501,21 @@ def test_stream_stops_when_the_decoder_ends_early(tmp_path):
     reader = archive.reader("bitcrush")
     reader._popen = FakeStreamer(truncate=True)  # pylint: disable=protected-access
     assert len(list(reader.stream())) == 3, "a short read ends the stream rather than reshaping it"
+
+
+def test_a_dark_verdict_survives_a_restart_and_is_keyed(tmp_path):
+    """A dark program has no archive, so only the verdict stops a resume re-probing it."""
+    archive = archive_at(tmp_path, popen=FakeFfmpeg())
+    assert not archive.dark("bitcrush", KEY)
+    archive.mark_dark("bitcrush", KEY, 11.2)
+    assert archive.dark("bitcrush", KEY) and not archive.dark("bitcrush", OTHER)
+    stored = json.loads(archive.dark_path("bitcrush").read_text(encoding="utf-8"))
+    assert stored["luma"] == 11.2 and stored["key_digest"] == KEY.digest
+
+
+def test_a_dark_verdict_does_not_make_the_program_look_archived(tmp_path):
+    """Nothing downstream may mistake a black program for measured frames."""
+    archive = archive_at(tmp_path, popen=FakeFfmpeg())
+    archive.mark_dark("bitcrush", KEY, 0.0)
+    assert not archive.has("bitcrush", KEY) and archive.reader("bitcrush") is None
+    assert "bitcrush" not in archive.committed(), "a verdict is not an archive"

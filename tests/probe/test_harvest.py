@@ -120,9 +120,20 @@ class Archive:
         self.stored = {program: key.digest for program, key in stored}
         self.rows = {}
         self.keys = {}
+        self.marked = set()
+        self.marked_key = {}
+        self.dark_luma = {}
 
     def has(self, program, key):
         return self.stored.get(program) == key.digest
+
+    def dark(self, program, key):
+        return self.marked_key.get(program) == key.digest
+
+    def mark_dark(self, program, key, luma):
+        self.marked.add(program)
+        self.marked_key[program] = key.digest
+        self.dark_luma[program] = luma
 
     def paths(self, program):
         return tuple(self.directory / f"{program}{suffix}" for suffix in (".mkv", ".parquet", ".json"))
@@ -637,3 +648,19 @@ def test_a_failure_with_a_live_canary_carries_on(tmp_path):
         clock=FakeClock(),
     )
     assert not report.stopped and [r.program for r in report.results] == ["Alpha", "Beta"]
+
+
+def test_a_dark_program_is_not_probed_again_on_resume(tmp_path):
+    """Loads are the scarce resource: a program that is itself black has no archive to resume."""
+    archive = Archive(tmp_path)
+    dark_run(archive, canary_luma=200, programs=("Alpha",))
+    assert archive.marked == {"Alpha"}, "the verdict is recorded against the key"
+    report = dark_run(archive, canary_luma=200, programs=("Alpha",))
+    assert [r.cached for r in report.results] == [True] and report.frames == 0
+
+
+def test_a_dark_verdict_from_other_firmware_is_not_trusted(tmp_path):
+    archive = Archive(tmp_path)
+    archive.marked_key["Alpha"] = "0.9.0-digest"
+    report = dark_run(archive, canary_luma=200, programs=("Alpha",))
+    assert not report.results[0].cached, "a reflash re-probes it"

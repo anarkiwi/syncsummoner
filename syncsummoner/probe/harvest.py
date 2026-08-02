@@ -27,6 +27,7 @@ __all__ = [
     "ProgramResult",
     "harvest",
     "carries_stimulus",
+    "discard_dark",
     "harvest_program",
     "native_burst",
     "sweep_vectors",
@@ -267,6 +268,20 @@ def upload_stimulus(player: Any, config: HarvestConfig, rng: np.random.Generator
     return player.upload(loop.frames())
 
 
+def discard_dark(archive: Any, program: str, key: ProgramKey, result: ProgramResult) -> ProgramResult:
+    """Remove a black program's archive, keeping the level that condemned it.
+
+    A resume must not skip it as archived, and the level is what the dark verdict
+    is later keyed and reported on.
+    """
+    del key
+    for path in archive.paths(program):
+        path.unlink(missing_ok=True)
+    return ProgramResult(
+        program, error="discarded: archived only black frames", luma=result.luma, settled=result.settled
+    )
+
+
 def harvest_program(
     session: Any,
     capture: Any,
@@ -364,7 +379,7 @@ def harvest(
             capture = stack.enter_context(open_capture())
             for name in names:
                 key = ProgramKey(name, firmware, KeyKind.NAME_FIRMWARE)
-                if archive.has(name, key):
+                if archive.has(name, key) or archive.dark(name, key):
                     results.append(ProgramResult(name))
                     note(str(results[-1]))
                     continue
@@ -409,10 +424,8 @@ def harvest(
                 note(str(results[-1]))
                 if not results[-1].dark:
                     continue
-                for path in archive.paths(name):
-                    path.unlink(missing_ok=True)
-                results[-1] = ProgramResult(name, error="discarded: archived only black frames")
-                if carries_stimulus(
+                results[-1] = discard_dark(archive, name, key, results[-1])
+                if not carries_stimulus(
                     session,
                     capture,
                     transport,
@@ -422,11 +435,11 @@ def harvest(
                     sleep=sleep,
                     clock=clock,
                 ):
-                    note(f"{name} discarded: dark, but the rig still carries the source")
-                    continue
-                blacked = True
-                note(BLACKED_NOTE)
-                break
+                    blacked = True
+                    note(BLACKED_NOTE)
+                    break
+                archive.mark_dark(name, key, results[-1].luma)
+                note(f"{name} discarded: dark, but the rig still carries the source")
     finally:
         transport.close()
     return HarvestReport(results=results, wedged=stopped, blacked=blacked, seconds=clock() - start)
