@@ -49,10 +49,11 @@ def setpoints(reader: Any) -> Iterator[tuple[int, tuple[int, ...], list[np.ndarr
 
 
 def blank_digest(archive: Any, programs: Iterable[str]) -> str | None:
-    """The frame the device emits while blanked, taken from the run rather than assumed.
+    """The frame programs share on opening, which a sweep has not yet moved away from.
 
-    Two programs cannot both produce the same frame from different vectors, so a
-    digest shared by their opening setpoints is the device's own blanking frame.
+    Sharing alone does not prove a device fault: black is black, and any two
+    programs keyed off produce the same frame. It only says the frame is not a
+    response to a vector yet, which is why only a leading run of it is dropped.
     """
     opening: Counter[str] = Counter()
     for name in programs:
@@ -76,16 +77,17 @@ def program_records(
 ) -> list[MeasurementRecord]:
     """Measurements for every setpoint of one archived program.
 
-    A setpoint holding nothing but ``blank`` is dropped: the device was still
-    blanked from the load, so the vector on those rows produced no picture.
+    Only a *leading* run of ``blank`` is dropped, as the load blackout can only
+    sit at the start: the same frame later in the sweep is the program keyed off
+    by its own parameters, which is a measurement and not a gap.
     """
     reader = archive.reader(program)
     if reader is None:
         return []
     firmware = str(reader.meta.get("key_material", "unknown"))
-    records = []
+    records: list[MeasurementRecord] = []
     for setpoint, params, frames in setpoints(reader):
-        if blank is not None and all(digest(frame) == blank for frame in frames):
+        if not records and blank is not None and all(digest(frame) == blank for frame in frames):
             continue
         records.append(
             measurement(

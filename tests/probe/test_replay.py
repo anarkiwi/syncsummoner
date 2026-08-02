@@ -75,7 +75,7 @@ def test_blank_digest_is_none_when_no_two_programs_open_alike():
     assert R.blank_digest(archive, ["a", "b", "missing"]) is None
 
 
-def test_a_setpoint_that_is_only_the_blanking_frame_is_dropped():
+def test_a_leading_setpoint_that_is_only_the_blanking_frame_is_dropped():
     """Those rows carry a real vector against a picture the device never drew."""
     blank = native(7)
     reader = Reader([blank, blank, native(90), native(95)], setpoints=[0, 0, 1, 1])
@@ -138,3 +138,19 @@ def test_replay_reads_several_programs_at_once():
     )
     out = R.replay(archive, analyzer=FakeAnalyzer(), jobs=4)
     assert sorted(out) == ["a", "b", "c", "d"] and all(len(v) == 1 for v in out.values())
+
+
+def test_the_same_frame_later_in_the_sweep_is_a_measurement():
+    """Black is black: a program keyed off by its own parameters looks identical to a blanked one."""
+    blank = native(0)
+    reader = Reader([blank, native(90), blank, native(120), blank], setpoints=[0, 1, 2, 3, 4])
+    records = R.program_records(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), blank=R.digest(blank))
+    assert [r.state_index for r in records] == [1, 2, 3, 4], "only the leading run is a gap"
+
+
+def test_a_program_that_never_leaves_the_blanking_frame_measures_nothing():
+    """All lead and no sweep; the rig discards such a program before it is ever archived."""
+    blank = native(0)
+    reader = Reader([blank, blank, blank], setpoints=[0, 1, 2])
+    records = R.program_records(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), blank=R.digest(blank))
+    assert not records
