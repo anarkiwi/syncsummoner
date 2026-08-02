@@ -28,6 +28,7 @@ syncsummoner device list | ping | programs
 
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/
 syncsummoner probe sim --program blur --image zoneplate.png
+syncsummoner probe archive --out archive/    # native frames for every program, resumable
 
 syncsummoner profile show | diff | atlas --program bitcrush_displace
 
@@ -45,7 +46,7 @@ syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
 | Package | Role |
 | --- | --- |
 | `syncsummoner.device` | pyvmancer transport, session discipline, capture, playout |
-| `syncsummoner.probe` | stimulus battery, sweep plans, runner, GHDL simulation, profile fitting |
+| `syncsummoner.probe` | stimulus battery, sweep plans, runner, frame archive, GHDL simulation, profile fitting |
 | `syncsummoner.compose` | audio and video features, gesture vocabulary, planner, score IR, render |
 | `syncsummoner.aesthetics` | perceptual metrics; imports nothing from the rest, extraction-ready |
 

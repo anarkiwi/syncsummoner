@@ -113,15 +113,29 @@ class Capture:
         ok, frame = self._cap.read()
         return frame if ok and frame is not None else None
 
+    def _require_native(self) -> None:
+        """Raise unless this handle was opened for the card's own buffer."""
+        if self.mode is not PixelMode.YVYU:
+            raise CaptureError(f"native frames need PixelMode.YVYU, not {self.mode}")
+
     def read_native(self) -> np.ndarray | None:
         """One frame in the card's own layout: packed YVYU ``(H, W, 2)`` uint8.
 
         The card offers no other format, so BGR is an upsample of this and carries
         nothing more. Only available on a handle opened in :data:`PixelMode.YVYU`.
         """
-        if self.mode is not PixelMode.YVYU:
-            raise CaptureError(f"native frames need PixelMode.YVYU, not {self.mode}")
+        self._require_native()
         return self._grab()
+
+    def read_pair(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """One grab as both the native buffer and the RGB float32 view of it.
+
+        Archiving a frame and measuring it must describe the same frame, and a
+        second grab is a different frame.
+        """
+        self._require_native()
+        frame = self._grab()
+        return (None, None) if frame is None else (frame, bgr_to_rgb(yvyu_to_bgr(frame)))
 
     def read_raw(self) -> np.ndarray | None:
         """One frame as uint8 BGR, or None on a failed grab.

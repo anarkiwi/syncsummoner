@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring,protected-access
 
+import dataclasses
 import sys
 import types
 
@@ -23,20 +24,26 @@ class FakeSession:
     def __init__(self):
         self.programs = []
         self.calls = []
+        self.links = []
 
-    def load_program(self, name):
+    def load_program(self, name, *, link=None):
         self.programs.append(name)
+        self.links.append(link)
 
     def set_params(self, values):
         self.calls.append(dict(values))
 
 
+class FakeLink:
+    """Stands in for the source HDMI link; a real one blanks the Pi framebuffer."""
+
+
 class FakeRig(R.Rig):
     """Loopback rig: the capture returns whatever was last played out, optionally dropping frames."""
 
-    def __init__(self, *, drop_every=0, no_signal=False):
+    def __init__(self, *, drop_every=0, no_signal=False, link=None):
         session = FakeSession()
-        super().__init__(session=session, capture=self, playout=self)
+        super().__init__(session=session, capture=self, playout=self, link=link)
         self.last = None
         self.n = 0
         self.drop_every = drop_every
@@ -123,6 +130,13 @@ def test_play_pass_loads_once_and_returns_cropped_aligned_frames():
     assert np.allclose(out, frames[:, CONFIG.strip_px :])
     assert [list(c) for c in rig.session.calls] == [[2], [2], [2]]
     assert all(0.0 <= v <= 1.0 for call in rig.session.calls for v in call.values())
+
+
+def test_play_pass_drops_the_source_link_across_the_program_change():
+    link = FakeLink()
+    rig = FakeRig(link=link)
+    R.play_pass(rig, source_stack(n=2), Automation.empty(), program="glitch", config=CONFIG)
+    assert rig.session.links == [link], "every load must hold the source link down"
 
 
 def test_play_pass_survives_dropped_and_dead_captures():
@@ -260,16 +274,24 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
         monkeypatch.setattr("syncsummoner.device." + name.rsplit(".", 1)[1], mod, raising=False)
         return mod
 
+    def record(key):
+        def make(*args, **kwargs):
+            built[key] = (args, kwargs)
+            return built[key]
+
+        return make
+
     module("syncsummoner.device.transport", Transport=types.SimpleNamespace(open=lambda: "transport"))
-    module(
-        "syncsummoner.device.session",
-        Session=lambda t, cc_budget_hz: built.setdefault("session", (t, cc_budget_hz)),
-    )
-    module("syncsummoner.device.capture", Capture=lambda **kw: built.setdefault("capture", kw))
-    module("syncsummoner.device.playout", Playout=lambda **kw: built.setdefault("playout", kw))
+    module("syncsummoner.device.session", Session=record("session"))
+    module("syncsummoner.device.capture", Capture=record("capture"))
+    module("syncsummoner.device.playout", Playout=record("playout"))
+    module("syncsummoner.device.link", Link=record("link"))
     rig = R.open_rig(CONFIG)
-    assert rig.session == ("transport", CONFIG.cc_budget_hz)
-    assert built["capture"]["width"] == 32 and built["playout"]["height"] == 24
+    assert rig.session == (("transport",), {"cc_budget_hz": CONFIG.cc_budget_hz})
+    assert built["capture"][1]["width"] == 32 and built["playout"][1]["height"] == 24
+    assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
+    R.open_rig(dataclasses.replace(CONFIG, source_host="pi@rig"))
+    assert built["link"][0] == ("pi@rig",) and built["playout"][0] == ("pi@rig",)
 
 
 def test_enforce_safety_repairs_an_unsafe_pass():

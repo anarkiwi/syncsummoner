@@ -4,7 +4,7 @@ Nothing here imports :mod:`syncsummoner.aesthetics` at module scope; the analyze
 injected, so a probe run can be re-scored under a different metrics version.
 """
 
-from syncsummoner.probe import archive, codeframes, fit, patterns, plans, runner, sim, store
+from syncsummoner.probe import archive, codeframes, fit, harvest, patterns, plans, runner, sim, store
 from syncsummoner.probe.archive import FrameArchive, FrameReader, FrameRow, FrameWriter
 from syncsummoner.probe.codeframes import (
     ChannelState,
@@ -15,6 +15,7 @@ from syncsummoner.probe.codeframes import (
     build_loop,
 )
 from syncsummoner.probe.fit import fit_profile, load_profile, save_measurements, save_profile
+from syncsummoner.probe.harvest import HarvestConfig, HarvestReport, ProgramResult
 from syncsummoner.probe.patterns import PATTERNS, crop_strip, generate, read_state_index, with_state_index
 from syncsummoner.probe.plans import hysteresis, oat, sobol, tongue_raster
 from syncsummoner.probe.runner import run_plan
@@ -28,9 +29,12 @@ __all__ = [
     "FrameReader",
     "FrameRow",
     "FrameWriter",
+    "HarvestConfig",
+    "HarvestReport",
     "KeyKind",
     "LoopReport",
     "ProgramKey",
+    "ProgramResult",
     "ResultStore",
     "Verdict",
     "analyse",
@@ -41,6 +45,7 @@ __all__ = [
     "fit",
     "fit_profile",
     "generate",
+    "harvest",
     "hysteresis",
     "load_profile",
     "oat",
