@@ -364,7 +364,7 @@ def harvest(
             capture = stack.enter_context(open_capture())
             for name in names:
                 key = ProgramKey(name, firmware, KeyKind.NAME_FIRMWARE)
-                if archive.has(name, key):
+                if archive.has(name, key) or archive.dark(name, key):
                     results.append(ProgramResult(name))
                     note(str(results[-1]))
                     continue
@@ -409,6 +409,7 @@ def harvest(
                 note(str(results[-1]))
                 if not results[-1].dark:
                     continue
+                luma = results[-1].luma
                 for path in archive.paths(name):
                     path.unlink(missing_ok=True)
                 results[-1] = ProgramResult(name, error="discarded: archived only black frames")
@@ -422,6 +423,7 @@ def harvest(
                     sleep=sleep,
                     clock=clock,
                 ):
+                    archive.mark_dark(name, key, luma)
                     note(f"{name} discarded: dark, but the rig still carries the source")
                     continue
                 blacked = True
