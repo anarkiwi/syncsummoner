@@ -183,23 +183,11 @@ def test_a_clip_player_decodes_at_the_framebuffer_geometry():
     assert "scale=1280:720" in player.command().format(fps=25)
 
 
-def test_a_clip_player_allows_a_whole_clip_to_go_up():
+def test_a_clip_player_allows_a_whole_clip_to_go_up(monkeypatch):
     """A 449MB clip at ssh speed needs minutes, and the default runner gives thirty seconds."""
-    from syncsummoner.device.playout import UPLOAD_TIMEOUT, ClipPlayer, Playout
-
-    seen = {}
-    ClipPlayer("pi@rig", runner=None, ssh_timeout_s=UPLOAD_TIMEOUT)
-    import syncsummoner.device.playout as mod
-
-    original = mod.ssh_runner
-    mod.ssh_runner = lambda host, timeout: seen.setdefault("timeout", timeout) or original(
-        host, timeout=timeout
-    )
-    try:
-        ClipPlayer("pi@rig")
-        assert seen["timeout"] == UPLOAD_TIMEOUT >= 300.0
-        seen.clear()
-        Playout("pi@rig")
-        assert seen["timeout"] < UPLOAD_TIMEOUT, "a still frame does not need the same budget"
-    finally:
-        mod.ssh_runner = original
+    seen = []
+    monkeypatch.setattr(po, "ssh_runner", lambda host, timeout: seen.append(timeout))
+    po.ClipPlayer("pi@rig")
+    po.Playout("pi@rig")
+    assert seen[0] == po.UPLOAD_TIMEOUT >= 300.0
+    assert seen[1] < seen[0], "a still frame does not need a clip's budget"
