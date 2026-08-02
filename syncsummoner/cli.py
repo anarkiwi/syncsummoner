@@ -295,7 +295,7 @@ def _compose_cmd(args: argparse.Namespace) -> int:
     if not profiles:
         raise ValueError(f"no profiles in {args.profiles}; run `syncsummoner probe run` first")
     features = analyze(args.clip, args.audio, rng=rng)
-    score = search(profiles, features, style=args.style, rng=rng, budget=args.budget)
+    score = search(profiles, features, style=args.style, rng=rng, budget=args.budget, density=args.density)
     score.save(Path(args.output))
     print(f"{args.output}: {len(score.layers)} layers over {score.duration:.1f}s")
     return 0
@@ -403,6 +403,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--style", default="default")
     compose.add_argument("--seed", type=int, default=0)
     compose.add_argument("--budget", type=int, default=48)
+    compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 

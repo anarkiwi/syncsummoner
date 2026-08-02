@@ -3,6 +3,8 @@
 # pylint: disable=missing-function-docstring
 
 import pytest
+from pathlib import Path
+from types import SimpleNamespace
 
 from syncsummoner import cli
 from syncsummoner.device import capture as capture_mod
@@ -176,3 +178,31 @@ def test_probe_archive_reports_a_wedged_device_as_a_failure(monkeypatch, tmp_pat
     monkeypatch.setattr(link_mod, "Link", Link)
     monkeypatch.setattr(harvest_mod, "harvest", lambda *a, **kw: harvest_mod.HarvestReport(wedged=True))
     assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 1
+
+
+def test_compose_passes_density_through(monkeypatch, tmp_path):
+    """`search` always took density; the composer could not say it."""
+    seen = {}
+
+    def fake_search(profiles, features, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(layers=[], duration=1.0, save=lambda path: Path(path).write_text("{}"))
+
+    monkeypatch.setattr("syncsummoner.compose.planner.search", fake_search)
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.analyze", lambda *a, **k: SimpleNamespace(audio=None, video=None)
+    )
+    monkeypatch.setattr("syncsummoner.cli._profiles_in", lambda directory: {"p": object()})
+    cli.main(
+        [
+            "compose",
+            "clip.mkv",
+            "--profiles",
+            str(tmp_path),
+            "--density",
+            "0.9",
+            "-o",
+            str(tmp_path / "score.yaml"),
+        ]
+    )
+    assert seen["density"] == 0.9
