@@ -434,6 +434,7 @@ def render_played(
     rig: Rig | None = None,
     config: RenderConfig | None = None,
     scratch: str | Path = "timecoded.mkv",
+    prepared: bool = False,
 ) -> int:
     """Render a pass the playout plays for itself, at rate.
 
@@ -447,7 +448,11 @@ def render_played(
     config = RenderConfig() if config is None else config
     owned = rig is None
     rig = open_rig(config, player=True) if owned else rig
-    total = write_timecoded(source, scratch, config=config, seconds=score.duration)
+    total = (
+        int(round(score.duration * config.fps))
+        if prepared
+        else write_timecoded(source, scratch, config=config, seconds=score.duration)
+    )
     video = VideoSink(out, config.fps)
     try:
         autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)

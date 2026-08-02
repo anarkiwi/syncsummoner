@@ -325,6 +325,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
             profiles=profiles,
             config=config,
             scratch=args.scratch,
+            prepared=args.prepared,
         )
         print(f"{args.output}: {frames} frames")
         return 0
