@@ -284,12 +284,18 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
 
     module("syncsummoner.device.transport", Transport=types.SimpleNamespace(open=lambda: "transport"))
     module("syncsummoner.device.session", Session=record("session"))
-    module("syncsummoner.device.capture", Capture=record("capture"))
+
+    def capture(*args, **kwargs):
+        built["capture"] = (args, kwargs)
+        return types.SimpleNamespace(open=lambda: "open capture")
+
+    module("syncsummoner.device.capture", Capture=capture)
     module("syncsummoner.device.playout", Playout=record("playout"))
     module("syncsummoner.device.link", Link=record("link"))
     rig = R.open_rig(CONFIG)
     assert rig.session == (("transport",), {"cc_budget_hz": CONFIG.cc_budget_hz})
     assert built["capture"][1]["width"] == 32 and built["playout"][1]["height"] == 24
+    assert rig.capture == "open capture", "the rig hands back an opened capture"
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
     R.open_rig(dataclasses.replace(CONFIG, source_host="pi@rig"))
     assert built["link"][0] == ("pi@rig",) and built["playout"][0] == ("pi@rig",)
@@ -370,3 +376,57 @@ def test_a_source_already_at_the_session_raster_is_untouched(monkeypatch):
     )
     got = R._source_frames("clip.mkv", CONFIG)
     assert got.shape == (1, CONFIG.height, CONFIG.width, 3) and float(got.min()) == 0.25
+
+
+def test_open_rig_hands_back_an_open_capture(monkeypatch):
+    """A pass grabs frame by frame and never enters the capture as a context."""
+    opened = []
+
+    class FakeCapture:
+        """Capture stand-in recording open and close."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def open(self):
+            """Open."""
+            opened.append("open")
+            return self
+
+        def close(self):
+            """Close."""
+            opened.append("close")
+
+    import syncsummoner.device.capture as capture_mod
+    import syncsummoner.device.link as link_mod
+    import syncsummoner.device.playout as playout_mod
+    import syncsummoner.device.session as session_mod
+    import syncsummoner.device.transport as transport_mod
+
+    monkeypatch.setattr(capture_mod, "Capture", FakeCapture)
+    monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
+    monkeypatch.setattr(playout_mod, "Playout", lambda *a, **k: None)
+    monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
+    monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
+    rig = R.open_rig(CONFIG)
+    assert opened == ["open"] and isinstance(rig.capture, FakeCapture)
+
+
+def test_render_closes_the_capture_it_opened(monkeypatch):
+    closed = []
+
+    class Cap:
+        """Capture that records being closed."""
+
+        def close(self):
+            """Close."""
+            closed.append(True)
+
+    rig = R.Rig(session=None, capture=Cap(), playout=None)
+    monkeypatch.setattr(R, "open_rig", lambda config: rig)
+    monkeypatch.setattr(R, "_source_frames", lambda *a, **k: np.zeros((1, 4, 4, 3), np.float32))
+    monkeypatch.setattr(R, "_passes", lambda *a, **k: [])
+    score = Score(seed=1, bpm=120.0, duration=1.0, fps=CONFIG.fps)
+    with pytest.raises(ValueError, match="no layers"):
+        R.render(score, "clip.mkv", "out.mkv", profiles={}, config=CONFIG)
+    assert closed == [True], "a rig it opened is a rig it closes, even when the render fails"

@@ -167,7 +167,12 @@ def write_video(path: str | Path, frames: np.ndarray, fps: float) -> None:
 
 
 def open_rig(config: RenderConfig) -> Rig:
-    """Build the real rig from the device layer; imported here so compose never needs hardware."""
+    """Build the real rig from the device layer, capture open and ready to grab.
+
+    Imported here so compose never needs hardware. The capture is opened rather
+    than merely constructed: a pass grabs frame by frame and never enters it as a
+    context, so an unopened handle only fails once the first frame is due.
+    """
     from syncsummoner.device import capture as capture_mod
     from syncsummoner.device import link as link_mod
     from syncsummoner.device import playout as playout_mod
@@ -178,7 +183,7 @@ def open_rig(config: RenderConfig) -> Rig:
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         session=session_mod.Session(transport, cc_budget_hz=config.cc_budget_hz),
-        capture=capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)),
+        capture=capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)).open(),
         playout=playout_mod.Playout(*host, width=config.width, height=config.height),
         link=link_mod.Link(*host),
     )
@@ -291,13 +296,18 @@ def render(
     if profiles is None:
         raise ValueError("render requires the measured profiles the score was planned against")
     config = RenderConfig() if config is None else config
-    rig = open_rig(config) if rig is None else rig
-    frames = _source_frames(source, config, seconds=score.duration)
-    results = _passes(score, frames, profiles, rig, config, passes)
-    if not results:
-        raise ValueError("score has no layers to render")
-    final = composite(results, mode=mode) if len(results) > 1 else results[0]
-    (sink or write_video)(out, enforce_safety(final, fps=config.fps), config.fps)
+    owned = rig is None
+    rig = open_rig(config) if owned else rig
+    try:
+        frames = _source_frames(source, config, seconds=score.duration)
+        results = _passes(score, frames, profiles, rig, config, passes)
+        if not results:
+            raise ValueError("score has no layers to render")
+        final = composite(results, mode=mode) if len(results) > 1 else results[0]
+        (sink or write_video)(out, enforce_safety(final, fps=config.fps), config.fps)
+    finally:
+        if owned:
+            rig.capture.close()
 
 
 def audition(
@@ -316,9 +326,14 @@ def audition(
     if profiles is None:
         raise ValueError("audition requires the measured profiles the score was planned against")
     config = RenderConfig() if config is None else config
-    rig = open_rig(config) if rig is None else rig
-    frames = _source_frames(source, config, seconds=seconds)[: max(1, int(round(seconds * config.fps)))]
-    step = max(1, int(round(1.0 / max(scale, 1e-6))))
-    frames = np.ascontiguousarray(frames[:, ::step, ::step])
-    results = _passes(score, frames, profiles, rig, config, passes)
-    return composite(results, mode=mode) if len(results) > 1 else results[0]
+    owned = rig is None
+    rig = open_rig(config) if owned else rig
+    try:
+        frames = _source_frames(source, config, seconds=seconds)[: max(1, int(round(seconds * config.fps)))]
+        step = max(1, int(round(1.0 / max(scale, 1e-6))))
+        frames = np.ascontiguousarray(frames[:, ::step, ::step])
+        results = _passes(score, frames, profiles, rig, config, passes)
+        return composite(results, mode=mode) if len(results) > 1 else results[0]
+    finally:
+        if owned:
+            rig.capture.close()
