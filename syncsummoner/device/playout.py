@@ -8,9 +8,10 @@ uploaded once and cycled by the Pi, so the host pushes no frame per pass.
 from __future__ import annotations
 
 import gzip
+import subprocess
 import time
 from contextlib import contextmanager
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
 
@@ -105,6 +106,9 @@ class Playout:
         self._runner = ssh_runner(host, timeout=ssh_timeout_s) if runner is None else runner
         self._sleep = sleep
         self._clock = clock
+        self._host = host
+        self._popen: Any = subprocess.Popen
+        self._pump: Any = None
 
     @property
     def frame_bytes(self) -> int:
@@ -117,9 +121,55 @@ class Playout:
             raise ValueError(f"frame must be ({self.height}, {self.width}), got {frame.shape[:2]}")
         return to_fb565(frame)
 
+    #: Blits whole frames from stdin, so a pass costs one connection instead of one each.
+    PUMP_SOURCE = (
+        "import os, sys\n"
+        "fb = os.open(sys.argv[1], os.O_RDWR)\n"
+        "size = int(sys.argv[2])\n"
+        "read = sys.stdin.buffer.read\n"
+        "buf = read(size)\n"
+        "while len(buf) == size:\n"
+        "    os.lseek(fb, 0, 0)\n"
+        "    os.write(fb, buf)\n"
+        "    buf = read(size)\n"
+    )
+    PUMP_PATH = "/dev/shm/syncsummoner-pump.py"
+
     def show(self, frame: np.ndarray) -> None:
-        """Display one still frame."""
-        self._runner(f"cat > {self.framebuffer}", self.encode(frame))
+        """Display one still frame, down the open pump when there is one.
+
+        A connection per frame costs its whole handshake: measured, that paced a
+        render at 0.8 frames a second against a session of thirty.
+        """
+        data = self.encode(frame)
+        if self._pump is not None:
+            self._pump.stdin.write(data)
+            return
+        self._runner(f"cat > {self.framebuffer}", data)
+
+    @contextmanager
+    def streaming(self) -> Iterator["Playout"]:
+        """Hold one connection open for a whole pass, frames going down its stdin."""
+        self._runner(f"cat > {self.PUMP_PATH}", self.PUMP_SOURCE.encode())
+        self._pump = self._popen(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                self._host,
+                f"python3 {self.PUMP_PATH} {self.framebuffer} {self.frame_bytes}",
+            ],
+            stdin=subprocess.PIPE,
+        )
+        try:
+            yield self
+        finally:
+            pump, self._pump = self._pump, None
+            try:
+                pump.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            pump.wait(timeout=DEFAULT_TIMEOUT)
 
     def play(self, frames: Iterable[np.ndarray], *, fps: float = 60.0) -> int:
         """Display a sequence, paced against a monotonic clock; returns frames shown."""

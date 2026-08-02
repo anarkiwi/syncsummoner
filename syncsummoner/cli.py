@@ -295,7 +295,7 @@ def _compose_cmd(args: argparse.Namespace) -> int:
     if not profiles:
         raise ValueError(f"no profiles in {args.profiles}; run `syncsummoner probe run` first")
     features = analyze(args.clip, args.audio, rng=rng)
-    score = search(profiles, features, style=args.style, rng=rng, budget=args.budget)
+    score = search(profiles, features, style=args.style, rng=rng, budget=args.budget, density=args.density)
     score.save(Path(args.output))
     print(f"{args.output}: {len(score.layers)} layers over {score.duration:.1f}s")
     return 0
@@ -307,12 +307,18 @@ def _render_cmd(args: argparse.Namespace) -> int:
 
     score = Score.load(Path(args.score))
     profiles = _profiles_in(Path(args.profiles))
-    config = render_mod.RenderConfig(source_host=args.source_host)
+    config = (
+        render_mod.RenderConfig.for_format(args.format, source_host=args.source_host)
+        if args.format
+        else render_mod.RenderConfig(source_host=args.source_host)
+    )
     if args.render_cmd == "audition":
         frames = render_mod.audition(
             score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
         )
         render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
+    elif args.stream:
+        render_mod.render_stream(score, args.source, args.output, profiles=profiles, config=config)
     else:
         render_mod.render(
             score, args.source, args.output, passes=args.passes, profiles=profiles, config=config
@@ -399,6 +405,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--style", default="default")
     compose.add_argument("--seed", type=int, default=0)
     compose.add_argument("--budget", type=int, default=48)
+    compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
@@ -409,6 +416,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     audition.add_argument("--seconds", type=float, default=30.0)
     audition.add_argument("--passes", type=int, default=1)
     audition.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
+    audition.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
     audition.add_argument("-o", "--output", default="audition.mkv")
     audition.set_defaults(func=_render_cmd, render_cmd="audition")
 
@@ -419,6 +427,8 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     full.add_argument("--passes", type=int, default=1)
     full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     full.add_argument("-o", "--output", default="out.mkv")
+    full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
+    full.add_argument("--stream", action="store_true", help="write the take as it is captured, for one pass")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

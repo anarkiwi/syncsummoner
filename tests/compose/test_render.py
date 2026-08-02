@@ -234,7 +234,7 @@ def test_config_formats_and_source_loading(monkeypatch):
         "syncsummoner.compose.features.read_frames",
         lambda p, max_frames=None: iter([(CONFIG.fps, np.zeros((4, 4, 3), np.float32))] * 2),
     )
-    assert R._source_frames("clip.mp4", CONFIG).shape == (2, 4, 4, 3)
+    assert R._source_frames("clip.mp4", CONFIG).shape == (2, CONFIG.height, CONFIG.width, 3)
 
 
 def test_write_video_uses_the_bgr_boundary(monkeypatch, tmp_path):
@@ -284,12 +284,18 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
 
     module("syncsummoner.device.transport", Transport=types.SimpleNamespace(open=lambda: "transport"))
     module("syncsummoner.device.session", Session=record("session"))
-    module("syncsummoner.device.capture", Capture=record("capture"))
+
+    def capture(*args, **kwargs):
+        built["capture"] = (args, kwargs)
+        return types.SimpleNamespace(open=lambda: "open capture")
+
+    module("syncsummoner.device.capture", Capture=capture)
     module("syncsummoner.device.playout", Playout=record("playout"))
     module("syncsummoner.device.link", Link=record("link"))
     rig = R.open_rig(CONFIG)
     assert rig.session == (("transport",), {"cc_budget_hz": CONFIG.cc_budget_hz})
     assert built["capture"][1]["width"] == 32 and built["playout"][1]["height"] == 24
+    assert rig.capture == "open capture", "the rig hands back an opened capture"
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
     R.open_rig(dataclasses.replace(CONFIG, source_host="pi@rig"))
     assert built["link"][0] == ("pi@rig",) and built["playout"][0] == ("pi@rig",)
@@ -325,7 +331,8 @@ def test_source_frames_are_resampled_to_the_session_rate(monkeypatch):
     config = R.RenderConfig(fps=50.0)
     got = R._source_frames("clip.mkv", config)
     assert got.shape[0] == 10, "half the rate means every frame is held twice"
-    assert [float(f[0, 0, 0]) for f in got] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+    middle = (got.shape[1] // 2, got.shape[2] // 2)
+    assert [round(float(f[middle][0])) for f in got] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
 
 
 def test_source_frames_decode_only_the_span_the_pass_uses(monkeypatch):
@@ -346,3 +353,232 @@ def test_source_frames_decode_only_the_span_the_pass_uses(monkeypatch):
 def test_source_frames_of_an_empty_clip(monkeypatch):
     monkeypatch.setattr("syncsummoner.compose.features.read_frames", lambda p, max_frames=None: iter([]))
     assert R._source_frames("clip.mkv", CONFIG).shape[0] == 0
+
+
+def test_source_frames_are_fitted_into_the_session_raster(monkeypatch):
+    """Playout takes the session geometry and nothing else; a 694x576 clip failed at the pipe."""
+    clip = [np.full((576, 694, 3), 0.5, np.float32)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames", lambda p, max_frames=None: iter([(10.0, clip[0])])
+    )
+    got = R._source_frames("clip.mkv", CONFIG)
+    assert got.shape == (1, CONFIG.height, CONFIG.width, 3)
+    filled = got[0].any(axis=2)
+    assert filled.all(axis=0).any(), "a full column of picture, so the height is filled"
+    assert not filled[:, 0].any() and not filled[:, -1].any(), "pillarboxed, not stretched"
+
+
+def test_a_source_already_at_the_session_raster_is_untouched(monkeypatch):
+    frames = [np.full((CONFIG.height, CONFIG.width, 3), 0.25, np.float32)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, frames[0])]),
+    )
+    got = R._source_frames("clip.mkv", CONFIG)
+    assert got.shape == (1, CONFIG.height, CONFIG.width, 3) and float(got.min()) == 0.25
+
+
+def test_open_rig_hands_back_an_open_capture(monkeypatch):
+    """A pass grabs frame by frame and never enters the capture as a context."""
+    opened = []
+
+    class FakeCapture:
+        """Capture stand-in recording open and close."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def open(self):
+            """Open."""
+            opened.append("open")
+            return self
+
+        def close(self):
+            """Close."""
+            opened.append("close")
+
+    import syncsummoner.device.capture as capture_mod
+    import syncsummoner.device.link as link_mod
+    import syncsummoner.device.playout as playout_mod
+    import syncsummoner.device.session as session_mod
+    import syncsummoner.device.transport as transport_mod
+
+    monkeypatch.setattr(capture_mod, "Capture", FakeCapture)
+    monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
+    monkeypatch.setattr(playout_mod, "Playout", lambda *a, **k: None)
+    monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
+    monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
+    rig = R.open_rig(CONFIG)
+    assert opened == ["open"] and isinstance(rig.capture, FakeCapture)
+
+
+def test_render_closes_the_capture_it_opened(monkeypatch):
+    closed = []
+
+    class Cap:
+        """Capture that records being closed."""
+
+        def close(self):
+            """Close."""
+            closed.append(True)
+
+    rig = R.Rig(session=None, capture=Cap(), playout=None)
+    monkeypatch.setattr(R, "open_rig", lambda config: rig)
+    monkeypatch.setattr(R, "_source_frames", lambda *a, **k: np.zeros((1, 4, 4, 3), np.float32))
+    monkeypatch.setattr(R, "_passes", lambda *a, **k: [])
+    score = Score(seed=1, bpm=120.0, duration=1.0, fps=CONFIG.fps)
+    with pytest.raises(ValueError, match="no layers"):
+        R.render(score, "clip.mkv", "out.mkv", profiles={}, config=CONFIG)
+    assert closed == [True], "a rig it opened is a rig it closes, even when the render fails"
+
+
+def test_the_rig_session_is_a_named_format():
+    """Playout writes the Pi framebuffer, which is 1920x1080: a 720p session showed nothing."""
+    rig = R.RenderConfig.for_format("1080p30")
+    assert (rig.width, rig.height, rig.fps) == (1920, 1080, 30.0)
+
+
+def test_a_frame_whose_strip_will_not_decode_is_still_kept():
+    """Kaledos decoded 4 of 40 strips; discarding the rest rendered the take as black."""
+    frames = {i: np.full((4, 4, 3), i / 10.0, np.float32) for i in range(10)}
+    stamps = {4: 2, 6: 4, 8: 6}  # a lag of two, measured from the three that decoded
+    placed = R._placed(frames, stamps, 10)
+    assert placed[2] is frames[4] and placed[6] is frames[8], "a stamp wins where it exists"
+    assert placed[0] is frames[2] and placed[7] is frames[9], "the rest land by arrival less the lag"
+    assert len(placed) == 8, "the two that predate the lag fall off the front"
+
+
+def test_placing_with_no_decoded_stamp_at_all_keeps_arrival_order():
+    frames = {i: np.full((2, 2, 3), i, np.float32) for i in range(4)}
+    placed = R._placed(frames, {}, 4)
+    assert [int(placed[i][0, 0, 0]) for i in sorted(placed)] == [0, 1, 2, 3]
+
+
+def test_a_pass_that_decodes_nothing_still_returns_the_pictures(monkeypatch):
+    """The captured stream is the performance; naming its frames is what alignment adds."""
+    monkeypatch.setattr(R, "read_timecode", lambda *a, **k: None)
+    shown, grabbed = [], []
+
+    class Playout:
+        """Playout stand-in."""
+
+        def show(self, frame):
+            """Show."""
+            shown.append(frame)
+
+    class Capture:
+        """Capture handing back a distinguishable frame each grab."""
+
+        def read(self):
+            """Read."""
+            got = np.full((8, 8, 3), 0.1 * (len(grabbed) + 1), np.float32)
+            grabbed.append(got)
+            return got
+
+    class Session:
+        """Session stand-in."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+
+        def set_params(self, values):
+            """Set params."""
+
+    rig = R.Rig(session=Session(), capture=Capture(), playout=Playout())
+    source = np.zeros((5, 8, 8, 3), np.float32)
+    out = R.play_pass(rig, source, Automation.empty(), program="Kaledos", config=CONFIG)
+    assert out.shape[0] == 5 and float(out.max()) > 0, "the take survives an unreadable strip"
+
+
+class Emitted:
+    """Collects what a sink wrote, standing in for the encoder."""
+
+    def __init__(self):
+        self.frames = []
+
+    def write(self, frame):
+        """Write."""
+        self.frames.append(np.array(frame, copy=True))
+
+
+def test_a_sink_emits_in_order_and_holds_over_a_gap():
+    out = Emitted()
+    sink = R.FrameSink(out.write, fps=30.0, window=4)
+    for index in (0, 1, 3):  # 2 never arrives
+        sink.add(index, np.full((4, 4, 3), (index + 1) / 10.0, np.float32))
+    sink.close(5)
+    assert len(out.frames) == 5, "the take is as long as it was asked for"
+    values = [round(float(f[0, 0, 0]), 1) for f in out.frames]
+    assert values[:2] == [0.1, 0.2] and values[2] == 0.2, "the gap holds the last good frame"
+
+
+def test_a_sink_never_holds_the_whole_take():
+    out = Emitted()
+    sink = R.FrameSink(out.write, fps=30.0, window=8)
+    for index in range(64):
+        sink.add(index, np.full((4, 4, 3), 0.5, np.float32))
+        assert len(sink.pending) <= 9 and len(sink.buffer) <= 8, "bounded no matter how long the take"
+    sink.close(64)
+    assert len(out.frames) == 64
+
+
+def test_render_stream_writes_a_take_it_never_holds(monkeypatch, tmp_path):
+    """180s at 1080p30 is 134GB as a stack; one pass has no need of it."""
+    clip = [np.full((4, 4, 3), i / 20.0, np.float32) for i in range(12)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
+    )
+    grabbed = []
+
+    class Capture:
+        """Capture handing back the frame it was shown."""
+
+        def __init__(self):
+            self.shown = None
+
+        def read(self):
+            """Read."""
+            grabbed.append(self.shown)
+            return self.shown
+
+        def close(self):
+            """Close."""
+
+    capture = Capture()
+
+    class Playout:
+        """Playout that feeds the capture what it shows."""
+
+        def show(self, frame):
+            """Show."""
+            capture.shown = frame
+
+    class Session:
+        """Session stand-in."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+
+        def set_params(self, values):
+            """Set params."""
+
+    out = Emitted()
+    rig = R.Rig(session=Session(), capture=capture, playout=Playout())
+    score = Score(
+        seed=1,
+        bpm=120.0,
+        duration=12 / CONFIG.fps,
+        fps=CONFIG.fps,
+        layers=[Layer(index=0, program="glitch", gestures=[])],
+    )
+    R.render_stream(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={"glitch": make_profile("glitch")},
+        rig=rig,
+        config=CONFIG,
+        sink=R.FrameSink(out.write, fps=CONFIG.fps, window=4),
+    )
+    assert len(out.frames) == 12 and grabbed, "every frame shown was captured and written"
