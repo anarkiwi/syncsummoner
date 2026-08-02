@@ -75,6 +75,7 @@ class Session:
         verify_settle_s: float = 0.25,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        journal: Any = None,
     ):
         if cc_budget_hz <= 0:
             raise ValueError(f"cc_budget_hz must be positive, got {cc_budget_hz}")
@@ -92,6 +93,7 @@ class Session:
                 raise ValueError(f"park_values must have {PARAM_COUNT} entries")
         self._sent: dict[int, int] = {}
         self._next_send = clock()
+        self.journal = journal
 
     @property
     def park_values(self) -> np.ndarray:
@@ -226,6 +228,20 @@ class Session:
         for index in range(1, PARAM_COUNT + 1):
             self.transport.set_modulation_source(index, DISABLED_OPERATOR)
 
+    def _note(self, kind: str, **detail: Any) -> None:
+        """Record an action, when a journal is attached."""
+        if self.journal is not None:
+            self.journal.record("call", verb=kind, **detail)
+
+    def health(self, capture: Any = None) -> dict[str, Any]:
+        """Probe and journal whether the device is carrying video."""
+        from .journal import probe_health
+
+        state = probe_health(self.transport, capture)
+        if self.journal is not None:
+            self.journal.record("health", **state)
+        return state
+
     def ensure_live(
         self, capture: Any, *, timeout_s: float = 20.0, attempts: int = 1, require_motion: bool = True
     ) -> None:
@@ -233,18 +249,24 @@ class Session:
 
         ``require_motion`` distinguishes the two callers: playing a clip, a frozen
         frame means the output died; probing a still stimulus, no motion is
-        correct and only the splash indicates failure.
+        correct and only the splash indicates failure. A journalled failure
+        reports what was asked of the device since it was last healthy.
         """
         wait = capture.wait_for_content if require_motion else capture.wait_for_lock
-        for _ in range(max(1, attempts) + 1):
+        for attempt in range(max(1, attempts) + 1):
             if wait(timeout_s=timeout_s):
+                if self.journal is not None:
+                    self.journal.record("health", ok=True, via="ensure_live")
                 return
+            self._note("resync", attempt=attempt)
             if not self.transport.resync():
                 break
-        raise DeviceError("capture is not carrying content; power-cycle the device")
+        trail = self.journal.report() if self.journal is not None else "no journal attached"
+        raise DeviceError(f"capture is not carrying content; power-cycle the device\n{trail}")
 
     def load_program(self, name: str, *, park: bool = True) -> None:
         """Load a program, absorb the multi-second output blackout, and re-park."""
+        self._note("load_program", program=name)
         self.transport.load_program(name)
         self._sleep(self.load_blackout_s)
         self._sent.clear()

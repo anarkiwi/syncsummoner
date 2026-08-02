@@ -27,11 +27,15 @@ PATTERNS = (
     "dot_lattice",
     "siemens_star",
     "noise_1f",
+    "band_noise",
     "flat_grey",
     "black",
     "motion_ball",
 )
 
+#: Band-noise blur radius as a fraction of width; chosen by measuring the
+#: trade-off between misalignment robustness and displacement sensitivity.
+BAND_NOISE_SIGMA = 0.025
 _GUARD_CELLS = 2
 _SUBSAMPLES = 5
 _INNER = 0.5
@@ -162,6 +166,22 @@ def _noise_1f(width, height, _frame_index, rng, beta=1.0):
     return 0.5 + field / scale
 
 
+def _band_noise(width, height, _frame_index, rng, sigma_frac=BAND_NOISE_SIGMA):
+    """Low-pass colour noise: survives misalignment, breaks under displacement.
+
+    A zone plate collapses from 0.999 to 0.013 pointwise fit under one pixel of
+    shift and a ramp survives 24 pixels at 0.912; this sits between. Chromatic
+    because a grey stimulus reads as the capture card's achromatic splash.
+    """
+    import cv2  # pylint: disable=import-outside-toplevel,no-member
+
+    blob = max(2.0, sigma_frac * width)
+    coarse = rng.random((max(2, int(height / blob)), max(2, int(width / blob)), 3)).astype(np.float32)
+    field = cv2.resize(coarse, (width, height), interpolation=cv2.INTER_CUBIC)  # pylint: disable=no-member
+    span = float(np.ptp(field)) or 1.0
+    return np.clip((field - field.min()) / span, 0.0, 1.0)
+
+
 def _flat_grey(width, height, _frame_index, _rng, level=0.5):
     return np.full((height, width), np.float32(level))
 
@@ -190,6 +210,7 @@ _GENERATORS = {
     "dot_lattice": _dot_lattice,
     "siemens_star": _siemens_star,
     "noise_1f": _noise_1f,
+    "band_noise": _band_noise,
     "flat_grey": _flat_grey,
     "black": _black,
     "motion_ball": _motion_ball,

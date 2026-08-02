@@ -7,6 +7,7 @@ import types
 import numpy as np
 import pytest
 
+from syncsummoner.device import journal as jn
 from syncsummoner.device import session as sess_mod
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
 from syncsummoner.device.session import (
@@ -17,6 +18,8 @@ from syncsummoner.device.session import (
 )
 
 from .conftest import FakeCapture, FakeClock, FakeTransport
+
+_TICK = iter(float(n) for n in range(1, 100000))
 
 
 def make_session(transport=None, clock=None, **kwargs):
@@ -273,3 +276,34 @@ def test_ensure_live_returns_once_content_arrives():
 
     session.ensure_live(types.SimpleNamespace(wait_for_content=content))
     assert port.resyncs == 1
+
+
+def test_ensure_live_failure_reports_what_preceded_it():
+    """The whole point: name the actions since the device was last healthy."""
+    log = jn.Journal(clock=lambda: next(_TICK))
+    port = FakeTransport()
+    port.resync = lambda **_kw: False
+    session, _, _ = make_session(port)
+    session.journal = log
+    log.record("health", ok=True)
+    session.load_program("Isotherm", park=False)
+    capture = types.SimpleNamespace(wait_for_content=lambda **_kw: False, wait_for_lock=lambda **_kw: False)
+    with pytest.raises(sess_mod.DeviceError) as err:
+        session.ensure_live(capture)
+    text = str(err.value)
+    assert "load_program" in text and "Isotherm" in text
+    assert "last healthy" in text
+
+
+def test_health_marks_the_device_good_and_journals_it():
+    log = jn.Journal(clock=lambda: next(_TICK))
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    session.journal = log
+    rng = np.random.default_rng(1)
+    capture = types.SimpleNamespace(
+        frames=lambda n, **_kw: [rng.random((8, 8, 3)).astype(np.float32) for _ in range(n)],
+        chroma_fraction=lambda _f: 0.7,
+    )
+    assert session.health(capture)["ok"] is True
+    assert log.since_last_good() == []

@@ -198,3 +198,47 @@ def test_wait_for_content_resets_the_run_on_a_splash():
     port.is_no_signal = lambda frame: frame is blank
     _stream(port, good[:3] + [blank] + good)
     assert port.wait_for_content(timeout_s=5.0, run=5)
+
+
+def test_splash_test_reads_a_bounded_sample_not_every_pixel():
+    """Reading every pixel of a 1080p frame cost 3x a 30fps budget and pegged a core."""
+    frame = np.zeros((1080, 1920, 3), np.float32)
+    view = Capture._decimate(frame)  # pylint: disable=protected-access
+    assert view.size // 3 <= 4 * cap.SPLASH_SAMPLES
+    assert view.shape[0] < frame.shape[0] and view.shape[1] < frame.shape[1]
+
+
+def test_small_frames_are_not_decimated():
+    frame = np.zeros((45, 80, 3), np.float32)
+    assert Capture._decimate(frame).shape == frame.shape  # pylint: disable=protected-access
+
+
+def test_strided_chroma_fraction_tracks_the_full_frame_answer():
+    """The statistic is an area fraction, so a sample must agree with the whole."""
+    rng = np.random.default_rng(3)
+    frame = rng.random((540, 960, 3)).astype(np.float32)
+    frame[:, :480] = 0.5
+    port = Capture()
+    coarse = port.chroma_fraction(frame)
+    exact = port.chroma_fraction(frame, samples=frame.shape[0] * frame.shape[1])
+    assert abs(coarse - exact) < 0.02
+
+
+def test_frames_stops_at_the_budget_when_nothing_is_usable():
+    """An unbounded read-until-good loop stalls forever on a rejected stimulus."""
+    clock = FakeClock()
+    port = Capture(clock=clock, sleep=clock.sleep)
+    port.open = lambda: None
+    port.read = lambda: (clock.sleep(0.01), np.zeros((8, 8, 3), np.float32))[1]
+    port.is_no_signal = lambda _f: True
+    assert not port.frames(5, timeout_s=0.2)
+
+
+def test_frames_returns_what_it_collected():
+    clock = FakeClock()
+    rng = np.random.default_rng(2)
+    port = Capture(clock=clock, sleep=clock.sleep)
+    port.open = lambda: None
+    port.read = lambda: (clock.sleep(0.01), rng.random((8, 8, 3)).astype(np.float32))[1]
+    port.is_no_signal = lambda _f: False
+    assert len(port.frames(4, timeout_s=5.0, settle=2)) == 4

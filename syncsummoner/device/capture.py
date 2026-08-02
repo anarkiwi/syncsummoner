@@ -18,6 +18,9 @@ import numpy as np
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 #: HSV saturation 60/255, the threshold the no-signal splash was measured against.
 CHROMA_LEVEL = 60.0 / 255.0
+#: Samples the splash test estimates its area fractions from. They are fractions,
+#: so a decimated sample answers them; every pixel costs 3x a 30fps frame budget.
+SPLASH_SAMPLES = 50_000
 
 
 class CaptureError(RuntimeError):
@@ -78,10 +81,24 @@ class Capture:
             return None
         return np.ascontiguousarray(frame[:, :, ::-1], dtype=np.float32) / np.float32(255.0)
 
-    def chroma_fraction(self, frame: np.ndarray, *, level: float = CHROMA_LEVEL) -> float:
-        """Fraction of pixels carrying meaningful chroma (HSV saturation above ``level``)."""
-        peak = frame.max(axis=2)
-        span = peak - frame.min(axis=2)
+    @staticmethod
+    def _decimate(frame: np.ndarray, samples: int = SPLASH_SAMPLES) -> np.ndarray:
+        """Strided view holding about ``samples`` pixels, for area statistics."""
+        pixels = frame.shape[0] * frame.shape[1]
+        step = max(1, int(np.sqrt(pixels / max(samples, 1))))
+        return frame[::step, ::step]
+
+    def chroma_fraction(
+        self, frame: np.ndarray, *, level: float = CHROMA_LEVEL, samples: int = SPLASH_SAMPLES
+    ) -> float:
+        """Fraction of pixels carrying meaningful chroma (HSV saturation above ``level``).
+
+        Estimated from a strided sample: it is an area fraction, and reading
+        every pixel of a 1080p frame costs three times a 30fps frame budget.
+        """
+        view = self._decimate(frame, samples)
+        peak = view.max(axis=2)
+        span = peak - view.min(axis=2)
         return float(np.count_nonzero(span > level * np.maximum(peak, 1e-6)) / span.size)
 
     def is_no_signal(
@@ -104,7 +121,7 @@ class Capture:
             return True
         if self.chroma_fraction(frame) > max_chroma_frac:
             return False
-        luma = frame @ LUMA
+        luma = self._decimate(frame) @ LUMA
         bright_frac = float(np.count_nonzero(luma >= bright) / luma.size)
         mid_frac = float(np.count_nonzero((luma > dark) & (luma < bright)) / luma.size)
         return bright_frac >= min_bright_frac and mid_frac <= max_mid_frac
@@ -144,6 +161,24 @@ class Capture:
                     recent = recent[-(run - 1) :]
             if self._clock() >= deadline:
                 return False
+
+    def frames(self, count: int, *, timeout_s: float = 10.0, settle: int = 0) -> list[np.ndarray]:
+        """Collect ``count`` usable frames, or fewer if the budget runs out.
+
+        Bounded on purpose: a read-until-good loop hangs forever whenever the
+        splash test rejects everything, which is how a stimulus that happens to
+        look achromatic stalls a whole sweep.
+        """
+        self.open()
+        for _ in range(max(0, settle)):
+            self.read()
+        deadline = self._clock() + timeout_s
+        out: list[np.ndarray] = []
+        while len(out) < count and self._clock() < deadline:
+            frame = self.read()
+            if frame is not None and not self.is_no_signal(frame):
+                out.append(frame)
+        return out
 
     def close(self) -> None:
         """Release the capture device."""
