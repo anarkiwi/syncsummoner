@@ -554,11 +554,11 @@ def test_native_burst_paces_itself_across_the_dwell():
     assert len(got) == 8 and clock.now == pytest.approx(0.4), "one stored frame per interval"
 
 
-def test_harvest_fails_a_program_whose_picture_never_returns(tmp_path):
-    """The blanked output after a load must not be archived against real sweep vectors."""
+def test_a_program_whose_picture_never_moves_is_archived_and_flagged(tmp_path):
+    """A generator program is still by design: measured, five of six failed a motion gate."""
 
     class Blank(Cap):
-        """Capture that never sees the picture come back."""
+        """Capture whose picture never moves before the sweep."""
 
         def wait_for_content(self, timeout_s=15.0):
             del timeout_s
@@ -566,9 +566,14 @@ def test_harvest_fails_a_program_whose_picture_never_returns(tmp_path):
 
     archive = Archive(tmp_path)
     report = run(archive, capture=Blank())
-    assert not archive.rows, "nothing is archived from a blanked output"
-    assert len(report.failures) == 2 and report.frames == 0
-    assert "no moving picture" in report.failures[0].error
+    assert not report.failures and report.frames == 8, "a still picture is still a measurement"
+    assert [r.program for r in report.unsettled] == ["Alpha", "Beta"]
+    assert "UNSETTLED" in str(report.results[0])
+
+
+def test_a_settled_program_is_not_flagged(tmp_path):
+    report = run(Archive(tmp_path))
+    assert not report.unsettled and "UNSETTLED" not in str(report.results[0])
 
 
 def test_rows_carry_the_commanded_state_not_only_the_swept_slots(tmp_path):
@@ -578,3 +583,57 @@ def test_rows_carry_the_commanded_state_not_only_the_swept_slots(tmp_path):
     parked = H.raw_params(Sess(None).working_point(INFO))[CROSSFADER_INDEX - 1]
     assert parked, "the working point holds the crossfader open"
     assert all(row[1][CROSSFADER_INDEX - 1] == parked for row in archive.rows["Alpha"])
+
+
+def test_a_failure_on_a_dark_rig_stops_the_run(tmp_path):
+    """A raising program on a faulted rig must be diagnosed, not repeated 49 times."""
+
+    class Dark(Cap):
+        """Capture that reads black, so the passthrough canary fails too."""
+
+        def read_native(self):
+            self.reads += 1
+            return frame(0)
+
+    class Failing(Sess):
+        """Session that cannot load the first program."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            if name == "Alpha":
+                raise RuntimeError("that one is broken")
+
+    report = H.harvest(
+        Archive(tmp_path),
+        open_transport=Port,
+        open_capture=Dark,
+        session_factory=Failing,
+        config=CONFIG,
+        sleep=lambda _s: None,
+        clock=FakeClock(),
+    )
+    assert report.blacked and not report.wedged, "a dark rig is not a wedge"
+    assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than trying the rest"
+
+
+def test_a_failure_with_a_live_canary_carries_on(tmp_path):
+    """One broken program on a healthy rig must not stop the run."""
+
+    class Failing(Sess):
+        """Session that cannot load the first program."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            if name == "Alpha":
+                raise RuntimeError("that one is broken")
+
+    report = H.harvest(
+        Archive(tmp_path),
+        open_transport=Port,
+        open_capture=Cap,
+        session_factory=Failing,
+        config=CONFIG,
+        sleep=lambda _s: None,
+        clock=FakeClock(),
+    )
+    assert not report.stopped and [r.program for r in report.results] == ["Alpha", "Beta"]

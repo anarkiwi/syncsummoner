@@ -39,6 +39,9 @@ __all__ = [
 DARK_LUMA = 20.0
 #: Loaded to ask whether the device will still hold any program at all.
 WEDGE_PROBE = "Passthru"
+#: The two faults that stop a run: same remedy, different diagnosis, never conflated.
+WEDGED_NOTE = "no program will load: the device needs a power cycle, then rerun to resume"
+BLACKED_NOTE = "black output from a live source: the device needs a power cycle, then rerun"
 
 
 class HarvestError(RuntimeError):
@@ -80,6 +83,7 @@ class ProgramResult:
     seconds: float = 0.0
     luma: float = 0.0
     error: str = ""
+    settled: bool = True
 
     @property
     def cached(self) -> bool:
@@ -96,8 +100,8 @@ class ProgramResult:
             return f"{self.program}: FAILED {self.error}"
         if self.cached:
             return f"{self.program}: cached"
-        dark = " DARK" if self.dark else ""
-        return f"{self.program}: {self.frames} frames in {self.seconds:.0f}s Y={self.luma:.1f}{dark}"
+        flags = f"{' DARK' if self.dark else ''}{'' if self.settled else ' UNSETTLED'}"
+        return f"{self.program}: {self.frames} frames in {self.seconds:.0f}s Y={self.luma:.1f}{flags}"
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,11 @@ class HarvestReport:
     def failures(self) -> list[ProgramResult]:
         """Programs that raised rather than archiving."""
         return [r for r in self.results if r.error]
+
+    @property
+    def unsettled(self) -> list[ProgramResult]:
+        """Programs whose picture never moved before the sweep, for offline scrutiny."""
+        return [r for r in self.results if r.frames and not r.settled]
 
 
 def native_burst(
@@ -275,9 +284,9 @@ def harvest_program(
 ) -> ProgramResult:
     """Sweep one program and archive the native frames each setpoint produced.
 
-    The load drops the source link, so a picture that never returns raises rather
-    than archiving the blanked output against real sweep vectors. Rows carry the
-    whole commanded state, working point included, not the swept slots alone.
+    The load drops the source link, and the content wait covers the blackout that
+    follows. A generator program's picture is still, so a wait that expires is
+    reported rather than fatal. Rows carry the whole commanded state.
     """
     start = clock()
     session.load_program(program, park=True, link=link)
@@ -286,8 +295,7 @@ def harvest_program(
     info = transport.program_info()
     base = session.working_point(info)
     session.set_params(base)
-    if not capture.wait_for_content(timeout_s=config.content_timeout_s):
-        raise HarvestError(f"{program}: no moving picture within {config.content_timeout_s}s of the load")
+    settled = bool(capture.wait_for_content(timeout_s=config.content_timeout_s))
     written, levels = 0, []
     with archive.writer(program, key, width=config.width, height=config.height) as out:
         for setpoint, vector in enumerate(sweep_vectors(info, config, rng)):
@@ -306,7 +314,13 @@ def harvest_program(
                 out.write(frame, params=raw_params({**base, **vector}), setpoint=setpoint)
                 levels.append(float(frame[..., 0].mean()))
                 written += 1
-    return ProgramResult(program, written, clock() - start, float(np.mean(levels)) if levels else 0.0)
+    return ProgramResult(
+        program,
+        written,
+        clock() - start,
+        float(np.mean(levels)) if levels else 0.0,
+        settled=settled,
+    )
 
 
 def harvest(
@@ -376,9 +390,22 @@ def harvest(
                     note(str(results[-1]))
                     if wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep):
                         stopped = True
-                        note("no program will load: the device needs a power cycle, then rerun to resume")
+                        note(WEDGED_NOTE)
                         break
-                    continue
+                    if carries_stimulus(
+                        session,
+                        capture,
+                        transport,
+                        config=config,
+                        link=link,
+                        player=player,
+                        sleep=sleep,
+                        clock=clock,
+                    ):
+                        continue
+                    blacked = True
+                    note(BLACKED_NOTE)
+                    break
                 note(str(results[-1]))
                 if not results[-1].dark:
                     continue
@@ -398,7 +425,7 @@ def harvest(
                     note(f"{name} discarded: dark, but the rig still carries the source")
                     continue
                 blacked = True
-                note("black output from a live source: the device needs a power cycle, then rerun")
+                note(BLACKED_NOTE)
                 break
     finally:
         transport.close()
