@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -282,7 +282,16 @@ class FrameWriter:
 class FrameReader:
     """Random access into one archived program: its rows, and any frame by index."""
 
-    def __init__(self, video: Path, meta: Mapping[str, Any], rows: Sequence[FrameRow], *, ffmpeg, run):
+    def __init__(
+        self,
+        video: Path,
+        meta: Mapping[str, Any],
+        rows: Sequence[FrameRow],
+        *,
+        ffmpeg,
+        run,
+        popen: Callable[..., Any] = subprocess.Popen,
+    ):
         self.video = Path(video)
         self.meta = dict(meta)
         self.rows = list(rows)
@@ -291,6 +300,7 @@ class FrameReader:
         self.fps = float(self.meta["fps"])
         self._ffmpeg = ffmpeg
         self._run = run
+        self._popen = popen
 
     @property
     def count(self) -> int:
@@ -334,6 +344,43 @@ class FrameReader:
         if result.returncode or len(result.stdout) != self.height * self.width * CHANNELS:
             raise ArchiveError(f"decoding frame {index} of {self.video} gave {len(result.stdout)} bytes")
         return np.frombuffer(bytearray(result.stdout), dtype=np.uint8).reshape(self.shape)
+
+    def stream(self, *, start: int = 0, count: int | None = None) -> "Iterator[np.ndarray]":
+        """Yield frames in stream order from one decoder, rather than a seek per frame.
+
+        Reading the whole archive back frame by frame costs a process and a seek
+        each time; recomputing metrics offline reads it in order, so it does not.
+        """
+        want = self.count - start if count is None else min(int(count), self.count - start)
+        if want <= 0:
+            return
+        size = self.height * self.width * CHANNELS
+        argv = [
+            self._ffmpeg,
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{max(0.0, start - 0.5) / self.fps:.6f}",
+            "-i",
+            str(self.video),
+            "-frames:v",
+            str(want),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            PIPE_PIX_FMT,
+            "pipe:1",
+        ]
+        proc = self._popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(want):
+                buf = proc.stdout.read(size)
+                if buf is None or len(buf) < size:
+                    return
+                yield np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(self.shape)
+        finally:
+            proc.stdout.close()
+            proc.wait()
 
     def select(
         self,
@@ -432,4 +479,11 @@ class FrameArchive:
         meta = self.meta(program)
         if meta is None or (key is not None and meta.get("key_digest") != key.digest):
             return None
-        return FrameReader(self.paths(program)[0], meta, self.rows(program), ffmpeg=self.ffmpeg, run=self.run)
+        return FrameReader(
+            self.paths(program)[0],
+            meta,
+            self.rows(program),
+            ffmpeg=self.ffmpeg,
+            run=self.run,
+            popen=self.popen,
+        )
