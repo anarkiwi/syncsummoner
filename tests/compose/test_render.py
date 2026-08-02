@@ -231,7 +231,8 @@ def test_config_formats_and_source_loading(monkeypatch):
     assert (ntsc.width, ntsc.height) == (720, 480)
     assert R.RenderConfig.for_format("720p60", latency_s=0.1).fps == 60.0
     monkeypatch.setattr(
-        "syncsummoner.compose.features.read_video", lambda p: (np.zeros((2, 4, 4, 3), np.float32), 30.0)
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, np.zeros((4, 4, 3), np.float32))] * 2),
     )
     assert R._source_frames("clip.mp4", CONFIG).shape == (2, 4, 4, 3)
 
@@ -312,3 +313,36 @@ def test_enforce_safety_raises_when_mitigation_declined():
     frames[::2] = 1.0
     with pytest.raises(R.UnsafeOutputError, match="flashes/s"):
         R.enforce_safety(frames, fps=30.0, mitigate=False)
+
+
+def test_source_frames_are_resampled_to_the_session_rate(monkeypatch):
+    """A pass shows one source frame per session frame, so a 25fps clip would run fast."""
+    clip = [np.full((4, 4, 3), i, np.float32) for i in range(5)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(25.0, f) for f in clip]),
+    )
+    config = R.RenderConfig(fps=50.0)
+    got = R._source_frames("clip.mkv", config)
+    assert got.shape[0] == 10, "half the rate means every frame is held twice"
+    assert [float(f[0, 0, 0]) for f in got] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+
+
+def test_source_frames_decode_only_the_span_the_pass_uses(monkeypatch):
+    """A three minute clip is 21GB decoded whole; an excerpt must not pay for it."""
+    decoded = []
+
+    def frames(path, max_frames=None):
+        del path, max_frames
+        for i in range(10_000):
+            decoded.append(i)
+            yield 25.0, np.zeros((4, 4, 3), np.float32)
+
+    monkeypatch.setattr("syncsummoner.compose.features.read_frames", frames)
+    got = R._source_frames("clip.mkv", R.RenderConfig(fps=25.0), seconds=2.0)
+    assert got.shape[0] == 50 and len(decoded) == 50, "it stopped at the budget"
+
+
+def test_source_frames_of_an_empty_clip(monkeypatch):
+    monkeypatch.setattr("syncsummoner.compose.features.read_frames", lambda p, max_frames=None: iter([]))
+    assert R._source_frames("clip.mkv", CONFIG).shape[0] == 0
