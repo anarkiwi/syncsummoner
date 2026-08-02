@@ -11,6 +11,7 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -56,60 +57,110 @@ def _profiles_in(directory: Path) -> dict:
     return profiles
 
 
-def _probe_cmd(args: argparse.Namespace) -> int:
+def _link(args: argparse.Namespace):
+    """Source HDMI link for a run, or None when the caller opted out.
+
+    Every program change drops the link, because the device runs on the clock
+    recovered from the incoming video and reports lock before it has settled.
+    """
+    from syncsummoner.device.link import Link
+
+    if getattr(args, "no_link", False):
+        return None
+    host = getattr(args, "source_host", None)
+    return Link(host) if host else Link()
+
+
+def _measure(session, capture, args, *, program, specs, firmware, rng, writer):
+    """Records from every configured plan for one program, archiving frames if asked."""
     from syncsummoner import aesthetics
-    from syncsummoner.device.capture import Capture
+    from syncsummoner.probe import plans, runner
+
+    records = []
+    for plan_name in args.plan.split(","):
+        records += runner.run_plan(
+            session,
+            capture,
+            _make_plan(plans, plan_name, specs, rng),
+            program=program,
+            analyzer=aesthetics,
+            firmware=firmware,
+            allow_untagged=args.allow_untagged,
+            archive=writer,
+        )
+    return records
+
+
+def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tuple[list, Any]:
+    """Measure every requested program on the rig, resuming whatever is stored."""
+    from contextlib import ExitStack
+
+    from syncsummoner.device.capture import Capture, PixelMode
     from syncsummoner.device.session import Session
     from syncsummoner.device.transport import Transport
-    from syncsummoner.probe import plans, runner, sim
-    from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
+    from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.store import ResultStore, program_key
+
+    dev = Transport.open(serial=args.serial)
+    store = ResultStore(args.store or Path(args.out))
+    frames = FrameArchive(args.archive) if args.archive else None
+    link, records = _link(args), []
+    try:
+        names = dev.programs() if args.program == "all" else args.program.split(",")
+        firmware, manifest = dev.firmware(), dev.program_manifest()
+        session = Session(dev)
+        mode = PixelMode.YVYU if frames is not None else PixelMode.BGR
+        with Capture(device=args.capture, mode=mode) as capture:
+            for name in names:
+                key = program_key(dev, name, firmware=firmware, manifest=manifest)
+                done = store.get(name, key)
+                if done is not None:
+                    records += done
+                    continue
+                session.load_program(name, link=link)
+                session.ensure_live(capture, require_motion=False)
+                specs_by_program[name] = dev.program_info().params
+                with ExitStack() as stack:
+                    writer = (
+                        None
+                        if frames is None
+                        else stack.enter_context(
+                            frames.writer(name, key, width=capture.width, height=capture.height)
+                        )
+                    )
+                    measured = _measure(
+                        session,
+                        capture,
+                        args,
+                        program=name,
+                        specs=specs_by_program[name],
+                        firmware=firmware,
+                        rng=rng,
+                        writer=writer,
+                    )
+                if measured:
+                    store.put(name, key, measured)
+                records += measured
+    finally:
+        dev.close()
+    return records, store
+
+
+def _probe_cmd(args: argparse.Namespace) -> int:
+    from syncsummoner import aesthetics
+    from syncsummoner.probe import plans, sim
+    from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
     specs_by_program: dict[str, list] = {}
-    store = None
     if args.probe_cmd == "sim":
-        specs = []
-        records = sim.run_plan_sim(plans.oat(specs), program=args.program, analyzer=aesthetics, rng=rng)
+        store = None
+        records = sim.run_plan_sim(plans.oat([]), program=args.program, analyzer=aesthetics, rng=rng)
     else:
-        dev = Transport.open(serial=args.serial)
-        store = ResultStore(args.store or out)
-        try:
-            names = dev.programs() if args.program == "all" else args.program.split(",")
-            firmware, manifest = dev.firmware(), dev.program_manifest()
-            records = []
-            session = Session(dev)
-            with Capture(device=args.capture) as capture:
-                for name in names:
-                    key = program_key(dev, name, firmware=firmware, manifest=manifest)
-                    done = store.get(name, key)
-                    if done is not None:
-                        records += done
-                        continue
-                    session.load_program(name)
-                    session.ensure_live(capture, require_motion=False)
-                    specs = dev.program_info().params
-                    specs_by_program[name] = specs
-                    measured = []
-                    for plan_name in args.plan.split(","):
-                        plan = _make_plan(plans, plan_name, specs, rng)
-                        measured += runner.run_plan(
-                            session,
-                            capture,
-                            plan,
-                            program=name,
-                            analyzer=aesthetics,
-                            firmware=firmware,
-                            allow_untagged=args.allow_untagged,
-                        )
-                    if measured:
-                        store.put(name, key, measured)
-                    records += measured
-        finally:
-            dev.close()
+        records, store = _probe_hardware(args, rng, specs_by_program)
 
     written = []
     for program in sorted({r.program for r in records}):
@@ -121,6 +172,43 @@ def _probe_cmd(args: argparse.Namespace) -> int:
         written.append(str(path))
     print(json.dumps(written, indent=2))
     return 0
+
+
+def _harvest_cmd(args: argparse.Namespace) -> int:
+    """Drive a whole-library native frame archive run against the rig."""
+    from syncsummoner.device.capture import Capture, PixelMode
+    from syncsummoner.device.playout import LoopPlayer
+    from syncsummoner.device.transport import Transport
+    from syncsummoner.probe.archive import FrameArchive
+    from syncsummoner.probe.harvest import HarvestConfig, harvest
+
+    config = HarvestConfig(
+        width=args.width,
+        height=args.height,
+        capture_fps=args.capture_fps,
+        setpoints=args.setpoints,
+        frames_per_point=args.frames_per_point,
+        seed=args.seed,
+    )
+    host = {} if args.source_host is None else {"host": args.source_host}
+    report = harvest(
+        FrameArchive(args.out),
+        open_transport=lambda: Transport.open(serial=args.serial),
+        open_capture=lambda: Capture(
+            device=args.capture,
+            width=config.width,
+            height=config.height,
+            fps=config.capture_fps,
+            mode=PixelMode.YVYU,
+        ),
+        player=LoopPlayer(width=config.width, height=config.height, **host),
+        link=_link(args),
+        programs=None if args.program == "all" else args.program.split(","),
+        config=config,
+        log=lambda message: print(message, flush=True),
+    )
+    print(f"{report.frames} frames from {len(report.results)} programs in {report.seconds / 60:.1f} min")
+    return 1 if report.wedged else 0
 
 
 def _make_plan(plans, name: str, specs, rng):
@@ -191,15 +279,24 @@ def _render_cmd(args: argparse.Namespace) -> int:
 
     score = Score.load(Path(args.score))
     profiles = _profiles_in(Path(args.profiles))
+    config = render_mod.RenderConfig(source_host=args.source_host)
     if args.render_cmd == "audition":
         frames = render_mod.audition(
-            score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles
+            score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
         )
         render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
     else:
-        render_mod.render(score, args.source, args.output, passes=args.passes, profiles=profiles)
+        render_mod.render(
+            score, args.source, args.output, passes=args.passes, profiles=profiles, config=config
+        )
     print(args.output)
     return 0
+
+
+def _add_link_args(parser: argparse.ArgumentParser) -> None:
+    """Source-host options for any subcommand that changes program."""
+    parser.add_argument("--source-host", help="ssh target driving the stimulus and the HDMI link")
+    parser.add_argument("--no-link", action="store_true", help="do not drop the link across a load")
 
 
 def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-statements
@@ -222,11 +319,26 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--out", default="profiles/")
     run.add_argument("--store", help="resumable per-program result store (default: --out)")
+    run.add_argument("--archive", help="also store the native capture frames under this directory")
+    _add_link_args(run)
     simulate = probe_sub.add_parser("sim")
     simulate.add_argument("--program", required=True)
     simulate.add_argument("--seed", type=int, default=0)
     simulate.add_argument("--out", default="profiles/")
     probe.set_defaults(func=_probe_cmd)
+
+    collect = probe_sub.add_parser("archive", help="archive native frames for every program")
+    collect.add_argument("--program", default="all")
+    collect.add_argument("--capture", default="/dev/video0")
+    collect.add_argument("--out", default="archive/")
+    collect.add_argument("--width", type=int, default=1920)
+    collect.add_argument("--height", type=int, default=1080)
+    collect.add_argument("--capture-fps", type=int, default=30)
+    collect.add_argument("--setpoints", type=int, default=32)
+    collect.add_argument("--frames-per-point", type=int, default=30)
+    collect.add_argument("--seed", type=int, default=11)
+    _add_link_args(collect)
+    collect.set_defaults(func=_harvest_cmd)
 
     profile = sub.add_parser("profile", help="inspect fitted profiles")
     profile_sub = profile.add_subparsers(dest="profile_cmd", required=True)
@@ -260,6 +372,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     audition.add_argument("--profiles", default="profiles/")
     audition.add_argument("--seconds", type=float, default=30.0)
     audition.add_argument("--passes", type=int, default=1)
+    audition.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     audition.add_argument("-o", "--output", default="audition.mkv")
     audition.set_defaults(func=_render_cmd, render_cmd="audition")
 
@@ -268,6 +381,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     full.add_argument("--source", required=True)
     full.add_argument("--profiles", default="profiles/")
     full.add_argument("--passes", type=int, default=1)
+    full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     full.add_argument("-o", "--output", default="out.mkv")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 

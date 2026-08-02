@@ -39,6 +39,8 @@ class RenderConfig:
     latency_s: float = 0.0
     early_bias_s: float = EARLY_BIAS_S
     cc_budget_hz: float = 200.0
+    #: ssh target driving playout and the HDMI link; None takes the device layer's default.
+    source_host: str | None = None
 
     @classmethod
     def for_format(cls, name: str, **kw: Any) -> "RenderConfig":
@@ -49,11 +51,16 @@ class RenderConfig:
 
 @dataclass
 class Rig:
-    """The three real-time endpoints a pass drives, injectable so render stays testable."""
+    """The real-time endpoints a pass drives, injectable so render stays testable.
+
+    ``link`` is the source HDMI link, held down across every program change; None
+    leaves it alone, which only a rig without link control should do.
+    """
 
     session: Any
     capture: Any
     playout: Any
+    link: Any = None
 
 
 def burn_timecode(frame: np.ndarray, index: int, *, bits: int = 16, strip_px: int = 8) -> np.ndarray:
@@ -112,7 +119,7 @@ def play_pass(
     rig: Rig, frames: np.ndarray, auto: Automation, *, program: str, config: RenderConfig
 ) -> np.ndarray:
     """Run one real-time pass: load the program once, play out, drive CC, capture and align."""
-    rig.session.load_program(program)
+    rig.session.load_program(program, link=rig.link)
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
     captured: dict[int, np.ndarray] = {}
@@ -162,15 +169,18 @@ def write_video(path: str | Path, frames: np.ndarray, fps: float) -> None:
 def open_rig(config: RenderConfig) -> Rig:
     """Build the real rig from the device layer; imported here so compose never needs hardware."""
     from syncsummoner.device import capture as capture_mod
+    from syncsummoner.device import link as link_mod
     from syncsummoner.device import playout as playout_mod
     from syncsummoner.device import session as session_mod
     from syncsummoner.device import transport as transport_mod
 
     transport = transport_mod.Transport.open()
+    host = () if config.source_host is None else (config.source_host,)
     return Rig(
         session=session_mod.Session(transport, cc_budget_hz=config.cc_budget_hz),
         capture=capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)),
-        playout=playout_mod.Playout(width=config.width, height=config.height),
+        playout=playout_mod.Playout(*host, width=config.width, height=config.height),
+        link=link_mod.Link(*host),
     )
 
 
