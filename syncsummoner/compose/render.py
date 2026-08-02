@@ -7,6 +7,7 @@ the capture stream. Program is fixed per pass; loading it blacks the output out.
 
 from __future__ import annotations
 
+import subprocess
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,7 +81,7 @@ def read_timecode(
     frame: np.ndarray, *, bits: int = 16, strip_px: int = 8, min_contrast: float = 0.25
 ) -> int | None:
     """Recover the frame index from the edge strip; ``None`` when the strip is absent or washed out."""
-    strip = np.asarray(frame, dtype=np.float64)[:strip_px].mean(axis=(0, 2))
+    strip = np.asarray(frame[:strip_px], dtype=np.float64).mean(axis=(0, 2))
     edges = np.round(np.linspace(0, strip.size, bits + 2)).astype(int)
     cells = np.add.reduceat(strip, edges[:-1]) / np.maximum(np.diff(edges), 1)
     if np.ptp(cells) < min_contrast or cells[0] < cells.mean():
@@ -295,28 +296,67 @@ def write_video(path: str | Path, frames: np.ndarray, fps: float) -> None:
 class VideoSink:
     """An encoder that takes frames one at a time, opened once the first one arrives."""
 
-    def __init__(self, path: str | Path, fps: float):
+    def __init__(self, path: str | Path, fps: float, *, ffmpeg: str = "ffmpeg"):
         self.path = str(path)
         self.fps = float(fps)
+        self.ffmpeg = ffmpeg
         self._writer: Any = None
 
     def write(self, frame: np.ndarray) -> None:
-        """Encode one RGB float32 frame; OpenCV's BGR convention stops here."""
-        # pylint: disable=no-member
-        import cv2
+        """Hand one RGB float32 frame to the encoder, which runs in its own process.
 
+        Encoding in the capture loop cannot keep up: OpenCV's FFV1 measured 189ms
+        a frame, so a pass sampled one frame in six and held the rest.
+        """
         if self._writer is None:
-            height, width = frame.shape[:2]
-            self._writer = cv2.VideoWriter(
-                self.path, cv2.VideoWriter_fourcc(*"FFV1"), self.fps, (width, height)
-            )
-        self._writer.write(cv2.cvtColor((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+            self._writer = self._open(frame.shape[1], frame.shape[0])
+        try:
+            self._writer.stdin.write(np.ascontiguousarray((np.clip(frame, 0, 1) * 255).astype(np.uint8)).data)
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(f"the encoder stopped taking frames for {self.path}") from exc
+
+    def _open(self, width: int, height: int) -> Any:
+        """Start ffmpeg reading raw frames on stdin, as the frame archive does."""
+        return subprocess.Popen(
+            [
+                self.ffmpeg,
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(self.fps),
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "ffv1",
+                "-level",
+                "3",
+                "-slices",
+                "4",
+                "-slicecrc",
+                "1",
+                self.path,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+        )
 
     def close(self) -> None:
         """Finish the file, if anything was ever written to it."""
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
+        if self._writer is None:
+            return
+        writer, self._writer = self._writer, None
+        try:
+            writer.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        writer.wait()
 
 
 def write_timecoded(

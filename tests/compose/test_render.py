@@ -4,6 +4,7 @@
 
 import dataclasses
 import sys
+import time
 import types
 
 import numpy as np
@@ -639,3 +640,45 @@ def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
     assert total == len(written) == 6
     codes = [R.read_timecode(f, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in written]
     assert codes == list(range(6)), "each frame carries its own index"
+
+
+def test_the_sink_hands_frames_to_an_encoder_process(monkeypatch, tmp_path):
+    """OpenCV's FFV1 measured 189ms a frame, so a pass sampled one frame in six."""
+    started, written = [], []
+
+    class Proc:
+        """Encoder stand-in recording the bytes it was given."""
+
+        def __init__(self):
+            self.stdin = types.SimpleNamespace(
+                write=lambda data: written.append(memoryview(data).nbytes), close=lambda: None
+            )
+
+        def wait(self):
+            """Wait."""
+            return 0
+
+    def popen(argv, **kwargs):
+        del kwargs
+        started.append(argv)
+        return Proc()
+
+    monkeypatch.setattr(R.subprocess, "Popen", popen)
+    sink = R.VideoSink(tmp_path / "take.mkv", 30.0)
+    sink.write(np.zeros((8, 16, 3), np.float32))
+    sink.write(np.ones((8, 16, 3), np.float32))
+    sink.close()
+    assert len(started) == 1, "one encoder for the take, not one per frame"
+    assert "ffv1" in started[0] and "16x8" in started[0]
+    assert written == [8 * 16 * 3] * 2
+
+
+def test_reading_a_timecode_only_touches_the_strip():
+    """Converting the whole frame to float64 to read eight rows cost 12ms a frame."""
+    frame = np.random.random((1080, 1920, 3)).astype(np.float32)
+    stamped = R.burn_timecode(frame, 4242, bits=16, strip_px=8)
+    assert R.read_timecode(stamped, bits=16, strip_px=8) == 4242
+    start = time.perf_counter()
+    for _ in range(20):
+        R.read_timecode(stamped, bits=16, strip_px=8)
+    assert (time.perf_counter() - start) / 20 < 0.005, "a strip read is not a whole-frame conversion"
