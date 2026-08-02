@@ -300,3 +300,17 @@ def test_objective_weights_are_documented_defaults():
     assert control_rate(60.0) == 30.0
     assert not Layer("p").gestures
     assert not GestureInstance("hold", 0.0, 1.0).targets
+
+
+def test_a_program_with_nothing_to_drive_is_not_planned(features):
+    """Passthru, fitted from a one setpoint sweep, offered 49 gestures against no parameters."""
+    inert = make_profile("Passthru")
+    for spec in inert.params:
+        spec.sensitivity = 0.0
+    both = P.search(
+        {"glitch": make_profile("glitch"), "Passthru": inert},
+        features,
+        rng=np.random.default_rng(0),
+        budget=12,
+    )
+    assert both.layers and {layer.program for layer in both.layers} == {"glitch"}

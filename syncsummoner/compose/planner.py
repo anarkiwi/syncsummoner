@@ -423,7 +423,12 @@ def search(
     cc_budget_hz: float = CC_BUDGET_HZ,
     evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None,
 ) -> Score:
-    """Evolve one layer per program, then keep the best ``n_passes`` as the score's layers."""
+    """Evolve one layer per program, then keep the best ``n_passes`` as the score's layers.
+
+    A program whose parameters were never measured to move anything is skipped: a
+    gesture drives a parameter, so a profile with none can only score as the
+    absence of a change, which a passthrough wins.
+    """
     audio = features.audio
     if audio is None:
         raise ValueError("planner.search requires audio features")
@@ -444,6 +449,8 @@ def search(
 
     for program in programs:
         profile = profiles[program]
+        if not any(spec.sensitivity > 0 for spec in profile.params):
+            continue
         applicable = _applicable(profile, style_weights, rng)
         if not applicable:
             continue
