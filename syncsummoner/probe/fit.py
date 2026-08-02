@@ -186,12 +186,29 @@ def _hysteresis(order, values, metric, floor):
     return bool(abs(np.median(gaps)) > 2.0 * floor)
 
 
-def _fit_param(index, spec, values, metrics, names, span, noise, *, monotonic_rho, cliff_iqr):
+def _regression_effects(params, metrics, varying):
+    """Standardized main effects from a design that varies every parameter at once.
+
+    A Sobol sweep has no one-at-a-time subset, and the alternative is attributing
+    the whole sweep's variation to every parameter alike, which makes them
+    indistinguishable: measured, the effect vectors sat at cosine 0.84.
+    """
+    x = params[:, varying].astype(np.float64)
+    x = (x - x.mean(axis=0)) / (x.std(axis=0) + 1e-12)
+    y = (metrics - metrics.mean(axis=0)) / (metrics.std(axis=0) + 1e-12)
+    beta = np.linalg.lstsq(np.column_stack([np.ones(len(x)), x]), y, rcond=None)[0]
+    return {j: np.abs(beta[i + 1]) for i, j in enumerate(varying)}
+
+
+def _fit_param(
+    index, spec, values, metrics, names, span, noise, *, monotonic_rho, cliff_iqr, axis_effect=None
+):
     """Fill one ``ParamSpec`` from its one-at-a-time subset; returns the driving metric.
 
     Sensitivity is a signal-to-noise ratio, not a fraction of the metric's span:
     normalising by span pins every parameter that solely owns a metric at exactly
-    1.0, so the field cannot rank the parameters that matter.
+    1.0, so the field cannot rank the parameters that matter. ``axis_effect``
+    replaces the marginal effect where the design never isolated the parameter.
     """
     unique, curve = _curve(values, metrics)
     effect = np.ptp(curve, axis=0)
@@ -205,7 +222,7 @@ def _fit_param(index, spec, values, metrics, names, span, noise, *, monotonic_rh
     moving = np.concatenate(([True], np.abs(np.diff(response)) > noise[driver]))
     rho = spearmanr(unique[moving], response[moving]).statistic if moving.sum() > 2 else 1.0
     spec.monotonic = bool(np.isfinite(rho) and abs(rho) >= monotonic_rho)
-    spec.axis = _assign_axis(effect / span, names)
+    spec.axis = _assign_axis(effect / span if axis_effect is None else axis_effect, names)
     if unique.size < 2:
         return driver
     diffs = np.abs(np.diff(curve, axis=0))
@@ -392,6 +409,7 @@ def fit_profile(
     noise = _noise(params, metrics, noise_floor=noise_floor)
     varying = [j for j in range(PARAM_COUNT) if np.unique(params[:, j]).size > 1]
     modes = np.array([_mode(params[:, j]) for j in range(PARAM_COUNT)])
+    regressed = _regression_effects(params, metrics, varying) if len(varying) > 1 and names else {}
     fitted = []
     settle = {}
     for j in range(PARAM_COUNT):
@@ -404,7 +422,8 @@ def fit_profile(
             continue
         others = [k for k in varying if k != j]
         rows = np.flatnonzero((params[:, others] == modes[others]).all(axis=1))
-        if rows.size < 2:
+        isolated = rows.size >= 2
+        if not isolated:
             rows = np.arange(len(records))
         driver = _fit_param(
             j + 1,
@@ -416,6 +435,7 @@ def fit_profile(
             noise,
             monotonic_rho=monotonic_rho,
             cliff_iqr=cliff_iqr,
+            axis_effect=None if isolated else regressed.get(j),
         )
         spec.hysteresis = _hysteresis(rows, params[:, j], metrics[:, driver], noise_floor)
         settle[j + 1] = int(np.median([records[r].settle_frames for r in rows]))
