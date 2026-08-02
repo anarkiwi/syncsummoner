@@ -2,9 +2,10 @@
 
 # pylint: disable=missing-function-docstring
 
-import pytest
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from syncsummoner import cli
 from syncsummoner.device import capture as capture_mod
@@ -185,8 +186,11 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
     seen = {}
 
     def fake_search(profiles, features, **kwargs):
+        del profiles, features
         seen.update(kwargs)
-        return SimpleNamespace(layers=[], duration=1.0, save=lambda path: Path(path).write_text("{}"))
+        return SimpleNamespace(
+            layers=[], duration=1.0, save=lambda path: Path(path).write_text("{}", encoding="utf-8")
+        )
 
     monkeypatch.setattr("syncsummoner.compose.planner.search", fake_search)
     monkeypatch.setattr(
