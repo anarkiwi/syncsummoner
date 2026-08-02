@@ -216,6 +216,14 @@ def _fit_param(index, spec, values, metrics, names, span, noise, *, monotonic_rh
     return driver
 
 
+def _filled_mean(values, axis=None):
+    """Mean over the filled cells, where an empty slice is zero rather than a warning."""
+    filled = np.isfinite(values)
+    total = np.where(filled, values, 0.0).sum(axis=axis, keepdims=True)
+    count = filled.sum(axis=axis, keepdims=True)
+    return np.divide(total, count, out=np.zeros_like(total, dtype=float), where=count > 0)
+
+
 def _pair_strength(response, a_bins, b_bins, shape, min_filled):
     flat = a_bins * shape[1] + b_bins
     counts = np.bincount(flat, minlength=shape[0] * shape[1]).astype(float)
@@ -224,10 +232,8 @@ def _pair_strength(response, a_bins, b_bins, shape, min_filled):
     filled = np.isfinite(cells)
     if filled.mean() < min_filled:
         return 0.0
-    rows = np.nanmean(cells, axis=1, keepdims=True)
-    cols = np.nanmean(cells, axis=0, keepdims=True)
-    residual = cells - (rows + cols - np.nanmean(cells))
-    return float(np.sqrt(np.nanmean(residual[filled] ** 2)))
+    residual = cells - (_filled_mean(cells, axis=1) + _filled_mean(cells, axis=0) - _filled_mean(cells))
+    return float(np.sqrt(np.mean(residual[filled] ** 2)))
 
 
 def _bins(column, q):
