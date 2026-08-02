@@ -3,7 +3,14 @@
 import numpy as np
 import pytest
 
-from syncsummoner.device.profile import Axis, MeasurementRecord, ParamKind, ParamSpec, Source
+from syncsummoner.device.profile import (
+    PARAM_MAX,
+    Axis,
+    MeasurementRecord,
+    ParamKind,
+    ParamSpec,
+    Source,
+)
 from syncsummoner.probe import fit
 
 DEFAULT = 512
@@ -318,3 +325,46 @@ def test_measurements_parquet_roundtrip(tmp_path):
     assert rows[0]["source"] == "hw"
     assert any(row.get("winding_number") is not None for row in rows)
     assert any(row.get("winding_number") is None for row in rows)
+
+
+def a_record(*, params, metrics):
+    """A measurement record carrying just the metrics a signature reads."""
+    return MeasurementRecord(
+        program="P",
+        firmware="1.0",
+        analyzer="aesthetics 0",
+        source=Source.HW,
+        params=params,
+        state_index=0,
+        stimulus="codeframes",
+        metrics=metrics,
+        settle_frames=1,
+    )
+
+
+def test_a_sweep_that_never_isolates_a_parameter_still_separates_them():
+    """A Sobol design varies everything at once, so the one-at-a-time subset is empty."""
+    rng = np.random.default_rng(5)
+    records = []
+    for _ in range(48):
+        raw = rng.integers(0, PARAM_MAX, size=12)
+        chroma = raw[0] / PARAM_MAX
+        motion = raw[1] / PARAM_MAX
+        records.append(
+            a_record(
+                params=tuple(int(v) for v in raw),
+                metrics={
+                    "chroma_mean": chroma,
+                    "colourfulness": 0.9 * chroma,
+                    "chroma_std": 0.7 * chroma,
+                    "winding_number": motion,
+                    "period_frames": 0.8 * motion,
+                    "periodicity_strength": 0.5 * motion,
+                    "peak_scale": 0.02 * rng.random(),
+                },
+            )
+        )
+    profile = fit.fit_profile(records)
+    axes = {s.index: s.axis for s in profile.params}
+    assert axes[1] is Axis.COLOR_DESTRUCTION, "the chroma driver is not a texture parameter"
+    assert axes[2] is Axis.MOTION_RATE, "the motion driver is not a texture parameter"
