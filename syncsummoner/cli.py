@@ -441,6 +441,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     full.add_argument("-o", "--output", default="out.mkv")
     full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
     full.add_argument("--stream", action="store_true", help="write the take as it is captured, for one pass")
+    full.add_argument(
+        "--played", action="store_true", help="play the source from the rig, at rate, for one pass"
+    )
+    full.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
+    full.add_argument("--prepared", action="store_true", help="take --scratch as an already timecoded clip")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

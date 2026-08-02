@@ -210,3 +210,21 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ]
     )
     assert seen["density"] == 0.9
+
+
+@pytest.mark.parametrize(
+    "command, flags",
+    [
+        ("render", ["--stream", "--played", "--prepared", "--format", "--scratch", "--source"]),
+        ("audition", ["--seconds", "--format", "--source"]),
+        ("compose", ["--density", "--style", "--budget"]),
+        ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
+    ],
+)
+def test_every_documented_flag_is_actually_registered(command, flags, capsys):
+    """A flag that silently failed to land takes an rig run to discover."""
+    with pytest.raises(SystemExit):
+        cli.main(command.split() + ["--help"])
+    text = capsys.readouterr().out
+    missing = [flag for flag in flags if flag not in text]
+    assert not missing, f"{command} is missing {missing}"
