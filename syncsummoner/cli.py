@@ -307,7 +307,11 @@ def _render_cmd(args: argparse.Namespace) -> int:
 
     score = Score.load(Path(args.score))
     profiles = _profiles_in(Path(args.profiles))
-    config = render_mod.RenderConfig(source_host=args.source_host)
+    config = (
+        render_mod.RenderConfig.for_format(args.format, source_host=args.source_host)
+        if args.format
+        else render_mod.RenderConfig(source_host=args.source_host)
+    )
     if args.render_cmd == "audition":
         frames = render_mod.audition(
             score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
@@ -409,6 +413,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     audition.add_argument("--seconds", type=float, default=30.0)
     audition.add_argument("--passes", type=int, default=1)
     audition.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
+    audition.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
     audition.add_argument("-o", "--output", default="audition.mkv")
     audition.set_defaults(func=_render_cmd, render_cmd="audition")
 
@@ -419,6 +424,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     full.add_argument("--passes", type=int, default=1)
     full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     full.add_argument("-o", "--output", default="out.mkv")
+    full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

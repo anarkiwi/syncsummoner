@@ -23,7 +23,9 @@ class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
 
-SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "ntsc": (720, 480, 29.97)}
+#: Playout writes the Pi's framebuffer and capture reads the card, so a session is
+#: whatever both ends already run at; 1080p30 is this rig, measured.
+SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
 EARLY_BIAS_S = 0.015
 
 

@@ -430,3 +430,9 @@ def test_render_closes_the_capture_it_opened(monkeypatch):
     with pytest.raises(ValueError, match="no layers"):
         R.render(score, "clip.mkv", "out.mkv", profiles={}, config=CONFIG)
     assert closed == [True], "a rig it opened is a rig it closes, even when the render fails"
+
+
+def test_the_rig_session_is_a_named_format():
+    """Playout writes the Pi framebuffer, which is 1920x1080: a 720p session showed nothing."""
+    rig = R.RenderConfig.for_format("1080p30")
+    assert (rig.width, rig.height, rig.fps) == (1920, 1080, 30.0)
