@@ -67,7 +67,7 @@ def test_blank_digest_is_the_frame_two_programs_share():
             "b": Reader([blank, native(120)], setpoints=[0, 1]),
         }
     )
-    assert R.blank_digest(archive, ["a", "b"]) == R._digest(blank)  # pylint: disable=protected-access
+    assert R.blank_digest(archive, ["a", "b"]) == R.digest(blank)
 
 
 def test_blank_digest_is_none_when_no_two_programs_open_alike():
@@ -79,9 +79,7 @@ def test_a_setpoint_that_is_only_the_blanking_frame_is_dropped():
     """Those rows carry a real vector against a picture the device never drew."""
     blank = native(7)
     reader = Reader([blank, blank, native(90), native(95)], setpoints=[0, 0, 1, 1])
-    records = R.program_records(
-        Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), blank=R._digest(blank)
-    )  # pylint: disable=protected-access
+    records = R.program_records(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), blank=R.digest(blank))
     assert len(records) == 1 and records[0].state_index == 1
 
 
@@ -94,7 +92,7 @@ def test_records_carry_the_archive_provenance():
 
 
 def test_records_of_a_program_the_archive_does_not_hold():
-    assert R.program_records(Archive({}), "absent", analyzer=FakeAnalyzer()) == []
+    assert not R.program_records(Archive({}), "absent", analyzer=FakeAnalyzer())
 
 
 def test_replay_measures_every_committed_program():

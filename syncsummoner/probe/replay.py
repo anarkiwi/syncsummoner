@@ -17,13 +17,13 @@ from syncsummoner.device.capture import bgr_to_rgb, yvyu_to_bgr
 from syncsummoner.device.profile import MeasurementRecord, Source
 from syncsummoner.probe.runner import ANALYSIS_WIDTH, downscale, measurement
 
-__all__ = ["STIMULUS", "blank_digest", "program_records", "replay", "setpoints"]
+__all__ = ["STIMULUS", "blank_digest", "digest", "program_records", "replay", "setpoints"]
 
 #: What the archive run plays out; the loop is invariant across programs and setpoints.
 STIMULUS = "codeframes"
 
 
-def _digest(frame: np.ndarray) -> str:
+def digest(frame: np.ndarray) -> str:
     """Content digest of one native frame, for recognising a frame the device repeats."""
     return hashlib.blake2b(np.ascontiguousarray(frame).tobytes(), digest_size=8).hexdigest()
 
@@ -58,9 +58,9 @@ def blank_digest(archive: Any, programs: Iterable[str]) -> str | None:
         reader = archive.reader(name)
         if reader is None:
             continue
-        opening.update(_digest(frame) for frame in reader.stream(count=1))
-    digest, seen = opening.most_common(1)[0] if opening else (None, 0)
-    return digest if seen > 1 else None
+        opening.update(digest(frame) for frame in reader.stream(count=1))
+    shared, seen = opening.most_common(1)[0] if opening else (None, 0)
+    return shared if seen > 1 else None
 
 
 def program_records(
@@ -84,7 +84,7 @@ def program_records(
     firmware = str(reader.meta.get("key_material", "unknown"))
     records = []
     for setpoint, params, frames in setpoints(reader):
-        if blank is not None and all(_digest(frame) == blank for frame in frames):
+        if blank is not None and all(digest(frame) == blank for frame in frames):
             continue
         records.append(
             measurement(

@@ -496,6 +496,7 @@ def test_stream_of_an_empty_range_runs_no_decoder(tmp_path):
 
 
 def test_stream_stops_when_the_decoder_ends_early(tmp_path):
+    """A short read ends the stream rather than reshaping a partial frame."""
     archive, _, _ = write_archive(tmp_path, count=4)
     reader = archive.reader("bitcrush")
     reader._popen = FakeStreamer(truncate=True)  # pylint: disable=protected-access
