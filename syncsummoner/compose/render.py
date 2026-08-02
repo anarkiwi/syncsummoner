@@ -184,13 +184,30 @@ def open_rig(config: RenderConfig) -> Rig:
     )
 
 
-def _source_frames(source: Any, config: RenderConfig) -> np.ndarray:
-    if isinstance(source, np.ndarray):
-        return source.astype(np.float32)
-    from syncsummoner.compose.features import read_video
+def _source_frames(source: Any, config: RenderConfig, *, seconds: float | None = None) -> np.ndarray:
+    """Source frames at the session rate, decoding only the span a pass will use.
 
-    del config
-    return read_video(source)[0]
+    A pass consumes one source frame per session frame, so a clip at its own rate
+    plays at the wrong speed; frames are resampled by index rather than blended,
+    which repeats or drops whole frames exactly as playout would.
+    """
+    if isinstance(source, np.ndarray):
+        stack, fps = source.astype(np.float32), config.fps
+    else:
+        from syncsummoner.compose.features import read_frames
+
+        frames, fps, budget = [], config.fps, None
+        for rate, frame in read_frames(source):
+            fps = rate
+            budget = None if seconds is None else max(1, int(round(seconds * rate)))
+            frames.append(frame)
+            if budget is not None and len(frames) >= budget:
+                break
+        stack = np.stack(frames).astype(np.float32) if frames else np.zeros((0, 1, 1, 3), np.float32)
+    if not stack.shape[0] or fps <= 0 or abs(fps - config.fps) < 1e-6:
+        return stack
+    wanted = max(1, int(round(stack.shape[0] * config.fps / fps)))
+    return stack[np.minimum((np.arange(wanted) * fps / config.fps).astype(int), stack.shape[0] - 1)]
 
 
 def _passes(
@@ -252,7 +269,7 @@ def render(
         raise ValueError("render requires the measured profiles the score was planned against")
     config = RenderConfig() if config is None else config
     rig = open_rig(config) if rig is None else rig
-    frames = _source_frames(source, config)
+    frames = _source_frames(source, config, seconds=score.duration)
     results = _passes(score, frames, profiles, rig, config, passes)
     if not results:
         raise ValueError("score has no layers to render")
@@ -277,7 +294,7 @@ def audition(
         raise ValueError("audition requires the measured profiles the score was planned against")
     config = RenderConfig() if config is None else config
     rig = open_rig(config) if rig is None else rig
-    frames = _source_frames(source, config)[: max(1, int(round(seconds * config.fps)))]
+    frames = _source_frames(source, config, seconds=seconds)[: max(1, int(round(seconds * config.fps)))]
     step = max(1, int(round(1.0 / max(scale, 1e-6))))
     frames = np.ascontiguousarray(frames[:, ::step, ::step])
     results = _passes(score, frames, profiles, rig, config, passes)
