@@ -319,6 +319,67 @@ class VideoSink:
             self._writer = None
 
 
+def write_timecoded(
+    source: Any, out: str | Path, *, config: RenderConfig, seconds: float | None = None
+) -> int:
+    """Write the source at session geometry with each frame's index burnt in.
+
+    A clip the playout can identify frame by frame is what lets the source be
+    played from the other end, where it can run at rate.
+    """
+    total, frames = source_stream(source, config, seconds=seconds)
+    video = VideoSink(out, config.fps)
+    written = 0
+    try:
+        for index, frame in enumerate(frames):
+            video.write(burn_timecode(frame, index, bits=config.bits, strip_px=config.strip_px))
+            written = index + 1
+    finally:
+        video.close()
+    return written or total
+
+
+def capture_pass(
+    rig: Rig,
+    auto: Automation,
+    *,
+    program: str,
+    config: RenderConfig,
+    sink: FrameSink,
+    total: int,
+    timeout_s: float = 30.0,
+) -> int:
+    """Capture a pass whose source plays itself, driving automation from what arrives.
+
+    Position comes from the frame the card hands over, so the schedule follows the
+    playback rather than a clock the host keeps on its own.
+    """
+    rig.session.load_program(program, link=rig.link)
+    order = np.argsort(auto.times, kind="stable")
+    times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
+    cursor, seen, idle, lag = 0, 0, 0.0, 0
+    while seen < total and idle < timeout_s:
+        got = rig.capture.read()
+        if got is None:
+            idle += 1.0 / config.fps
+            continue
+        idle = 0.0
+        stamp = read_timecode(got, bits=config.bits, strip_px=config.strip_px)
+        index = stamp if stamp is not None and 0 <= stamp < total else seen - lag
+        if stamp is not None and 0 <= stamp < total:
+            lag = seen - stamp
+        due = int(np.searchsorted(times, index / config.fps, side="right"))
+        if due > cursor:
+            rig.session.set_params(
+                {int(k): float(v) / PARAM_MAX for k, v in zip(indices[cursor:due], values[cursor:due])}
+            )
+            cursor = due
+        sink.add(index, crop_strip(got, strip_px=config.strip_px))
+        seen += 1
+    sink.close(total)
+    return seen
+
+
 def render_stream(
     score: Score,
     source: Any,
@@ -364,7 +425,54 @@ def render_stream(
             rig.capture.close()
 
 
-def open_rig(config: RenderConfig) -> Rig:
+def render_played(
+    score: Score,
+    source: Any,
+    out: str | Path,
+    *,
+    profiles: Mapping[str, ProgramProfile],
+    rig: Rig | None = None,
+    config: RenderConfig | None = None,
+    scratch: str | Path = "timecoded.mkv",
+) -> int:
+    """Render a pass the playout plays for itself, at rate.
+
+    Pushing frames caps a pass at a few a second, which samples the instrument's
+    own motion far too slowly to be the performance it is meant to record. The
+    source goes over once, timecoded, and the host only drives and captures.
+    """
+    layers = sorted(score.layers, key=lambda item: item.index)
+    if not layers:
+        raise ValueError("score has no layers to render")
+    config = RenderConfig() if config is None else config
+    owned = rig is None
+    rig = open_rig(config, player=True) if owned else rig
+    total = write_timecoded(source, scratch, config=config, seconds=score.duration)
+    video = VideoSink(out, config.fps)
+    try:
+        autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
+        auto = schedule(
+            autos.get(layers[0].index, Automation.empty()),
+            latency_s=config.latency_s,
+            early_bias_s=config.early_bias_s,
+        )
+        rig.playout.upload(str(scratch))
+        with rig.playout.playing(fps=config.fps):
+            return capture_pass(
+                rig,
+                auto,
+                program=layers[0].program,
+                config=config,
+                sink=FrameSink(video.write, fps=config.fps),
+                total=total,
+            )
+    finally:
+        video.close()
+        if owned:
+            rig.capture.close()
+
+
+def open_rig(config: RenderConfig, *, player: bool = False) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
     Imported here so compose never needs hardware. The capture is opened rather
@@ -382,7 +490,9 @@ def open_rig(config: RenderConfig) -> Rig:
     return Rig(
         session=session_mod.Session(transport, cc_budget_hz=config.cc_budget_hz),
         capture=capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)).open(),
-        playout=playout_mod.Playout(*host, width=config.width, height=config.height),
+        playout=(playout_mod.ClipPlayer if player else playout_mod.Playout)(
+            *host, width=config.width, height=config.height
+        ),
         link=link_mod.Link(*host),
     )
 

@@ -582,3 +582,60 @@ def test_render_stream_writes_a_take_it_never_holds(monkeypatch, tmp_path):
         sink=R.FrameSink(out.write, fps=CONFIG.fps, window=4),
     )
     assert len(out.frames) == 12 and grabbed, "every frame shown was captured and written"
+
+
+def test_capture_pass_follows_the_playback_it_is_watching():
+    """The source plays itself, so position comes from the frame the card hands over."""
+    applied = []
+
+    class Session:
+        """Session recording the parameter writes a pass makes."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+
+        def set_params(self, values):
+            """Set params."""
+            applied.append(dict(values))
+
+    stamps = iter([0, 1, 2, 3, 4, 5])
+
+    class Capture:
+        """Capture handing back frames already carrying a timecode."""
+
+        def read(self):
+            """Read."""
+            index = next(stamps, None)
+            if index is None:
+                return None
+            return R.burn_timecode(
+                np.full((16, 16, 3), 0.5, np.float32), index, bits=CONFIG.bits, strip_px=CONFIG.strip_px
+            )
+
+    out = Emitted()
+    auto = Automation(times=np.array([2 / CONFIG.fps]), indices=np.array([3]), values=np.array([512.0]))
+    seen = R.capture_pass(
+        R.Rig(session=Session(), capture=Capture(), playout=None),
+        auto,
+        program="glitch",
+        config=CONFIG,
+        sink=R.FrameSink(out.write, fps=CONFIG.fps, window=3),
+        total=6,
+    )
+    assert seen == 6 and len(out.frames) == 6
+    assert applied and 3 in applied[0], "the automation fired against the decoded position"
+
+
+def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
+    clip = [np.full((4, 4, 3), 0.5, np.float32) for _ in range(6)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
+    )
+    written = []
+    monkeypatch.setattr(R.VideoSink, "write", lambda self, frame: written.append(frame))
+    monkeypatch.setattr(R.VideoSink, "close", lambda self: None)
+    total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG)
+    assert total == len(written) == 6
+    codes = [R.read_timecode(f, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in written]
+    assert codes == list(range(6)), "each frame carries its own index"
