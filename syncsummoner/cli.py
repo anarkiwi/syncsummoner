@@ -317,6 +317,8 @@ def _render_cmd(args: argparse.Namespace) -> int:
             score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
         )
         render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
+    elif args.stream:
+        render_mod.render_stream(score, args.source, args.output, profiles=profiles, config=config)
     else:
         render_mod.render(
             score, args.source, args.output, passes=args.passes, profiles=profiles, config=config
@@ -426,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     full.add_argument("-o", "--output", default="out.mkv")
     full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
+    full.add_argument("--stream", action="store_true", help="write the take as it is captured, for one pass")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

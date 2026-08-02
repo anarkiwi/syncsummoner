@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -117,6 +117,95 @@ def align(captured: Mapping[int, np.ndarray], n_frames: int, shape: tuple[int, .
     return out[idx]
 
 
+class FrameSink:
+    """Writes a pass out as it is captured, so a take is never held whole.
+
+    Frames arrive by index and leave in order, the last good one held over a gap.
+    Safety runs on a window rather than the finished take: flash risk is a rate,
+    so a window is where it can be judged at all.
+    """
+
+    def __init__(self, write: Callable[[np.ndarray], None], *, fps: float, window: int = 60):
+        self.write = write
+        self.fps = float(fps)
+        self.window = max(2, int(window))
+        self.pending: dict[int, np.ndarray] = {}
+        self.next = 0
+        self.held: np.ndarray | None = None
+        self.buffer: list[np.ndarray] = []
+
+    def add(self, index: int, frame: np.ndarray) -> None:
+        """Take one captured frame, emitting whatever its arrival completes."""
+        if index >= self.next:
+            self.pending[index] = frame
+        self._drain(len(self.pending) > self.window)
+
+    def _drain(self, forced: bool) -> None:
+        while self.pending and (forced or self.next in self.pending):
+            if self.next in self.pending:
+                self.held = self.pending.pop(self.next)
+            elif self.held is None:
+                self.held = self.pending[min(self.pending)]
+            self._emit(self.held)
+            self.next += 1
+            forced = len(self.pending) > self.window
+
+    def _emit(self, frame: np.ndarray) -> None:
+        self.buffer.append(frame)
+        if len(self.buffer) >= self.window:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self.buffer:
+            return
+        for frame in enforce_safety(np.stack(self.buffer), fps=self.fps):
+            self.write(frame)
+        self.buffer.clear()
+
+    def close(self, total: int) -> None:
+        """Emit everything left, holding the last frame out to ``total``."""
+        self._drain(True)
+        while self.next < total and self.held is not None:
+            self._emit(self.held)
+            self.next += 1
+        self._flush()
+
+
+def play_pass_stream(
+    rig: Rig,
+    frames: "Iterator[np.ndarray]",
+    auto: Automation,
+    *,
+    program: str,
+    config: RenderConfig,
+    sink: FrameSink,
+    total: int,
+) -> None:
+    """One real-time pass that never holds the take: each frame is written as it lands."""
+    rig.session.load_program(program, link=rig.link)
+    order = np.argsort(auto.times, kind="stable")
+    times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
+    cursor, lag, stamped = 0, 0, 0
+    for i, frame in enumerate(frames):
+        due = int(np.searchsorted(times, i / config.fps, side="right"))
+        if due > cursor:
+            rig.session.set_params(
+                {int(k): float(v) / PARAM_MAX for k, v in zip(indices[cursor:due], values[cursor:due])}
+            )
+            cursor = due
+        rig.playout.show(burn_timecode(frame, i, bits=config.bits, strip_px=config.strip_px))
+        got = rig.capture.read()
+        if got is None:
+            continue
+        tc = read_timecode(got, bits=config.bits, strip_px=config.strip_px)
+        if tc is not None and 0 <= tc < total:
+            lag, stamped = (lag * stamped + (i - tc)) // (stamped + 1), stamped + 1
+        sink.add(
+            tc if tc is not None and 0 <= tc < total else i - lag, crop_strip(got, strip_px=config.strip_px)
+        )
+    sink.close(total)
+
+
 def play_pass(
     rig: Rig, frames: np.ndarray, auto: Automation, *, program: str, config: RenderConfig
 ) -> np.ndarray:
@@ -194,6 +283,78 @@ def write_video(path: str | Path, frames: np.ndarray, fps: float) -> None:
     writer.release()
 
 
+class VideoSink:
+    """An encoder that takes frames one at a time, opened once the first one arrives."""
+
+    def __init__(self, path: str | Path, fps: float):
+        self.path = str(path)
+        self.fps = float(fps)
+        self._writer: Any = None
+
+    def write(self, frame: np.ndarray) -> None:
+        """Encode one RGB float32 frame; OpenCV's BGR convention stops here."""
+        # pylint: disable=no-member
+        import cv2
+
+        if self._writer is None:
+            height, width = frame.shape[:2]
+            self._writer = cv2.VideoWriter(
+                self.path, cv2.VideoWriter_fourcc(*"FFV1"), self.fps, (width, height)
+            )
+        self._writer.write(cv2.cvtColor((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+    def close(self) -> None:
+        """Finish the file, if anything was ever written to it."""
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+
+
+def render_stream(
+    score: Score,
+    source: Any,
+    out: str | Path,
+    *,
+    profiles: Mapping[str, ProgramProfile],
+    rig: Rig | None = None,
+    config: RenderConfig | None = None,
+    sink: FrameSink | None = None,
+) -> None:
+    """Render one pass straight to ``out``, holding neither the source nor the take.
+
+    The multi-pass path composites, so it needs both in hand; a single pass does
+    not, and a full length take is hundreds of gigabytes it would rather not hold.
+    """
+    layers = sorted(score.layers, key=lambda item: item.index)
+    if not layers:
+        raise ValueError("score has no layers to render")
+    config = RenderConfig() if config is None else config
+    owned = rig is None
+    rig = open_rig(config) if owned else rig
+    video = VideoSink(out, config.fps)
+    try:
+        autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
+        auto = schedule(
+            autos.get(layers[0].index, Automation.empty()),
+            latency_s=config.latency_s,
+            early_bias_s=config.early_bias_s,
+        )
+        total, frames = source_stream(source, config, seconds=score.duration)
+        play_pass_stream(
+            rig,
+            frames,
+            auto,
+            program=layers[0].program,
+            config=config,
+            sink=FrameSink(video.write, fps=config.fps) if sink is None else sink,
+            total=total,
+        )
+    finally:
+        video.close()
+        if owned:
+            rig.capture.close()
+
+
 def open_rig(config: RenderConfig) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
@@ -215,6 +376,38 @@ def open_rig(config: RenderConfig) -> Rig:
         playout=playout_mod.Playout(*host, width=config.width, height=config.height),
         link=link_mod.Link(*host),
     )
+
+
+def source_stream(source: Any, config: RenderConfig, *, seconds: float | None = None):
+    """Yield ``(total, frames)``: how many session frames a take is, and them one at a time.
+
+    A long take is never held: 180s at 1080p30 is 134GB as a stack, and the pass
+    only ever looks at one frame.
+    """
+    from syncsummoner.compose.features import read_frames
+
+    probe, rate = [], config.fps
+    for rate, frame in read_frames(source):
+        probe.append(frame)
+        break
+    if not probe:
+        return 0, iter(())
+    src_fps = rate if rate > 0 else config.fps
+    total = int(round((seconds or 0.0) * config.fps)) if seconds else 0
+
+    def frames() -> Iterator[np.ndarray]:
+        held, index = None, 0
+        source_index = -1
+        for _, frame in read_frames(source):
+            source_index += 1
+            held = frame
+            while index * src_fps / config.fps <= source_index:
+                yield _conform(np.asarray(held, dtype=np.float32)[None], config)[0]
+                index += 1
+                if total and index >= total:
+                    return
+
+    return total, frames()
 
 
 def _source_frames(source: Any, config: RenderConfig, *, seconds: float | None = None) -> np.ndarray:

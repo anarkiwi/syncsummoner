@@ -488,3 +488,97 @@ def test_a_pass_that_decodes_nothing_still_returns_the_pictures(monkeypatch):
     source = np.zeros((5, 8, 8, 3), np.float32)
     out = R.play_pass(rig, source, Automation.empty(), program="Kaledos", config=CONFIG)
     assert out.shape[0] == 5 and float(out.max()) > 0, "the take survives an unreadable strip"
+
+
+class Emitted:
+    """Collects what a sink wrote, standing in for the encoder."""
+
+    def __init__(self):
+        self.frames = []
+
+    def write(self, frame):
+        """Write."""
+        self.frames.append(np.array(frame, copy=True))
+
+
+def test_a_sink_emits_in_order_and_holds_over_a_gap():
+    out = Emitted()
+    sink = R.FrameSink(out.write, fps=30.0, window=4)
+    for index in (0, 1, 3):  # 2 never arrives
+        sink.add(index, np.full((4, 4, 3), (index + 1) / 10.0, np.float32))
+    sink.close(5)
+    assert len(out.frames) == 5, "the take is as long as it was asked for"
+    values = [round(float(f[0, 0, 0]), 1) for f in out.frames]
+    assert values[:2] == [0.1, 0.2] and values[2] == 0.2, "the gap holds the last good frame"
+
+
+def test_a_sink_never_holds_the_whole_take():
+    out = Emitted()
+    sink = R.FrameSink(out.write, fps=30.0, window=8)
+    for index in range(64):
+        sink.add(index, np.full((4, 4, 3), 0.5, np.float32))
+        assert len(sink.pending) <= 9 and len(sink.buffer) <= 8, "bounded no matter how long the take"
+    sink.close(64)
+    assert len(out.frames) == 64
+
+
+def test_render_stream_writes_a_take_it_never_holds(monkeypatch, tmp_path):
+    """180s at 1080p30 is 134GB as a stack; one pass has no need of it."""
+    clip = [np.full((4, 4, 3), i / 20.0, np.float32) for i in range(12)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
+    )
+    grabbed = []
+
+    class Capture:
+        """Capture handing back the frame it was shown."""
+
+        def __init__(self):
+            self.shown = None
+
+        def read(self):
+            """Read."""
+            grabbed.append(self.shown)
+            return self.shown
+
+        def close(self):
+            """Close."""
+
+    capture = Capture()
+
+    class Playout:
+        """Playout that feeds the capture what it shows."""
+
+        def show(self, frame):
+            """Show."""
+            capture.shown = frame
+
+    class Session:
+        """Session stand-in."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+
+        def set_params(self, values):
+            """Set params."""
+
+    out = Emitted()
+    rig = R.Rig(session=Session(), capture=capture, playout=Playout())
+    score = Score(
+        seed=1,
+        bpm=120.0,
+        duration=12 / CONFIG.fps,
+        fps=CONFIG.fps,
+        layers=[Layer(index=0, program="glitch", gestures=[])],
+    )
+    R.render_stream(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={"glitch": make_profile("glitch")},
+        rig=rig,
+        config=CONFIG,
+        sink=R.FrameSink(out.write, fps=CONFIG.fps, window=4),
+    )
+    assert len(out.frames) == 12 and grabbed, "every frame shown was captured and written"
