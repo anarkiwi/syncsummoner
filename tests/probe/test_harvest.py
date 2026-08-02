@@ -525,3 +525,56 @@ def test_a_discarded_program_has_its_archive_files_removed(tmp_path):
         path.write_bytes(b"stale")
     dark_run(archive, canary_luma=200, programs=("Alpha",))
     assert not any(path.exists() for path in archive.paths("Alpha"))
+
+
+def test_native_burst_drops_a_read_that_repeats_the_previous_frame():
+    """Measured, an unpaced 30-frame burst spanned 0.25s and held one distinct frame."""
+
+    class Stuck:
+        """Capture whose reads outrun the card and return the same buffer."""
+
+        def __init__(self):
+            self.reads = 0
+
+        def read_native(self):
+            """Read native."""
+            self.reads += 1
+            return frame(64)
+
+    clock = FakeClock()
+    capture = Stuck()
+    got = H.native_burst(capture, 5, settle=0, interval_s=0.1, sleep=clock.sleep, clock=clock)
+    assert len(got) == 1 and capture.reads == 5, "it kept reading, but stored one measurement"
+
+
+def test_native_burst_paces_itself_across_the_dwell():
+    """Unpaced, the burst samples the few milliseconds the reads take, not the setpoint."""
+    clock = FakeClock()
+    got = H.native_burst(Cap(), 8, settle=0, interval_s=0.05, sleep=clock.sleep, clock=clock)
+    assert len(got) == 8 and clock.now == pytest.approx(0.4), "one stored frame per interval"
+
+
+def test_harvest_fails_a_program_whose_picture_never_returns(tmp_path):
+    """The blanked output after a load must not be archived against real sweep vectors."""
+
+    class Blank(Cap):
+        """Capture that never sees the picture come back."""
+
+        def wait_for_content(self, timeout_s=15.0):
+            del timeout_s
+            return False
+
+    archive = Archive(tmp_path)
+    report = run(archive, capture=Blank())
+    assert not archive.rows, "nothing is archived from a blanked output"
+    assert len(report.failures) == 2 and report.frames == 0
+    assert "no moving picture" in report.failures[0].error
+
+
+def test_rows_carry_the_commanded_state_not_only_the_swept_slots(tmp_path):
+    """P12 gates the output and is held open off-sweep, so a zero there misreads the state."""
+    archive = Archive(tmp_path)
+    run(archive)
+    parked = H.raw_params(Sess(None).working_point(INFO))[CROSSFADER_INDEX - 1]
+    assert parked, "the working point holds the crossfader open"
+    assert all(row[1][CROSSFADER_INDEX - 1] == parked for row in archive.rows["Alpha"])
