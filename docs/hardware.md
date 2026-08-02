@@ -296,6 +296,26 @@ name plus firmware (`KeyKind.NAME_FIRMWARE`) rather than on the program binary:
 `program_key` hashes each binary over the serial shell, which its own docstring
 notes runs at wire speed and can time out.
 
+## Programs freeze while passthrough still carries the source
+
+Measured 2026-08-03, a third fault and the only one the canary calls healthy. The
+device answers, loads any program, and `Passthru` passes a moving source frame for
+frame; every other program emits a still picture. With the source playing at 30fps
+and a program loaded, the capture saw:
+
+| program | distinct pictures in 155 grabs | timecodes decoded |
+| --- | --- | --- |
+| `Passthru` | 148 | 148 |
+| `Jammer`, `Sabattier`, `Scramble`, `Derez`, `Stochasm` | 2 | 0 |
+
+`Capture.wait_for_content` returns False throughout, and waiting 25s past the load
+changes nothing. A power cycle clears it: the same programs then returned 152 and
+153 distinct pictures with their stamps intact.
+
+`carries_stimulus` loads `Passthru` to decide whether the rig or the program is
+dark, so this fault reads as a healthy rig and a dark program, once per program,
+for the whole library. A canary that only proves the passthrough cannot see it.
+
 ## The device emits pure black while reporting a live source
 
 Measured 2026-08-02, a second fault distinct from the wedge above. The device
