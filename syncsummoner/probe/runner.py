@@ -158,27 +158,37 @@ def _ahead(index, expected, capacity):
     return 0 < (index - expected) % capacity < capacity // 2
 
 
-def _collect(capture, expected, *, bits, strip_px, frames_per_point, max_wait_frames, allow_untagged):
+def _read(capture, native):
+    """One grab as ``(rgb, native)``; the card's own buffer only where it is archived."""
+    if not native:
+        return capture.read(), None
+    raw, rgb = capture.read_pair()
+    return rgb, raw
+
+
+def _collect(
+    capture, expected, *, bits, strip_px, frames_per_point, max_wait_frames, allow_untagged, native=False
+):
     capacity = patterns.state_index_capacity(bits)
-    frames = []
+    samples = []
     for _ in range(max_wait_frames):
-        if len(frames) >= frames_per_point:
+        if len(samples) >= frames_per_point:
             break
-        frame = capture.read()
+        frame, raw = _read(capture, native)
         if frame is None or capture.is_no_signal(frame):
             continue
         index = None if allow_untagged else patterns.read_state_index(frame, bits=bits, strip_px=strip_px)
         if index is None and not allow_untagged:
             continue
         if index is not None and index != expected:
-            if frames or _ahead(index, expected, capacity):
+            if samples or _ahead(index, expected, capacity):
                 break
             continue
         cropped = patterns.crop_strip(frame, strip_px=strip_px)
-        if frames and np.array_equal(cropped, frames[-1]):
+        if samples and np.array_equal(cropped, samples[-1][0]):
             continue
-        frames.append(cropped)
-    return frames
+        samples.append((cropped, raw))
+    return samples
 
 
 def run_plan(
@@ -202,11 +212,13 @@ def run_plan(
     analysis_width=ANALYSIS_WIDTH,
     replicates=DEFAULT_REPLICATES,
     rng=None,
+    archive=None,
 ):
     """Run ``plan`` on a live session and capture, returning measurement records.
 
     ``emit`` publishes the state index onto the played-out stimulus; with no
     playout, ``allow_untagged`` attributes signal frames to the current vector.
+    An open :class:`FrameWriter` in ``archive`` also stores the native frames.
     """
     firmware = firmware or _firmware(session)
     capacity = patterns.state_index_capacity(bits)
@@ -218,7 +230,7 @@ def run_plan(
         session.set_params(vector)
         if emit is not None:
             emit(state)
-        frames = _collect(
+        samples = _collect(
             capture,
             state,
             bits=bits,
@@ -226,9 +238,15 @@ def run_plan(
             frames_per_point=frames_per_point,
             max_wait_frames=max_wait_frames,
             allow_untagged=allow_untagged,
+            native=archive is not None,
         )
-        if not frames:
+        if not samples:
             continue
+        frames = [frame for frame, _ in samples]
+        params = raw_params(vector)
+        if archive is not None:
+            for _, raw in samples:
+                archive.write(raw, params=params, setpoint=step)
         records.append(
             measurement(
                 frames,
@@ -236,7 +254,7 @@ def run_plan(
                 program=program,
                 firmware=firmware,
                 source=source,
-                params=raw_params(vector),
+                params=params,
                 state_index=state,
                 stimulus=stimulus,
                 fps=fps,

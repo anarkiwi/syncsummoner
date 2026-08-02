@@ -278,6 +278,24 @@ dead frames straight through into the data; only the motion check catches both.
 `Transport.resync()` clears it: measured against a live failure, output motion
 went from 0.00000 to 0.02802 with no power cycle.
 
+## The device stops holding any program after ~15 loads
+
+Measured 2026-08-02 over a whole-library archive run. After roughly fifteen
+program loads the device still answers normally, firmware reads succeed and the
+HDMI input stays locked, but `program info` returns `[3] no program loaded` and
+no program will load again.
+
+There is no software recovery. Reloading, `Transport.resync()` (which returns
+False) and `set_video_timing()` all fail; only a power cycle clears it. A long
+run must therefore checkpoint per program, detect the wedge and stop rather than
+burning through the rest of the library, and resume by itself once power is
+cycled. `probe.harvest` does exactly that.
+
+Because the device wedges under serial load, an archive run keys its results on
+name plus firmware (`KeyKind.NAME_FIRMWARE`) rather than on the program binary:
+`program_key` hashes each binary over the serial shell, which its own docstring
+notes runs at wire speed and can time out.
+
 ## `settings export` and `settings get` hang the serial shell
 
 On `1.0.0-rc.37` both verbs return no response and leave the command processor

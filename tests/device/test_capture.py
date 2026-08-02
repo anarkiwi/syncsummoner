@@ -202,6 +202,29 @@ def test_native_frames_need_a_native_handle(opened):
         capture.open().read_native()
 
 
+def test_read_pair_describes_one_grab_twice(native):
+    """A second grab is a different frame, so archive and metrics must share one."""
+    capture, fake = native
+    frame = noise_frame(seed=5)
+    fake.frames = [frame]
+    raw, rgb = capture.open().read_pair()
+    assert raw is frame
+    assert rgb == pytest.approx(cap.bgr_to_rgb(cap.yvyu_to_bgr(frame)))
+    assert fake.reads == 1, "one pair costs one grab"
+
+
+def test_read_pair_returns_no_frame_on_a_failed_grab(native):
+    capture, _ = native
+    assert capture.open().read_pair() == (None, None)
+
+
+def test_read_pair_needs_a_native_handle(opened):
+    capture, fake, _ = opened
+    fake.frames = [noise_frame()]
+    with pytest.raises(CaptureError, match="PixelMode.YVYU"):
+        capture.open().read_pair()
+
+
 def test_read_native_returns_none_on_failed_grab(native):
     capture, _ = native
     assert capture.open().read_native() is None

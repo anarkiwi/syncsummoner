@@ -127,7 +127,7 @@ class Session:                       # settle timing, CC rate limiting, state ca
     def __init__(self, transport, *, cc_budget_hz=200.0): ...
     def set_params(self, values: Mapping[int, float | bool]) -> None: ...  # rate limited, cached
     def park(self) -> None: ...      # drive every parameter to a known reference
-    def load_program(self, name) -> None: ...   # absorbs the load blackout
+    def load_program(self, name, *, park=True, link=None) -> None: ...  # absorbs the load blackout
     def working_point(self, info, *, exclude=()) -> dict[int, float | bool]: ...
     def arm_modulation(self, info, operators, rng, *, exclude=(), count=5) -> list[str]: ...
     def disarm_modulation(self) -> None: ...
@@ -140,6 +140,12 @@ class Capture:                       # long-lived; never reopened per sample
     def wait_for_lock(self, timeout_s=10.0) -> bool
     def is_no_signal(self, frame) -> bool    # capture card synthesizes a splash; see docs/hardware.md
     def wait_for_content(self, timeout_s=15.0) -> bool   # past the splash AND moving
+    def read_native(self) -> np.ndarray | None           # packed YVYU (H, W, 2) uint8
+    def read_pair(self) -> tuple[np.ndarray | None, np.ndarray | None]   # one grab, both views
+
+class Link:                          # the HDMI link out of the stimulus source host
+    def down(self) / up(self) -> str: ...
+    def quiet(self) -> ContextManager["Link"]: ...   # held down across a program change
 ```
 
 `ParamSpec` / `ProgramProfile` and the measurement record schema live in
@@ -159,8 +165,15 @@ plans.sobol(spec, *, n, rng) -> Iterator[dict[int, float | bool]]
 plans.tongue_raster(spec, pair, *, n) -> Iterator[dict[int, float | bool]]
 plans.hysteresis(spec, index, *, n) -> Iterator[dict[int, float | bool]]
 
-runner.run_plan(session, capture, plan, *, program, analyzer) -> list[MeasurementRecord]
-fit.fit_profile(records) -> ProgramProfile
+runner.run_plan(session, capture, plan, *, program, analyzer, archive=None)
+    -> list[MeasurementRecord]      # archive: an open FrameWriter, which also stores frames
+fit.fit_profile(records, *, specs=None) -> ProgramProfile
+
+archive.FrameArchive(directory).writer(program, key, *, width, height) -> FrameWriter
+FrameWriter.write(native, *, params, setpoint, loop_index=None) -> int   # native is (H, W, 2) uint8
+
+harvest.harvest(archive, *, open_transport, open_capture, player=None, link=None,
+                programs=None, config=HarvestConfig(), session_factory=Session) -> HarvestReport
 ```
 
 ## `syncsummoner.compose`
@@ -171,4 +184,5 @@ vocabulary.GESTURES: dict[str, Gesture]
 planner.search(profiles, features, *, style, rng, budget) -> Score
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
+render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
 ```
