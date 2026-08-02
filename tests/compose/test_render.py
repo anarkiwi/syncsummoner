@@ -604,6 +604,11 @@ def test_capture_pass_follows_the_playback_it_is_watching():
     class Capture:
         """Capture handing back frames already carrying a timecode."""
 
+        def wait_for_content(self, timeout_s=30.0):
+            """Wait for content."""
+            del timeout_s
+            return True
+
         def read(self):
             """Read."""
             index = next(stamps, None)
@@ -682,3 +687,56 @@ def test_reading_a_timecode_only_touches_the_strip():
     for _ in range(20):
         R.read_timecode(stamped, bits=16, strip_px=8)
     assert (time.perf_counter() - start) / 20 < 0.005, "a strip read is not a whole-frame conversion"
+
+
+def test_a_pass_refuses_to_start_before_the_picture_returns():
+    """A load blacks the output for seconds: the first nine of a take came back blank."""
+
+    class Blank:
+        """Capture whose picture never comes back."""
+
+        def wait_for_content(self, timeout_s=30.0):
+            """Wait for content."""
+            del timeout_s
+            return False
+
+        def read(self):
+            """Read."""
+            return np.zeros((16, 16, 3), np.float32)
+
+    class Session:
+        """Session stand-in."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+
+        def set_params(self, values):
+            """Set params."""
+
+    out = Emitted()
+    with pytest.raises(R.BlankTakeError, match="no moving picture"):
+        R.capture_pass(
+            R.Rig(session=Session(), capture=Blank(), playout=None),
+            Automation.empty(),
+            program="Jammer",
+            config=CONFIG,
+            sink=R.FrameSink(out.write, fps=CONFIG.fps),
+            total=10,
+        )
+    assert not out.frames, "nothing is written from a blanked output"
+
+
+def test_a_take_reports_what_it_actually_holds():
+    """Distinctness alone cannot tell a black frame from a held one; both are one distinct."""
+    out = Emitted()
+    sink = R.FrameSink(out.write, fps=30.0, window=4)
+    for index in range(4):
+        sink.add(index, np.zeros((32, 32, 3), np.float32))
+    for index in range(4, 8):
+        sink.add(index, np.full((32, 32, 3), 0.4 + index / 100, np.float32))
+    sink.close(8)
+    report = sink.report
+    assert report.frames == 8 and report.blank == 4
+    assert report.distinct == 5 and 0.15 < report.luma < 0.3
+    assert not R.TakeReport(frames=8, distinct=1, blank=8, luma=0.0).usable
+    assert report.usable is False, "half the take blank is not a take"

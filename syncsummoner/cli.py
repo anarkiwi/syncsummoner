@@ -318,7 +318,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         )
         render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
     elif args.played:
-        frames = render_mod.render_played(
+        report = render_mod.render_played(
             score,
             args.source,
             args.output,
@@ -327,8 +327,8 @@ def _render_cmd(args: argparse.Namespace) -> int:
             scratch=args.scratch,
             prepared=args.prepared,
         )
-        print(f"{args.output}: {frames} frames")
-        return 0
+        print(f"{args.output}: {report}")
+        return 0 if report.usable else 1
     elif args.stream:
         render_mod.render_stream(score, args.source, args.output, profiles=profiles, config=config)
     else:

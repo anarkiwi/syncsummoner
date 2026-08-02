@@ -25,10 +25,38 @@ class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
 
+class BlankTakeError(RuntimeError):
+    """The device never returned a picture, so the take would have been black."""
+
+
+@dataclass(frozen=True)
+class TakeReport:
+    """What a finished take actually holds, so a blank one is caught here and not on playback."""
+
+    frames: int
+    distinct: int
+    blank: int
+    luma: float
+
+    @property
+    def usable(self) -> bool:
+        """Whether the take carries picture at all."""
+        return bool(self.frames) and self.blank < self.frames // 2 and self.distinct > 1
+
+    def __str__(self) -> str:
+        return (
+            f"{self.frames} frames, {self.distinct} distinct, "
+            f"{self.blank} blank, mean luma {self.luma:.3f}"
+            f"{'' if self.usable else '  UNUSABLE'}"
+        )
+
+
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
 #: whatever both ends already run at; 1080p30 is this rig, measured.
 SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
 EARLY_BIAS_S = 0.015
+#: Mean level below which a captured frame carries no picture; the archive uses the same idea.
+BLANK_LEVEL = 0.02
 
 
 @dataclass(frozen=True)
@@ -135,6 +163,20 @@ class FrameSink:
         self.next = 0
         self.held: np.ndarray | None = None
         self.buffer: list[np.ndarray] = []
+        self.emitted = 0
+        self.blank = 0
+        self.levels = 0.0
+        self._seen: set[bytes] = set()
+
+    @property
+    def report(self) -> "TakeReport":
+        """What has gone out so far, which is what a caller should check before shipping it."""
+        return TakeReport(
+            frames=self.emitted,
+            distinct=len(self._seen),
+            blank=self.blank,
+            luma=self.levels / self.emitted if self.emitted else 0.0,
+        )
 
     def add(self, index: int, frame: np.ndarray) -> None:
         """Take one captured frame, emitting whatever its arrival completes."""
@@ -153,6 +195,11 @@ class FrameSink:
             forced = len(self.pending) > self.window
 
     def _emit(self, frame: np.ndarray) -> None:
+        level = float(np.asarray(frame[::16, ::16]).mean())
+        self.emitted += 1
+        self.levels += level
+        self.blank += level < BLANK_LEVEL
+        self._seen.add(np.ascontiguousarray(frame[::32, ::32]).tobytes())
         self.buffer.append(frame)
         if len(self.buffer) >= self.window:
             self._flush()
@@ -388,13 +435,17 @@ def capture_pass(
     sink: FrameSink,
     total: int,
     timeout_s: float = 30.0,
+    settle_s: float = 40.0,
 ) -> int:
     """Capture a pass whose source plays itself, driving automation from what arrives.
 
     Position comes from the frame the card hands over, so the schedule follows the
-    playback rather than a clock the host keeps on its own.
+    playback rather than a clock the host keeps on its own. A load blacks the
+    output out for seconds, so the take does not start until the picture is back.
     """
     rig.session.load_program(program, link=rig.link)
+    if not rig.capture.wait_for_content(timeout_s=settle_s):
+        raise BlankTakeError(f"{program}: no moving picture within {settle_s}s of the load")
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
     cursor, seen, idle, lag = 0, 0, 0.0, 0
@@ -475,7 +526,7 @@ def render_played(
     config: RenderConfig | None = None,
     scratch: str | Path = "timecoded.mkv",
     prepared: bool = False,
-) -> int:
+) -> "TakeReport":
     """Render a pass the playout plays for itself, at rate.
 
     Pushing frames caps a pass at a few a second, which samples the instrument's
@@ -502,15 +553,17 @@ def render_played(
             early_bias_s=config.early_bias_s,
         )
         rig.playout.upload(str(scratch))
+        sink = FrameSink(video.write, fps=config.fps)
         with rig.playout.playing(fps=config.fps):
-            return capture_pass(
+            capture_pass(
                 rig,
                 auto,
                 program=layers[0].program,
                 config=config,
-                sink=FrameSink(video.write, fps=config.fps),
+                sink=sink,
                 total=total,
             )
+        return sink.report
     finally:
         video.close()
         if owned:
