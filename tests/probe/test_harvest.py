@@ -124,6 +124,9 @@ class Archive:
     def has(self, program, key):
         return self.stored.get(program) == key.digest
 
+    def paths(self, program):
+        return tuple(self.directory / f"{program}{suffix}" for suffix in (".mkv", ".parquet", ".json"))
+
     def writer(self, program, key, *, width, height, fps=25):
         del fps
         self.keys[program] = key
@@ -375,9 +378,10 @@ def test_harvest_only_probes_the_programs_it_was_given(tmp_path):
     assert [r.program for r in report.results] == ["Beta"]
 
 
-def test_dark_and_cached_results_report_themselves(tmp_path):
-    dark = run(Archive(tmp_path), capture=Cap(frames=(0, 1))).results[0]
+def test_dark_and_cached_results_report_themselves():
+    dark = H.ProgramResult("P", frames=4, seconds=1.0, luma=H.DARK_LUMA - 1)
     assert dark.dark and "DARK" in str(dark)
+    assert not H.ProgramResult("P", frames=4, seconds=1.0, luma=H.DARK_LUMA).dark
     assert str(H.ProgramResult("P")) == "P: cached"
     assert "FAILED" in str(H.ProgramResult("P", error="RuntimeError: x"))
     assert "Y=" in str(H.ProgramResult("P", frames=3, seconds=1.0, luma=99.0))
@@ -457,3 +461,67 @@ def test_harvest_restarts_a_player_that_died_mid_run(tmp_path):
     player = Dead()
     run(Archive(tmp_path), player=player)
     assert player.starts == 3, "once for the run, then once per program that found it down"
+
+
+class SwitchCap(Cap):
+    """Capture stub whose luma the session flips, so a canary can differ from a program."""
+
+    def __init__(self, box, calls=None):
+        super().__init__(calls=calls)
+        self.box = box
+
+    def read_native(self):
+        self.reads += 1
+        return frame(self.box["luma"])
+
+
+def dark_run(archive, *, canary_luma, programs=("Alpha", "Beta")):
+    """Harvest where every program is black and the canary reports ``canary_luma``."""
+    box = {"luma": 0}
+    port = Port(programs=programs)
+    capture = SwitchCap(box)
+
+    class Canary(Sess):
+        """Session stub that lifts the capture out of black only for the canary load."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            box["luma"] = canary_luma if name == H.WEDGE_PROBE else 0
+
+    return H.harvest(
+        archive,
+        open_transport=lambda: port,
+        open_capture=lambda: capture,
+        config=CONFIG,
+        sleep=lambda _s: None,
+        clock=FakeClock(),
+        session_factory=Canary,
+    )
+
+
+def test_a_dark_program_is_discarded_when_the_canary_still_carries_the_source(tmp_path):
+    """One black program is legitimate, so the run keeps going."""
+    archive = Archive(tmp_path)
+    report = dark_run(archive, canary_luma=200)
+    assert report.blacked is False and report.stopped is False
+    assert [r.program for r in report.results] == ["Alpha", "Beta"], "every program was attempted"
+    assert all("discarded" in r.error for r in report.results)
+    assert report.frames == 0, "black frames are not counted as harvested"
+
+
+def test_black_output_with_a_dark_canary_stops_the_run(tmp_path):
+    """A passthrough that carries nothing means the rig, not the program, is dark."""
+    archive = Archive(tmp_path)
+    report = dark_run(archive, canary_luma=0)
+    assert report.blacked is True and report.stopped is True
+    assert report.wedged is False, "a black output is not a wedge, and needs its own diagnosis"
+    assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than archiving more"
+
+
+def test_a_discarded_program_has_its_archive_files_removed(tmp_path):
+    """Black frames must not stay committed, or a resume would skip re-probing them."""
+    archive = Archive(tmp_path)
+    for path in archive.paths("Alpha"):
+        path.write_bytes(b"stale")
+    dark_run(archive, canary_luma=200, programs=("Alpha",))
+    assert not any(path.exists() for path in archive.paths("Alpha"))

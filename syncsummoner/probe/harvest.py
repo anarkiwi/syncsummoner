@@ -26,6 +26,7 @@ __all__ = [
     "HarvestReport",
     "ProgramResult",
     "harvest",
+    "carries_stimulus",
     "harvest_program",
     "native_burst",
     "sweep_vectors",
@@ -64,6 +65,7 @@ class HarvestConfig:
     health_timeout_s: float = 3600.0
     health_poll_s: float = 10.0
     wedge_settle_s: float = 2.0
+    canary_frames: int = 8
     seed: int = 11
     loop_seed: int = 7
 
@@ -103,7 +105,13 @@ class HarvestReport:
 
     results: list[ProgramResult] = field(default_factory=list)
     wedged: bool = False
+    blacked: bool = False
     seconds: float = 0.0
+
+    @property
+    def stopped(self) -> bool:
+        """Whether a device fault ended the run before the last program."""
+        return self.wedged or self.blacked
 
     @property
     def frames(self) -> int:
@@ -171,6 +179,31 @@ def wedged(
         return False
     except Exception:
         return True
+
+
+def carries_stimulus(
+    session: Any,
+    capture: Any,
+    transport: Any,
+    *,
+    config: HarvestConfig,
+    program: str = WEDGE_PROBE,
+    link: Any = None,
+    player: Any = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Does a passthrough still carry the source? Proof the rig, not the program, is dark.
+
+    One program going dark is legitimate, so only a failing passthrough shows the
+    device has stopped emitting while still answering and reporting source lock.
+    """
+    session.load_program(program, park=True, link=link)
+    if player is not None and not player.is_running():
+        player.start(fps=config.loop_fps)
+    session.set_params(session.working_point(transport.program_info()))
+    capture.wait_for_content(timeout_s=config.content_timeout_s)
+    burst = native_burst(capture, config.canary_frames, timeout_s=config.burst_timeout_s, clock=clock)
+    return bool(burst) and float(np.mean([f[..., 0].mean() for f in burst])) >= DARK_LUMA
 
 
 def wait_healthy(
@@ -285,7 +318,7 @@ def harvest(
     session = session_factory(transport, load_blackout_s=config.load_blackout_s)
     firmware = str(transport.firmware())
     names: Sequence[str] = list(programs) if programs else sorted(transport.programs())
-    results, stopped, start = [], False, clock()
+    results, stopped, blacked, start = [], False, False, clock()
     try:
         with ExitStack() as stack:
             if player is not None:
@@ -324,6 +357,19 @@ def harvest(
                         break
                     continue
                 note(str(results[-1]))
+                if not results[-1].dark:
+                    continue
+                for path in archive.paths(name):
+                    path.unlink(missing_ok=True)
+                results[-1] = ProgramResult(name, error="discarded: archived only black frames")
+                if carries_stimulus(
+                    session, capture, transport, config=config, link=link, player=player, clock=clock
+                ):
+                    note(f"{name} discarded: dark, but the rig still carries the source")
+                    continue
+                blacked = True
+                note("black output from a live source: the device needs a power cycle, then rerun")
+                break
     finally:
         transport.close()
-    return HarvestReport(results=results, wedged=stopped, seconds=clock() - start)
+    return HarvestReport(results=results, wedged=stopped, blacked=blacked, seconds=clock() - start)
