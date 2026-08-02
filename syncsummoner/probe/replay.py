@@ -112,9 +112,10 @@ def replay(
     **kwargs: Any,
 ) -> dict[str, list[MeasurementRecord]]:
     """Measurements for every committed program, keyed by program name."""
-    names = sorted(archive.committed()) if programs is None else list(programs)
+    committed = sorted(archive.committed())
+    names = committed if programs is None else list(programs)
     note = log if log is not None else lambda _message: None
-    blank = blank_digest(archive, names)
+    blank = blank_digest(archive, committed)
     note(f"blanking frame {blank}" if blank else "no blanking frame shared between programs")
     out = {}
     for name in names:

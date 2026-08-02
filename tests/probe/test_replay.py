@@ -114,3 +114,18 @@ def test_replay_notes_when_nothing_is_shared_between_programs():
     notes = []
     out = R.replay(archive, analyzer=FakeAnalyzer(), programs=["a"], log=notes.append)
     assert len(out["a"]) == 1 and any("no blanking frame" in n for n in notes)
+
+
+def test_the_blanking_frame_is_found_across_the_run_not_the_subset():
+    """Asking for one program must not lose the evidence that names its blank frame."""
+    blank = native(7)
+    archive = Archive(
+        {
+            "a": Reader([blank, blank, native(90)], setpoints=[0, 0, 1]),
+            "b": Reader([blank, native(120)], setpoints=[0, 1]),
+        }
+    )
+    notes = []
+    out = R.replay(archive, analyzer=FakeAnalyzer(), programs=["a"], log=notes.append)
+    assert sorted(out) == ["a"] and len(out["a"]) == 1, "the blanked setpoint is still dropped"
+    assert any(R.digest(blank) in n for n in notes)

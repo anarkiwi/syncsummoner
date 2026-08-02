@@ -186,7 +186,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     programs = None if args.program == "all" else args.program.split(",")
     measured = replay(
-        FrameArchive(args.archive),
+        FrameArchive(args.archive, ffmpeg=args.ffmpeg),
         analyzer=aesthetics,
         programs=programs,
         log=lambda message: print(message, flush=True),
@@ -358,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     refit.add_argument("--program", default="all")
     refit.add_argument("--archive", default="archive/")
     refit.add_argument("--out", default="profiles/")
+    refit.add_argument("--ffmpeg", default="ffmpeg", help="decoder to read the archive with")
     refit.set_defaults(func=_refit_cmd)
 
     collect = probe_sub.add_parser("archive", help="archive native frames for every program")
