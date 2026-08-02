@@ -59,7 +59,8 @@ class HarvestConfig:
     burst_settle: int = 4
     burst_timeout_s: float = 20.0
     settle_s: float = 0.35
-    content_timeout_s: float = 10.0
+    #: Relock after a load was measured at up to 19.1s, so 10s returned before the picture did.
+    content_timeout_s: float = 30.0
     load_blackout_s: float = 4.5
     startup_s: float = 2.0
     health_timeout_s: float = 3600.0
@@ -130,19 +131,28 @@ def native_burst(
     *,
     settle: int = 4,
     timeout_s: float = 20.0,
+    interval_s: float = 0.0,
+    sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> list[np.ndarray]:
-    """Grab ``count`` native 4:2:2 frames, discarding a short settle run."""
+    """Grab up to ``count`` distinct native 4:2:2 frames, one per ``interval_s``.
+
+    Unpaced reads outrun the card and hand back its previous buffer: measured, a
+    30-frame burst spanned 0.25s and held as little as one distinct frame. Pacing
+    spreads the burst over the dwell, and a still picture ends it early.
+    """
     deadline = clock() + timeout_s
     got: list[np.ndarray] = []
     seen = 0
-    while len(got) < count and clock() < deadline:
+    for _ in range(settle + count):
+        if len(got) >= count or clock() >= deadline:
+            break
         frame = capture.read_native()
-        if frame is None:
-            continue
-        seen += 1
-        if seen > settle:
-            got.append(frame)
+        if frame is not None:
+            seen += 1
+            if seen > settle and not (got and np.array_equal(frame, got[-1])):
+                got.append(frame)
+        sleep(interval_s)
     return got
 
 
@@ -190,6 +200,7 @@ def carries_stimulus(
     program: str = WEDGE_PROBE,
     link: Any = None,
     player: Any = None,
+    sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> bool:
     """Does a passthrough still carry the source? Proof the rig, not the program, is dark.
@@ -202,7 +213,14 @@ def carries_stimulus(
         player.start(fps=config.loop_fps)
     session.set_params(session.working_point(transport.program_info()))
     capture.wait_for_content(timeout_s=config.content_timeout_s)
-    burst = native_burst(capture, config.canary_frames, timeout_s=config.burst_timeout_s, clock=clock)
+    burst = native_burst(
+        capture,
+        config.canary_frames,
+        timeout_s=config.burst_timeout_s,
+        interval_s=1.0 / config.capture_fps,
+        sleep=sleep,
+        clock=clock,
+    )
     return bool(burst) and float(np.mean([f[..., 0].mean() for f in burst])) >= DARK_LUMA
 
 
@@ -257,16 +275,19 @@ def harvest_program(
 ) -> ProgramResult:
     """Sweep one program and archive the native frames each setpoint produced.
 
-    The load drops the source link, and ``wait_for_content`` afterwards is what
-    keeps the archive off the black frames a fresh load emits for seconds.
+    The load drops the source link, so a picture that never returns raises rather
+    than archiving the blanked output against real sweep vectors. Rows carry the
+    whole commanded state, working point included, not the swept slots alone.
     """
     start = clock()
     session.load_program(program, park=True, link=link)
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     info = transport.program_info()
-    session.set_params(session.working_point(info))
-    capture.wait_for_content(timeout_s=config.content_timeout_s)
+    base = session.working_point(info)
+    session.set_params(base)
+    if not capture.wait_for_content(timeout_s=config.content_timeout_s):
+        raise HarvestError(f"{program}: no moving picture within {config.content_timeout_s}s of the load")
     written, levels = 0, []
     with archive.writer(program, key, width=config.width, height=config.height) as out:
         for setpoint, vector in enumerate(sweep_vectors(info, config, rng)):
@@ -277,10 +298,12 @@ def harvest_program(
                 config.frames_per_point,
                 settle=config.burst_settle,
                 timeout_s=config.burst_timeout_s,
+                interval_s=1.0 / config.capture_fps,
+                sleep=sleep,
                 clock=clock,
             )
             for frame in burst:
-                out.write(frame, params=raw_params(vector), setpoint=setpoint)
+                out.write(frame, params=raw_params({**base, **vector}), setpoint=setpoint)
                 levels.append(float(frame[..., 0].mean()))
                 written += 1
     return ProgramResult(program, written, clock() - start, float(np.mean(levels)) if levels else 0.0)
@@ -363,7 +386,14 @@ def harvest(
                     path.unlink(missing_ok=True)
                 results[-1] = ProgramResult(name, error="discarded: archived only black frames")
                 if carries_stimulus(
-                    session, capture, transport, config=config, link=link, player=player, clock=clock
+                    session,
+                    capture,
+                    transport,
+                    config=config,
+                    link=link,
+                    player=player,
+                    sleep=sleep,
+                    clock=clock,
                 ):
                     note(f"{name} discarded: dark, but the rig still carries the source")
                     continue

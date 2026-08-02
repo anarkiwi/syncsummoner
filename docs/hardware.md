@@ -296,6 +296,43 @@ name plus firmware (`KeyKind.NAME_FIRMWARE`) rather than on the program binary:
 `program_key` hashes each binary over the serial shell, which its own docstring
 notes runs at wire speed and can time out.
 
+## The device emits pure black while reporting a live source
+
+Measured 2026-08-02, a second fault distinct from the wedge above. The device
+answers normally, loads programs on request and reports `source_locked=True`,
+but emits only black. An archive run stored **18 consecutive programs of black
+frames**, every one at mean luma 11.2, and labelled them DARK without acting.
+
+A dark frame on its own does not prove a fault: one program in the same run
+(`Corollas`) was genuinely black while the rig was healthy. Only a **passthrough
+canary** separates the two. `probe.harvest` therefore deletes a dark program's
+archive, loads `Passthru` and re-measures: content back means only that program
+was dark and the run continues; black back means the device is faulted and the
+run stops. Both faults need a power cycle, and the report keeps them apart
+(`wedged` against `blacked`) because the diagnosis differs.
+
+The same fault frame also opens an otherwise healthy program. Scanned across a
+complete 49-program archive (2026-08-02, firmware `1.0.0-rc.40`), that frame is
+byte-identical everywhere it appears and held **33 of 1506 setpoints across 12
+programs**, always as a leading run of up to 5 setpoints. Timestamps put the
+picture back **12.2-19.1s after the load**, past the 10s `content_timeout_s`
+whose result the caller discarded, so the blanked output was archived against
+real sweep vectors. The wait is now honoured and the budget covers the measured
+relock; a per-program mean cannot catch this, because the program is not dark.
+
+## Reads outrun the card
+
+A 30-frame burst spanned **0.20-0.50s** against a 30fps capture, with 20-92% of
+its reads under 10ms apart: `VideoCapture.read` hands back the previous buffer
+rather than blocking. Bursts held 19-30 distinct frames of 30 where the picture
+moved and **as little as one** where it did not, so an unpaced burst samples the
+few milliseconds the reads take instead of the setpoint. `native_burst` drops a
+frame equal to the one stored before it and paces at the capture period.
+
+`DARK_LUMA` is 20.0. The codeframe stimulus reaches the card near mid grey
+(Y~128), healthy programs measured 62-180 and the two faults measured 0.0 and
+11.2, so the threshold sits in a wide empirical gap rather than on a tuned edge.
+
 ## `settings export` and `settings get` hang the serial shell
 
 On `1.0.0-rc.37` both verbs return no response and leave the command processor
