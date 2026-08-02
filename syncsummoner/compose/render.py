@@ -7,6 +7,7 @@ the capture stream. Program is fixed per pass; loading it blacks the output out.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -186,6 +187,14 @@ def play_pass_stream(
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
     cursor, lag, stamped = 0, 0, 0
+    streaming = getattr(rig.playout, "streaming", None)
+    with streaming() if streaming is not None else nullcontext():
+        _drive(rig, frames, config, times, indices, values, cursor, lag, stamped, sink, total)
+    sink.close(total)
+
+
+def _drive(rig, frames, config, times, indices, values, cursor, lag, stamped, sink, total):
+    """The frame loop of a streaming pass: show, grab, place."""
     for i, frame in enumerate(frames):
         due = int(np.searchsorted(times, i / config.fps, side="right"))
         if due > cursor:
