@@ -1,7 +1,8 @@
-"""Hardware layer: transport, measurement session, capture and stimulus playout."""
+"""Hardware layer: transport, measurement session, capture, playout and source link."""
 
 from .capture import Capture, CaptureError
-from .playout import Playout, to_fb565
+from .link import Link, LinkError
+from .playout import LoopPlayer, Playout, PlayoutError, to_fb565
 from .profile import (
     Axis,
     Cliff,
@@ -23,12 +24,16 @@ __all__ = [
     "CaptureError",
     "Cliff",
     "DeviceError",
+    "Link",
+    "LinkError",
     "LockMap",
+    "LoopPlayer",
     "MeasurementRecord",
     "ParamKind",
     "ParamSpec",
     "ParkError",
     "Playout",
+    "PlayoutError",
     "ProgramInfo",
     "ProgramProfile",
     "Session",

@@ -6,6 +6,12 @@ keeps no global RNG state. Boundary types are pinned in ``docs/contracts.md``.
 """
 
 from syncsummoner.aesthetics.channels import ChannelEnergy, gabor_energy, gabor_bank
+from syncsummoner.aesthetics.flicker import (
+    TemporalSplit,
+    flicker_ratio,
+    temporal_split,
+    usable_rate_hz,
+)
 from syncsummoner.aesthetics.dynamics import (
     DynamicsResult,
     StabilityClass,
@@ -28,6 +34,7 @@ from syncsummoner.aesthetics.score import (
     score_clip,
 )
 from syncsummoner.aesthetics.spectrum import SpectralStats, spectral_stats
+from syncsummoner.aesthetics.structure import PointwiseFit, pointwise_fit, pointwise_r2
 from syncsummoner.aesthetics.surprisal import (
     SurprisalModel,
     entropy_rate,
@@ -44,16 +51,19 @@ __all__ = [
     "FlashRisk",
     "LevelStats",
     "MotionStats",
+    "PointwiseFit",
     "ScoreWeights",
     "SpectralStats",
     "StabilityClass",
     "SurprisalModel",
+    "TemporalSplit",
     "SyncResult",
     "analyze_dynamics",
     "av_correlation",
     "dead_output",
     "describe_clip",
     "entropy_rate",
+    "flicker_ratio",
     "flash_risk",
     "gabor_bank",
     "gabor_energy",
@@ -62,9 +72,13 @@ __all__ = [
     "mitigate_flashes",
     "motion_stats",
     "passthrough_distance",
+    "pointwise_fit",
+    "pointwise_r2",
     "relative_luminance",
     "score_clip",
     "spectral_stats",
+    "temporal_split",
+    "usable_rate_hz",
     "winding_number",
     "__version__",
 ]

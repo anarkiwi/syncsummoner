@@ -7,7 +7,7 @@ import subprocess
 import numpy as np
 import pytest
 
-from syncsummoner.device import playout as po
+from syncsummoner.device import host, playout as po
 from syncsummoner.device.playout import Playout, to_fb565
 
 from .conftest import FakeClock
@@ -135,22 +135,14 @@ def test_play_rejects_bad_fps():
         Playout(runner=FakeRunner()).play([], fps=0)
 
 
-def test_ssh_runner_shells_out(monkeypatch):
+def test_default_runner_is_ssh(monkeypatch):
     seen = {}
 
     def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        seen["input"] = kwargs["input"]
-        return subprocess.CompletedProcess(argv, 0)
+        seen.update(argv=argv, input=kwargs["input"])
+        return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
 
-    monkeypatch.setattr(po.subprocess, "run", fake_run)
-    po.ssh_runner("pi@videopi")("cat > /dev/fb0", b"\x00\x01")
-    assert seen["argv"] == ["ssh", "-o", "BatchMode=yes", "pi@videopi", "cat > /dev/fb0"]
-    assert seen["input"] == b"\x00\x01"
-
-
-def test_default_runner_is_ssh(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(po.subprocess, "run", lambda argv, **kwargs: seen.update(argv=argv))
+    monkeypatch.setattr(host.subprocess, "run", fake_run)
     Playout(width=2, height=2).show(frame((0, 0, 0), 2, 2))
-    assert seen["argv"][:4] == ["ssh", "-o", "BatchMode=yes", "pi@videopi"]
+    assert seen["argv"] == ["ssh", "-o", "BatchMode=yes", po.DEFAULT_HOST, f"cat > {po.DEFAULT_FB}"]
+    assert len(seen["input"]) == 8

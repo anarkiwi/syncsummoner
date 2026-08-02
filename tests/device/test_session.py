@@ -2,11 +2,13 @@
 
 # pylint: disable=missing-function-docstring
 
+import contextlib
 import types
 
 import numpy as np
 import pytest
 
+from syncsummoner.device import journal as jn
 from syncsummoner.device import session as sess_mod
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
 from syncsummoner.device.session import (
@@ -17,6 +19,8 @@ from syncsummoner.device.session import (
 )
 
 from .conftest import FakeCapture, FakeClock, FakeTransport
+
+_TICK = iter(float(n) for n in range(1, 100000))
 
 
 def make_session(transport=None, clock=None, **kwargs):
@@ -167,6 +171,95 @@ def test_load_program_can_skip_park():
     assert not session.sent
 
 
+class FakeLink:
+    """Source link stub recording its transitions into a shared timeline."""
+
+    def __init__(self, log):
+        self.log = log
+
+    @contextlib.contextmanager
+    def quiet(self):
+        self.log.append(("link", "down"))
+        try:
+            yield self
+        finally:
+            self.log.append(("link", "up"))
+
+
+def logging_session(port, clock, **kwargs):
+    """Session whose sleeps land in the transport's call timeline."""
+
+    def sleep(seconds):
+        port.calls.append(("sleep", seconds))
+        clock.sleep(seconds)
+
+    return Session(port, sleep=sleep, clock=clock, **kwargs)
+
+
+def test_load_program_holds_the_link_down_across_the_whole_reconfiguration():
+    port, clock = FakeTransport(), FakeClock()
+    session = logging_session(port, clock, load_blackout_s=4.0)
+    session.load_program("Isotherm", link=FakeLink(port.calls), park=False)
+    assert port.calls == [
+        ("link", "down"),
+        ("load", "Isotherm"),
+        ("sleep", 4.0),
+        ("link", "up"),
+        ("video_status",),
+    ]
+
+
+def test_load_program_waits_for_source_lock_before_parking():
+    port, clock = FakeTransport(), FakeClock()
+    session = logging_session(port, clock, load_blackout_s=0.0)
+    session.load_program("Isotherm", link=FakeLink(port.calls), park=True)
+    lock = port.calls.index(("video_status",))
+    writes = [i for i, call in enumerate(port.calls) if call[0] == "manual"]
+    assert writes and lock < min(writes)
+
+
+def test_load_program_without_a_link_does_not_wait_for_lock():
+    port, clock = FakeTransport(), FakeClock()
+    session = logging_session(port, clock, load_blackout_s=0.0)
+    session.load_program("Isotherm", park=False)
+    assert ("video_status",) not in port.calls
+
+
+def test_wait_source_lock_gives_up_when_the_source_never_returns():
+    port, clock = FakeTransport(source_locked=False), FakeClock()
+    session = logging_session(port, clock)
+    assert session.wait_source_lock(polls=3) is False
+    assert port.calls.count(("video_status",)) == 3
+
+
+def test_load_program_restores_the_link_when_the_load_fails():
+    port, clock = FakeTransport(), FakeClock()
+
+    def boom(_name):
+        raise RuntimeError("serial died")
+
+    port.load_program = boom
+    session = logging_session(port, clock)
+    with pytest.raises(RuntimeError):
+        session.load_program("Isotherm", link=FakeLink(port.calls))
+    assert port.calls == [("link", "down"), ("link", "up")]
+
+
+def test_load_program_without_a_link_touches_nothing_extra():
+    port, clock = FakeTransport(), FakeClock()
+    logging_session(port, clock, load_blackout_s=4.0).load_program("Isotherm", park=False)
+    assert port.calls == [("load", "Isotherm"), ("sleep", 4.0)]
+
+
+def test_load_program_journals_whether_the_link_was_used():
+    log = jn.Journal(clock=lambda: next(_TICK))
+    session, port, _ = make_session()
+    session.journal = log
+    session.load_program("Isotherm", park=False)
+    session.load_program("Colorbars", link=FakeLink(port.calls), park=False)
+    assert [e["link"] for e in log.events] == [False, True]
+
+
 def ramp_frames(diffs, size=4):
     """Frames whose successive mean absolute differences follow ``diffs``."""
     frames = [np.zeros((size, size, 3), dtype=np.float32)]
@@ -273,3 +366,47 @@ def test_ensure_live_returns_once_content_arrives():
 
     session.ensure_live(types.SimpleNamespace(wait_for_content=content))
     assert port.resyncs == 1
+
+
+def test_ensure_live_failure_reports_what_preceded_it():
+    """The whole point: name the actions since the device was last healthy."""
+    log = jn.Journal(clock=lambda: next(_TICK))
+    port = FakeTransport()
+    port.resync = lambda **_kw: False
+    session, _, _ = make_session(port)
+    session.journal = log
+    log.record("health", ok=True)
+    session.load_program("Isotherm", park=False)
+    capture = types.SimpleNamespace(wait_for_content=lambda **_kw: False, wait_for_lock=lambda **_kw: False)
+    with pytest.raises(sess_mod.DeviceError) as err:
+        session.ensure_live(capture)
+    text = str(err.value)
+    assert "load_program" in text and "Isotherm" in text
+    assert "last healthy" in text
+
+
+def test_health_marks_the_device_good_and_journals_it():
+    log = jn.Journal(clock=lambda: next(_TICK))
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    session.journal = log
+    rng = np.random.default_rng(1)
+    capture = types.SimpleNamespace(
+        frames=lambda n, **_kw: [rng.random((8, 8, 3)).astype(np.float32) for _ in range(n)],
+        chroma_fraction=lambda _f: 0.7,
+    )
+    assert session.health(capture)["ok"] is True
+    assert log.since_last_good() == []
+
+
+def test_health_reports_the_writes_since_the_last_probe():
+    """A 171s gap between probes hid whatever preceded a fault."""
+    log = jn.Journal(clock=lambda: next(_TICK))
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    session.journal = log
+    session.set_params({1: 0.2, 2: 0.4})
+    session.set_params({1: 0.6})
+    first = session.health()
+    assert first["writes"] == 3
+    assert session.health()["writes"] == 0, "the counter resets so each window stands alone"

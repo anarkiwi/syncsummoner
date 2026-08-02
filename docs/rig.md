@@ -59,6 +59,19 @@ ssh pi@videopi 'cat > /dev/fb0' < /tmp/f.raw
 `syncsummoner.device.playout` does the conversion with numpy and pushes over a
 runner callable, so it is testable without the Pi attached.
 
+A per-frame push costs about 1.1 s at 1920x1080 (4.1 MB of BGR565 at the 3.8
+MB/s the framebuffer write sustains), so a 24-frame loop played that way is 26 s
+per pass. `LoopPlayer` instead uploads the whole loop once into `/dev/shm` and
+starts a detached Pi-side process that cycles it, addressed by pidfile:
+
+```sh
+python3 -c 'from syncsummoner.device import LoopPlayer; p = LoopPlayer(); print(p.is_running())'
+```
+
+Measured on this rig, 24 frames is 99.5 MB raw, uploading in 10.3 s; gzipped it
+is 10.0 MB and 2.2 s, so the upload is compressed. The loop is invariant across
+programs and setpoints, so that upload is paid once per run rather than per pass.
+
 ## Bring-up checks
 
 ```sh

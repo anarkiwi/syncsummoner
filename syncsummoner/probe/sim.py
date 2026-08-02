@@ -16,9 +16,9 @@ from pathlib import Path
 
 import numpy as np
 
-from syncsummoner.device.profile import MeasurementRecord, Source
+from syncsummoner.device.profile import Source
 from syncsummoner.probe import patterns
-from syncsummoner.probe.runner import raw_params, frame_metrics
+from syncsummoner.probe.runner import measurement, raw_params
 
 __all__ = ["SimError", "SimUnavailableError", "SimBackend", "run_plan_sim"]
 
@@ -114,22 +114,22 @@ def run_plan_sim(
     """Run a plan as GHDL simulations against a still stimulus, one record per point."""
     backend = backend or SimBackend()
     source_frame = patterns.generate(stimulus, width=width, height=height, rng=rng)
-    analyzer_version = f"aesthetics {getattr(analyzer, '__version__', 'unknown')}"
     records = []
     with tempfile.TemporaryDirectory(prefix="syncsummoner-sim-") as workdir:
         for step, vector in enumerate(plan):
             raw = raw_params(vector)
             output = backend.render(program, raw, source_frame, workdir=workdir)
             records.append(
-                MeasurementRecord(
+                measurement(
+                    [output],
+                    analyzer,
                     program=program,
                     firmware=firmware,
-                    analyzer=analyzer_version,
                     source=Source.SIM,
                     params=raw,
                     state_index=step,
                     stimulus=stimulus,
-                    metrics=frame_metrics([output], analyzer, reference=source_frame),
+                    reference=source_frame,
                 )
             )
     return records

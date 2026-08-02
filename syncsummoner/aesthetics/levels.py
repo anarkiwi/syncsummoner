@@ -1,7 +1,11 @@
-"""Luma / chroma level statistics and distance from passthrough."""
+"""Level statistics, and the frame helpers every other metric module shares.
 
-# cv2 is a C extension; pylint cannot introspect its members.
-# pylint: disable=no-member
+Both luma bases live here so the split is visible in one place: BT.601 for the
+level statistics, Rec.709 for the perceptual metrics. They are different
+matrices, deliberately.
+"""
+
+# pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 
 from dataclasses import dataclass
 
@@ -13,6 +17,8 @@ YUV_MATRIX = np.array(
     [[0.299, 0.587, 0.114], [-0.14713, -0.28886, 0.436], [0.615, -0.51499, -0.10001]],
     dtype=np.float32,
 )
+#: Rec.709 luma weights, for RGB in [0, 1].
+LUMA_709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 LEGAL_LO = 16.0 / 255.0
 LEGAL_HI = 235.0 / 255.0
 
@@ -41,6 +47,28 @@ def as_frame(frame: np.ndarray) -> np.ndarray:
 def luma(frame: np.ndarray) -> np.ndarray:
     """BT.601 luma of an RGB frame, ``(H, W) float32``."""
     return as_frame(frame) @ YUV_MATRIX[0]
+
+
+def luma_709(frames: np.ndarray) -> np.ndarray:
+    """Rec.709 luma of an RGB frame or frame stack, weighted over the last axis."""
+    return frames @ LUMA_709
+
+
+def downscale(frame: np.ndarray, *, max_width: int | None = None, max_side: int | None = None):
+    """Area-average a frame down to a width or longest-side cap, never enlarging.
+
+    Area statistics are scale-free and their cost is not, so the metrics run on
+    the small frame; INTER_AREA is the resampling that preserves an area fraction.
+    """
+    height, width = frame.shape[:2]
+    scale = min(
+        max_width / width if max_width else 1.0,
+        max_side / max(height, width) if max_side else 1.0,
+    )
+    if scale >= 1.0:
+        return frame
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
 
 def chroma(frame: np.ndarray) -> np.ndarray:

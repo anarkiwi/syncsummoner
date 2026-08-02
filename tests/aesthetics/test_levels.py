@@ -3,7 +3,15 @@
 import numpy as np
 import pytest
 
-from syncsummoner.aesthetics.levels import chroma, level_stats, luma, passthrough_distance
+from syncsummoner.aesthetics.levels import (
+    LUMA_709,
+    chroma,
+    downscale,
+    level_stats,
+    luma,
+    luma_709,
+    passthrough_distance,
+)
 from tests.aesthetics import grating, texture, to_rgb
 
 
@@ -12,6 +20,23 @@ def test_luma_matches_bt601_weights():
     frame = np.zeros((2, 2, 3), dtype=np.float32)
     frame[..., 1] = 1.0
     assert luma(frame) == pytest.approx(0.587, abs=1e-6)
+
+
+def test_the_two_luma_bases_are_distinct_and_both_normalised():
+    """601 and 709 weight green differently; every consumer picks one explicitly."""
+    frame = np.zeros((2, 2, 3), dtype=np.float32)
+    frame[..., 1] = 1.0
+    assert LUMA_709.sum() == pytest.approx(1.0, abs=1e-6)
+    assert luma_709(frame) == pytest.approx(0.7152, abs=1e-6)
+
+
+def test_downscale_caps_either_dimension_and_never_enlarges():
+    """One helper serves the width cap and the longest-side cap, and passes small frames through."""
+    frame = np.zeros((90, 160, 3), dtype=np.float32)
+    assert downscale(frame, max_width=80).shape[:2] == (45, 80)
+    assert downscale(frame, max_side=32).shape[:2] == (18, 32)
+    assert downscale(frame, max_width=320) is frame
+    assert downscale(frame) is frame
 
 
 def test_grey_frames_have_no_chroma_or_colour():

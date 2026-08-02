@@ -63,38 +63,51 @@ def _probe_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe import plans, runner, sim
     from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
+    from syncsummoner.probe.store import ResultStore, program_key
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
     specs_by_program: dict[str, list] = {}
+    store = None
     if args.probe_cmd == "sim":
         specs = []
         records = sim.run_plan_sim(plans.oat(specs), program=args.program, analyzer=aesthetics, rng=rng)
     else:
         dev = Transport.open(serial=args.serial)
+        store = ResultStore(args.store or out)
         try:
             names = dev.programs() if args.program == "all" else args.program.split(",")
+            firmware, manifest = dev.firmware(), dev.program_manifest()
             records = []
             session = Session(dev)
             with Capture(device=args.capture) as capture:
                 for name in names:
+                    key = program_key(dev, name, firmware=firmware, manifest=manifest)
+                    done = store.get(name, key)
+                    if done is not None:
+                        records += done
+                        continue
                     session.load_program(name)
                     session.ensure_live(capture, require_motion=False)
                     specs = dev.program_info().params
                     specs_by_program[name] = specs
+                    measured = []
                     for plan_name in args.plan.split(","):
                         plan = _make_plan(plans, plan_name, specs, rng)
-                        records += runner.run_plan(
+                        measured += runner.run_plan(
                             session,
                             capture,
                             plan,
                             program=name,
                             analyzer=aesthetics,
-                            firmware=dev.firmware(),
+                            firmware=firmware,
                             allow_untagged=args.allow_untagged,
                         )
+                    if measured:
+                        store.put(name, key, measured)
+                    records += measured
         finally:
             dev.close()
 
@@ -103,7 +116,8 @@ def _probe_cmd(args: argparse.Namespace) -> int:
         subset = [r for r in records if r.program == program]
         path = out / f"{program}.yaml"
         save_profile(fit_profile(subset, specs=specs_by_program.get(program)), path)
-        save_measurements(subset, out / f"{program}.parquet")
+        if store is None:
+            save_measurements(subset, out / f"{program}.parquet")
         written.append(str(path))
     print(json.dumps(written, indent=2))
     return 0
@@ -207,6 +221,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     run.add_argument("--allow-untagged", action="store_true", help="dwell instead of state-index match")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--out", default="profiles/")
+    run.add_argument("--store", help="resumable per-program result store (default: --out)")
     simulate = probe_sub.add_parser("sim")
     simulate.add_argument("--program", required=True)
     simulate.add_argument("--seed", type=int, default=0)

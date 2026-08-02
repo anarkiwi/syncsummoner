@@ -42,6 +42,19 @@ class Axis(enum.Enum):
     UNASSIGNED = "unassigned"
 
 
+class ProgramStyle(enum.Enum):
+    """Whether a program remaps values in place or re-addresses the picture.
+
+    Analog-style effects are pointwise, so their parameters can only flicker
+    when cycled; digital-style effects displace, so cycling them reads as motion.
+    """
+
+    ANALOG = "analog"
+    DIGITAL = "digital"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
 class Source(enum.Enum):
     """Where a measurement came from. The planner discounts simulated entries."""
 
@@ -125,6 +138,12 @@ class LockMap:
     tongues: list[Tongue] = field(default_factory=list)
 
 
+_PARAM_COLUMNS = tuple(f"p{i + 1}" for i in range(PARAM_COUNT))
+_NON_METRIC_COLUMNS = frozenset(
+    _PARAM_COLUMNS + ("program", "firmware", "analyzer", "source", "state_index", "stimulus", "settle_frames")
+)
+
+
 @dataclass
 class MeasurementRecord:
     """One captured sample: the parameter vector, and what the analyzer saw.
@@ -158,6 +177,25 @@ class MeasurementRecord:
         row.update(self.metrics)
         return row
 
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "MeasurementRecord":
+        """Rebuild from the flat form produced by :meth:`as_row`.
+
+        Columns absent from a heterogeneous union arrive as None and are dropped,
+        so a record only carries the metrics it was measured with.
+        """
+        return cls(
+            program=str(row["program"]),
+            firmware=str(row["firmware"]),
+            analyzer=str(row["analyzer"]),
+            source=Source(row["source"]),
+            params=tuple(int(row[name]) for name in _PARAM_COLUMNS),
+            state_index=int(row["state_index"]),
+            stimulus=str(row["stimulus"]),
+            metrics={k: float(v) for k, v in row.items() if v is not None and k not in _NON_METRIC_COLUMNS},
+            settle_frames=int(row.get("settle_frames") or 0),
+        )
+
 
 @dataclass
 class ProgramProfile:
@@ -173,6 +211,9 @@ class ProgramProfile:
     stability_by_region: list[dict[str, Any]] = field(default_factory=list)
     settle_frames: dict[int, int] = field(default_factory=dict)
     non_settling: bool = False
+    style: ProgramStyle = ProgramStyle.UNKNOWN
+    pointwise: float = 0.0
+    binary_hash: str = ""
 
     def by_axis(self, axis: Axis) -> list[ParamSpec]:
         """Parameters assigned to a canonical axis, so gestures stay program-agnostic."""
@@ -201,6 +242,9 @@ class ProgramProfile:
             stability_by_region=list(data.get("stability_by_region", ())),
             settle_frames={int(k): int(v) for k, v in data.get("settle_frames", {}).items()},
             non_settling=bool(data.get("non_settling", False)),
+            style=ProgramStyle(data.get("style", "unknown")),
+            pointwise=float(data.get("pointwise", 0.0)),
+            binary_hash=str(data.get("binary_hash", "")),
         )
 
 
