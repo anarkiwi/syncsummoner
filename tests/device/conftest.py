@@ -2,6 +2,8 @@
 
 # pylint: disable=missing-function-docstring
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -139,7 +141,7 @@ class FakeTransport:
 
     msgs_per_param = 2
 
-    def __init__(self, manual=None, gain=1.0, bias=0):
+    def __init__(self, manual=None, gain=1.0, bias=0, *, source_locked=True):
         start = [512] * PARAM_COUNT if manual is None else manual
         self.manual = np.array(start, dtype=int)
         self.midi = np.zeros(PARAM_COUNT, dtype=int)
@@ -149,6 +151,11 @@ class FakeTransport:
         self.loaded = None
         self.sources = {}
         self.resyncs = 0
+        self.source_locked = source_locked
+
+    def video_status(self):
+        self.calls.append(("video_status",))
+        return SimpleNamespace(source_locked=self.source_locked)
 
     def set_param(self, index, value):
         self.calls.append(("cc", index, int(value)))
@@ -242,10 +249,3 @@ def device_fixture():
 @pytest.fixture(name="clock")
 def clock_fixture():
     return FakeClock()
-
-
-def bgr_frame(rgb, height=4, width=4):
-    """Build a uint8 BGR frame of a constant RGB colour."""
-    frame = np.empty((height, width, 3), dtype=np.uint8)
-    frame[:, :] = np.asarray(rgb, dtype=np.uint8)[::-1]
-    return frame

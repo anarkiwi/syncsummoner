@@ -7,6 +7,7 @@ manual value, so absolute addressing only exists relative to a parked reference.
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -19,6 +20,10 @@ PARK_REFERENCE = 0
 DEFAULT_TOLERANCE = 8
 #: The operator name that means no modulation.
 DISABLED_OPERATOR = "Disabled"
+
+#: The source returns before the device re-locks to it; writes are lost until it has.
+LOCK_POLLS = 40
+LOCK_POLL_S = 0.25
 
 
 def default_park() -> np.ndarray:
@@ -94,6 +99,7 @@ class Session:
         self._sent: dict[int, int] = {}
         self._next_send = clock()
         self.journal = journal
+        self._writes = 0
 
     @property
     def park_values(self) -> np.ndarray:
@@ -126,6 +132,8 @@ class Session:
     def set_params(self, values: Mapping[int, float | bool]) -> None:
         """Write parameters as additive CC offsets, deduplicated and rate limited."""
         pending = [(i, o) for i, o in self.offsets(values).items() if self._sent.get(i) != o]
+        if pending:
+            self._writes += len(pending)
         for index, offset in pending:
             self._throttle(self.transport.msgs_per_param)
             self.transport.set_param(index, offset)
@@ -234,12 +242,18 @@ class Session:
             self.journal.record("call", verb=kind, **detail)
 
     def health(self, capture: Any = None) -> dict[str, Any]:
-        """Probe and journal whether the device is carrying video."""
+        """Probe and journal whether the device is carrying video.
+
+        The parameter-write count rides along, because the interesting question
+        is what the device was asked to do between one healthy probe and the next.
+        """
         from .journal import probe_health
 
         state = probe_health(self.transport, capture)
+        state["writes"] = self._writes
         if self.journal is not None:
             self.journal.record("health", **state)
+        self._writes = 0
         return state
 
     def ensure_live(
@@ -264,14 +278,39 @@ class Session:
         trail = self.journal.report() if self.journal is not None else "no journal attached"
         raise DeviceError(f"capture is not carrying content; power-cycle the device\n{trail}")
 
-    def load_program(self, name: str, *, park: bool = True) -> None:
-        """Load a program, absorb the multi-second output blackout, and re-park."""
-        self._note("load_program", program=name)
-        self.transport.load_program(name)
-        self._sleep(self.load_blackout_s)
+    def load_program(self, name: str, *, park: bool = True, link: Any = None) -> None:
+        """Load a program, absorb the multi-second output blackout, and re-park.
+
+        An optional source ``link`` is held down across the reconfiguration,
+        because the FPGA runs on the clock recovered from the incoming video.
+        The drop clears the source framebuffer: re-push any stimulus afterwards.
+        """
+        self._note("load_program", program=name, link=link is not None)
+        with ExitStack() as stack:
+            if link is not None:
+                stack.enter_context(link.quiet())
+            self.transport.load_program(name)
+            self._sleep(self.load_blackout_s)
         self._sent.clear()
+        if link is not None:
+            self.wait_source_lock()
         if park:
             self.park()
+
+    def wait_source_lock(self, *, polls: int = LOCK_POLLS, poll_s: float = LOCK_POLL_S) -> bool:
+        """Wait for the device to regain lock on its source, reporting whether it did.
+
+        The source returns before the device has re-locked to it, and parameter
+        writes are lost until the FPGA has its recovered clock back.
+        """
+        for _ in range(int(polls)):
+            try:
+                if bool(self.transport.video_status().source_locked):
+                    return True
+            except Exception:  # pylint: disable=broad-except
+                pass
+            self._sleep(poll_s)
+        return False
 
     def framediff_floor(
         self, capture: Any, frames: int = 8, *, sigma: float = 3.0, eps: float = 1e-6

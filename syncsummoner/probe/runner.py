@@ -12,7 +12,7 @@ import numpy as np
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, MeasurementRecord, Source
 from syncsummoner.probe import patterns
 
-__all__ = ["run_plan", "frame_metrics", "settle_frames", "raw_params", "STABILITY_ORDER"]
+__all__ = ["run_plan", "frame_metrics", "measurement", "settle_frames", "raw_params", "STABILITY_ORDER"]
 
 #: Analysis width; Gabor and optical flow on full 1080p cost far more for no gain.
 ANALYSIS_WIDTH = 480
@@ -70,14 +70,10 @@ def _with_replicates(vectors, replicates, rng):
 
 
 def downscale(frames, max_width):
-    """Shrink frames before analysis; the metrics are areal, the cost is not."""
-    if not max_width or frames[0].shape[1] <= max_width:
-        return frames
-    import cv2  # pylint: disable=import-outside-toplevel,no-member
+    """Shrink frames before analysis, sharing the analyzer's own resampling."""
+    from syncsummoner.aesthetics.levels import downscale as shrink
 
-    scale = max_width / frames[0].shape[1]
-    size = (max_width, max(1, int(round(frames[0].shape[0] * scale))))
-    return [cv2.resize(f, size, interpolation=cv2.INTER_AREA) for f in frames]  # pylint: disable=no-member
+    return [shrink(f, max_width=max_width) for f in frames]
 
 
 def frame_metrics(
@@ -139,6 +135,25 @@ def frame_metrics(
     return metrics
 
 
+def measurement(frames, analyzer, *, program, firmware, source, params, state_index, stimulus, **metrics):
+    """One measurement record: the metric vector over ``frames`` and its provenance.
+
+    Shared by the hardware and simulation backends so both stamp a record the
+    same way; ``metrics`` are the :func:`frame_metrics` options.
+    """
+    return MeasurementRecord(
+        program=program,
+        firmware=firmware,
+        analyzer=f"aesthetics {getattr(analyzer, '__version__', 'unknown')}",
+        source=source,
+        params=params,
+        state_index=state_index,
+        stimulus=stimulus,
+        metrics=frame_metrics(frames, analyzer, **metrics),
+        settle_frames=settle_frames(frames),
+    )
+
+
 def _ahead(index, expected, capacity):
     return 0 < (index - expected) % capacity < capacity // 2
 
@@ -193,7 +208,6 @@ def run_plan(
     ``emit`` publishes the state index onto the played-out stimulus; with no
     playout, ``allow_untagged`` attributes signal frames to the current vector.
     """
-    analyzer_version = f"aesthetics {getattr(analyzer, '__version__', 'unknown')}"
     firmware = firmware or _firmware(session)
     capacity = patterns.state_index_capacity(bits)
     max_wait_frames = max_wait_frames or 8 * frames_per_point
@@ -216,18 +230,18 @@ def run_plan(
         if not frames:
             continue
         records.append(
-            MeasurementRecord(
+            measurement(
+                frames,
+                analyzer,
                 program=program,
                 firmware=firmware,
-                analyzer=analyzer_version,
                 source=source,
                 params=raw_params(vector),
                 state_index=state,
                 stimulus=stimulus,
-                metrics=frame_metrics(
-                    frames, analyzer, fps=fps, reference=reference, analysis_width=analysis_width
-                ),
-                settle_frames=settle_frames(frames),
+                fps=fps,
+                reference=reference,
+                analysis_width=analysis_width,
             )
         )
     return records

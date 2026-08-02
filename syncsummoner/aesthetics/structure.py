@@ -11,8 +11,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-#: Luma weights matching the rest of the package.
-LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+from syncsummoner.aesthetics.levels import luma_709
+
 DEFAULT_BINS = 32
 
 
@@ -25,11 +25,6 @@ class PointwiseFit:
     support: float
 
 
-def luma(frame: np.ndarray) -> np.ndarray:
-    """Rec.709 luma of an RGB frame."""
-    return frame @ LUMA
-
-
 def pointwise_fit(source: np.ndarray, output: np.ndarray, *, bins: int = DEFAULT_BINS) -> PointwiseFit:
     """Fraction of output variance explained by co-located source luma.
 
@@ -37,8 +32,8 @@ def pointwise_fit(source: np.ndarray, output: np.ndarray, *, bins: int = DEFAULT
     predictor there is, so what it leaves unexplained is what no value curve
     can account for.
     """
-    x = np.clip(luma(source), 0.0, 1.0).ravel()
-    y = luma(output).ravel()
+    x = np.clip(luma_709(source), 0.0, 1.0).ravel()
+    y = luma_709(output).ravel()
     if x.size != y.size or y.size == 0:
         raise ValueError(f"source and output must match in size, got {x.size} and {y.size}")
     total = float(y.var())

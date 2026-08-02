@@ -1,37 +1,69 @@
 """Long-lived V4L2 capture session.
 
 Lock costs ~3.2 s on a timing change and ~0.5 s on reopen, so the stream is
-opened once for a whole sweep and never per sample.
+opened once for a whole sweep and never per sample. The card advertises YUYV
+and delivers YVYU, so every frame is decoded with the chroma pair exchanged.
 """
 
 from __future__ import annotations
 
+import enum
 import time
-from typing import Any, Callable
+from itertools import islice
+from typing import Any, Callable, Iterator
 
 import cv2
 import numpy as np
 
 # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 
-#: Rec.709 luma weights, applied to RGB float frames.
-LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 #: HSV saturation 60/255, the threshold the no-signal splash was measured against.
 CHROMA_LEVEL = 60.0 / 255.0
 #: Samples the splash test estimates its area fractions from. They are fractions,
 #: so a decimated sample answers them; every pixel costs 3x a 30fps frame budget.
 SPLASH_SAMPLES = 50_000
+#: Spatial variation below this is a dead output, however unlike the splash it looks.
+MIN_SIGNAL_STD = 0.005
+#: The one format V4L2 enumerates, and what it must be asked for; the bytes are YVYU.
+NATIVE_FOURCC = "YUYV"
 
 
 class CaptureError(RuntimeError):
     """The capture device could not be opened or configured."""
 
 
+class PixelMode(enum.Enum):
+    """Whether the caller wants converted frames only, or the native buffer too.
+
+    Both open with ``CAP_PROP_CONVERT_RGB`` off: the card's own conversion reads
+    the chroma pair in the advertised order and clips the result, which no later
+    correction can undo, so the 4:2:2 upsample always happens in software here.
+    """
+
+    BGR = "bgr"
+    YVYU = "yvyu"
+
+
+def yvyu_to_bgr(frame: np.ndarray) -> np.ndarray:
+    """Packed native ``(H, W, 2)`` to uint8 BGR, reading the chroma pair as YVYU.
+
+    Measured, not advertised: a red source arrives as Cb=241 Cr=109, which the
+    advertised YUYV order decodes as blue.
+    """
+    return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YVYU)
+
+
+def bgr_to_rgb(frame: np.ndarray) -> np.ndarray:
+    """uint8 BGR to the RGB float32 in ``[0, 1]`` the analyzer works in."""
+    return np.ascontiguousarray(frame[:, :, ::-1], dtype=np.float32) / np.float32(255.0)
+
+
 class Capture:
     """RGB float32 frames from a V4L2 capture card, held open for the session.
 
-    ``read`` returns ``(H, W, 3)`` in ``[0, 1]``; OpenCV's BGR is converted at
-    this boundary and never leaves it.
+    ``read`` returns ``(H, W, 3)`` in ``[0, 1]`` whatever the mode; under
+    :data:`PixelMode.YVYU` the card's own 4:2:2 buffer is also available, which
+    is what the raw archive stores.
     """
 
     def __init__(
@@ -41,7 +73,8 @@ class Capture:
         width: int = 720,
         height: int = 576,
         fps: int = 50,
-        fourcc: str = "YUYV",
+        fourcc: str = NATIVE_FOURCC,
+        mode: PixelMode = PixelMode.BGR,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -50,6 +83,7 @@ class Capture:
         self.height = int(height)
         self.fps = int(fps)
         self.fourcc = fourcc
+        self.mode = PixelMode(mode)
         self._sleep = sleep
         self._clock = clock
         self._cap: Any = None
@@ -66,20 +100,42 @@ class Capture:
             (cv2.CAP_PROP_FRAME_WIDTH, self.width),
             (cv2.CAP_PROP_FRAME_HEIGHT, self.height),
             (cv2.CAP_PROP_FPS, self.fps),
-            (cv2.CAP_PROP_CONVERT_RGB, 1),
+            (cv2.CAP_PROP_CONVERT_RGB, 0),
         ):
             cap.set(prop, value)
         self._cap = cap
         return self
 
-    def read(self) -> np.ndarray | None:
-        """One frame as RGB float32 in ``[0, 1]``, or None when the grab failed."""
+    def _grab(self) -> np.ndarray | None:
+        """The one call into OpenCV; every other read is a conversion of this."""
         if self._cap is None:
             raise CaptureError("capture is not open")
         ok, frame = self._cap.read()
-        if not ok or frame is None:
-            return None
-        return np.ascontiguousarray(frame[:, :, ::-1], dtype=np.float32) / np.float32(255.0)
+        return frame if ok and frame is not None else None
+
+    def read_native(self) -> np.ndarray | None:
+        """One frame in the card's own layout: packed YVYU ``(H, W, 2)`` uint8.
+
+        The card offers no other format, so BGR is an upsample of this and carries
+        nothing more. Only available on a handle opened in :data:`PixelMode.YVYU`.
+        """
+        if self.mode is not PixelMode.YVYU:
+            raise CaptureError(f"native frames need PixelMode.YVYU, not {self.mode}")
+        return self._grab()
+
+    def read_raw(self) -> np.ndarray | None:
+        """One frame as uint8 BGR, or None on a failed grab.
+
+        The 4:2:2 upsample runs here in both modes, so both return the same array
+        for the same native buffer.
+        """
+        frame = self._grab()
+        return None if frame is None else yvyu_to_bgr(frame)
+
+    def read(self) -> np.ndarray | None:
+        """One frame as RGB float32 in ``[0, 1]``, or None when the grab failed."""
+        frame = self.read_raw()
+        return None if frame is None else bgr_to_rgb(frame)
 
     @staticmethod
     def _decimate(frame: np.ndarray, samples: int = SPLASH_SAMPLES) -> np.ndarray:
@@ -117,26 +173,46 @@ class Capture:
         variance-based liveness tests score it as content, which silently
         corrupts a sweep.
         """
+        from syncsummoner.aesthetics.levels import luma_709  # keeps scipy off the device import path
+
         if frame is None:
             return True
         if self.chroma_fraction(frame) > max_chroma_frac:
             return False
-        luma = self._decimate(frame) @ LUMA
+        luma = luma_709(self._decimate(frame))
         bright_frac = float(np.count_nonzero(luma >= bright) / luma.size)
         mid_frac = float(np.count_nonzero((luma > dark) & (luma < bright)) / luma.size)
         return bright_frac >= min_bright_frac and mid_frac <= max_mid_frac
 
-    def wait_for_lock(self, timeout_s: float = 10.0, *, poll_s: float = 0.05) -> bool:
-        """Block until a frame arrives that is neither a failed grab nor the splash."""
+    def _stream(self, timeout_s: float, *, poll_s: float = 0.0) -> Iterator[np.ndarray | None]:
+        """Yield every read until ``timeout_s`` elapses, None where it was unusable.
+
+        Bounded on purpose: a read-until-good loop hangs forever whenever the
+        splash test rejects everything, which is how a stimulus that happens to
+        look achromatic stalls a whole sweep.
+        """
         self.open()
         deadline = self._clock() + timeout_s
         while True:
             frame = self.read()
-            if frame is not None and not self.is_no_signal(frame):
-                return True
+            yield None if frame is None or self.is_no_signal(frame) else frame
             if self._clock() >= deadline:
-                return False
-            self._sleep(poll_s)
+                return
+            if poll_s:
+                self._sleep(poll_s)
+
+    def wait_for_lock(
+        self, timeout_s: float = 10.0, *, poll_s: float = 0.05, min_std: float = MIN_SIGNAL_STD
+    ) -> bool:
+        """Block until a frame arrives carrying picture, not a grab failure or the splash.
+
+        A dead output is black, which is neither, so spatial variance is the
+        test: a still stimulus has it even when nothing is moving.
+        """
+        return any(
+            frame is not None and float(self._decimate(frame).std()) >= min_std
+            for frame in self._stream(timeout_s, poll_s=poll_s)
+        )
 
     def wait_for_content(self, timeout_s: float = 15.0, *, run: int = 10, min_motion: float = 1e-4) -> bool:
         """Block until frames are both past the splash and actually moving.
@@ -145,40 +221,25 @@ class Capture:
         re-lock, so a fixed dwell samples the splash. The drop this rig is prone
         to freezes the output instead, which only the motion test catches.
         """
-        self.open()
-        deadline = self._clock() + timeout_s
         recent: list[np.ndarray] = []
-        while True:
-            frame = self.read()
-            if frame is None or self.is_no_signal(frame):
+        for frame in self._stream(timeout_s):
+            if frame is None:
                 recent.clear()
-            else:
-                recent.append(frame)
-                if len(recent) >= run:
-                    moving = np.abs(np.diff(np.stack(recent[-run:]), axis=0)).mean()
-                    if moving > min_motion:
-                        return True
-                    recent = recent[-(run - 1) :]
-            if self._clock() >= deadline:
-                return False
+                continue
+            recent.append(frame)
+            if len(recent) >= run:
+                if np.abs(np.diff(np.stack(recent[-run:]), axis=0)).mean() > min_motion:
+                    return True
+                recent = recent[-(run - 1) :]
+        return False
 
     def frames(self, count: int, *, timeout_s: float = 10.0, settle: int = 0) -> list[np.ndarray]:
-        """Collect ``count`` usable frames, or fewer if the budget runs out.
-
-        Bounded on purpose: a read-until-good loop hangs forever whenever the
-        splash test rejects everything, which is how a stimulus that happens to
-        look achromatic stalls a whole sweep.
-        """
+        """Collect ``count`` usable frames, or fewer if the budget runs out."""
         self.open()
         for _ in range(max(0, settle)):
             self.read()
-        deadline = self._clock() + timeout_s
-        out: list[np.ndarray] = []
-        while len(out) < count and self._clock() < deadline:
-            frame = self.read()
-            if frame is not None and not self.is_no_signal(frame):
-                out.append(frame)
-        return out
+        usable = (f for f in self._stream(timeout_s) if f is not None)
+        return list(islice(usable, max(0, count)))
 
     def close(self) -> None:
         """Release the capture device."""

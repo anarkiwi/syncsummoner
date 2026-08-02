@@ -138,6 +138,12 @@ class LockMap:
     tongues: list[Tongue] = field(default_factory=list)
 
 
+_PARAM_COLUMNS = tuple(f"p{i + 1}" for i in range(PARAM_COUNT))
+_NON_METRIC_COLUMNS = frozenset(
+    _PARAM_COLUMNS + ("program", "firmware", "analyzer", "source", "state_index", "stimulus", "settle_frames")
+)
+
+
 @dataclass
 class MeasurementRecord:
     """One captured sample: the parameter vector, and what the analyzer saw.
@@ -170,6 +176,25 @@ class MeasurementRecord:
         row.update({f"p{i + 1}": v for i, v in enumerate(self.params)})
         row.update(self.metrics)
         return row
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "MeasurementRecord":
+        """Rebuild from the flat form produced by :meth:`as_row`.
+
+        Columns absent from a heterogeneous union arrive as None and are dropped,
+        so a record only carries the metrics it was measured with.
+        """
+        return cls(
+            program=str(row["program"]),
+            firmware=str(row["firmware"]),
+            analyzer=str(row["analyzer"]),
+            source=Source(row["source"]),
+            params=tuple(int(row[name]) for name in _PARAM_COLUMNS),
+            state_index=int(row["state_index"]),
+            stimulus=str(row["stimulus"]),
+            metrics={k: float(v) for k, v in row.items() if v is not None and k not in _NON_METRIC_COLUMNS},
+            settle_frames=int(row.get("settle_frames") or 0),
+        )
 
 
 @dataclass

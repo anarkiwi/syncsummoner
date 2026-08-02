@@ -53,6 +53,7 @@ syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
 
 - [docs/design.md](docs/design.md) — the design being realized
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
+- [docs/signal-loss.md](docs/signal-loss.md) — video path, and diagnosis of the intermittent input fault
 - [docs/contracts.md](docs/contracts.md) — normative cross-package signatures
 - [docs/rig.md](docs/rig.md) — wiring, permissions, and bring-up
 

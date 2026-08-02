@@ -10,6 +10,8 @@ does not import it. Converts OpenCV's BGR uint8 to the RGB float32 boundary type
 import cv2
 import numpy as np
 
+from syncsummoner.aesthetics.levels import downscale
+
 DEFAULT_FPS = 30.0
 
 
@@ -42,10 +44,7 @@ def _iter_frames(capture, max_frames: int | None, stride: int, max_width: int | 
         if not ok:
             return
         if index % stride == 0:
-            frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            if max_width is not None and frame.shape[1] > max_width:
-                height = max(1, round(frame.shape[0] * max_width / frame.shape[1]))
-                frame = cv2.resize(frame, (max_width, height), interpolation=cv2.INTER_AREA)
+            frame = downscale(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), max_width=max_width)
             kept += 1
             yield np.asarray(frame, dtype=np.float32) / 255.0
         index += 1

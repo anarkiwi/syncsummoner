@@ -1,7 +1,6 @@
-"""Capture: V4L2 configuration, RGB conversion, no-signal splash detection."""
+"""Capture: V4L2 configuration, YVYU decoding, no-signal splash detection."""
 
-# pylint: disable=missing-function-docstring
-# pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
+# pylint: disable=missing-function-docstring,no-member  ; cv2 defeats pylint introspection
 
 import cv2
 import numpy as np
@@ -9,10 +8,16 @@ import pytest
 
 from syncsummoner.device import capture as cap
 from syncsummoner.device.capture import Capture, CaptureError
+from tests import MEASURED_YVYU, native_frame
 
-from .conftest import FakeClock, FakeVideoCapture, bgr_frame
+from .conftest import FakeClock, FakeVideoCapture
 
 SIZE = (48, 64)
+
+
+def packed(frame):
+    """Pack an RGB float frame into the card's native ``(H, W, 2)`` YVYU layout."""
+    return cv2.cvtColor((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2YUV_YVYU)
 
 
 @pytest.fixture(name="opened")
@@ -57,7 +62,7 @@ def test_open_configures_v4l2(opened):
     assert fake.props[cv2.CAP_PROP_FRAME_HEIGHT] == 576
     assert fake.props[cv2.CAP_PROP_FPS] == 50
     assert fake.props[cv2.CAP_PROP_FOURCC] == cv2.VideoWriter_fourcc(*"YUYV")
-    assert fake.props[cv2.CAP_PROP_CONVERT_RGB] == 1
+    assert fake.props[cv2.CAP_PROP_CONVERT_RGB] == 0
 
 
 def test_open_is_idempotent(opened):
@@ -78,18 +83,134 @@ def test_read_before_open_raises(opened):
         capture.read()
 
 
-def test_read_converts_bgr_to_rgb_float(opened):
+@pytest.mark.parametrize("colour", sorted(MEASURED_YVYU))
+def test_measured_buffers_decode_to_the_colour_that_was_sent(opened, colour):
+    """The regression: these bytes read as YUYV give the complementary hue."""
+    planes, expected = MEASURED_YVYU[colour]
     capture, fake, _ = opened
-    fake.frames = [bgr_frame((255, 128, 0))]
+    fake.frames = [native_frame(planes)]
     frame = capture.open().read()
-    assert frame.dtype == np.float32
-    assert frame.shape == (4, 4, 3)
-    assert frame[0, 0] == pytest.approx([1.0, 128 / 255, 0.0], abs=1e-6)
+    assert frame.dtype == np.float32 and frame.shape == (4, 4, 3)
+    assert frame[0, 0] * 255.0 == pytest.approx(expected, abs=1.0)
+
+
+def test_the_advertised_byte_order_reads_red_as_blue():
+    """What the card enumerates disagrees with what it sends, so decoding is measured."""
+    planes, expected = MEASURED_YVYU["red"]
+    frame = native_frame(planes)
+    assert cap.yvyu_to_bgr(frame)[0, 0].tolist() == list(expected)[::-1]
+    assert cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)[0, 0].tolist() == [255, 0, 0]
+
+
+def test_read_raw_is_the_decoded_bgr_of_the_native_buffer(opened):
+    """The archive keeps native buffers; every other caller gets this upsample."""
+    capture, fake, _ = opened
+    native = native_frame(MEASURED_YVYU["green"][0])
+    fake.frames = [native]
+    raw = capture.open().read_raw()
+    assert raw.dtype == np.uint8 and raw.shape == (4, 4, 3)
+    assert np.array_equal(raw, cap.yvyu_to_bgr(native))
+
+
+def test_read_is_a_view_of_the_raw_frame(opened):
+    """One decode path: the float RGB frame is exactly the raw frame rescaled."""
+    capture, fake, _ = opened
+    native = native_frame(MEASURED_YVYU["blue"][0])
+    fake.frames = [native]
+    assert capture.open().read() == pytest.approx(cap.yvyu_to_bgr(native)[:, :, ::-1] / 255.0, abs=1e-6)
 
 
 def test_read_returns_none_on_failed_grab(opened):
     capture, _, _ = opened
     assert capture.open().read() is None
+
+
+def test_read_raw_returns_none_on_failed_grab(opened):
+    capture, _, _ = opened
+    assert capture.open().read_raw() is None
+
+
+def test_read_raw_before_open_raises(opened):
+    capture, _, _ = opened
+    with pytest.raises(CaptureError, match="not open"):
+        capture.read_raw()
+
+
+@pytest.fixture(name="native")
+def native_fixture(monkeypatch):
+    """A native-mode Capture bound to a fake cv2.VideoCapture, plus that fake."""
+    fake = FakeVideoCapture("/dev/video0")
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *args, **kwargs: fake)
+    return Capture(mode=cap.PixelMode.YVYU), fake
+
+
+def noise_frame(height=4, width=4, seed=0):
+    """Packed native ``(H, W, 2)`` uint8 frame, two bytes per pixel."""
+    return np.random.default_rng(seed).integers(0, 256, (height, width, 2), dtype=np.uint8)
+
+
+def test_native_mode_asks_the_card_not_to_convert(native):
+    """The card's only format is YUYV, so conversion is what gets switched off."""
+    capture, fake = native
+    capture.open()
+    assert fake.props[cv2.CAP_PROP_CONVERT_RGB] == 0
+    assert fake.props[cv2.CAP_PROP_FOURCC] == cv2.VideoWriter_fourcc(*"YUYV")
+
+
+@pytest.mark.parametrize("colour", sorted(MEASURED_YVYU))
+def test_both_modes_decode_one_buffer_to_the_same_rgb(monkeypatch, colour):
+    """Neither mode may leave the card's conversion in the path: it bakes in the swap."""
+    planes, expected = MEASURED_YVYU[colour]
+    outputs = []
+    for mode in (cap.PixelMode.BGR, cap.PixelMode.YVYU):
+        fake = FakeVideoCapture("/dev/video0")
+        fake.frames = [native_frame(planes)]
+        monkeypatch.setattr(cv2, "VideoCapture", lambda *a, _fake=fake, **kw: _fake)
+        capture = Capture(mode=mode).open()
+        assert fake.props[cv2.CAP_PROP_CONVERT_RGB] == 0
+        outputs.append(capture.read())
+    assert np.array_equal(outputs[0], outputs[1])
+    assert outputs[0][0, 0] * 255.0 == pytest.approx(expected, abs=1.0)
+
+
+def test_read_native_hands_back_the_cards_own_buffer(native):
+    """The archive must store what the card produced, never an upsample of it."""
+    capture, fake = native
+    frame = noise_frame()
+    fake.frames = [frame]
+    got = capture.open().read_native()
+    assert got is frame
+    assert got.shape == (4, 4, 2) and got.dtype == np.uint8
+
+
+def test_native_mode_still_serves_bgr_and_float_rgb(native):
+    """Existing callers are unaffected; the 4:2:2 upsample just moves into software."""
+    capture, fake = native
+    frame = noise_frame(seed=3)
+    fake.frames = [frame, frame]
+    assert np.array_equal(capture.open().read_raw(), cap.yvyu_to_bgr(frame))
+    rgb = capture.read()
+    assert rgb.dtype == np.float32 and rgb.shape == (4, 4, 3)
+    assert rgb == pytest.approx(cap.bgr_to_rgb(cap.yvyu_to_bgr(frame)))
+
+
+def test_native_frames_need_a_native_handle(opened):
+    """Only the native mode promises the raw buffer, whatever the handle now carries."""
+    capture, fake, _ = opened
+    fake.frames = [noise_frame()]
+    with pytest.raises(CaptureError, match="PixelMode.YVYU"):
+        capture.open().read_native()
+
+
+def test_read_native_returns_none_on_failed_grab(native):
+    capture, _ = native
+    assert capture.open().read_native() is None
+
+
+def test_read_native_before_open_raises(native):
+    capture, _ = native
+    with pytest.raises(CaptureError, match="not open"):
+        capture.read_native()
 
 
 def test_context_manager_releases(opened):
@@ -147,23 +268,16 @@ def test_missing_frame_is_no_signal(opened):
 
 def test_wait_for_lock_succeeds_after_splash(opened):
     capture, fake, clock = opened
-    fake.frames = [
-        (splash() * 255).astype(np.uint8),
-        (colorbars() * 255).astype(np.uint8)[:, :, ::-1],
-    ]
+    fake.frames = [packed(splash()), packed(colorbars())]
     assert capture.wait_for_lock(1.0)
     assert clock.slept == [0.05]
 
 
 def test_wait_for_lock_times_out(opened):
     capture, fake, clock = opened
-    fake.frames = [(splash() * 255).astype(np.uint8)] * 100
+    fake.frames = [packed(splash())] * 100
     assert not capture.wait_for_lock(0.2)
     assert clock.now >= 0.2
-
-
-def test_luma_weights_sum_to_one():
-    assert cap.LUMA.sum() == pytest.approx(1.0, abs=1e-6)
 
 
 def _stream(target, frames):
@@ -242,3 +356,25 @@ def test_frames_returns_what_it_collected():
     port.read = lambda: (clock.sleep(0.01), rng.random((8, 8, 3)).astype(np.float32))[1]
     port.is_no_signal = lambda _f: False
     assert len(port.frames(4, timeout_s=5.0, settle=2)) == 4
+
+
+def test_wait_for_lock_rejects_a_black_frame():
+    """A dead output is black: not a grab failure, not the splash, and not content."""
+    clock = FakeClock()
+    port = Capture(clock=clock, sleep=clock.sleep)
+    port.open = lambda: None
+    port.is_no_signal = lambda _f: False
+    port.read = lambda: (clock.sleep(0.01), np.zeros((32, 32, 3), np.float32))[1]
+    assert not port.wait_for_lock(0.5)
+
+
+def test_wait_for_lock_accepts_a_still_stimulus():
+    """Spatial variance, not motion: a still pattern is legitimate content."""
+    clock = FakeClock()
+    rng = np.random.default_rng(7)
+    still = rng.random((32, 32, 3)).astype(np.float32)
+    port = Capture(clock=clock, sleep=clock.sleep)
+    port.open = lambda: None
+    port.is_no_signal = lambda _f: False
+    port.read = lambda: still
+    assert port.wait_for_lock(5.0)

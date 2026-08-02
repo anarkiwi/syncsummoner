@@ -15,6 +15,9 @@ coordinated change; changing `aesthetics` is a version bump.
 
 OpenCV decodes BGR. Convert at the boundary. `aesthetics` never sees BGR.
 
+The capture card advertises `YUYV` and delivers `YVYU`, so `device.capture` is
+the only place that decodes 4:2:2 and it does so as YVYU; see `docs/hardware.md`.
+
 ## `syncsummoner.aesthetics`
 
 ```python

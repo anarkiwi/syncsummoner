@@ -13,11 +13,30 @@ them wrong produces a harness that silently measures the wrong thing.
 | MIDI node | `/dev/snd/midiC4D0` |
 | Serial node | `/dev/ttyACM0` (needs `dialout` or an ACL) |
 | Capture card | AVerMedia Live Gamer Ultra 2.1, `/dev/video0`, uvcvideo |
-| Session format | **720x576i PAL @ 50**, YUYV 4:2:2 |
+| Session format | **720x576i PAL @ 50**, `YUYV` advertised, **YVYU delivered** |
 
 The serial ACL is dropped whenever the device re-enumerates; `/dev/ttyACM0`
 returns as `c---------`. Re-run `setfacl` after any replug, or install a udev
 rule.
+
+## The capture card lies about its byte order
+
+`v4l2-ctl --list-formats-ext` reports exactly one format, `YUYV 4:2:2`, but the
+bytes are `YVYU`: Cb and Cr arrive exchanged, which swaps red and blue. A full
+red source reads back `Y=40.9 Cb=240.8 Cr=109.0`, which BT.601 calls blue;
+decoding the same buffer as YVYU recovers `R=208.6`, the limited-range red the
+playout chain actually sends. The card's own `Colorbars` program shows the same
+exchange with no source in the path, so the fault is the capture card's.
+
+Consequences, all handled in `syncsummoner/device/capture.py`:
+
+* Decode native buffers with `COLOR_YUV2BGR_YVYU`, never `..._YUYV`.
+* Never let the card convert (`CAP_PROP_CONVERT_RGB=1`). It uses the advertised
+  order **and clips**: full red becomes a clipped `B=254.5`, so the true `R=208.6`
+  is gone and no channel swap or matrix correction recovers it.
+* Raw archives must tag the pipe `yvyu422`. Under `yuyv422` the bytes still
+  round-trip bit-exactly while the stored `yuv422p` holds the chroma planes
+  exchanged, which bakes the swap in permanently.
 
 ## Parameters are additive
 

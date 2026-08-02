@@ -9,14 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 
-# pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
+from syncsummoner.aesthetics.levels import LUMA_709, downscale
 
 SRGB_KNEE = 0.04045
-LUMA_709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -46,12 +44,10 @@ def saturated_red(frames: np.ndarray, *, fraction: float = 0.8) -> np.ndarray:
 
 def _downsample(frames: np.ndarray, max_side: int) -> np.ndarray:
     """Shrink a frame stack so area statistics stay cheap on long clips."""
-    height, width = frames.shape[1:3]
-    scale = max_side / max(height, width)
-    if scale >= 1.0:
+    small = [downscale(f, max_side=max_side) for f in frames]
+    if small[0].shape == frames.shape[1:]:
         return frames.astype(np.float32, copy=False)
-    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-    return np.stack([cv2.resize(f, size, interpolation=cv2.INTER_AREA) for f in frames]).astype(np.float32)
+    return np.stack(small).astype(np.float32)
 
 
 def _windowed_rate(events: np.ndarray, window: int) -> np.ndarray:
