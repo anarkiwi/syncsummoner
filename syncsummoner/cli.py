@@ -312,12 +312,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         if args.format
         else render_mod.RenderConfig(source_host=args.source_host)
     )
-    if args.render_cmd == "audition":
-        frames = render_mod.audition(
-            score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
-        )
-        render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
-    elif args.cut_programs:
+    if args.cut_programs:
         plan = render_mod.render_cuts(
             score,
             args.source,
@@ -333,27 +328,17 @@ def _render_cmd(args: argparse.Namespace) -> int:
             print(f"  {cut.start:7.2f}-{cut.end:7.2f}s  {cut.program}")
         print(f"{args.output}: {len(plan)} cuts")
         return 0
-    elif args.played:
-        report = render_mod.render_played(
-            score,
-            args.source,
-            args.output,
-            profiles=profiles,
-            config=config,
-            scratch=args.scratch,
-            prepared=args.prepared,
-            raw=args.raw,
-        )
-        print(f"{args.output}: {report}")
-        return 0 if report.usable else 1
-    elif args.stream:
-        render_mod.render_stream(score, args.source, args.output, profiles=profiles, config=config)
-    else:
-        render_mod.render(
-            score, args.source, args.output, passes=args.passes, profiles=profiles, config=config
-        )
-    print(args.output)
-    return 0
+    report = render_mod.render_played(
+        score,
+        args.source,
+        args.output,
+        profiles=profiles,
+        config=config,
+        scratch=args.scratch,
+        prepared=args.prepared,
+    )
+    print(f"{args.output}: {report}")
+    return 0 if report.usable else 1
 
 
 def _add_link_args(parser: argparse.ArgumentParser) -> None:
@@ -438,26 +423,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
-    audition = sub.add_parser("audition", help="render a short low-resolution proxy")
-    audition.add_argument("score")
-    audition.add_argument("--source", required=True)
-    audition.add_argument("--profiles", default="profiles/")
-    audition.add_argument("--seconds", type=float, default=30.0)
-    audition.add_argument("--passes", type=int, default=1)
-    audition.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
-    audition.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
-    audition.add_argument("-o", "--output", default="audition.mkv")
-    audition.set_defaults(func=_render_cmd, render_cmd="audition")
-
     full = sub.add_parser("render", help="render the full pass")
     full.add_argument("score")
     full.add_argument("--source", required=True)
     full.add_argument("--profiles", default="profiles/")
-    full.add_argument("--passes", type=int, default=1)
     full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     full.add_argument("-o", "--output", default="out.mkv")
     full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
-    full.add_argument("--stream", action="store_true", help="write the take as it is captured, for one pass")
     full.add_argument(
         "--played", action="store_true", help="play the source from the rig, at rate, for one pass"
     )
@@ -467,7 +439,6 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         "--cut-programs", help="cut between these programs on the score's sections, one pass each"
     )
     full.add_argument("--takes", default=".", help="where the per-program passes are written")
-    full.add_argument("--raw", help="capture to this raw file and encode after, sparing the loop")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

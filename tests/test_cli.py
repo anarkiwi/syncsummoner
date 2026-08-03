@@ -218,7 +218,6 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         (
             "render",
             [
-                "--stream",
                 "--played",
                 "--prepared",
                 "--format",
@@ -228,7 +227,6 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
                 "--takes",
             ],
         ),
-        ("audition", ["--seconds", "--format", "--source"]),
         ("compose", ["--density", "--style", "--budget"]),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
     ],
