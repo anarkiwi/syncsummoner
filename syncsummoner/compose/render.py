@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import subprocess
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -17,7 +17,7 @@ import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
 from syncsummoner.compose.planner import plan_automation
-from syncsummoner.compose.score import Score
+from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
 
 
@@ -340,6 +340,72 @@ def write_video(path: str | Path, frames: np.ndarray, fps: float) -> None:
     writer.release()
 
 
+class RawSink:
+    """Writes frames verbatim, so the capture loop pays for no encoder.
+
+    Lossless 1080p costs hundreds of percent of CPU to encode, which starves the
+    loop that is meant to be grabbing at session rate: the card then hands back
+    the same buffer and the take fills with repeats. Raw bytes to an NVMe cost
+    almost nothing, and the encode is a job for afterwards.
+    """
+
+    def __init__(self, path: str | Path, fps: float):
+        self.path = str(path)
+        self.fps = float(fps)
+        self.shape: tuple[int, ...] = ()
+        self._handle: Any = None
+
+    def write(self, frame: np.ndarray) -> None:
+        """Append one frame as raw uint8."""
+        if self._handle is None:
+            self.shape = frame.shape
+            self._handle = open(self.path, "wb")  # pylint: disable=consider-using-with
+        self._handle.write(np.ascontiguousarray((np.clip(frame, 0, 1) * 255).astype(np.uint8)).data)
+
+    def close(self) -> None:
+        """Finish the file."""
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    def encode(self, out: str | Path, *, ffmpeg: str = "ffmpeg", crf: int = 16) -> None:
+        """Turn the raw take into a video, once the rig is no longer waiting on us."""
+        if not self.shape:
+            raise ValueError(f"nothing was written to {self.path}")
+        height, width = self.shape[:2]
+        done = subprocess.run(
+            [
+                ffmpeg,
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(self.fps),
+                "-i",
+                self.path,
+                "-c:v",
+                "libx264",
+                "-crf",
+                str(crf),
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                str(out),
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if done.returncode:
+            raise RuntimeError(f"encoding {self.path} failed: {done.stderr.decode('utf-8','replace')[:200]}")
+
+
 class VideoSink:
     """An encoder that takes frames one at a time, opened once the first one arrives."""
 
@@ -526,12 +592,15 @@ def render_played(
     config: RenderConfig | None = None,
     scratch: str | Path = "timecoded.mkv",
     prepared: bool = False,
+    raw: str | Path | None = None,
 ) -> "TakeReport":
     """Render a pass the playout plays for itself, at rate.
 
     Pushing frames caps a pass at a few a second, which samples the instrument's
     own motion far too slowly to be the performance it is meant to record. The
     source goes over once, timecoded, and the host only drives and captures.
+    ``raw`` writes the take verbatim and encodes it afterwards, so the encoder
+    never competes with the capture loop for the CPU.
     """
     layers = sorted(score.layers, key=lambda item: item.index)
     if not layers:
@@ -539,12 +608,12 @@ def render_played(
     config = RenderConfig() if config is None else config
     owned = rig is None
     rig = open_rig(config, player=True) if owned else rig
+    sink_of: Any = RawSink(raw, config.fps) if raw else VideoSink(out, config.fps)
     total = (
         int(round(score.duration * config.fps))
         if prepared
         else write_timecoded(source, scratch, config=config, seconds=score.duration)
     )
-    video = VideoSink(out, config.fps)
     try:
         autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
         auto = schedule(
@@ -553,7 +622,7 @@ def render_played(
             early_bias_s=config.early_bias_s,
         )
         rig.playout.upload(str(scratch))
-        sink = FrameSink(video.write, fps=config.fps)
+        sink = FrameSink(sink_of.write, fps=config.fps)
         with rig.playout.playing(fps=config.fps):
             capture_pass(
                 rig,
@@ -563,11 +632,103 @@ def render_played(
                 sink=sink,
                 total=total,
             )
-        return sink.report
+        report = sink.report
     finally:
-        video.close()
+        sink_of.close()
         if owned:
             rig.capture.close()
+    if raw:
+        sink_of.encode(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+    return report
+
+
+@dataclass(frozen=True)
+class Cut:
+    """One span of the timeline and the program that renders it."""
+
+    start: float
+    end: float
+    program: str
+
+    @property
+    def duration(self) -> float:
+        """Span length in seconds."""
+        return max(0.0, self.end - self.start)
+
+
+def cut_plan(score: Score, programs: Sequence[str]) -> list[Cut]:
+    """Assign programs to the score's sections in rotation.
+
+    Cutting inside a pass is not open to us: a program change blacks this device
+    out for seconds, so each program renders the whole take and the spans are
+    taken from those afterwards. Sections are where the music already changes.
+    """
+    if not programs:
+        raise ValueError("cutting needs at least one program")
+    spans = [(s.start, s.end) for s in score.sections] or [(0.0, score.duration)]
+    return [Cut(start, end, programs[i % len(programs)]) for i, (start, end) in enumerate(spans)]
+
+
+def assemble(
+    cuts: Sequence[Cut], takes: Mapping[str, str | Path], out: str | Path, *, ffmpeg: str = "ffmpeg"
+) -> None:
+    """Splice each cut's span out of its program's take, in order.
+
+    Every take covers the whole timeline, so a span is the same span in each; the
+    cut is a choice of which one to show, not a re-timing.
+    """
+    if not cuts:
+        raise ValueError("nothing to assemble")
+    argv = [ffmpeg, "-loglevel", "error", "-y"]
+    for cut in cuts:
+        argv += ["-ss", f"{cut.start:.3f}", "-to", f"{cut.end:.3f}", "-i", str(takes[cut.program])]
+    joins = "".join(f"[{i}:v]" for i in range(len(cuts)))
+    argv += ["-filter_complex", f"{joins}concat=n={len(cuts)}:v=1:a=0[v]", "-map", "[v]", str(out)]
+    done = subprocess.run(argv, check=False, capture_output=True)
+    if done.returncode:
+        raise RuntimeError(f"assembling the cut failed: {done.stderr.decode('utf-8', 'replace')[:200]}")
+
+
+def render_cuts(
+    score: Score,
+    source: Any,
+    out: str | Path,
+    *,
+    profiles: Mapping[str, ProgramProfile],
+    programs: Sequence[str],
+    config: RenderConfig | None = None,
+    scratch: str | Path = "timecoded.mkv",
+    prepared: bool = False,
+    takes: str | Path = ".",
+    pass_render: Callable[..., Any] | None = None,
+) -> list[Cut]:
+    """Render one pass per program and cut between them on the score's sections.
+
+    Returns the plan that was cut, so a caller can report what came from where.
+    """
+    config = RenderConfig() if config is None else config
+    plan = cut_plan(score, programs)
+    run = render_played if pass_render is None else pass_render
+    paths: dict[str, str] = {}
+    for program in dict.fromkeys(cut.program for cut in plan):
+        layer = Layer(
+            index=0, program=program, gestures=list(score.layers[0].gestures) if score.layers else []
+        )
+        take = str(Path(takes) / f"take-{program.replace(' ', '_')}.mkv")
+        report = run(
+            replace(score, layers=[layer]),
+            source,
+            take,
+            profiles=profiles,
+            config=config,
+            scratch=scratch,
+            prepared=prepared,
+        )
+        if report is not None and not report.usable:
+            raise BlankTakeError(f"{program}: {report}")
+        paths[program] = take
+    assemble(plan, paths, out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+    return plan
 
 
 def open_rig(config: RenderConfig, *, player: bool = False) -> Rig:

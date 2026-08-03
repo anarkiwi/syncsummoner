@@ -215,7 +215,19 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "command, flags",
     [
-        ("render", ["--stream", "--played", "--prepared", "--format", "--scratch", "--source"]),
+        (
+            "render",
+            [
+                "--stream",
+                "--played",
+                "--prepared",
+                "--format",
+                "--scratch",
+                "--source",
+                "--cut-programs",
+                "--takes",
+            ],
+        ),
         ("audition", ["--seconds", "--format", "--source"]),
         ("compose", ["--density", "--style", "--budget"]),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),

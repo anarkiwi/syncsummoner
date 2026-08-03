@@ -317,6 +317,22 @@ def _render_cmd(args: argparse.Namespace) -> int:
             score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
         )
         render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
+    elif args.cut_programs:
+        plan = render_mod.render_cuts(
+            score,
+            args.source,
+            args.output,
+            profiles=profiles,
+            programs=[p.strip() for p in args.cut_programs.split(",") if p.strip()],
+            config=config,
+            scratch=args.scratch,
+            prepared=args.prepared,
+            takes=args.takes,
+        )
+        for cut in plan:
+            print(f"  {cut.start:7.2f}-{cut.end:7.2f}s  {cut.program}")
+        print(f"{args.output}: {len(plan)} cuts")
+        return 0
     elif args.played:
         report = render_mod.render_played(
             score,
@@ -326,6 +342,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
             config=config,
             scratch=args.scratch,
             prepared=args.prepared,
+            raw=args.raw,
         )
         print(f"{args.output}: {report}")
         return 0 if report.usable else 1
@@ -446,6 +463,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     )
     full.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
     full.add_argument("--prepared", action="store_true", help="take --scratch as an already timecoded clip")
+    full.add_argument(
+        "--cut-programs", help="cut between these programs on the score's sections, one pass each"
+    )
+    full.add_argument("--takes", default=".", help="where the per-program passes are written")
+    full.add_argument("--raw", help="capture to this raw file and encode after, sparing the loop")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

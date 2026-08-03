@@ -740,3 +740,118 @@ def test_a_take_reports_what_it_actually_holds():
     assert report.distinct == 5 and 0.15 < report.luma < 0.3
     assert not R.TakeReport(frames=8, distinct=1, blank=8, luma=0.0).usable
     assert report.usable is False, "half the take blank is not a take"
+
+
+def test_cuts_follow_the_score_sections_in_rotation():
+    """Sections are where the music already changes, so they are where a cut belongs."""
+    score = Score(
+        seed=1,
+        bpm=120.0,
+        duration=40.0,
+        fps=30.0,
+        sections=[Section(0.0, 10.0, "A"), Section(10.0, 25.0, "B"), Section(25.0, 40.0, "C")],
+    )
+    plan = R.cut_plan(score, ["X", "Y"])
+    assert [(c.start, c.end, c.program) for c in plan] == [
+        (0.0, 10.0, "X"),
+        (10.0, 25.0, "Y"),
+        (25.0, 40.0, "X"),
+    ]
+    assert plan[1].duration == 15.0
+
+
+def test_a_score_with_no_sections_cuts_once():
+    score = Score(seed=1, bpm=120.0, duration=12.0, fps=30.0)
+    assert [(c.start, c.end, c.program) for c in R.cut_plan(score, ["Solo"])] == [(0.0, 12.0, "Solo")]
+    with pytest.raises(ValueError, match="at least one program"):
+        R.cut_plan(score, [])
+
+
+def test_assembling_takes_each_span_from_its_own_pass(monkeypatch, tmp_path):
+    seen = {}
+
+    def run(argv, check=False, capture_output=False):
+        del check, capture_output
+        seen["argv"] = argv
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(R.subprocess, "run", run)
+    cuts = [R.Cut(0.0, 5.0, "X"), R.Cut(5.0, 9.0, "Y"), R.Cut(9.0, 12.0, "X")]
+    R.assemble(cuts, {"X": tmp_path / "x.mkv", "Y": tmp_path / "y.mkv"}, tmp_path / "out.mkv")
+    argv = seen["argv"]
+    assert argv.count("-i") == 3, "one input per cut, from that cut's take"
+    assert argv[argv.index("-ss") + 1] == "0.000" and "concat=n=3" in " ".join(argv)
+    assert str(tmp_path / "y.mkv") in argv, "the middle span comes from the other program"
+
+
+def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypatch, tmp_path):
+    """A blank pass must not be spliced into a demo as though it were footage."""
+    calls = []
+
+    def fake_render(score, source, out, **kwargs):
+        del source, kwargs
+        calls.append((score.layers[0].program, out))
+        blank = score.layers[0].program == "Bad"
+        return R.TakeReport(frames=10, distinct=1 if blank else 9, blank=10 if blank else 0, luma=0.4)
+
+    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    score = Score(
+        seed=1,
+        bpm=120.0,
+        duration=20.0,
+        fps=30.0,
+        sections=[Section(0.0, 10.0, "A"), Section(10.0, 20.0, "B")],
+        layers=[Layer(index=0, program="ignored", gestures=[])],
+    )
+    plan = R.render_cuts(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        programs=["Good", "Other"],
+        takes=tmp_path,
+        pass_render=fake_render,
+    )
+    assert [c.program for c in plan] == ["Good", "Other"] and len(calls) == 2
+    with pytest.raises(R.BlankTakeError):
+        R.render_cuts(
+            score,
+            "clip.mkv",
+            tmp_path / "out.mkv",
+            profiles={},
+            programs=["Bad"],
+            takes=tmp_path,
+            pass_render=fake_render,
+        )
+
+
+def test_a_raw_take_costs_the_loop_no_encoder(tmp_path):
+    """Encoding lossless 1080p in the capture loop starves it and the card repeats frames."""
+    sink = R.RawSink(tmp_path / "take.raw", 30.0)
+    for level in (0.0, 0.5, 1.0):
+        sink.write(np.full((4, 8, 3), level, np.float32))
+    sink.close()
+    written = (tmp_path / "take.raw").read_bytes()
+    assert len(written) == 3 * 4 * 8 * 3 and sink.shape == (4, 8, 3)
+    assert written[0] == 0 and written[-1] == 255, "frames go down verbatim, in order"
+
+
+def test_a_raw_take_encodes_afterwards(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda argv, **kw: seen.setdefault("argv", argv)
+        and None
+        or types.SimpleNamespace(returncode=0, stderr=b""),
+    )
+    sink = R.RawSink(tmp_path / "take.raw", 30.0)
+    sink.write(np.zeros((8, 16, 3), np.float32))
+    sink.close()
+    sink.encode(tmp_path / "take.mkv")
+    assert "16x8" in seen["argv"] and "rawvideo" in seen["argv"]
+
+
+def test_encoding_an_empty_raw_take_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="nothing was written"):
+        R.RawSink(tmp_path / "empty.raw", 30.0).encode(tmp_path / "out.mkv")
