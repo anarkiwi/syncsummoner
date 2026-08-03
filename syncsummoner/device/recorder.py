@@ -7,7 +7,9 @@ process and 25 without it, against 59.8 for ffmpeg reading the card in MJPEG.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import signal
 import subprocess
 import tempfile
 import time
@@ -27,6 +29,7 @@ __all__ = [
     "Recorder",
     "RecorderError",
     "TakeReport",
+    "die_with_parent",
     "inspect_take",
     "settle",
 ]
@@ -55,6 +58,8 @@ FFV1 = (
     "-pix_fmt",
     "yuv422p",
 )
+#: Linux prctl option tying a child's lifetime to its parent's.
+PR_SET_PDEATHSIG = 1
 #: Mean level below which a captured frame carries no picture.
 BLANK_LEVEL = 0.02
 #: Width every take is judged at; a blank frame is blank at any scale.
@@ -63,6 +68,19 @@ INSPECT_WIDTH = 160
 
 class RecorderError(RuntimeError):
     """The recording did not start, or did not produce a file."""
+
+
+def die_with_parent() -> None:
+    """Ask the kernel to signal this child when its parent dies.
+
+    A recorder holds the capture card, and the harness being killed skips every
+    ``finally`` that would have stopped it, so the card stays held by a process
+    nobody is waiting on. ``PR_SET_PDEATHSIG`` covers the signal a handler cannot.
+    """
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except OSError:
+        pass
 
 
 def _diagnostic(errors: Any, *, limit: int = 400) -> str:
@@ -171,15 +189,17 @@ class Recorder:
         """Record for the duration of the block, yielding once it is running.
 
         ffmpeg's diagnostics are kept rather than discarded: a recorder that dies
-        silently is a fault nobody can tell from a rig that has gone dark.
+        silently is a fault nobody can tell from a rig that has gone dark. The
+        ``preexec_fn`` warning does not apply: a pass records from one thread.
         """
         errors = tempfile.TemporaryFile()
         try:
-            proc = self._popen(
+            proc = self._popen(  # pylint: disable=subprocess-popen-preexec-fn
                 self.command(path, seconds=seconds),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=errors,
+                preexec_fn=die_with_parent,
             )
             self._sleep(settle_s)
             if proc.poll() is not None:

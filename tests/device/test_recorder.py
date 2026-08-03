@@ -304,3 +304,29 @@ def test_settle_reports_the_recorder_error_when_the_card_never_opens(tmp_path, c
             clock=clock,
             sleep=clock.sleep,
         )
+
+
+def test_the_recorder_is_asked_to_die_with_the_harness(tmp_path):
+    """Killing the harness skips every finally, and the card stays held by nobody's child."""
+    seen = {}
+
+    def popen(argv, **kwargs):
+        del argv
+        seen.update(kwargs)
+        (tmp_path / "take.mkv").write_bytes(b"x")
+        return types.SimpleNamespace(
+            stdin=types.SimpleNamespace(write=lambda b: None, flush=lambda: None, close=lambda: None),
+            poll=lambda: None,
+            returncode=None,
+            wait=lambda timeout=None: 0,
+            kill=lambda: None,
+        )
+
+    with Recorder(popen=popen, sleep=lambda s: None).recording(tmp_path / "take.mkv"):
+        pass
+    assert seen["preexec_fn"] is rec.die_with_parent
+
+
+def test_asking_to_die_with_the_parent_is_survivable():
+    """A kernel that will not take the request must not stop a recording."""
+    rec.die_with_parent()

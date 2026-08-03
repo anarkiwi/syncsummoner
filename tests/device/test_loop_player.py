@@ -24,7 +24,8 @@ KILL_RE = re.compile(r"^kill (?:-0 )?(\d+)")
 class FakePi:
     """Models the Pi's tmpfs, pidfile and process liveness, without any shell."""
 
-    def __init__(self, *, spawns=True, stuck=False):
+    def __init__(self, *, spawns=True, stuck=False, contenders=()):
+        self.contenders = list(contenders)
         self.commands = []
         self.frames = []
         self.script = None
@@ -68,6 +69,8 @@ class FakePi:
             return ""
         if "wc -l" in command:
             return str(len(self.frames))
+        if command.startswith("fuser "):
+            return " ".join(str(pid) for pid in self.contenders)
         if command.startswith("tail "):
             return self.log
         raise AssertionError(f"unmodelled command: {command}")
@@ -301,3 +304,20 @@ def test_player_program_leaves_a_whole_frame_when_stopped_mid_stride(tmp_path):
             pass
     assert proc.returncode == 0
     assert fb.read_bytes() in frames
+
+
+def test_start_refuses_a_framebuffer_another_writer_already_holds():
+    """Two writers interleave frames, so the stimulus is a mixture of both."""
+    player, _, _ = make_player(FakePi(contenders=[1646]))
+    with pytest.raises(PlayoutError, match="1646"):
+        player.start(fps=12.0)
+
+
+def test_start_ignores_the_players_own_hold_on_the_framebuffer():
+    """The player is a legitimate holder; only somebody else is contention."""
+    pi = FakePi()
+    player, _, _ = make_player(pi)
+    player.start(fps=12.0)
+    pi.contenders = [player.pid()]
+    assert player.contenders() == []
+    player.start(fps=12.0)

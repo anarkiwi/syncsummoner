@@ -331,6 +331,17 @@ class LoopPlayer(Playout):
                 raise PlayoutError(f"{what} after {self.timeout_s}s: {self.log()}")
             self._sleep(self.poll_s)
 
+    def contenders(self) -> list[int]:
+        """Pids other than this player's holding the framebuffer open.
+
+        Two writers on one framebuffer interleave their frames, so the stimulus
+        becomes a mixture of both and every measurement taken against it is of
+        something that was never played.
+        """
+        out = str(self._runner(f"fuser {self.framebuffer} 2>/dev/null || true") or "")
+        mine = self.pid()
+        return [int(v) for v in out.split() if v.isdigit() and int(v) != mine]
+
     def start(self, *, fps: float = DEFAULT_LOOP_FPS) -> int:
         """Restart the detached player at ``fps`` per loop frame; returns its pid.
 
@@ -339,6 +350,12 @@ class LoopPlayer(Playout):
         """
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
+        held = self.contenders()
+        if held:
+            raise PlayoutError(
+                f"{self.framebuffer} is already held by {held}: a second writer would "
+                "interleave its frames into the stimulus"
+            )
         self.stop()
         self._runner(f"mkdir -p {self.directory} && cat > {self.script_path}", PLAYER_SOURCE.encode())
         self._runner(
