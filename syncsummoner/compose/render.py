@@ -73,6 +73,8 @@ class RenderConfig:
     cc_budget_hz: float = 200.0
     #: Budget for the picture to return after a load; relock was measured at 12 to 19 seconds.
     settle_s: float = 40.0
+    #: Where the liveness probe is recorded before a take begins.
+    probe_path: str = "/tmp/syncsummoner-probe.mkv"
     #: ssh target driving playout and the HDMI link; None takes the device layer's default.
     source_host: str | None = None
 
@@ -242,6 +244,34 @@ def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240
     )
 
 
+def settle(
+    recorder: Any,
+    config: RenderConfig,
+    *,
+    program: str,
+    probe_s: float = 2.0,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> TakeReport:
+    """Wait for the picture to come back after a load, by recording a short probe.
+
+    Liveness is judged the same way a take is, because judging it any other way
+    is how a working rig gets called faulted.
+    """
+    deadline = clock() + config.settle_s
+    probe = Path(str(config.probe_path))
+    report = TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
+    while clock() < deadline:
+        with recorder.recording(probe, seconds=probe_s):
+            sleep(probe_s)
+        report = inspect_take(probe, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+        if report.usable:
+            probe.unlink(missing_ok=True)
+            return report
+    probe.unlink(missing_ok=True)
+    raise BlankTakeError(f"{program}: no picture within {config.settle_s}s of the load ({report})")
+
+
 def render_played(
     score: Score,
     source: Any,
@@ -281,9 +311,7 @@ def render_played(
         rig.playout.upload(str(scratch))
         with rig.playout.playing(fps=config.fps):
             rig.session.load_program(layers[0].program, link=rig.link)
-            if not rig.capture.wait_for_content(timeout_s=config.settle_s):
-                raise BlankTakeError(f"{layers[0].program}: no moving picture within {config.settle_s}s")
-            rig.capture.close()
+            settle(recorder, config, program=layers[0].program)
             with recorder.recording(out, seconds=score.duration):
                 drive(rig, auto, duration=score.duration)
     finally:

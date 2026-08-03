@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring,protected-access
 
+import contextlib
 import dataclasses
 import sys
 import time
@@ -311,3 +312,46 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
             takes=tmp_path,
             pass_render=fake_render,
         )
+
+
+def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path):
+    """A guard built on the discarded per-frame loop failed on a perfectly good picture."""
+    seen = []
+
+    class Rec:
+        """Recorder stand-in producing whatever the next report says."""
+
+        def recording(self, path, seconds=None, settle_s=0.0):
+            """Recording."""
+            del seconds, settle_s
+            seen.append(str(path))
+            return contextlib.nullcontext()
+
+    reports = iter(
+        [
+            R.TakeReport(frames=10, distinct=1, blank=10, luma=0.0),
+            R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4),
+        ]
+    )
+    monkeypatch.setattr(R, "inspect_take", lambda path, ffmpeg="ffmpeg": next(reports))
+    config = dataclasses.replace(CONFIG, probe_path=str(tmp_path / "probe.mkv"))
+    got = R.settle(Rec(), config, program="Teletext", probe_s=0.0, sleep=lambda s: None)
+    assert got.usable and len(seen) == 2, "it keeps probing until the picture is back"
+
+
+def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
+    class Rec:
+        """Recorder that only ever sees black."""
+
+        def recording(self, path, seconds=None, settle_s=0.0):
+            """Recording."""
+            del path, seconds, settle_s
+            return contextlib.nullcontext()
+
+    monkeypatch.setattr(
+        R, "inspect_take", lambda path, ffmpeg="ffmpeg": R.TakeReport(frames=6, distinct=1, blank=6, luma=0.0)
+    )
+    ticks = iter([0.0, 0.0, 99.0, 99.0])
+    config = dataclasses.replace(CONFIG, settle_s=1.0, probe_path=str(tmp_path / "probe.mkv"))
+    with pytest.raises(R.BlankTakeError, match="no picture within"):
+        R.settle(Rec(), config, program="Dead", probe_s=0.0, clock=lambda: next(ticks), sleep=lambda s: None)
