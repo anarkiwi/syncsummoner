@@ -476,3 +476,12 @@ def test_a_real_recording_reads_back_frame_for_frame_in_colour(tmp_path):
             assert decoded[16, i * 16 + 8] == pytest.approx(colour, abs=4)
     assert [f.shape for f in reader.stream()] == [(32, 64, CHANNELS)] * 4
     assert [f.shape for f in reader.stream(width=32)] == [reader.shape(32)] * 4
+
+
+def test_a_scratch_recording_names_a_container_the_recorder_can_infer(tmp_path):
+    """ffmpeg reads the container off the extension, so a bare .tmp will not open."""
+    archive = archive_at(tmp_path)
+    scratch = archive.scratch("bitcrush")
+    assert scratch.suffix == archive.paths("bitcrush")[0].suffix
+    assert scratch.name.startswith("."), "an uncommitted recording is not an archive"
+    assert scratch != archive.paths("bitcrush")[0] and scratch.parent == archive.directory

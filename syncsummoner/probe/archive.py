@@ -20,7 +20,7 @@ import numpy as np
 
 from syncsummoner.device.profile import PARAM_COUNT
 from syncsummoner.probe.fit import load_measurements, save_measurements
-from syncsummoner.probe.store import ProgramKey, atomic_write, slug, temp_sibling
+from syncsummoner.probe.store import ProgramKey, atomic_write, slug
 
 __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
@@ -300,9 +300,14 @@ class FrameArchive:
         return [FrameRow.from_row(row) for row in load_measurements(self.paths(program)[1])]
 
     def scratch(self, program: str) -> Path:
-        """Where a recording is made so that committing it is a rename, not a copy."""
+        """Where a recording is made so that committing it is a rename, not a copy.
+
+        It keeps the video suffix because the recorder infers the container from
+        it, and hides behind a dot so an uncommitted one is never mistaken for an
+        archive.
+        """
         self.directory.mkdir(parents=True, exist_ok=True)
-        return temp_sibling(self.paths(program)[0])
+        return self.directory / f".{slug(program)}.recording{VIDEO_SUFFIX}"
 
     def commit(
         self,
