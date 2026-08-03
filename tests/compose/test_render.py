@@ -377,3 +377,76 @@ def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
     assert R.open_rig(CONFIG, capture=False).capture is None and not opened
     R.open_rig(CONFIG, capture=True)
     assert opened == [True], "the old path still gets one when it asks"
+
+
+def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
+    """Parking drives every parameter to zero, and a program at zero renders black."""
+    calls = []
+
+    class Session:
+        """Session recording load and parameter writes in order."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+            del link
+            calls.append(("load", program))
+
+        def working_point(self, info):
+            """Working point."""
+            del info
+            return {1: 0.5, 12: 1.0}
+
+        def set_params(self, values):
+            """Set params."""
+            calls.append(("params", dict(values)))
+
+    class Player:
+        """Playout stand-in."""
+
+        def upload(self, path):
+            """Upload."""
+
+        def playing(self, fps):
+            """Playing."""
+            del fps
+            return contextlib.nullcontext()
+
+    rig = R.Rig(
+        session=Session(),
+        capture=None,
+        playout=Player(),
+        transport=types.SimpleNamespace(program_info=lambda: None),
+    )
+    monkeypatch.setattr(R, "settle", lambda *a, **k: None)
+    monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
+    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: R.TakeReport(4, 4, 0, 0.4))
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+
+    class Rec:
+        """Recorder stand-in."""
+
+        def recording(self, path, seconds=None):
+            """Recording."""
+            del path, seconds
+            return contextlib.nullcontext()
+
+    score = Score(
+        seed=1,
+        bpm=120.0,
+        duration=1.0,
+        fps=CONFIG.fps,
+        layers=[Layer(index=0, program="Teletext", gestures=[])],
+    )
+    R.render_played(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        rig=rig,
+        config=CONFIG,
+        scratch=tmp_path / "tc.mkv",
+        prepared=True,
+        recorder=Rec(),
+    )
+    assert calls[0] == ("load", "Teletext")
+    assert calls[1][0] == "params" and calls[1][1] == {1: 0.5, 12: 1.0}, "the load is followed by a picture"

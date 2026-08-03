@@ -97,6 +97,7 @@ class Rig:
     capture: Any
     playout: Any
     link: Any = None
+    transport: Any = None
 
 
 def burn_timecode(frame: np.ndarray, index: int, *, bits: int = 16, strip_px: int = 8) -> np.ndarray:
@@ -311,6 +312,7 @@ def render_played(
         rig.playout.upload(str(scratch))
         with rig.playout.playing(fps=config.fps):
             rig.session.load_program(layers[0].program, link=rig.link)
+            rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
             settle(recorder, config, program=layers[0].program)
             with recorder.recording(out, seconds=score.duration):
                 drive(rig, auto, duration=score.duration)
@@ -425,6 +427,7 @@ def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True
     transport = transport_mod.Transport.open()
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
+        transport=transport,
         session=session_mod.Session(transport, cc_budget_hz=config.cc_budget_hz),
         capture=(
             capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)).open()
