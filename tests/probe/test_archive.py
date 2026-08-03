@@ -249,14 +249,29 @@ def test_a_newer_schema_is_not_trusted(tmp_path):
     assert archive.reader("bitcrush") is None
 
 
-def test_an_archive_written_with_the_chroma_pair_reversed_is_refused(tmp_path):
-    """Schema 2 stored its chroma planes exchanged; decoding it now would swap red and blue."""
+@pytest.mark.parametrize("stored", [{"schema_version": 2, "pix_fmt": "yvyu422"}, {"schema_version": 1}])
+def test_an_archive_from_the_reversed_chroma_era_is_refused(tmp_path, stored):
+    """Both older schemas stored the chroma pair exchanged; reading either now would lie.
+
+    Version 1 carried today's ``pix_fmt`` tag, so only the version number tells
+    the two apart and the guard cannot be a ceiling.
+    """
     archive, _, _ = write_archive(tmp_path, 2)
     meta_path = archive.paths("bitcrush")[2]
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta_path.write_text(json.dumps(meta | {"schema_version": 2, "pix_fmt": "yvyu422"}), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta | stored), encoding="utf-8")
     assert archive.meta("bitcrush") is None
     assert archive.reader("bitcrush") is None and not archive.committed()
+
+
+def test_committing_a_short_parameter_vector_is_refused(tmp_path):
+    """A sidecar row that is not a full vector would write null columns silently."""
+    archive = archive_at(tmp_path)
+    video = archive.scratch("bitcrush")
+    video.write_bytes(b"x")
+    row = FrameRow(frame=0, program="bitcrush", params=(1, 2, 3), setpoint=0)
+    with pytest.raises(ArchiveError):
+        archive.commit("bitcrush", KEY, video, [row], width=SIZE[1], height=SIZE[0], fps=FPS)
 
 
 def test_awkward_program_names_get_distinct_archives(tmp_path):

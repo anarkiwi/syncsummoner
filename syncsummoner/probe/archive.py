@@ -241,7 +241,7 @@ class FrameArchive:
             return None
         if str(meta.get("pix_fmt")) != CAPTURE_PIX_FMT:
             return None
-        if int(meta.get("schema_version", 0)) > ARCHIVE_SCHEMA_VERSION:
+        if int(meta.get("schema_version", 0)) != ARCHIVE_SCHEMA_VERSION:
             return None
         return meta if video.exists() and data.exists() else None
 
@@ -324,6 +324,8 @@ class FrameArchive:
             raise ArchiveError(f"no frames archived for {program!r}")
         if len(rows) != len({row.frame for row in rows}):
             raise ArchiveError(f"{program!r} has repeated frame indices in its sidecar")
+        for row in rows:
+            _params(row.params)
         target, data, meta_path = self.paths(program)
         self.directory.mkdir(parents=True, exist_ok=True)
         os.replace(Path(video), target)
