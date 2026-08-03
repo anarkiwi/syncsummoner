@@ -71,8 +71,8 @@ def _link(args: argparse.Namespace):
     return Link(host) if host else Link()
 
 
-def _measure(session, capture, args, *, program, specs, firmware, rng, writer):
-    """Records from every configured plan for one program, archiving frames if asked."""
+def _measure(session, capture, args, *, program, specs, firmware, rng):
+    """Records from every configured plan for one program."""
     from syncsummoner import aesthetics
     from syncsummoner.probe import plans, runner
 
@@ -86,31 +86,25 @@ def _measure(session, capture, args, *, program, specs, firmware, rng, writer):
             analyzer=aesthetics,
             firmware=firmware,
             allow_untagged=args.allow_untagged,
-            archive=writer,
         )
     return records
 
 
 def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tuple[list, Any]:
     """Measure every requested program on the rig, resuming whatever is stored."""
-    from contextlib import ExitStack
-
-    from syncsummoner.device.capture import Capture, PixelMode
+    from syncsummoner.device.capture import Capture
     from syncsummoner.device.session import Session
     from syncsummoner.device.transport import Transport
-    from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.store import ResultStore, program_key
 
     dev = Transport.open(serial=args.serial)
     store = ResultStore(args.store or Path(args.out))
-    frames = FrameArchive(args.archive) if args.archive else None
     link, records = _link(args), []
     try:
         names = dev.programs() if args.program == "all" else args.program.split(",")
         firmware, manifest = dev.firmware(), dev.program_manifest()
         session = Session(dev)
-        mode = PixelMode.YVYU if frames is not None else PixelMode.BGR
-        with Capture(device=args.capture, mode=mode) as capture:
+        with Capture(device=args.capture) as capture:
             for name in names:
                 key = program_key(dev, name, firmware=firmware, manifest=manifest)
                 done = store.get(name, key)
@@ -120,24 +114,15 @@ def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tu
                 session.load_program(name, link=link)
                 session.ensure_live(capture, require_motion=False)
                 specs_by_program[name] = dev.program_info().params
-                with ExitStack() as stack:
-                    writer = (
-                        None
-                        if frames is None
-                        else stack.enter_context(
-                            frames.writer(name, key, width=capture.width, height=capture.height)
-                        )
-                    )
-                    measured = _measure(
-                        session,
-                        capture,
-                        args,
-                        program=name,
-                        specs=specs_by_program[name],
-                        firmware=firmware,
-                        rng=rng,
-                        writer=writer,
-                    )
+                measured = _measure(
+                    session,
+                    capture,
+                    args,
+                    program=name,
+                    specs=specs_by_program[name],
+                    firmware=firmware,
+                    rng=rng,
+                )
                 if measured:
                     store.put(name, key, measured)
                 records += measured
@@ -204,8 +189,8 @@ def _refit_cmd(args: argparse.Namespace) -> int:
 
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
-    from syncsummoner.device.capture import Capture, PixelMode
     from syncsummoner.device.playout import LoopPlayer
+    from syncsummoner.device.recorder import FFV1, Recorder
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.harvest import HarvestConfig, harvest
@@ -215,19 +200,20 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         height=args.height,
         capture_fps=args.capture_fps,
         setpoints=args.setpoints,
-        frames_per_point=args.frames_per_point,
+        dwell_s=args.dwell,
         seed=args.seed,
     )
     host = {} if args.source_host is None else {"host": args.source_host}
     report = harvest(
         FrameArchive(args.out),
         open_transport=lambda: Transport.open(serial=args.serial),
-        open_capture=lambda: Capture(
+        recorder=Recorder(
             device=args.capture,
             width=config.width,
             height=config.height,
             fps=config.capture_fps,
-            mode=PixelMode.YVYU,
+            mode=FFV1,
+            copyts=True,
         ),
         player=LoopPlayer(width=config.width, height=config.height, **host),
         link=_link(args),
@@ -312,19 +298,33 @@ def _render_cmd(args: argparse.Namespace) -> int:
         if args.format
         else render_mod.RenderConfig(source_host=args.source_host)
     )
-    if args.render_cmd == "audition":
-        frames = render_mod.audition(
-            score, args.source, seconds=args.seconds, passes=args.passes, profiles=profiles, config=config
+    if args.cut_programs:
+        plan = render_mod.render_cuts(
+            score,
+            args.source,
+            args.output,
+            profiles=profiles,
+            programs=[p.strip() for p in args.cut_programs.split(",") if p.strip()],
+            config=config,
+            scratch=args.scratch,
+            prepared=args.prepared,
+            takes=args.takes,
         )
-        render_mod.write_video(args.output, frames, score.fps * args.seconds / max(len(frames), 1))
-    elif args.stream:
-        render_mod.render_stream(score, args.source, args.output, profiles=profiles, config=config)
-    else:
-        render_mod.render(
-            score, args.source, args.output, passes=args.passes, profiles=profiles, config=config
-        )
-    print(args.output)
-    return 0
+        for cut in plan:
+            print(f"  {cut.start:7.2f}-{cut.end:7.2f}s  {cut.program}")
+        print(f"{args.output}: {len(plan)} cuts")
+        return 0
+    report = render_mod.render_played(
+        score,
+        args.source,
+        args.output,
+        profiles=profiles,
+        config=config,
+        scratch=args.scratch,
+        prepared=args.prepared,
+    )
+    print(f"{args.output}: {report}")
+    return 0 if report.usable else 1
 
 
 def _add_link_args(parser: argparse.ArgumentParser) -> None:
@@ -353,7 +353,6 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--out", default="profiles/")
     run.add_argument("--store", help="resumable per-program result store (default: --out)")
-    run.add_argument("--archive", help="also store the native capture frames under this directory")
     _add_link_args(run)
     simulate = probe_sub.add_parser("sim")
     simulate.add_argument("--program", required=True)
@@ -377,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--height", type=int, default=1080)
     collect.add_argument("--capture-fps", type=int, default=30)
     collect.add_argument("--setpoints", type=int, default=32)
-    collect.add_argument("--frames-per-point", type=int, default=30)
+    collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
     collect.add_argument("--seed", type=int, default=11)
     _add_link_args(collect)
     collect.set_defaults(func=_harvest_cmd)
@@ -409,26 +408,22 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
-    audition = sub.add_parser("audition", help="render a short low-resolution proxy")
-    audition.add_argument("score")
-    audition.add_argument("--source", required=True)
-    audition.add_argument("--profiles", default="profiles/")
-    audition.add_argument("--seconds", type=float, default=30.0)
-    audition.add_argument("--passes", type=int, default=1)
-    audition.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
-    audition.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
-    audition.add_argument("-o", "--output", default="audition.mkv")
-    audition.set_defaults(func=_render_cmd, render_cmd="audition")
-
     full = sub.add_parser("render", help="render the full pass")
     full.add_argument("score")
     full.add_argument("--source", required=True)
     full.add_argument("--profiles", default="profiles/")
-    full.add_argument("--passes", type=int, default=1)
     full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     full.add_argument("-o", "--output", default="out.mkv")
     full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
-    full.add_argument("--stream", action="store_true", help="write the take as it is captured, for one pass")
+    full.add_argument(
+        "--played", action="store_true", help="play the source from the rig, at rate, for one pass"
+    )
+    full.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
+    full.add_argument("--prepared", action="store_true", help="take --scratch as an already timecoded clip")
+    full.add_argument(
+        "--cut-programs", help="cut between these programs on the score's sections, one pass each"
+    )
+    full.add_argument("--takes", default=".", help="where the per-program passes are written")
     full.set_defaults(func=_render_cmd, render_cmd="render")
 
     return parser

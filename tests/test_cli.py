@@ -10,9 +10,9 @@ import pytest
 from syncsummoner import cli
 from syncsummoner.device import capture as capture_mod
 from syncsummoner.device import link as link_mod
+from syncsummoner.device import recorder as recorder_mod
 from syncsummoner.device import session as session_mod
 from syncsummoner.device import transport as transport_mod
-from syncsummoner.probe import archive as archive_mod
 from syncsummoner.probe import harvest as harvest_mod
 from syncsummoner.probe import runner as runner_mod
 
@@ -52,16 +52,23 @@ class Port:
 
 
 class Cap:
-    """Capture stub recording the pixel mode it was opened in."""
+    """Capture stub recording the geometry it was opened at."""
 
-    def __init__(self, device=None, *, width=720, height=576, fps=50, mode=None):
-        self.device, self.width, self.height, self.fps, self.mode = device, width, height, fps, mode
+    def __init__(self, device=None, *, width=720, height=576, fps=50):
+        self.device, self.width, self.height, self.fps = device, width, height, fps
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         return False
+
+
+class Rec:
+    """Recorder stub recording how the card was asked to be read."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
 
 
 class Sess:
@@ -119,64 +126,53 @@ def test_probe_run_honours_an_explicit_source_host_and_opting_out(tmp_path):
     assert Sess.loads[1][1] is None
 
 
-def test_probe_run_without_archive_keeps_the_default_capture_path(rig, tmp_path):
+def test_probe_run_measures_through_the_capture_and_archives_nothing(rig, tmp_path):
+    """Archiving is its own subcommand now: the plan runner only measures."""
     cli.main(["probe", "run", "--out", str(tmp_path)])
-    assert rig["plans"][0]["archive"] is None
+    assert "archive" not in rig["plans"][0]
 
 
-def test_probe_run_archives_native_frames_when_asked(rig, tmp_path, monkeypatch):
-    """``--archive`` is opt-in; it switches the capture into the card's own format."""
-    opened = {}
-
-    class Archive:
-        """FrameArchive stub recording the writer it was asked for."""
-
-        def __init__(self, directory):
-            opened["directory"] = directory
-
-        def writer(self, program, key, *, width, height):
-            """Writer."""
-            opened["writer"] = (program, key, width, height)
-            return _Writer()
-
-    class _Writer:
-        """Open writer stub."""
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(archive_mod, "FrameArchive", Archive)
-    cli.main(["probe", "run", "--out", str(tmp_path), "--archive", str(tmp_path / "frames")])
-    assert opened["writer"][0] == "Colorbars" and opened["writer"][2:] == (720, 576)
-    assert rig["plans"][0]["archive"] is not None
-
-
-def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(monkeypatch, tmp_path, capsys):
+@pytest.fixture(name="harvested")
+def harvested_fixture(monkeypatch):
+    """Patch the archive run's endpoints, returning what ``harvest`` was handed."""
     seen = {}
 
     def fake_harvest(archive, **kwargs):
         seen.update(kwargs, archive=archive)
-        return harvest_mod.HarvestReport(results=[harvest_mod.ProgramResult("Colorbars", 4)], seconds=60.0)
+        return harvest_mod.HarvestReport(
+            results=[harvest_mod.ProgramResult("Colorbars", frames=4)], seconds=60.0
+        )
 
     monkeypatch.setattr(transport_mod, "Transport", Port)
-    monkeypatch.setattr(capture_mod, "Capture", Cap)
     monkeypatch.setattr(link_mod, "Link", Link)
+    monkeypatch.setattr(recorder_mod, "Recorder", Rec)
     monkeypatch.setattr(harvest_mod, "harvest", fake_harvest)
-    assert cli.main(["probe", "archive", "--out", str(tmp_path), "--setpoints", "3"]) == 0
-    assert isinstance(seen["link"], Link) and seen["player"] is not None
-    assert seen["config"].setpoints == 3 and seen["programs"] is None
-    assert seen["open_capture"]().mode is capture_mod.PixelMode.YVYU
+    return seen
+
+
+def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tmp_path, capsys):
+    args = ["--out", str(tmp_path), "--setpoints", "3", "--dwell", "2.5", "--capture", "/dev/video9"]
+    assert cli.main(["probe", "archive"] + args) == 0
+    assert isinstance(harvested["link"], Link) and harvested["player"] is not None
+    assert harvested["config"].setpoints == 3 and harvested["config"].dwell_s == 2.5
+    assert harvested["programs"] is None
     assert "4 frames" in capsys.readouterr().out
+
+
+def test_probe_archive_records_the_card_losslessly_with_the_hosts_own_clock(harvested, tmp_path):
+    """Under ``copyts`` the stored frame times are what ``time.monotonic`` reads."""
+    assert cli.main(["probe", "archive", "--out", str(tmp_path), "--capture", "/dev/video9"]) == 0
+    kwargs = harvested["recorder"].kwargs
+    assert kwargs["mode"] is recorder_mod.FFV1 and kwargs["copyts"] is True
+    assert kwargs["device"] == "/dev/video9"
+    assert (kwargs["width"], kwargs["height"], kwargs["fps"]) == (1920, 1080, 30)
 
 
 def test_probe_archive_reports_a_wedged_device_as_a_failure(monkeypatch, tmp_path):
     """A wedge needs a power cycle, so the exit status has to say so."""
     monkeypatch.setattr(transport_mod, "Transport", Port)
-    monkeypatch.setattr(capture_mod, "Capture", Cap)
     monkeypatch.setattr(link_mod, "Link", Link)
+    monkeypatch.setattr(recorder_mod, "Recorder", Rec)
     monkeypatch.setattr(harvest_mod, "harvest", lambda *a, **kw: harvest_mod.HarvestReport(wedged=True))
     assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 1
 
@@ -210,3 +206,32 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ]
     )
     assert seen["density"] == 0.9
+
+
+@pytest.mark.parametrize(
+    "command, flags",
+    [
+        (
+            "render",
+            [
+                "--played",
+                "--prepared",
+                "--format",
+                "--scratch",
+                "--source",
+                "--cut-programs",
+                "--takes",
+            ],
+        ),
+        ("compose", ["--density", "--style", "--budget"]),
+        ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
+        ("probe archive", ["--capture", "--setpoints", "--dwell", "--width", "--no-link"]),
+    ],
+)
+def test_every_documented_flag_is_actually_registered(command, flags, capsys):
+    """A flag that silently failed to land takes an rig run to discover."""
+    with pytest.raises(SystemExit):
+        cli.main(command.split() + ["--help"])
+    text = capsys.readouterr().out
+    missing = [flag for flag in flags if flag not in text]
+    assert not missing, f"{command} is missing {missing}"

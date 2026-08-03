@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import subprocess
 import time
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator
 
@@ -184,6 +185,56 @@ class Playout:
             if delay > 0:
                 self._sleep(delay)
         return count
+
+
+class ClipPlayer(Playout):
+    """Plays a whole clip from the Pi, so the host pushes nothing per frame.
+
+    The framebuffer takes 4MB a frame and the Pi decrypts every byte of it, which
+    caps a pushed pass at a few frames a second; decoding locally does not.
+    """
+
+    CLIP_PATH = "/dev/shm/syncsummoner-clip.mkv"
+    PID_PATH = "/dev/shm/syncsummoner-clip.pid"
+
+    def __init__(self, host: str = DEFAULT_HOST, *, ssh_timeout_s: float = UPLOAD_TIMEOUT, **kwargs):
+        super().__init__(host, ssh_timeout_s=ssh_timeout_s, **kwargs)
+
+    def upload(self, path: str) -> int:
+        """Send the clip into tmpfs; returns the bytes put on the wire."""
+        data = Path(path).read_bytes()
+        self._runner(f"cat > {self.CLIP_PATH}", data)
+        return len(data)
+
+    def command(self) -> str:
+        """Pi-side pipeline: decode the clip at framebuffer geometry, blit each frame."""
+        return (
+            f"ffmpeg -hide_banner -loglevel error -re -i {self.CLIP_PATH} "
+            f"-vf scale={self.width}:{self.height} -r {{fps}} -pix_fmt bgr565le -f rawvideo - "
+            f"| python3 {self.PUMP_PATH} {self.framebuffer} {self.frame_bytes}"
+        )
+
+    def start(self, *, fps: float) -> None:
+        """Begin playing, detached, with its pid recorded rather than pattern matched."""
+        self._runner(f"cat > {self.PUMP_PATH}", self.PUMP_SOURCE.encode())
+        run = self.command().format(fps=fps)
+        self._runner(f"setsid nohup sh -c '{run}' >/dev/null 2>&1 & echo $! > {self.PID_PATH}")
+
+    def stop(self) -> None:
+        """Stop whatever this player started, by the pid it recorded."""
+        self._runner(
+            f"kill -TERM -$(cat {self.PID_PATH}) 2>/dev/null; kill -TERM $(cat {self.PID_PATH})"
+            f" 2>/dev/null; rm -f {self.PID_PATH}; true"
+        )
+
+    @contextmanager
+    def playing(self, *, fps: float) -> Iterator["ClipPlayer"]:
+        """Play for the duration of the block, and stop afterwards whatever happens."""
+        self.start(fps=fps)
+        try:
+            yield self
+        finally:
+            self.stop()
 
 
 class PlayoutError(RuntimeError):

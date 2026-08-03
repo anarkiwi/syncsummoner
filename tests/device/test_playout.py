@@ -146,3 +146,48 @@ def test_default_runner_is_ssh(monkeypatch):
     Playout(width=2, height=2).show(frame((0, 0, 0), 2, 2))
     assert seen["argv"] == ["ssh", "-o", "BatchMode=yes", po.DEFAULT_HOST, f"cat > {po.DEFAULT_FB}"]
     assert len(seen["input"]) == 8
+
+
+class Recorder:
+    """Runner recording every command and payload it is handed."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, command, data=None):
+        self.calls.append((command, None if data is None else len(data)))
+        return ""
+
+
+def test_a_clip_player_uploads_once_and_plays_from_the_pi(tmp_path):
+    """The Pi decrypts every pushed byte, which caps a pushed pass at a few frames a second."""
+    from syncsummoner.device.playout import ClipPlayer
+
+    clip = tmp_path / "clip.mkv"
+    clip.write_bytes(b"x" * 2048)
+    runner = Recorder()
+    player = ClipPlayer("pi@rig", width=1920, height=1080, runner=runner)
+    assert player.upload(str(clip)) == 2048
+    with player.playing(fps=30.0):
+        pass
+    commands = [c for c, _ in runner.calls]
+    assert any(player.CLIP_PATH in c and c.startswith("cat >") for c in commands), "clip goes up once"
+    assert any("ffmpeg" in c and "-re" in c and str(player.frame_bytes) in c for c in commands)
+    assert any(c.startswith("kill -TERM") for c in commands), "and is stopped by pid, not by pattern"
+
+
+def test_a_clip_player_decodes_at_the_framebuffer_geometry():
+    from syncsummoner.device.playout import ClipPlayer
+
+    player = ClipPlayer("pi@rig", width=1280, height=720, runner=Recorder())
+    assert "scale=1280:720" in player.command().format(fps=25)
+
+
+def test_a_clip_player_allows_a_whole_clip_to_go_up(monkeypatch):
+    """A 449MB clip at ssh speed needs minutes, and the default runner gives thirty seconds."""
+    seen = []
+    monkeypatch.setattr(po, "ssh_runner", lambda host, timeout: seen.append(timeout))
+    po.ClipPlayer("pi@rig")
+    po.Playout("pi@rig")
+    assert seen[0] == po.UPLOAD_TIMEOUT >= 300.0
+    assert seen[1] < seen[0], "a still frame does not need a clip's budget"

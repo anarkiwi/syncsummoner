@@ -1,8 +1,8 @@
-"""Archive every program's native capture frames against a parameter sweep.
+"""Archive every program's native capture against a parameter sweep, in one recording.
 
-Probing costs hours of rig time and the device wedges partway through, so frames
-are stored once with the vector that produced them and metrics are recomputed
-offline. Every endpoint is injected, so the driver runs with no hardware.
+ffmpeg records the card for the whole of a program's sweep while the host only
+writes setpoints and notes when each was held. Frames are attributed to setpoints
+afterwards from the card's own capture times, so nothing paces or samples a loop.
 """
 
 from __future__ import annotations
@@ -15,8 +15,10 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
+from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
 from syncsummoner.device.session import Session
 from syncsummoner.probe import codeframes, plans
+from syncsummoner.probe.archive import GAP, FrameRow
 from syncsummoner.probe.runner import raw_params
 from syncsummoner.probe.store import KeyKind, ProgramKey
 
@@ -25,19 +27,19 @@ __all__ = [
     "HarvestError",
     "HarvestReport",
     "ProgramResult",
-    "harvest",
+    "Window",
+    "attribute",
     "carries_stimulus",
     "discard_dark",
+    "harvest",
     "harvest_program",
-    "native_burst",
+    "sweep",
     "sweep_vectors",
     "upload_stimulus",
     "wait_healthy",
     "wedged",
 ]
 
-#: Mean luma below which an archived program is reported as black rather than content.
-DARK_LUMA = 20.0
 #: Loaded to ask whether the device will still hold any program at all.
 WEDGE_PROBE = "Passthru"
 #: The two faults that stop a run: same remedy, different diagnosis, never conflated.
@@ -59,20 +61,29 @@ class HarvestConfig:
     loop_fps: float = 12.0
     loop_frames: int = codeframes.DEFAULT_COUNT
     setpoints: int = 32
-    frames_per_point: int = 30
-    burst_settle: int = 4
-    burst_timeout_s: float = 20.0
+    dwell_s: float = 1.0
     settle_s: float = 0.35
-    #: Relock after a load was measured at up to 19.1s, so 10s returned before the picture did.
-    content_timeout_s: float = 30.0
+    #: Relock after a load was measured at up to 19.1s, so anything shorter gives up early.
+    live_timeout_s: float = 40.0
+    probe_s: float = 2.0
+    probe_path: str = "/tmp/syncsummoner-probe.mkv"
     load_blackout_s: float = 4.5
     startup_s: float = 2.0
     health_timeout_s: float = 3600.0
     health_poll_s: float = 10.0
     wedge_settle_s: float = 2.0
-    canary_frames: int = 8
     seed: int = 11
     loop_seed: int = 7
+
+
+@dataclass(frozen=True)
+class Window:
+    """One setpoint, its raw parameter vector, and the span it was held over."""
+
+    setpoint: int
+    params: tuple[int, ...]
+    start: float
+    end: float
 
 
 @dataclass(frozen=True)
@@ -81,10 +92,10 @@ class ProgramResult:
 
     program: str
     frames: int = 0
+    measured: int = 0
     seconds: float = 0.0
-    luma: float = 0.0
+    report: TakeReport | None = None
     error: str = ""
-    settled: bool = True
 
     @property
     def cached(self) -> bool:
@@ -93,16 +104,18 @@ class ProgramResult:
 
     @property
     def dark(self) -> bool:
-        """True when frames were archived but carry no picture."""
-        return bool(self.frames) and self.luma < DARK_LUMA
+        """True when frames were archived but carry no moving picture."""
+        return self.report is not None and not self.report.usable
 
     def __str__(self) -> str:
         if self.error:
             return f"{self.program}: FAILED {self.error}"
         if self.cached:
             return f"{self.program}: cached"
-        flags = f"{' DARK' if self.dark else ''}{'' if self.settled else ' UNSETTLED'}"
-        return f"{self.program}: {self.frames} frames in {self.seconds:.0f}s Y={self.luma:.1f}{flags}"
+        return (
+            f"{self.program}: {self.measured}/{self.frames} frames measured "
+            f"in {self.seconds:.0f}s, {self.report}"
+        )
 
 
 @dataclass(frozen=True)
@@ -129,42 +142,6 @@ class HarvestReport:
         """Programs that raised rather than archiving."""
         return [r for r in self.results if r.error]
 
-    @property
-    def unsettled(self) -> list[ProgramResult]:
-        """Programs whose picture never moved before the sweep, for offline scrutiny."""
-        return [r for r in self.results if r.frames and not r.settled]
-
-
-def native_burst(
-    capture: Any,
-    count: int,
-    *,
-    settle: int = 4,
-    timeout_s: float = 20.0,
-    interval_s: float = 0.0,
-    sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-) -> list[np.ndarray]:
-    """Grab up to ``count`` distinct native 4:2:2 frames, one per ``interval_s``.
-
-    Unpaced reads outrun the card and hand back its previous buffer: measured, a
-    30-frame burst spanned 0.25s and held as little as one distinct frame. Pacing
-    spreads the burst over the dwell, and a still picture ends it early.
-    """
-    deadline = clock() + timeout_s
-    got: list[np.ndarray] = []
-    seen = 0
-    for _ in range(settle + count):
-        if len(got) >= count or clock() >= deadline:
-            break
-        frame = capture.read_native()
-        if frame is not None:
-            seen += 1
-            if seen > settle and not (got and np.array_equal(frame, got[-1])):
-                got.append(frame)
-        sleep(interval_s)
-    return got
-
 
 def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) -> list[dict]:
     """Sobol vectors over every used parameter but the crossfader.
@@ -177,6 +154,64 @@ def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) ->
     if not any(p.kind is not ParamKind.UNUSED for p in spec):
         return [{}]
     return list(plans.sobol(spec, n=config.setpoints, rng=rng))
+
+
+def sweep(
+    session: Any,
+    base: dict,
+    vectors: Sequence[dict],
+    *,
+    config: HarvestConfig,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Window]:
+    """Write every setpoint in turn, returning the span each was held over.
+
+    A window opens only after the parameters have settled, so the frames it
+    claims were captured under that vector and no other.
+    """
+    windows = []
+    for setpoint, vector in enumerate(vectors):
+        session.set_params(vector)
+        sleep(config.settle_s)
+        start = clock()
+        sleep(config.dwell_s)
+        windows.append(Window(setpoint, raw_params({**base, **vector}), start, clock()))
+    return windows
+
+
+def attribute(
+    times: np.ndarray, windows: Sequence[Window], program: str, *, base: Sequence[int]
+) -> list[FrameRow]:
+    """Assign each captured frame to the setpoint that was being held when it arrived.
+
+    Frames between windows are kept as :data:`GAP` rather than dropped, so the
+    sidecar stays one row per frame and the archive needs no re-encode.
+    """
+    times = np.asarray(times, dtype=np.float64)
+    if not windows:
+        return []
+    starts = np.array([w.start for w in windows])
+    ends = np.array([w.end for w in windows])
+    order = np.argsort(starts, kind="stable")
+    starts, ends = starts[order], ends[order]
+    slot = np.searchsorted(starts, times, side="right") - 1
+    held = np.clip(slot, 0, len(windows) - 1)
+    inside = (slot >= 0) & (times <= ends[held])
+    fallback = tuple(int(v) for v in base)
+    rows = []
+    for index, (captured, hit, at) in enumerate(zip(times, inside, held)):
+        window = windows[int(order[at])]
+        rows.append(
+            FrameRow(
+                frame=index,
+                program=program,
+                params=window.params if hit else fallback,
+                setpoint=window.setpoint if hit else GAP,
+                captured=float(captured),
+            )
+        )
+    return rows
 
 
 def wedged(
@@ -203,7 +238,7 @@ def wedged(
 
 def carries_stimulus(
     session: Any,
-    capture: Any,
+    recorder: Any,
     transport: Any,
     *,
     config: HarvestConfig,
@@ -222,16 +257,19 @@ def carries_stimulus(
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     session.set_params(session.working_point(transport.program_info()))
-    capture.wait_for_content(timeout_s=config.content_timeout_s)
-    burst = native_burst(
-        capture,
-        config.canary_frames,
-        timeout_s=config.burst_timeout_s,
-        interval_s=1.0 / config.capture_fps,
-        sleep=sleep,
-        clock=clock,
-    )
-    return bool(burst) and float(np.mean([f[..., 0].mean() for f in burst])) >= DARK_LUMA
+    try:
+        settle(
+            recorder,
+            program=program,
+            timeout_s=config.live_timeout_s,
+            probe_path=config.probe_path,
+            probe_s=config.probe_s,
+            clock=clock,
+            sleep=sleep,
+        )
+        return True
+    except BlankTakeError:
+        return False
 
 
 def wait_healthy(
@@ -277,14 +315,12 @@ def discard_dark(archive: Any, program: str, key: ProgramKey, result: ProgramRes
     del key
     for path in archive.paths(program):
         path.unlink(missing_ok=True)
-    return ProgramResult(
-        program, error="discarded: archived only black frames", luma=result.luma, settled=result.settled
-    )
+    return ProgramResult(program, error="discarded: archived only black frames", report=result.report)
 
 
 def harvest_program(
     session: Any,
-    capture: Any,
+    recorder: Any,
     archive: Any,
     transport: Any,
     program: str,
@@ -297,11 +333,10 @@ def harvest_program(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> ProgramResult:
-    """Sweep one program and archive the native frames each setpoint produced.
+    """Sweep one program into a single recording, then commit it as its archive.
 
-    The load drops the source link, and the content wait covers the blackout that
-    follows. A generator program's picture is still, so a wait that expires is
-    reported rather than fatal. Rows carry the whole commanded state.
+    The load drops the source link and blacks the output, so the picture is
+    waited for before the recording starts rather than measured through it.
     """
     start = clock()
     session.load_program(program, park=True, link=link)
@@ -310,31 +345,45 @@ def harvest_program(
     info = transport.program_info()
     base = session.working_point(info)
     session.set_params(base)
-    settled = bool(capture.wait_for_content(timeout_s=config.content_timeout_s))
-    written, levels = 0, []
-    with archive.writer(program, key, width=config.width, height=config.height) as out:
-        for setpoint, vector in enumerate(sweep_vectors(info, config, rng)):
-            session.set_params(vector)
-            sleep(config.settle_s)
-            burst = native_burst(
-                capture,
-                config.frames_per_point,
-                settle=config.burst_settle,
-                timeout_s=config.burst_timeout_s,
-                interval_s=1.0 / config.capture_fps,
+    settle(
+        recorder,
+        program=program,
+        timeout_s=config.live_timeout_s,
+        probe_path=config.probe_path,
+        probe_s=config.probe_s,
+        clock=clock,
+        sleep=sleep,
+    )
+    video = archive.scratch(program)
+    try:
+        with recorder.recording(video):
+            windows = sweep(
+                session,
+                base,
+                sweep_vectors(info, config, rng),
+                config=config,
                 sleep=sleep,
                 clock=clock,
             )
-            for frame in burst:
-                out.write(frame, params=raw_params({**base, **vector}), setpoint=setpoint)
-                levels.append(float(frame[..., 0].mean()))
-                written += 1
+        rows = attribute(recorder.timestamps(video), windows, program, base=raw_params(base))
+        report = inspect_take(video, ffmpeg=recorder.ffmpeg)
+        archive.commit(
+            program,
+            key,
+            video,
+            rows,
+            width=config.width,
+            height=config.height,
+            fps=config.capture_fps,
+        )
+    finally:
+        video.unlink(missing_ok=True)
     return ProgramResult(
         program,
-        written,
-        clock() - start,
-        float(np.mean(levels)) if levels else 0.0,
-        settled=settled,
+        frames=len(rows),
+        measured=sum(1 for row in rows if row.setpoint != GAP),
+        seconds=clock() - start,
+        report=report,
     )
 
 
@@ -342,7 +391,7 @@ def harvest(
     archive: Any,
     *,
     open_transport: Callable[[], Any],
-    open_capture: Callable[[], Any],
+    recorder: Any,
     player: Any = None,
     link: Any = None,
     programs: Iterable[str] | None = None,
@@ -371,12 +420,12 @@ def harvest(
     firmware = str(transport.firmware())
     names: Sequence[str] = list(programs) if programs else sorted(transport.programs())
     results, stopped, blacked, start = [], False, False, clock()
+    live = {"config": config, "link": link, "player": player, "sleep": sleep, "clock": clock}
     try:
         with ExitStack() as stack:
             if player is not None:
                 stack.enter_context(player.playing(fps=config.loop_fps))
                 sleep(config.startup_s)
-            capture = stack.enter_context(open_capture())
             for name in names:
                 key = ProgramKey(name, firmware, KeyKind.NAME_FIRMWARE)
                 if archive.has(name, key) or archive.dark(name, key):
@@ -387,7 +436,7 @@ def harvest(
                     results.append(
                         harvest_program(
                             session,
-                            capture,
+                            recorder,
                             archive,
                             transport,
                             name,
@@ -407,16 +456,7 @@ def harvest(
                         stopped = True
                         note(WEDGED_NOTE)
                         break
-                    if carries_stimulus(
-                        session,
-                        capture,
-                        transport,
-                        config=config,
-                        link=link,
-                        player=player,
-                        sleep=sleep,
-                        clock=clock,
-                    ):
+                    if carries_stimulus(session, recorder, transport, **live):
                         continue
                     blacked = True
                     note(BLACKED_NOTE)
@@ -424,21 +464,13 @@ def harvest(
                 note(str(results[-1]))
                 if not results[-1].dark:
                     continue
+                luma = results[-1].report.luma if results[-1].report else 0.0
                 results[-1] = discard_dark(archive, name, key, results[-1])
-                if not carries_stimulus(
-                    session,
-                    capture,
-                    transport,
-                    config=config,
-                    link=link,
-                    player=player,
-                    sleep=sleep,
-                    clock=clock,
-                ):
+                if not carries_stimulus(session, recorder, transport, **live):
                     blacked = True
                     note(BLACKED_NOTE)
                     break
-                archive.mark_dark(name, key, results[-1].luma)
+                archive.mark_dark(name, key, luma)
                 note(f"{name} discarded: dark, but the rig still carries the source")
     finally:
         transport.close()

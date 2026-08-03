@@ -140,8 +140,14 @@ class Capture:                       # long-lived; never reopened per sample
     def wait_for_lock(self, timeout_s=10.0) -> bool
     def is_no_signal(self, frame) -> bool    # capture card synthesizes a splash; see docs/hardware.md
     def wait_for_content(self, timeout_s=15.0) -> bool   # past the splash AND moving
-    def read_native(self) -> np.ndarray | None           # packed YVYU (H, W, 2) uint8
-    def read_pair(self) -> tuple[np.ndarray | None, np.ndarray | None]   # one grab, both views
+
+class Recorder:                      # ffmpeg owns the card; the host touches no frame
+    def __init__(self, device="/dev/video0", *, width, height, fps, mode=MJPEG, copyts=False): ...
+    def command(self, path, *, seconds=None) -> list[str]     # -t is unusable under copyts
+    def recording(self, path, *, seconds=None) -> ContextManager   # records for the block
+    def timestamps(self, path) -> np.ndarray   # per-frame CLOCK_MONOTONIC capture times
+inspect_take(path) -> TakeReport                      # frames, distinct, blank, luma
+settle(recorder, *, program, timeout_s, probe_path)   # records a probe; raises BlankTakeError
 
 class Link:                          # the HDMI link out of the stimulus source host
     def down(self) / up(self) -> str: ...
@@ -165,18 +171,19 @@ plans.sobol(spec, *, n, rng) -> Iterator[dict[int, float | bool]]
 plans.tongue_raster(spec, pair, *, n) -> Iterator[dict[int, float | bool]]
 plans.hysteresis(spec, index, *, n) -> Iterator[dict[int, float | bool]]
 
-runner.run_plan(session, capture, plan, *, program, analyzer, archive=None)
-    -> list[MeasurementRecord]      # archive: an open FrameWriter, which also stores frames
+runner.run_plan(session, capture, plan, *, program, analyzer) -> list[MeasurementRecord]
 fit.fit_profile(records, *, specs=None) -> ProgramProfile
 
-archive.FrameArchive(directory).writer(program, key, *, width, height) -> FrameWriter
-FrameWriter.write(native, *, params, setpoint, loop_index=None) -> int   # native is (H, W, 2) uint8
-FrameReader.stream(*, start=0, count=None) -> Iterator[native]           # one decoder, in order
+archive.FrameArchive(directory).scratch(program) -> Path        # record here, commit is a rename
+FrameArchive.commit(program, key, video, rows, *, width, height, fps) -> dict
+FrameReader.stream(*, start=0, count=None, width=None) -> Iterator[rgb24]  # ffmpeg scales
 
 replay.replay(archive, *, analyzer, programs=None) -> dict[str, list[MeasurementRecord]]
-replay.blank_digest(archive, programs) -> str | None    # the frame the device emits while blanked
+replay.setpoints(reader, *, width) -> Iterator[(setpoint, params, frames)]   # GAP rows dropped
 
-harvest.harvest(archive, *, open_transport, open_capture, player=None, link=None,
+harvest.sweep(session, base, vectors, *, config) -> list[Window]   # when each setpoint was held
+harvest.attribute(times, windows, program, *, base) -> list[FrameRow]   # frame -> setpoint
+harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
                 programs=None, config=HarvestConfig(), session_factory=Session) -> HarvestReport
 ```
 

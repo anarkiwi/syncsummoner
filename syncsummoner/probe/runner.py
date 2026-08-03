@@ -158,23 +158,13 @@ def _ahead(index, expected, capacity):
     return 0 < (index - expected) % capacity < capacity // 2
 
 
-def _read(capture, native):
-    """One grab as ``(rgb, native)``; the card's own buffer only where it is archived."""
-    if not native:
-        return capture.read(), None
-    raw, rgb = capture.read_pair()
-    return rgb, raw
-
-
-def _collect(
-    capture, expected, *, bits, strip_px, frames_per_point, max_wait_frames, allow_untagged, native=False
-):
+def _collect(capture, expected, *, bits, strip_px, frames_per_point, max_wait_frames, allow_untagged):
     capacity = patterns.state_index_capacity(bits)
     samples = []
     for _ in range(max_wait_frames):
         if len(samples) >= frames_per_point:
             break
-        frame, raw = _read(capture, native)
+        frame = capture.read()
         if frame is None or capture.is_no_signal(frame):
             continue
         index = None if allow_untagged else patterns.read_state_index(frame, bits=bits, strip_px=strip_px)
@@ -185,9 +175,9 @@ def _collect(
                 break
             continue
         cropped = patterns.crop_strip(frame, strip_px=strip_px)
-        if samples and np.array_equal(cropped, samples[-1][0]):
+        if samples and np.array_equal(cropped, samples[-1]):
             continue
-        samples.append((cropped, raw))
+        samples.append(cropped)
     return samples
 
 
@@ -212,13 +202,11 @@ def run_plan(
     analysis_width=ANALYSIS_WIDTH,
     replicates=DEFAULT_REPLICATES,
     rng=None,
-    archive=None,
 ):
     """Run ``plan`` on a live session and capture, returning measurement records.
 
     ``emit`` publishes the state index onto the played-out stimulus; with no
     playout, ``allow_untagged`` attributes signal frames to the current vector.
-    An open :class:`FrameWriter` in ``archive`` also stores the native frames.
     """
     firmware = firmware or _firmware(session)
     capacity = patterns.state_index_capacity(bits)
@@ -238,18 +226,13 @@ def run_plan(
             frames_per_point=frames_per_point,
             max_wait_frames=max_wait_frames,
             allow_untagged=allow_untagged,
-            native=archive is not None,
         )
         if not samples:
             continue
-        frames = [frame for frame, _ in samples]
         params = raw_params(vector)
-        if archive is not None:
-            for _, raw in samples:
-                archive.write(raw, params=params, setpoint=step)
         records.append(
             measurement(
-                frames,
+                samples,
                 analyzer,
                 program=program,
                 firmware=firmware,

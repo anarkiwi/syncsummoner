@@ -103,7 +103,7 @@ def test_the_advertised_byte_order_reads_red_as_blue():
 
 
 def test_read_raw_is_the_decoded_bgr_of_the_native_buffer(opened):
-    """The archive keeps native buffers; every other caller gets this upsample."""
+    """Every caller gets the same 4:2:2 upsample of the card's own buffer."""
     capture, fake, _ = opened
     native = native_frame(MEASURED_YVYU["green"][0])
     fake.frames = [native]
@@ -136,104 +136,11 @@ def test_read_raw_before_open_raises(opened):
         capture.read_raw()
 
 
-@pytest.fixture(name="native")
-def native_fixture(monkeypatch):
-    """A native-mode Capture bound to a fake cv2.VideoCapture, plus that fake."""
-    fake = FakeVideoCapture("/dev/video0")
-    monkeypatch.setattr(cv2, "VideoCapture", lambda *args, **kwargs: fake)
-    return Capture(mode=cap.PixelMode.YVYU), fake
-
-
-def noise_frame(height=4, width=4, seed=0):
-    """Packed native ``(H, W, 2)`` uint8 frame, two bytes per pixel."""
-    return np.random.default_rng(seed).integers(0, 256, (height, width, 2), dtype=np.uint8)
-
-
-def test_native_mode_asks_the_card_not_to_convert(native):
-    """The card's only format is YUYV, so conversion is what gets switched off."""
-    capture, fake = native
-    capture.open()
-    assert fake.props[cv2.CAP_PROP_CONVERT_RGB] == 0
-    assert fake.props[cv2.CAP_PROP_FOURCC] == cv2.VideoWriter_fourcc(*"YUYV")
-
-
-@pytest.mark.parametrize("colour", sorted(MEASURED_YVYU))
-def test_both_modes_decode_one_buffer_to_the_same_rgb(monkeypatch, colour):
-    """Neither mode may leave the card's conversion in the path: it bakes in the swap."""
-    planes, expected = MEASURED_YVYU[colour]
-    outputs = []
-    for mode in (cap.PixelMode.BGR, cap.PixelMode.YVYU):
-        fake = FakeVideoCapture("/dev/video0")
-        fake.frames = [native_frame(planes)]
-        monkeypatch.setattr(cv2, "VideoCapture", lambda *a, _fake=fake, **kw: _fake)
-        capture = Capture(mode=mode).open()
-        assert fake.props[cv2.CAP_PROP_CONVERT_RGB] == 0
-        outputs.append(capture.read())
-    assert np.array_equal(outputs[0], outputs[1])
-    assert outputs[0][0, 0] * 255.0 == pytest.approx(expected, abs=1.0)
-
-
-def test_read_native_hands_back_the_cards_own_buffer(native):
-    """The archive must store what the card produced, never an upsample of it."""
-    capture, fake = native
-    frame = noise_frame()
-    fake.frames = [frame]
-    got = capture.open().read_native()
-    assert got is frame
-    assert got.shape == (4, 4, 2) and got.dtype == np.uint8
-
-
-def test_native_mode_still_serves_bgr_and_float_rgb(native):
-    """Existing callers are unaffected; the 4:2:2 upsample just moves into software."""
-    capture, fake = native
-    frame = noise_frame(seed=3)
-    fake.frames = [frame, frame]
-    assert np.array_equal(capture.open().read_raw(), cap.yvyu_to_bgr(frame))
-    rgb = capture.read()
-    assert rgb.dtype == np.float32 and rgb.shape == (4, 4, 3)
-    assert rgb == pytest.approx(cap.bgr_to_rgb(cap.yvyu_to_bgr(frame)))
-
-
-def test_native_frames_need_a_native_handle(opened):
-    """Only the native mode promises the raw buffer, whatever the handle now carries."""
+def test_one_read_costs_one_grab(opened):
+    """Metrics and any archive of a frame must come from the same grab, not two."""
     capture, fake, _ = opened
-    fake.frames = [noise_frame()]
-    with pytest.raises(CaptureError, match="PixelMode.YVYU"):
-        capture.open().read_native()
-
-
-def test_read_pair_describes_one_grab_twice(native):
-    """A second grab is a different frame, so archive and metrics must share one."""
-    capture, fake = native
-    frame = noise_frame(seed=5)
-    fake.frames = [frame]
-    raw, rgb = capture.open().read_pair()
-    assert raw is frame
-    assert rgb == pytest.approx(cap.bgr_to_rgb(cap.yvyu_to_bgr(frame)))
-    assert fake.reads == 1, "one pair costs one grab"
-
-
-def test_read_pair_returns_no_frame_on_a_failed_grab(native):
-    capture, _ = native
-    assert capture.open().read_pair() == (None, None)
-
-
-def test_read_pair_needs_a_native_handle(opened):
-    capture, fake, _ = opened
-    fake.frames = [noise_frame()]
-    with pytest.raises(CaptureError, match="PixelMode.YVYU"):
-        capture.open().read_pair()
-
-
-def test_read_native_returns_none_on_failed_grab(native):
-    capture, _ = native
-    assert capture.open().read_native() is None
-
-
-def test_read_native_before_open_raises(native):
-    capture, _ = native
-    with pytest.raises(CaptureError, match="not open"):
-        capture.read_native()
+    fake.frames = [native_frame(MEASURED_YVYU["red"][0])]
+    assert capture.open().read() is not None and fake.reads == 1
 
 
 def test_context_manager_releases(opened):
@@ -313,12 +220,13 @@ def _stream(target, frames):
 def test_wait_for_content_requires_motion_not_just_a_signal():
     """The rig's drop freezes the output; a splash test alone would pass it."""
     rng = np.random.default_rng(0)
+    clock = FakeClock()
     frozen = np.full((8, 8, 3), 0.4, np.float32)
-    port = Capture()
+    port = Capture(clock=clock, sleep=clock.sleep)
     port.open = lambda: None
     port.is_no_signal = lambda _f: False
-    _stream(port, [frozen] * 40)
-    assert not port.wait_for_content(timeout_s=0.0, run=4)
+    port.read = lambda: (clock.sleep(0.01), frozen)[1]
+    assert not port.wait_for_content(timeout_s=0.2, run=4), "a frozen output never earns a streak"
 
     moving = [rng.random((8, 8, 3)).astype(np.float32) for _ in range(40)]
     _stream(port, moving)
