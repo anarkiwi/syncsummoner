@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -62,6 +63,16 @@ INSPECT_WIDTH = 160
 
 class RecorderError(RuntimeError):
     """The recording did not start, or did not produce a file."""
+
+
+def _diagnostic(errors: Any, *, limit: int = 400) -> str:
+    """The tail of what ffmpeg said, for an error that has to be actionable."""
+    try:
+        errors.seek(0)
+        said = errors.read().decode("utf-8", "replace").strip()
+    except (OSError, ValueError, AttributeError):
+        return "no diagnostic"
+    return said[-limit:] if said else "no diagnostic"
 
 
 class BlankTakeError(RuntimeError):
@@ -157,23 +168,33 @@ class Recorder:
     def recording(
         self, path: str | Path, *, seconds: float | None = None, settle_s: float = 1.5
     ) -> Iterator[Any]:
-        """Record for the duration of the block, yielding once it is running."""
-        proc = self._popen(
-            self.command(path, seconds=seconds),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self._sleep(settle_s)
-        if proc.poll() is not None:
-            raise RecorderError(f"the recorder exited immediately for {self.device}")
+        """Record for the duration of the block, yielding once it is running.
+
+        ffmpeg's diagnostics are kept rather than discarded: a recorder that dies
+        silently is a fault nobody can tell from a rig that has gone dark.
+        """
+        errors = tempfile.TemporaryFile()
         try:
-            yield proc
+            proc = self._popen(
+                self.command(path, seconds=seconds),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=errors,
+            )
+            self._sleep(settle_s)
+            if proc.poll() is not None:
+                raise RecorderError(
+                    f"the recorder exited {proc.returncode} for {self.device}: {_diagnostic(errors)}"
+                )
+            try:
+                yield proc
+            finally:
+                self.stop(proc)
+            written = Path(path)
+            if not written.exists() or not written.stat().st_size:
+                raise RecorderError(f"the recorder wrote nothing to {path}: {_diagnostic(errors)}")
         finally:
-            self.stop(proc)
-        written = Path(path)
-        if not written.exists() or not written.stat().st_size:
-            raise RecorderError(f"the recorder wrote nothing to {path}")
+            errors.close()
 
     def stop(self, proc: Any, *, timeout_s: float = 20.0) -> int:
         """Ask ffmpeg to finish the file, and wait for it to do so."""
@@ -261,18 +282,26 @@ def settle(
     """Wait for the picture to come back after a load, by recording a short probe.
 
     Liveness is judged the same way a take is, because judging it any other way
-    is how a working rig gets called faulted.
+    is how a working rig gets called faulted. A load drops the source link and the
+    card has no mode to open until it relocks, so a recorder that will not start
+    yet is part of what this waits through rather than a failure.
     """
     deadline = clock() + timeout_s
     probe = Path(str(probe_path))
     report = TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
+    said = ""
     try:
         while clock() < deadline:
-            with recorder.recording(probe, seconds=probe_s):
-                sleep(probe_s)
+            try:
+                with recorder.recording(probe, seconds=probe_s):
+                    sleep(probe_s)
+            except RecorderError as exc:
+                said = str(exc)
+                continue
             report = inspect_take(probe, ffmpeg=recorder.ffmpeg)
             if report.usable:
                 return report
     finally:
         probe.unlink(missing_ok=True)
-    raise BlankTakeError(f"{program}: no picture within {timeout_s}s of the load ({report})")
+    trailer = f"; last recorder error: {said}" if said else ""
+    raise BlankTakeError(f"{program}: no picture within {timeout_s}s of the load ({report}{trailer})")
