@@ -294,7 +294,7 @@ def render_played(
         raise ValueError("score has no layers to render")
     config = RenderConfig() if config is None else config
     owned = rig is None
-    rig = open_rig(config, player=True) if owned else rig
+    rig = open_rig(config, player=True, capture=False) if owned else rig
     if not prepared:
         write_timecoded(source, scratch, config=config, seconds=score.duration)
     if recorder is None:
@@ -315,7 +315,7 @@ def render_played(
             with recorder.recording(out, seconds=score.duration):
                 drive(rig, auto, duration=score.duration)
     finally:
-        if owned:
+        if owned and rig.capture is not None:
             rig.capture.close()
     return inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
 
@@ -409,12 +409,12 @@ def render_cuts(
     return plan
 
 
-def open_rig(config: RenderConfig, *, player: bool = False) -> Rig:
+def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
-    Imported here so compose never needs hardware. The capture is opened rather
-    than merely constructed: a pass grabs frame by frame and never enters it as a
-    context, so an unopened handle only fails once the first frame is due.
+    Imported here so compose never needs hardware. A recorded pass wants no
+    capture at all: ffmpeg opens the card itself, and a handle held here would
+    keep it from doing so.
     """
     from syncsummoner.device import capture as capture_mod
     from syncsummoner.device import link as link_mod
@@ -426,7 +426,11 @@ def open_rig(config: RenderConfig, *, player: bool = False) -> Rig:
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         session=session_mod.Session(transport, cc_budget_hz=config.cc_budget_hz),
-        capture=capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)).open(),
+        capture=(
+            capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)).open()
+            if capture
+            else None
+        ),
         playout=(playout_mod.ClipPlayer if player else playout_mod.Playout)(
             *host, width=config.width, height=config.height
         ),

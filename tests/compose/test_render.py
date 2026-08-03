@@ -355,3 +355,25 @@ def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
     config = dataclasses.replace(CONFIG, settle_s=1.0, probe_path=str(tmp_path / "probe.mkv"))
     with pytest.raises(R.BlankTakeError, match="no picture within"):
         R.settle(Rec(), config, program="Dead", probe_s=0.0, clock=lambda: next(ticks), sleep=lambda s: None)
+
+
+def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
+    """A capture held here stops ffmpeg opening the card, and the pass dies at once."""
+    import syncsummoner.device.capture as capture_mod
+    import syncsummoner.device.link as link_mod
+    import syncsummoner.device.playout as playout_mod
+    import syncsummoner.device.session as session_mod
+    import syncsummoner.device.transport as transport_mod
+
+    opened = []
+    monkeypatch.setattr(
+        capture_mod, "Capture", lambda **kw: types.SimpleNamespace(open=lambda: opened.append(True))
+    )
+    monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
+    monkeypatch.setattr(playout_mod, "Playout", lambda *a, **k: None)
+    monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
+    monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
+    monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
+    assert R.open_rig(CONFIG, capture=False).capture is None and not opened
+    R.open_rig(CONFIG, capture=True)
+    assert opened == [True], "the old path still gets one when it asks"
