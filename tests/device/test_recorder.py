@@ -255,3 +255,52 @@ def test_settling_past_the_deadline_never_records(monkeypatch, tmp_path):
             sleep=lambda s: None,
         )
     assert not recorder.probes
+
+
+def test_settle_waits_through_a_recorder_that_cannot_open_the_card_yet(tmp_path, monkeypatch, clock):
+    """A load drops the source link, so the card has no mode to open until it relocks."""
+    attempts = []
+
+    def popen(argv, *, stderr=None, **kwargs):
+        del argv, kwargs
+        attempts.append(1)
+        if len(attempts) < 3:
+            if stderr is not None:
+                stderr.write(b"/dev/video0: No such device")
+            return types.SimpleNamespace(poll=lambda: 1, returncode=1, wait=lambda timeout=None: 1)
+        (tmp_path / "probe.mkv").write_bytes(b"x")
+        return types.SimpleNamespace(
+            stdin=types.SimpleNamespace(write=lambda b: None, flush=lambda: None, close=lambda: None),
+            poll=lambda: None,
+            returncode=None,
+            wait=lambda timeout=None: 0,
+            kill=lambda: None,
+        )
+
+    live = TakeReport(frames=8, distinct=8, blank=0, luma=0.4)
+    monkeypatch.setattr(rec, "inspect_take", lambda *a, **k: live)
+    recorder = Recorder(popen=popen, sleep=clock.sleep)
+    report = settle(
+        recorder,
+        program="Teletext",
+        timeout_s=40.0,
+        probe_path=tmp_path / "probe.mkv",
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert report is live and len(attempts) == 3
+
+
+def test_settle_reports_the_recorder_error_when_the_card_never_opens(tmp_path, clock):
+    """Giving up on a card that never opened must not read as a black picture."""
+    popen = fake_popen([], returncode=1, says=b"/dev/video0: Device or resource busy")
+    recorder = Recorder(popen=popen, sleep=clock.sleep)
+    with pytest.raises(BlankTakeError, match="Device or resource busy"):
+        settle(
+            recorder,
+            program="Teletext",
+            timeout_s=6.0,
+            probe_path=tmp_path / "probe.mkv",
+            clock=clock,
+            sleep=clock.sleep,
+        )

@@ -282,18 +282,26 @@ def settle(
     """Wait for the picture to come back after a load, by recording a short probe.
 
     Liveness is judged the same way a take is, because judging it any other way
-    is how a working rig gets called faulted.
+    is how a working rig gets called faulted. A load drops the source link and the
+    card has no mode to open until it relocks, so a recorder that will not start
+    yet is part of what this waits through rather than a failure.
     """
     deadline = clock() + timeout_s
     probe = Path(str(probe_path))
     report = TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
+    said = ""
     try:
         while clock() < deadline:
-            with recorder.recording(probe, seconds=probe_s):
-                sleep(probe_s)
+            try:
+                with recorder.recording(probe, seconds=probe_s):
+                    sleep(probe_s)
+            except RecorderError as exc:
+                said = str(exc)
+                continue
             report = inspect_take(probe, ffmpeg=recorder.ffmpeg)
             if report.usable:
                 return report
     finally:
         probe.unlink(missing_ok=True)
-    raise BlankTakeError(f"{program}: no picture within {timeout_s}s of the load ({report})")
+    trailer = f"; last recorder error: {said}" if said else ""
+    raise BlankTakeError(f"{program}: no picture within {timeout_s}s of the load ({report}{trailer})")
