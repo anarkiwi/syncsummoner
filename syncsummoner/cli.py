@@ -71,8 +71,8 @@ def _link(args: argparse.Namespace):
     return Link(host) if host else Link()
 
 
-def _measure(session, capture, args, *, program, specs, firmware, rng, writer):
-    """Records from every configured plan for one program, archiving frames if asked."""
+def _measure(session, capture, args, *, program, specs, firmware, rng):
+    """Records from every configured plan for one program."""
     from syncsummoner import aesthetics
     from syncsummoner.probe import plans, runner
 
@@ -86,31 +86,25 @@ def _measure(session, capture, args, *, program, specs, firmware, rng, writer):
             analyzer=aesthetics,
             firmware=firmware,
             allow_untagged=args.allow_untagged,
-            archive=writer,
         )
     return records
 
 
 def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tuple[list, Any]:
     """Measure every requested program on the rig, resuming whatever is stored."""
-    from contextlib import ExitStack
-
-    from syncsummoner.device.capture import Capture, PixelMode
+    from syncsummoner.device.capture import Capture
     from syncsummoner.device.session import Session
     from syncsummoner.device.transport import Transport
-    from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.store import ResultStore, program_key
 
     dev = Transport.open(serial=args.serial)
     store = ResultStore(args.store or Path(args.out))
-    frames = FrameArchive(args.archive) if args.archive else None
     link, records = _link(args), []
     try:
         names = dev.programs() if args.program == "all" else args.program.split(",")
         firmware, manifest = dev.firmware(), dev.program_manifest()
         session = Session(dev)
-        mode = PixelMode.YVYU if frames is not None else PixelMode.BGR
-        with Capture(device=args.capture, mode=mode) as capture:
+        with Capture(device=args.capture) as capture:
             for name in names:
                 key = program_key(dev, name, firmware=firmware, manifest=manifest)
                 done = store.get(name, key)
@@ -120,24 +114,15 @@ def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tu
                 session.load_program(name, link=link)
                 session.ensure_live(capture, require_motion=False)
                 specs_by_program[name] = dev.program_info().params
-                with ExitStack() as stack:
-                    writer = (
-                        None
-                        if frames is None
-                        else stack.enter_context(
-                            frames.writer(name, key, width=capture.width, height=capture.height)
-                        )
-                    )
-                    measured = _measure(
-                        session,
-                        capture,
-                        args,
-                        program=name,
-                        specs=specs_by_program[name],
-                        firmware=firmware,
-                        rng=rng,
-                        writer=writer,
-                    )
+                measured = _measure(
+                    session,
+                    capture,
+                    args,
+                    program=name,
+                    specs=specs_by_program[name],
+                    firmware=firmware,
+                    rng=rng,
+                )
                 if measured:
                     store.put(name, key, measured)
                 records += measured
@@ -204,8 +189,8 @@ def _refit_cmd(args: argparse.Namespace) -> int:
 
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
-    from syncsummoner.device.capture import Capture, PixelMode
     from syncsummoner.device.playout import LoopPlayer
+    from syncsummoner.device.recorder import FFV1, Recorder
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.harvest import HarvestConfig, harvest
@@ -215,19 +200,20 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         height=args.height,
         capture_fps=args.capture_fps,
         setpoints=args.setpoints,
-        frames_per_point=args.frames_per_point,
+        dwell_s=args.dwell,
         seed=args.seed,
     )
     host = {} if args.source_host is None else {"host": args.source_host}
     report = harvest(
         FrameArchive(args.out),
         open_transport=lambda: Transport.open(serial=args.serial),
-        open_capture=lambda: Capture(
+        recorder=Recorder(
             device=args.capture,
             width=config.width,
             height=config.height,
             fps=config.capture_fps,
-            mode=PixelMode.YVYU,
+            mode=FFV1,
+            copyts=True,
         ),
         player=LoopPlayer(width=config.width, height=config.height, **host),
         link=_link(args),
@@ -367,7 +353,6 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--out", default="profiles/")
     run.add_argument("--store", help="resumable per-program result store (default: --out)")
-    run.add_argument("--archive", help="also store the native capture frames under this directory")
     _add_link_args(run)
     simulate = probe_sub.add_parser("sim")
     simulate.add_argument("--program", required=True)
@@ -391,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--height", type=int, default=1080)
     collect.add_argument("--capture-fps", type=int, default=30)
     collect.add_argument("--setpoints", type=int, default=32)
-    collect.add_argument("--frames-per-point", type=int, default=30)
+    collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
     collect.add_argument("--seed", type=int, default=11)
     _add_link_args(collect)
     collect.set_defaults(func=_harvest_cmd)

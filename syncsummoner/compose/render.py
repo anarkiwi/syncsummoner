@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
+from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
@@ -25,38 +26,10 @@ class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
 
-class BlankTakeError(RuntimeError):
-    """The device never returned a picture, so the take would have been black."""
-
-
-@dataclass(frozen=True)
-class TakeReport:
-    """What a finished take actually holds, so a blank one is caught here and not on playback."""
-
-    frames: int
-    distinct: int
-    blank: int
-    luma: float
-
-    @property
-    def usable(self) -> bool:
-        """Whether the take carries picture at all."""
-        return bool(self.frames) and self.blank < self.frames // 2 and self.distinct > 1
-
-    def __str__(self) -> str:
-        return (
-            f"{self.frames} frames, {self.distinct} distinct, "
-            f"{self.blank} blank, mean luma {self.luma:.3f}"
-            f"{'' if self.usable else '  UNUSABLE'}"
-        )
-
-
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
 #: whatever both ends already run at; 1080p30 is this rig, measured.
 SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
 EARLY_BIAS_S = 0.015
-#: Mean level below which a captured frame carries no picture; the archive uses the same idea.
-BLANK_LEVEL = 0.02
 
 
 @dataclass(frozen=True)
@@ -212,67 +185,6 @@ def drive(rig: Rig, auto: Automation, *, duration: float, clock=time.monotonic, 
     return written
 
 
-def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240) -> TakeReport:
-    """Measure a finished take, so a blank one is caught here and not on playback."""
-    import hashlib
-
-    argv = [
-        ffmpeg,
-        "-loglevel",
-        "error",
-        "-i",
-        str(path),
-        "-vf",
-        f"scale=160:-2,fps=source_fps/{max(1, samples // 60)}",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "gray",
-        "pipe:1",
-    ]
-    done = subprocess.run(argv, check=False, capture_output=True)
-    data = done.stdout
-    if not data:
-        return TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
-    stride = 160 * 90
-    frames = [data[i : i + stride] for i in range(0, len(data) - stride + 1, stride)]
-    levels = [float(np.frombuffer(f, np.uint8).mean()) / 255.0 for f in frames]
-    return TakeReport(
-        frames=len(frames),
-        distinct=len({hashlib.blake2b(f, digest_size=8).digest() for f in frames}),
-        blank=sum(1 for lvl in levels if lvl < BLANK_LEVEL),
-        luma=float(np.mean(levels)) if levels else 0.0,
-    )
-
-
-def settle(
-    recorder: Any,
-    config: RenderConfig,
-    *,
-    program: str,
-    probe_s: float = 2.0,
-    clock=time.monotonic,
-    sleep=time.sleep,
-) -> TakeReport:
-    """Wait for the picture to come back after a load, by recording a short probe.
-
-    Liveness is judged the same way a take is, because judging it any other way
-    is how a working rig gets called faulted.
-    """
-    deadline = clock() + config.settle_s
-    probe = Path(str(config.probe_path))
-    report = TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
-    while clock() < deadline:
-        with recorder.recording(probe, seconds=probe_s):
-            sleep(probe_s)
-        report = inspect_take(probe, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
-        if report.usable:
-            probe.unlink(missing_ok=True)
-            return report
-    probe.unlink(missing_ok=True)
-    raise BlankTakeError(f"{program}: no picture within {config.settle_s}s of the load ({report})")
-
-
 def render_played(
     score: Score,
     source: Any,
@@ -313,7 +225,12 @@ def render_played(
         with rig.playout.playing(fps=config.fps):
             rig.session.load_program(layers[0].program, link=rig.link)
             rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
-            settle(recorder, config, program=layers[0].program)
+            settle(
+                recorder,
+                program=layers[0].program,
+                timeout_s=config.settle_s,
+                probe_path=config.probe_path,
+            )
             with recorder.recording(out, seconds=score.duration):
                 drive(rig, auto, duration=score.duration)
     finally:

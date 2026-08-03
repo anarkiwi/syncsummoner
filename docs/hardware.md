@@ -8,35 +8,37 @@ them wrong produces a harness that silently measures the wrong thing.
 | Part | Value |
 | --- | --- |
 | Videomancer serial | `E464B0605F113625` |
-| Firmware | `1.0.0-rc.37` |
-| Programs installed | 21 |
+| Firmware | `1.0.0-rc.40` |
+| Programs installed | 52 |
 | MIDI node | `/dev/snd/midiC4D0` |
 | Serial node | `/dev/ttyACM0` (needs `dialout` or an ACL) |
 | Capture card | AVerMedia Live Gamer Ultra 2.1, `/dev/video0`, uvcvideo |
-| Session format | **720x576i PAL @ 50**, `YUYV` advertised, **YVYU delivered** |
+| Session format | **1920x1080 @ 30**, `YUYV` advertised, **chroma pair exchanged** |
 
 The serial ACL is dropped whenever the device re-enumerates; `/dev/ttyACM0`
 returns as `c---------`. Re-run `setfacl` after any replug, or install a udev
 rule.
 
-## The capture card lies about its byte order
+## The chroma pair arrives exchanged
 
-`v4l2-ctl --list-formats-ext` reports exactly one format, `YUYV 4:2:2`, but the
-bytes are `YVYU`: Cb and Cr arrive exchanged, which swaps red and blue. A full
-red source reads back `Y=40.9 Cb=240.8 Cr=109.0`, which BT.601 calls blue;
-decoding the same buffer as YVYU recovers `R=208.6`, the limited-range red the
-playout chain actually sends. The card's own `Colorbars` program shows the same
-exchange with no source in the path, so the fault is the capture card's.
+`v4l2-ctl --list-formats-ext` reports exactly one format, `YUYV 4:2:2`, but Cb and
+Cr arrive exchanged, which swaps red and blue. The proof needs no source: the
+device's own `Colorbars` decodes as white, **cyan, yellow**, green, magenta,
+**blue, red**, black under the advertised order, and as textbook SMPTE order once
+the pair is put back. The card's MJPEG output carries the same exchange, so
+choosing a format does not avoid it.
 
-Consequences, all handled in `syncsummoner/device/capture.py`:
+Consequences:
 
-* Decode native buffers with `COLOR_YUV2BGR_YVYU`, never `..._YUYV`.
+* `syncsummoner/device/capture.py` decodes native buffers with
+  `COLOR_YUV2BGR_YVYU`, never `..._YUYV`.
+* The archive recorder captures `yuyv422` and filters `-vf swapuv` before
+  encoding, so what is stored is already right and nothing downstream corrects it.
+* A recording stored with `-c copy` cannot be filtered, so an MJPEG take keeps the
+  exchange and has to be swapped wherever it is re-encoded.
 * Never let the card convert (`CAP_PROP_CONVERT_RGB=1`). It uses the advertised
   order **and clips**: full red becomes a clipped `B=254.5`, so the true `R=208.6`
   is gone and no channel swap or matrix correction recovers it.
-* Raw archives must tag the pipe `yvyu422`. Under `yuyv422` the bytes still
-  round-trip bit-exactly while the stored `yuv422p` holds the chroma planes
-  exchanged, which bakes the swap in permanently.
 
 ## Parameters are additive
 
@@ -83,10 +85,9 @@ Measured against Colorbars, holding the stream open past lock:
 | `1080p30` | **no signal** |
 | `1080i60` | **no signal** |
 
-Measured while genlocked to an NTSC source. 720p60 was the only usable
-progressive format. Since the source is now PAL and the device auto-genlocks,
-no override is used and the session runs at 720x576i throughout. Format is a
-session constant, never a parameter.
+Measured while genlocked to an NTSC source, where 720p60 was the only usable
+progressive format. The session now genlocks to the Pi over HDMI at 1920x1080@30
+with no override. Format is a session constant, never a parameter.
 
 ## The capture card synthesizes a "No Signal" splash
 
@@ -139,24 +140,25 @@ require an external loop via Dual In (HDMI in, analog out, external chain,
 analog in). The `feedback_gain` canonical axis is unmeasurable until that loop
 exists.
 
-## Playout is a Raspberry Pi on composite
+## Playout is a Raspberry Pi
 
-This host has no usable HDMI output, and the Videomancer's HDMI input reads
-`connected: false`. Stimulus playout is instead a Raspberry Pi 4B (`pi@videopi`)
-driving composite video into the Videomancer's analog input, which genlocks to
-it. `video input analog` selects it; `video input` accepts only `analog|hdmi`.
+This host has no usable HDMI output. Stimulus playout is a Raspberry Pi 4B
+(`pi@videopi`) writing its framebuffer, which the Videomancer genlocks to.
+`video input` accepts only `analog|hdmi`. The composite path below was the
+original chain and is kept for its transfer measurements; the session now runs
+1920x1080 over HDMI, which carries chroma where composite did not.
 
 | Pi property | Value |
 | --- | --- |
-| Framebuffer | `/dev/fb0`, 720x576, 16bpp RGB565, stride 1440, no padding |
-| Driver | `vc4drmfb`, `enable_tvout=1`, `dtoverlay=vc4-kms-v3d,composite` |
-| TV norm | `vc4.tv_norm=PAL` on the kernel cmdline |
+| Framebuffer | `/dev/fb0`, 1920x1080, 16bpp, stride 3840 |
+| Word layout | **BGR565**: `rgb565le` bytes come back with red and blue exchanged |
+| Frame size | 4147200 bytes |
+| Composite framebuffer | 720x576, stride 1440, 829440 bytes, `vc4.tv_norm=PAL` |
 | Composite modes | `720x576i`, `720x480i`, `720x288`, `720x240` |
 | Compositor | none running, so DRM is free |
-| Frame size | 829440 bytes |
 
-A frame is displayed by writing raw RGB565 little-endian bytes to `/dev/fb0`.
-The Pi's HDMI outputs are unused.
+A frame is displayed by writing raw 16-bit little-endian words to `/dev/fb0`,
+blue in the high bits. `ffmpeg -pix_fmt bgr565le` produces them directly.
 
 ## Measured chain transfer
 
@@ -218,7 +220,9 @@ Observed repeatedly on `1.0.0-rc.37`: the input stops passing video while the
 device still reports `hdmi.locked: true`, usually with `hdmi.connected: false`,
 and sometimes with the top-level `locked` false while the sub-status disagrees.
 The front-panel HDMI input light stays lit, and the source keeps driving a valid
-mode, so it is a firmware state rather than a cable fault.
+mode. Check the cable before the firmware: on 2026-08-03 a failing output cable
+produced the same picture, and `hdmi.connected` went false to true when it was
+replaced.
 
 | Recovery attempt | Result |
 | --- | --- |
@@ -254,10 +258,11 @@ reads false whenever timing is overridden even though the input is fine. The
 selected input's own sub-status is the authoritative field, which is what
 `VideoStatus.source_locked` reads.
 
-Every one of these flags is advisory. The firmware reports `hdmi.connected:
-false` while passing video perfectly, and reports a locked input while passing
-nothing at all. Only a capture proves frames are arriving, so anything that
-records must check the frames themselves.
+Every one of these flags is advisory in isolation. The firmware has reported
+`hdmi.connected: false` while passing video perfectly, and a locked input while
+passing nothing at all; it has also tracked a real cable fault exactly. Only a
+capture proves frames are arriving, so anything that records must check the
+frames themselves.
 
 `VideoStatus.source_locked` exists because of this: it cross-checks the selected
 input's own sub-status against the top-level flag, so an unattended sweep fails
@@ -296,25 +301,19 @@ name plus firmware (`KeyKind.NAME_FIRMWARE`) rather than on the program binary:
 `program_key` hashes each binary over the serial shell, which its own docstring
 notes runs at wire speed and can time out.
 
-## Programs freeze while passthrough still carries the source
+## Retracted: "programs freeze while passthrough carries the source"
 
-Measured 2026-08-03, a third fault and the only one the canary calls healthy. The
-device answers, loads any program, and `Passthru` passes a moving source frame for
-frame; every other program emits a still picture. With the source playing at 30fps
-and a program loaded, the capture saw:
+Recorded here on 2026-08-03 as a third fault and **withdrawn the same day**. Two
+faults of the harness produced it together: capture was a per-frame Python loop
+that could not hold the session rate and handed back repeated buffers, and the
+HDMI cable from the Videomancer to the capture card was failing. Replacing the
+cable restored the picture with no power cycle, and `hdmi.connected` went false to
+true across the swap. Under ffmpeg-owned capture a 60s take of `Teletext` on the
+same device held **894 distinct frames of 900**.
 
-| program | distinct pictures in 155 grabs | timecodes decoded |
-| --- | --- | --- |
-| `Passthru` | 148 | 148 |
-| `Jammer`, `Sabattier`, `Scramble`, `Derez`, `Stochasm` | 2 | 0 |
-
-`Capture.wait_for_content` returns False throughout, and waiting 25s past the load
-changes nothing. A power cycle clears it: the same programs then returned 152 and
-153 distinct pictures with their stamps intact.
-
-`carries_stimulus` loads `Passthru` to decide whether the rig or the program is
-dark, so this fault reads as a healthy rig and a dark program, once per program,
-for the whole library. A canary that only proves the passthrough cannot see it.
+The lesson is kept because it was expensive: liveness must be judged the same way
+a take is judged, from a recording, and a rig that a person can watch working is
+working.
 
 ## The device emits pure black while reporting a live source
 
@@ -339,27 +338,43 @@ count: it commits per program and resumes from what is stored, and the operator 
 told which fault stopped it. A 49-program library costs an unknown number of power
 cycles, several at least.
 
-The same fault frame also opens an otherwise healthy program. Scanned across a
-complete 49-program archive (2026-08-02, firmware `1.0.0-rc.40`), that frame is
-byte-identical everywhere it appears and held **33 of 1506 setpoints across 12
-programs**, always as a leading run of up to 5 setpoints. Timestamps put the
-picture back **12.2-19.1s after the load**, past the 10s `content_timeout_s`
-whose result the caller discarded, so the blanked output was archived against
-real sweep vectors. The wait is now honoured and the budget covers the measured
-relock; a per-program mean cannot catch this, because the program is not dark.
+How much of this survives the failing HDMI cable found on 2026-08-03 is not
+settled: some of the black attributed to the device was that cable, and the
+49-program archive it is measured from was captured through both faults. The
+recurrence and the passthrough canary are kept because the canary is cheap and
+the diagnosis it gives is the one an operator needs; the numbers are not to be
+relied on until a run on the repaired rig either reproduces them or does not.
 
-## Reads outrun the card
+The load blackout itself is real and slow: timestamps put the picture back
+**12.2-19.1s after the load**, which is why the settle budget is 40s. It is now
+covered by construction rather than by a heuristic — the sweep only opens a
+setpoint's window once the picture is back and the parameters have landed, so a
+frame captured during the blackout is outside every window and is never
+attributed to a vector.
 
-A 30-frame burst spanned **0.20-0.50s** against a 30fps capture, with 20-92% of
-its reads under 10ms apart: `VideoCapture.read` hands back the previous buffer
-rather than blocking. Bursts held 19-30 distinct frames of 30 where the picture
-moved and **as little as one** where it did not, so an unpaced burst samples the
-few milliseconds the reads take instead of the setpoint. `native_burst` drops a
-frame equal to the one stored before it and paces at the capture period.
+## A per-frame host loop cannot hold the session rate
 
-`DARK_LUMA` is 20.0. The codeframe stimulus reaches the card near mid grey
-(Y~128), healthy programs measured 62-180 and the two faults measured 0.0 and
-11.2, so the threshold sits in a wide empirical gap rather than on a tuned edge.
+`VideoCapture.read` does not block: a 30-frame burst spanned **0.20-0.50s** with
+20-92% of its reads under 10ms apart, handing back the previous buffer rather
+than waiting, and held **as little as one distinct frame** where the picture was
+still. Pacing and de-duplicating the reads hid the shortfall rather than fixing
+it, and made a working rig look faulted.
+
+Measured throughput at 1920x1080, same card and host:
+
+| Path | Rate |
+| --- | --- |
+| Python loop, frames into an FFV1 encoder in-process | 7.7 fps |
+| Python loop, frames discarded | 25 fps |
+| `ffmpeg -f v4l2 -input_format yuyv422 -c:v ffv1` | 29.8 fps |
+| `ffmpeg -f v4l2 -input_format mjpeg -c copy` | 59.8 fps |
+
+Capture is therefore owned by ffmpeg and the host touches no frame while the rig
+runs. Under `-copyts` the stored presentation times are the card's own
+`CLOCK_MONOTONIC` capture times, which is the clock `time.monotonic` reads, so
+frames can be attributed to the setpoint that was being held when each arrived
+with no alignment step. `-t` must not be used with `-copyts`: it is read against
+the card's clock and ends the recording immediately.
 
 ## `settings export` and `settings get` hang the serial shell
 

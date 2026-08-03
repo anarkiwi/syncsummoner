@@ -103,6 +103,36 @@ def test_schedule_biases_visuals_early():
     assert R.schedule(auto).times[0] < auto.times[0]
 
 
+class Clock:
+    """Monotonic clock advanced only by the sleeps handed to it."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        """Sleep."""
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_drive_wakes_only_when_a_parameter_is_due():
+    """The host does nothing per frame: simultaneous writes are one batch, not one call each."""
+    auto = Automation.concat([Automation.of([0.0, 0.4], 2, [500, 900]), Automation.of([0.0], 5, 300)])
+    rig = R.Rig(session=FakeSession(), capture=None, playout=None)
+    clock = Clock()
+    written = R.drive(rig, auto, duration=1.0, clock=clock, sleep=clock.sleep)
+    assert written == 3
+    assert rig.session.calls == [
+        {2: 500 / R.PARAM_MAX, 5: 300 / R.PARAM_MAX},
+        {2: 900 / R.PARAM_MAX},
+    ]
+    assert clock.slept == pytest.approx([0.4, 0.6]), "it sleeps to the next event, then out the take"
+
+
 def test_open_rig_builds_from_the_device_layer(monkeypatch):
     built = {}
 
@@ -314,47 +344,82 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
         )
 
 
-def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path):
-    """A guard built on the discarded per-frame loop failed on a perfectly good picture."""
-    seen = []
+def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_path):
+    """The load blacks the output out, so the take may not start until it is back."""
+    order = []
 
-    class Rec:
-        """Recorder stand-in producing whatever the next report says."""
+    class Session:
+        """Session recording the load only."""
 
-        def recording(self, path, seconds=None, settle_s=0.0):
-            """Recording."""
-            del seconds, settle_s
-            seen.append(str(path))
+        def load_program(self, program, link=None):
+            """Load program."""
+            del link
+            order.append(("load", program))
+
+        def working_point(self, info):
+            """Working point."""
+            del info
+            return {}
+
+        def set_params(self, values):
+            """Set params."""
+            del values
+
+    class Player:
+        """Playout stand-in."""
+
+        def upload(self, path):
+            """Upload."""
+
+        def playing(self, fps):
+            """Playing."""
+            del fps
             return contextlib.nullcontext()
 
-    reports = iter(
-        [
-            R.TakeReport(frames=10, distinct=1, blank=10, luma=0.0),
-            R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4),
-        ]
-    )
-    monkeypatch.setattr(R, "inspect_take", lambda path, ffmpeg="ffmpeg": next(reports))
-    config = dataclasses.replace(CONFIG, probe_path=str(tmp_path / "probe.mkv"))
-    got = R.settle(Rec(), config, program="Teletext", probe_s=0.0, sleep=lambda s: None)
-    assert got.usable and len(seen) == 2, "it keeps probing until the picture is back"
-
-
-def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
     class Rec:
-        """Recorder that only ever sees black."""
+        """Recorder stand-in recording when the take itself started."""
 
-        def recording(self, path, seconds=None, settle_s=0.0):
+        def recording(self, path, seconds=None):
             """Recording."""
-            del path, seconds, settle_s
+            del path, seconds
+            order.append(("record",))
             return contextlib.nullcontext()
 
-    monkeypatch.setattr(
-        R, "inspect_take", lambda path, ffmpeg="ffmpeg": R.TakeReport(frames=6, distinct=1, blank=6, luma=0.0)
+    def fake_settle(recorder, **kwargs):
+        del recorder
+        order.append(("settle", kwargs))
+        return R.TakeReport(4, 4, 0, 0.4)
+
+    monkeypatch.setattr(R, "settle", fake_settle)
+    monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
+    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: R.TakeReport(4, 4, 0, 0.4))
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+    config = dataclasses.replace(CONFIG, settle_s=7.5, probe_path=str(tmp_path / "probe.mkv"))
+    score = Score(
+        seed=1, duration=1.0, fps=CONFIG.fps, layers=[Layer(index=0, program="Teletext", gestures=[])]
     )
-    ticks = iter([0.0, 0.0, 99.0, 99.0])
-    config = dataclasses.replace(CONFIG, settle_s=1.0, probe_path=str(tmp_path / "probe.mkv"))
-    with pytest.raises(R.BlankTakeError, match="no picture within"):
-        R.settle(Rec(), config, program="Dead", probe_s=0.0, clock=lambda: next(ticks), sleep=lambda s: None)
+    R.render_played(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        rig=R.Rig(
+            session=Session(),
+            capture=None,
+            playout=Player(),
+            transport=types.SimpleNamespace(program_info=lambda: None),
+        ),
+        config=config,
+        scratch=tmp_path / "tc.mkv",
+        prepared=True,
+        recorder=Rec(),
+    )
+    assert [step[0] for step in order] == ["load", "settle", "record"]
+    assert order[1][1] == {
+        "program": "Teletext",
+        "timeout_s": 7.5,
+        "probe_path": config.probe_path,
+    }
 
 
 def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):

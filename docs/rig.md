@@ -89,8 +89,10 @@ the program.
 
 ## Gotchas
 
-Hold the capture stream open. Lock costs are seconds, far above any per-sample
-dwell, and reopening per sample makes the sweep meaningless.
+Only one process may hold `/dev/video0`. ffmpeg records the card, so nothing
+else may open it during a pass; a `Capture` handle left open makes the recorder
+exit immediately. Reopening also costs about 0.5 s of lock, so a pass records
+once rather than per sample.
 
 The capture card synthesizes a "No Signal" splash rather than going black. It
 has high variance and will pass any naive liveness test as content.

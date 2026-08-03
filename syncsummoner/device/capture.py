@@ -7,7 +7,6 @@ and delivers YVYU, so every frame is decoded with the chroma pair exchanged.
 
 from __future__ import annotations
 
-import enum
 import time
 from itertools import islice
 from typing import Any, Callable, Iterator
@@ -32,23 +31,11 @@ class CaptureError(RuntimeError):
     """The capture device could not be opened or configured."""
 
 
-class PixelMode(enum.Enum):
-    """Whether the caller wants converted frames only, or the native buffer too.
-
-    Both open with ``CAP_PROP_CONVERT_RGB`` off: the card's own conversion reads
-    the chroma pair in the advertised order and clips the result, which no later
-    correction can undo, so the 4:2:2 upsample always happens in software here.
-    """
-
-    BGR = "bgr"
-    YVYU = "yvyu"
-
-
 def yvyu_to_bgr(frame: np.ndarray) -> np.ndarray:
     """Packed native ``(H, W, 2)`` to uint8 BGR, reading the chroma pair as YVYU.
 
-    Measured, not advertised: a red source arrives as Cb=241 Cr=109, which the
-    advertised YUYV order decodes as blue.
+    The chroma pair arrives exchanged whatever format the card is asked for: its
+    own ``Colorbars`` decodes to SMPTE order only once the pair is put back.
     """
     return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YVYU)
 
@@ -61,9 +48,8 @@ def bgr_to_rgb(frame: np.ndarray) -> np.ndarray:
 class Capture:
     """RGB float32 frames from a V4L2 capture card, held open for the session.
 
-    ``read`` returns ``(H, W, 3)`` in ``[0, 1]`` whatever the mode; under
-    :data:`PixelMode.YVYU` the card's own 4:2:2 buffer is also available, which
-    is what the raw archive stores.
+    ``read`` returns ``(H, W, 3)`` in ``[0, 1]``. Recording a pass is the
+    recorder's job; only one process may hold the card at a time.
     """
 
     def __init__(
@@ -74,7 +60,6 @@ class Capture:
         height: int = 576,
         fps: int = 50,
         fourcc: str = NATIVE_FOURCC,
-        mode: PixelMode = PixelMode.BGR,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -83,7 +68,6 @@ class Capture:
         self.height = int(height)
         self.fps = int(fps)
         self.fourcc = fourcc
-        self.mode = PixelMode(mode)
         self._sleep = sleep
         self._clock = clock
         self._cap: Any = None
@@ -112,30 +96,6 @@ class Capture:
             raise CaptureError("capture is not open")
         ok, frame = self._cap.read()
         return frame if ok and frame is not None else None
-
-    def _require_native(self) -> None:
-        """Raise unless this handle was opened for the card's own buffer."""
-        if self.mode is not PixelMode.YVYU:
-            raise CaptureError(f"native frames need PixelMode.YVYU, not {self.mode}")
-
-    def read_native(self) -> np.ndarray | None:
-        """One frame in the card's own layout: packed YVYU ``(H, W, 2)`` uint8.
-
-        The card offers no other format, so BGR is an upsample of this and carries
-        nothing more. Only available on a handle opened in :data:`PixelMode.YVYU`.
-        """
-        self._require_native()
-        return self._grab()
-
-    def read_pair(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """One grab as both the native buffer and the RGB float32 view of it.
-
-        Archiving a frame and measuring it must describe the same frame, and a
-        second grab is a different frame.
-        """
-        self._require_native()
-        frame = self._grab()
-        return (None, None) if frame is None else (frame, bgr_to_rgb(yvyu_to_bgr(frame)))
 
     def read_raw(self) -> np.ndarray | None:
         """One frame as uint8 BGR, or None on a failed grab.

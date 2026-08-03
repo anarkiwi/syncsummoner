@@ -7,62 +7,41 @@ reason to probe again, and a metric change costs a re-read instead of hours.
 
 from __future__ import annotations
 
-import hashlib
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Iterator
 
 import numpy as np
 
-from syncsummoner.device.capture import bgr_to_rgb, yvyu_to_bgr
 from syncsummoner.device.profile import MeasurementRecord, Source
-from syncsummoner.probe.runner import ANALYSIS_WIDTH, downscale, measurement
+from syncsummoner.probe.archive import GAP
+from syncsummoner.probe.runner import ANALYSIS_WIDTH, measurement
 
-__all__ = ["STIMULUS", "blank_digest", "digest", "program_records", "replay", "setpoints"]
+__all__ = ["STIMULUS", "program_records", "replay", "setpoints"]
 
 #: What the archive run plays out; the loop is invariant across programs and setpoints.
 STIMULUS = "codeframes"
 
 
-def digest(frame: np.ndarray) -> str:
-    """Content digest of one native frame, for recognising a frame the device repeats."""
-    return hashlib.blake2b(np.ascontiguousarray(frame).tobytes(), digest_size=8).hexdigest()
+def setpoints(
+    reader: Any, *, width: int = ANALYSIS_WIDTH
+) -> Iterator[tuple[int, tuple[int, ...], list[np.ndarray]]]:
+    """Group one archive into ``(setpoint, params, frames)``, in stream order.
 
-
-def _analysis_rgb(frame: np.ndarray, width: int) -> np.ndarray:
-    """One archived frame as the analyzer's RGB, shrunk before anything accumulates."""
-    return downscale([bgr_to_rgb(yvyu_to_bgr(frame))], width)[0]
-
-
-def setpoints(reader: Any) -> Iterator[tuple[int, tuple[int, ...], list[np.ndarray]]]:
-    """Group one archive into ``(setpoint, params, frames)``, in stream order."""
+    Frames the sweep captured between setpoints carry :data:`GAP` and are
+    dropped: they were taken while the parameters were still moving.
+    """
     current: list[np.ndarray] = []
     setpoint, params = None, ()
-    for row, frame in zip(reader.rows, reader.stream()):
+    for row, frame in zip(reader.rows, reader.stream(width=width)):
+        if row.setpoint == GAP:
+            continue
         if row.setpoint != setpoint:
             if current:
                 yield setpoint, params, current
             setpoint, params, current = row.setpoint, row.params, []
-        current.append(frame)
+        current.append(np.asarray(frame, dtype=np.float32) / np.float32(255.0))
     if current:
         yield setpoint, params, current
-
-
-def blank_digest(archive: Any, programs: Iterable[str]) -> str | None:
-    """The frame programs share on opening, which a sweep has not yet moved away from.
-
-    Sharing alone does not prove a device fault: black is black, and any two
-    programs keyed off produce the same frame. It only says the frame is not a
-    response to a vector yet, which is why only a leading run of it is dropped.
-    """
-    opening: Counter[str] = Counter()
-    for name in programs:
-        reader = archive.reader(name)
-        if reader is None:
-            continue
-        opening.update(digest(frame) for frame in reader.stream(count=1))
-    shared, seen = opening.most_common(1)[0] if opening else (None, 0)
-    return shared if seen > 1 else None
 
 
 def program_records(
@@ -70,40 +49,30 @@ def program_records(
     program: str,
     *,
     analyzer: Any,
-    blank: str | None = None,
     source: Source = Source.HW,
     analysis_width: int = ANALYSIS_WIDTH,
     **metrics: Any,
 ) -> list[MeasurementRecord]:
-    """Measurements for every setpoint of one archived program.
-
-    Only a *leading* run of ``blank`` is dropped, as the load blackout can only
-    sit at the start: the same frame later in the sweep is the program keyed off
-    by its own parameters, which is a measurement and not a gap.
-    """
+    """Measurements for every setpoint of one archived program."""
     reader = archive.reader(program)
     if reader is None:
         return []
     firmware = str(reader.meta.get("key_material", "unknown"))
-    records: list[MeasurementRecord] = []
-    for setpoint, params, frames in setpoints(reader):
-        if not records and blank is not None and all(digest(frame) == blank for frame in frames):
-            continue
-        records.append(
-            measurement(
-                [_analysis_rgb(frame, analysis_width) for frame in frames],
-                analyzer,
-                program=program,
-                firmware=firmware,
-                source=source,
-                params=params,
-                state_index=setpoint,
-                stimulus=STIMULUS,
-                analysis_width=analysis_width,
-                **metrics,
-            )
+    return [
+        measurement(
+            frames,
+            analyzer,
+            program=program,
+            firmware=firmware,
+            source=source,
+            params=params,
+            state_index=setpoint,
+            stimulus=STIMULUS,
+            analysis_width=analysis_width,
+            **metrics,
         )
-    return records
+        for setpoint, params, frames in setpoints(reader, width=analysis_width)
+    ]
 
 
 def replay(
@@ -120,14 +89,11 @@ def replay(
     ``jobs`` reads that many programs at once: the cost is a decoder subprocess
     and array work that both drop the lock, so threads are enough to overlap them.
     """
-    committed = sorted(archive.committed())
-    names = committed if programs is None else list(programs)
+    names = sorted(archive.committed()) if programs is None else list(programs)
     note = log if log is not None else lambda _message: None
-    blank = blank_digest(archive, committed)
-    note(f"blanking frame {blank}" if blank else "no blanking frame shared between programs")
 
     def measure(name: str) -> tuple[str, list[MeasurementRecord]]:
-        return name, program_records(archive, name, analyzer=analyzer, blank=blank, **kwargs)
+        return name, program_records(archive, name, analyzer=analyzer, **kwargs)
 
     out = {}
     with ThreadPoolExecutor(max_workers=max(1, int(jobs))) as pool:

@@ -1,36 +1,64 @@
-"""Harvest: whole-library native frame archiving, resume, and wedge detection."""
+"""Harvest: one recording per program, frames attributed to setpoints by capture time."""
 
 # pylint: disable=missing-function-docstring
+
+from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
+from syncsummoner.device.recorder import BlankTakeError, TakeReport
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import harvest as H
+from syncsummoner.probe.archive import GAP
 from syncsummoner.probe.store import KeyKind, ProgramKey
 from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport
 
 FIRMWARE = "1.0.0-rc.37"
 INFO = ProgramInfo.from_json(COLORBARS_INFO)
+KEY = ProgramKey("Alpha", FIRMWARE, KeyKind.NAME_FIRMWARE)
 CONFIG = H.HarvestConfig(
     width=64,
     height=48,
+    capture_fps=4,
     setpoints=2,
-    frames_per_point=2,
-    burst_settle=1,
-    settle_s=0.0,
+    settle_s=0.25,
+    dwell_s=1.0,
     startup_s=0.0,
     health_poll_s=0.0,
     wedge_settle_s=0.0,
     loop_frames=2,
 )
+#: A take that carries a moving picture, and one that is black however long it ran.
+LIVE = TakeReport(frames=30, distinct=24, blank=0, luma=0.42)
+DARK = TakeReport(frames=30, distinct=1, blank=30, luma=0.001)
+#: Frames per program at ``capture_fps`` over two dwells and their settles.
+PER_PROGRAM = 10
+MEASURED = 9
+BASE = tuple(range(12))
 
 
-def frame(value, size=(48, 64)):
-    """A packed native frame of one constant sample value."""
-    return np.full(size + (2,), value, dtype=np.uint8)
+@pytest.fixture(autouse=True)
+def no_ffmpeg(monkeypatch):
+    """No rig and no ffmpeg: the picture always returns, and every take carries one."""
+    monkeypatch.setattr(H, "settle", lambda recorder, **kwargs: LIVE)
+    monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: LIVE)
+
+
+def blind(monkeypatch, *, canary=True, take=DARK):
+    """Every take reads black; ``canary`` says whether the passthrough still carries one."""
+    monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: take)
+
+    def probe(recorder, *, program, **kwargs):
+        del recorder, kwargs
+        if program == H.WEDGE_PROBE and not canary:
+            raise BlankTakeError(f"{program}: no picture")
+        return LIVE
+
+    monkeypatch.setattr(H, "settle", probe)
 
 
 class Port:
@@ -68,58 +96,44 @@ class Port:
         self.closed = True
 
 
-class Cap:
-    """Capture stub cycling a fixed native frame sequence, recording the call order."""
+class Rec:
+    """Recorder stub: ffmpeg's file, and the card times it would report for it."""
 
-    def __init__(self, frames=(64, 200), calls=None):
-        self.values = list(frames)
-        self.reads = 0
-        self.calls = [] if calls is None else calls
+    ffmpeg = "ffmpeg"
 
-    def read_native(self):
-        self.reads += 1
-        return frame(self.values[self.reads % len(self.values)])
+    def __init__(self, clock, *, fps=CONFIG.capture_fps):
+        self.clock = clock
+        self.fps = float(fps)
+        self.recordings = []
+        self.spans = []
 
-    def wait_for_content(self, timeout_s=15.0):
-        del timeout_s
-        self.calls.append("wait_for_content")
-        return True
+    @contextmanager
+    def recording(self, path, *, seconds=None, settle_s=1.5):
+        """Run for the length of the block, leaving one file behind."""
+        del seconds, settle_s
+        start = self.clock()
+        Path(path).write_bytes(b"one continuous recording")
+        self.recordings.append(Path(path))
+        yield self
+        self.spans.append((start, self.clock()))
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class Writer:
-    """Open-writer stub checking geometry and keeping every row it was handed."""
-
-    def __init__(self, rows, shape):
-        self.rows = rows
-        self.shape = shape
-
-    def write(self, native, *, params, setpoint, loop_index=None, captured=None):
-        del loop_index, captured
-        assert native.shape == self.shape, "the archive stores the card's own buffer"
-        self.rows.append((int(native[0, 0, 0]), tuple(params), setpoint))
-        return len(self.rows) - 1
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+    def timestamps(self, path):
+        """One capture time per delivered frame, across the whole recording."""
+        del path
+        start, end = self.spans[-1]
+        return np.arange(start, end, 1.0 / self.fps)
 
 
 class Archive:
-    """Frame archive stub keyed exactly as the real one, with no encoder."""
+    """Frame archive stub keyed exactly as the real one, publishing by rename."""
 
     def __init__(self, directory, stored=()):
-        self.directory = directory
+        self.directory = Path(directory)
         self.stored = {program: key.digest for program, key in stored}
         self.rows = {}
         self.keys = {}
+        self.commits = []
+        self.geometry = {}
         self.marked = set()
         self.marked_key = {}
         self.dark_luma = {}
@@ -138,10 +152,19 @@ class Archive:
     def paths(self, program):
         return tuple(self.directory / f"{program}{suffix}" for suffix in (".mkv", ".parquet", ".json"))
 
-    def writer(self, program, key, *, width, height, fps=25):
-        del fps
+    def scratch(self, program):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        return self.directory / f"{program}.scratch.mkv"
+
+    def commit(self, program, key, video, rows, *, width, height, fps):
+        assert Path(video).exists(), "the recording is published, not re-encoded"
         self.keys[program] = key
-        return Writer(self.rows.setdefault(program, []), (height, width, 2))
+        self.rows[program] = list(rows)
+        self.geometry[program] = (width, height, fps)
+        self.commits.append(program)
+        Path(video).replace(self.paths(program)[0])
+        self.paths(program)[1].write_bytes(b"sidecar")
+        self.paths(program)[2].write_bytes(b"meta")
 
 
 class Player:
@@ -191,7 +214,6 @@ class Sess:
         self.kwargs = kwargs
         self.loads = []
         self.vectors = []
-        self.calls = kwargs.pop("calls", None)
 
     def load_program(self, name, *, park=True, link=None):
         self.loads.append((name, park, link))
@@ -203,9 +225,10 @@ class Sess:
         self.vectors.append(dict(values))
 
 
-def run(archive, *, port=None, capture=None, sessions=None, **kwargs):
+def run(archive, *, port=None, recorder=None, sessions=None, clock=None, **kwargs):
     """Drive a harvest against stubs, returning the report."""
     port = Port() if port is None else port
+    clock = FakeClock() if clock is None else clock
     made = [] if sessions is None else sessions
 
     def factory(transport, **kw):
@@ -213,15 +236,20 @@ def run(archive, *, port=None, capture=None, sessions=None, **kwargs):
         return made[-1]
 
     kwargs.setdefault("config", CONFIG)
+    kwargs.setdefault("session_factory", factory)
     return H.harvest(
         archive,
         open_transport=lambda: port,
-        open_capture=lambda: Cap() if capture is None else capture,
-        session_factory=factory,
-        sleep=lambda _s: None,
-        clock=FakeClock(),
+        recorder=Rec(clock) if recorder is None else recorder,
+        sleep=clock.sleep,
+        clock=clock,
         **kwargs,
     )
+
+
+def window(setpoint, start, end):
+    """One held setpoint, with a vector that names it."""
+    return H.Window(setpoint, tuple([setpoint] * 12), start, end)
 
 
 def test_sweep_excludes_the_crossfader_but_keeps_booleans():
@@ -237,21 +265,57 @@ def test_sweep_of_a_program_with_no_used_parameters_is_one_empty_vector():
     assert H.sweep_vectors(info, CONFIG, np.random.default_rng(0)) == [{}]
 
 
-def test_native_burst_discards_a_settle_run():
-    got = H.native_burst(Cap(), 3, settle=2, clock=FakeClock())
-    assert len(got) == 3 and all(f.dtype == np.uint8 for f in got)
-
-
-def test_native_burst_gives_up_at_the_deadline():
-    class Dead:
-        """Capture that never produces a frame."""
-
-        def read_native(self):
-            """Read native."""
-            clock.now += 1.0
-
+def test_a_window_opens_only_once_the_parameters_have_settled():
+    """A window that opened on the write would claim frames from the previous setpoint."""
     clock = FakeClock()
-    assert not H.native_burst(Dead(), 5, timeout_s=3.0, clock=clock)
+    session = Sess(None)
+    windows = H.sweep(session, {}, [{1: 0.0}, {1: 1.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
+    assert [w.setpoint for w in windows] == [0, 1]
+    assert [(w.start, w.end) for w in windows] == [(0.25, 1.25), (1.5, 2.5)]
+    assert session.vectors == [{1: 0.0}, {1: 1.0}], "one write per setpoint, before its window"
+
+
+def test_a_window_carries_the_whole_commanded_state_not_only_the_swept_slots():
+    """P12 gates the output and is held open off-sweep, so a zero there misreads the state."""
+    clock = FakeClock()
+    base = Sess(None).working_point(INFO)
+    windows = H.sweep(Sess(None), base, [{1: 0.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
+    parked = H.raw_params(base)[CROSSFADER_INDEX - 1]
+    assert parked and len(windows[0].params) == 12
+    assert windows[0].params[CROSSFADER_INDEX - 1] == parked
+
+
+def test_a_frame_is_attributed_to_the_setpoint_that_was_being_held_when_it_arrived():
+    windows = [window(0, 1.0, 2.0), window(1, 2.5, 3.5)]
+    rows = H.attribute(np.array([1.0, 1.9, 2.5, 3.5]), windows, "Alpha", base=BASE)
+    assert [r.setpoint for r in rows] == [0, 0, 1, 1], "the ends of a window are inside it"
+    assert [r.frame for r in rows] == [0, 1, 2, 3]
+    assert [r.params for r in rows] == [windows[0].params] * 2 + [windows[1].params] * 2
+    assert [r.captured for r in rows] == [1.0, 1.9, 2.5, 3.5]
+    assert {r.program for r in rows} == {"Alpha"}
+
+
+def test_a_frame_captured_between_windows_is_kept_as_a_gap():
+    """The sidecar stays one row per frame, so the archive needs no re-encode."""
+    windows = [window(0, 1.0, 2.0), window(1, 2.5, 3.5)]
+    rows = H.attribute(np.array([0.5, 2.25, 9.0]), windows, "Alpha", base=BASE)
+    assert [r.setpoint for r in rows] == [GAP, GAP, GAP], "before, between and after all count"
+    assert [r.params for r in rows] == [BASE] * 3, "a gap row carries the base state"
+
+
+def test_attribution_does_not_depend_on_the_order_windows_were_recorded_in():
+    windows = [window(1, 2.5, 3.5), window(0, 1.0, 2.0)]
+    rows = H.attribute(np.array([1.5, 3.0]), windows, "Alpha", base=BASE)
+    assert [(r.setpoint, r.params) for r in rows] == [(0, windows[1].params), (1, windows[0].params)]
+
+
+def test_attribution_without_a_window_archives_nothing():
+    """A sweep that never opened a window has nothing to say about any frame."""
+    assert not H.attribute(np.array([1.0, 2.0]), [], "Alpha", base=BASE)
+
+
+def test_attribution_of_a_recording_that_holds_no_frames():
+    assert not H.attribute(np.array([]), [window(0, 1.0, 2.0)], "Alpha", base=BASE)
 
 
 def test_wedged_distinguishes_a_live_device_from_one_that_holds_nothing():
@@ -274,16 +338,88 @@ def test_wait_healthy_gives_up_rather_than_blocking_forever():
         H.wait_healthy(lambda: Port(holds=False), config=config, sleep=clock.sleep, clock=clock)
 
 
-def test_harvest_archives_every_setpoint_with_the_vector_that_produced_it(tmp_path):
+def test_wait_healthy_tolerates_a_transport_that_will_not_even_open():
+    """A power cycle re-enumerates the serial node, so opening fails for a while."""
+    attempts = []
+
+    def opener():
+        attempts.append(len(attempts))
+        if len(attempts) < 3:
+            raise OSError("no such device")
+        return Port()
+
+    got = H.wait_healthy(opener, config=CONFIG, sleep=lambda _s: None, clock=FakeClock())
+    assert isinstance(got, Port) and len(attempts) == 3
+
+
+def test_the_canary_loads_a_passthrough_and_watches_for_the_picture():
+    clock = FakeClock()
+    port = Port()
+    session = Sess(port)
+    assert H.carries_stimulus(session, Rec(clock), port, config=CONFIG, sleep=clock.sleep, clock=clock)
+    assert session.loads == [(H.WEDGE_PROBE, True, None)]
+    assert session.vectors, "a parked passthrough with no working point carries nothing either"
+
+
+def test_the_canary_restarts_the_stimulus_before_blaming_the_rig():
+    """A dead loop is a black picture too, and it is the host's fault, not the device's."""
+    clock = FakeClock()
+    port = Port()
+    player = Player(running=False)
+    assert H.carries_stimulus(
+        Sess(port), Rec(clock), port, config=CONFIG, player=player, sleep=clock.sleep, clock=clock
+    )
+    assert player.starts == 1 and player.running
+
+
+def test_the_canary_is_false_when_the_picture_never_comes_back(monkeypatch):
+    """A passthrough that carries nothing means the rig, not the program, is dark."""
+    blind(monkeypatch, canary=False)
+    clock = FakeClock()
+    port = Port()
+    assert not H.carries_stimulus(Sess(port), Rec(clock), port, config=CONFIG, sleep=clock.sleep, clock=clock)
+
+
+def test_a_program_is_swept_into_exactly_one_recording(tmp_path):
+    """The card is read once per program; the host only writes setpoints while it runs."""
+    clock = FakeClock()
+    recorder = Rec(clock)
+    archive = Archive(tmp_path)
+    port = Port()
+    session = Sess(port)
+    result = H.harvest_program(
+        session,
+        recorder,
+        archive,
+        port,
+        "Alpha",
+        KEY,
+        config=CONFIG,
+        rng=np.random.default_rng(0),
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    assert len(recorder.recordings) == 1 and archive.commits == ["Alpha"]
+    assert not recorder.recordings[0].exists(), "the scratch recording was published, not left behind"
+    assert archive.paths("Alpha")[0].exists()
+    assert archive.geometry["Alpha"] == (CONFIG.width, CONFIG.height, CONFIG.capture_fps)
+    assert (result.frames, result.measured) == (PER_PROGRAM, MEASURED)
+    assert result.seconds == pytest.approx(2.5) and result.report is LIVE and not result.dark
+    assert len(session.vectors) == 1 + CONFIG.setpoints, "the working point, then every setpoint"
+
+
+def test_every_captured_frame_is_archived_against_the_vector_it_was_captured_under(tmp_path):
     archive = Archive(tmp_path)
     report = run(archive)
     assert [r.program for r in report.results] == ["Alpha", "Beta"]
-    assert report.frames == 8, "two programs, two setpoints, two frames each"
+    assert report.frames == 2 * PER_PROGRAM
     for program in ("Alpha", "Beta"):
         rows = archive.rows[program]
-        assert [row[2] for row in rows] == [0, 0, 1, 1]
-        assert all(len(row[1]) == 12 for row in rows), "rows carry the full raw vector"
-        assert len({row[1] for row in rows}) == 2, "one vector per setpoint"
+        assert [r.frame for r in rows] == list(range(PER_PROGRAM))
+        assert sorted({r.setpoint for r in rows}) == [GAP, 0, 1]
+        assert all(len(r.params) == 12 for r in rows), "rows carry the full raw vector"
+        assert len({r.params for r in rows if r.setpoint != GAP}) == 2, "one vector per setpoint"
+        assert [r.captured for r in rows] == sorted(r.captured for r in rows)
 
 
 def test_harvest_keys_on_name_and_firmware_not_the_program_binary(tmp_path):
@@ -303,26 +439,22 @@ def test_harvest_drops_the_link_on_every_program_load(tmp_path):
     assert sessions[0].loads == [("Alpha", True, link), ("Beta", True, link)]
 
 
-def test_harvest_waits_for_content_before_reading_a_single_frame(tmp_path):
-    """A too-short settle after a load archives pure black; the wait is what fixes it."""
-    calls = []
-    capture = Cap(calls=calls)
-    run(Archive(tmp_path), capture=capture)
-    assert calls == ["wait_for_content", "wait_for_content"]
-
-
 def test_harvest_resumes_by_skipping_what_is_already_archived(tmp_path):
-    key = ProgramKey("Alpha", FIRMWARE, KeyKind.NAME_FIRMWARE)
-    archive = Archive(tmp_path, stored=[("Alpha", key)])
+    archive = Archive(tmp_path, stored=[("Alpha", ProgramKey("Alpha", FIRMWARE, KeyKind.NAME_FIRMWARE))])
     report = run(archive)
     assert [r.cached for r in report.results] == [True, False]
-    assert "Alpha" not in archive.rows and report.frames > 0
+    assert "Alpha" not in archive.rows and report.frames == PER_PROGRAM
 
 
 def test_harvest_reflashed_firmware_invalidates_a_stored_archive(tmp_path):
     stale = ProgramKey("Alpha", "0.9.0", KeyKind.NAME_FIRMWARE)
     archive = Archive(tmp_path, stored=[("Alpha", stale)])
     assert not run(archive).results[0].cached
+
+
+def test_harvest_only_probes_the_programs_it_was_given(tmp_path):
+    report = run(Archive(tmp_path), programs=["Beta"])
+    assert [r.program for r in report.results] == ["Beta"]
 
 
 def test_harvest_stops_once_the_device_will_not_hold_a_program(tmp_path):
@@ -337,23 +469,16 @@ def test_harvest_stops_once_the_device_will_not_hold_a_program(tmp_path):
                 self.transport.holds = False
                 raise RuntimeError("load failed")
 
-    sessions = []
     port = Port(programs=("Alpha", "Beta", "Gamma"))
-    report = H.harvest(
-        Archive(tmp_path),
-        open_transport=lambda: port,
-        open_capture=Cap,
-        session_factory=lambda t, **kw: sessions.append(Failing(t, **kw)) or sessions[-1],
-        config=CONFIG,
-        sleep=lambda _s: None,
-        clock=FakeClock(),
-    )
+    report = run(Archive(tmp_path), port=port, session_factory=Failing)
     assert report.wedged and [r.program for r in report.results] == ["Alpha", "Beta"]
     assert report.failures[0].error.startswith("RuntimeError")
     assert port.closed
 
 
-def test_harvest_carries_on_past_a_program_that_failed_without_wedging(tmp_path):
+def test_a_failure_with_a_live_canary_carries_on(tmp_path):
+    """One broken program on a healthy rig must not stop the run."""
+
     class Failing(Sess):
         """Session that cannot load one particular program."""
 
@@ -362,17 +487,89 @@ def test_harvest_carries_on_past_a_program_that_failed_without_wedging(tmp_path)
             if name == "Alpha":
                 raise RuntimeError("that one is broken")
 
-    report = H.harvest(
-        Archive(tmp_path),
-        open_transport=Port,
-        open_capture=Cap,
-        session_factory=Failing,
-        config=CONFIG,
-        sleep=lambda _s: None,
-        clock=FakeClock(),
+    report = run(Archive(tmp_path), session_factory=Failing)
+    assert not report.stopped and [r.program for r in report.results] == ["Alpha", "Beta"]
+    assert report.failures and report.results[1].frames == PER_PROGRAM
+
+
+def test_a_failure_on_a_dark_rig_stops_the_run(tmp_path, monkeypatch):
+    """A raising program on a faulted rig must be diagnosed, not repeated 49 times."""
+    blind(monkeypatch, canary=False)
+
+    class Failing(Sess):
+        """Session that cannot load the first program."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            if name == "Alpha":
+                raise RuntimeError("that one is broken")
+
+    report = run(Archive(tmp_path), session_factory=Failing)
+    assert report.blacked and not report.wedged, "a dark rig is not a wedge"
+    assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than trying the rest"
+
+
+def test_a_dark_program_is_discarded_when_the_canary_still_carries_the_source(tmp_path, monkeypatch):
+    """One black program is legitimate, so the run keeps going."""
+    blind(monkeypatch, canary=True)
+    archive = Archive(tmp_path)
+    report = run(archive)
+    assert report.blacked is False and report.stopped is False
+    assert [r.program for r in report.results] == ["Alpha", "Beta"], "every program was attempted"
+    assert all("discarded" in r.error for r in report.results)
+    assert report.frames == 0, "black frames are not counted as harvested"
+    assert archive.dark_luma == {"Alpha": DARK.luma, "Beta": DARK.luma}
+
+
+def test_black_output_with_a_dark_canary_stops_the_run(tmp_path, monkeypatch):
+    """A passthrough that carries nothing means the rig, not the program, is dark."""
+    blind(monkeypatch, canary=False)
+    report = run(Archive(tmp_path))
+    assert report.blacked is True and report.stopped is True
+    assert report.wedged is False, "a black output is not a wedge, and needs its own diagnosis"
+    assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than archiving more"
+
+
+def test_a_discarded_program_has_its_archive_files_removed(tmp_path, monkeypatch):
+    """Black frames must not stay committed, or a resume would skip re-probing them."""
+    blind(monkeypatch, canary=True)
+    archive = Archive(tmp_path)
+    run(archive, programs=["Alpha"])
+    assert not any(path.exists() for path in archive.paths("Alpha"))
+
+
+def test_a_dark_program_is_not_probed_again_on_resume(tmp_path, monkeypatch):
+    """Loads are the scarce resource: a program that is itself black has no archive to resume."""
+    blind(monkeypatch, canary=True)
+    archive = Archive(tmp_path)
+    run(archive, programs=["Alpha"])
+    assert archive.marked == {"Alpha"}, "the verdict is recorded against the key"
+    report = run(archive, programs=["Alpha"])
+    assert [r.cached for r in report.results] == [True] and report.frames == 0
+
+
+def test_a_dark_verdict_from_other_firmware_is_not_trusted(tmp_path, monkeypatch):
+    blind(monkeypatch, canary=True)
+    archive = Archive(tmp_path)
+    archive.marked_key["Alpha"] = "0.9.0-digest"
+    assert not run(archive, programs=["Alpha"]).results[0].cached, "a reflash re-probes it"
+
+
+def test_results_report_what_the_take_actually_held():
+    measured = H.ProgramResult("P", frames=10, measured=9, seconds=12.0, report=LIVE)
+    assert not measured.dark and "9/10 frames measured in 12s" in str(measured)
+    assert "24 distinct" in str(measured)
+    assert H.ProgramResult("P", frames=10, report=DARK).dark and "UNUSABLE" in str(
+        H.ProgramResult("P", frames=10, report=DARK)
     )
-    assert not report.wedged and len(report.results) == 2
-    assert report.failures and report.results[1].frames == 4
+    assert str(H.ProgramResult("P")) == "P: cached"
+    assert "FAILED" in str(H.ProgramResult("P", error="RuntimeError: x"))
+
+
+def test_upload_stimulus_builds_a_loop_at_the_playout_geometry():
+    player = Player()
+    config = H.HarvestConfig(width=64, height=48, loop_frames=3)
+    assert H.upload_stimulus(player, config) == 3
 
 
 def test_harvest_uploads_the_stimulus_once_and_restarts_a_dead_player(tmp_path):
@@ -383,25 +580,18 @@ def test_harvest_uploads_the_stimulus_once_and_restarts_a_dead_player(tmp_path):
     assert player.stopped and any("Alpha" in m for m in messages)
 
 
-def test_harvest_only_probes_the_programs_it_was_given(tmp_path):
-    archive = Archive(tmp_path)
-    report = run(archive, programs=["Beta"])
-    assert [r.program for r in report.results] == ["Beta"]
+def test_harvest_restarts_a_player_that_died_mid_run(tmp_path):
+    """The loop is the stimulus; without it every archived frame is of nothing."""
 
+    class Dead(Player):
+        """Player whose loop never stays up."""
 
-def test_dark_and_cached_results_report_themselves():
-    dark = H.ProgramResult("P", frames=4, seconds=1.0, luma=H.DARK_LUMA - 1)
-    assert dark.dark and "DARK" in str(dark)
-    assert not H.ProgramResult("P", frames=4, seconds=1.0, luma=H.DARK_LUMA).dark
-    assert str(H.ProgramResult("P")) == "P: cached"
-    assert "FAILED" in str(H.ProgramResult("P", error="RuntimeError: x"))
-    assert "Y=" in str(H.ProgramResult("P", frames=3, seconds=1.0, luma=99.0))
+        def is_running(self):
+            return False
 
-
-def test_upload_stimulus_builds_a_loop_at_the_playout_geometry():
-    player = Player()
-    config = H.HarvestConfig(width=64, height=48, loop_frames=3)
-    assert H.upload_stimulus(player, config) == 3
+    player = Dead()
+    run(Archive(tmp_path), player=player)
+    assert player.starts == 3, "once for the run, then once per program that found it down"
 
 
 def test_a_real_session_holds_the_link_down_across_the_whole_load(tmp_path):
@@ -430,237 +620,13 @@ def test_a_real_session_holds_the_link_down_across_the_whole_load(tmp_path):
     port.program_info = lambda name=None: INFO
     port.close = lambda: calls.append("close")
     port.load_program = lambda name: calls.append(f"load {name}")
-    archive = Archive(tmp_path)
-    report = H.harvest(
-        archive,
-        open_transport=lambda: port,
-        open_capture=Cap,
-        link=Link(),
-        config=CONFIG,
-        sleep=clock.sleep,
+    report = run(
+        Archive(tmp_path),
+        port=port,
         clock=clock,
+        link=Link(),
         session_factory=lambda t, **kw: Session(t, sleep=clock.sleep, clock=clock, **kw),
     )
-    assert report.frames == 4
+    assert report.frames and not report.failures
     start = calls.index("down")
     assert calls[start : start + 3] == ["down", "load Alpha", "up"], "down for the whole load"
-
-
-def test_wait_healthy_tolerates_a_transport_that_will_not_even_open():
-    """A power cycle re-enumerates the serial node, so opening fails for a while."""
-    attempts = []
-
-    def opener():
-        attempts.append(len(attempts))
-        if len(attempts) < 3:
-            raise OSError("no such device")
-        return Port()
-
-    got = H.wait_healthy(opener, config=CONFIG, sleep=lambda _s: None, clock=FakeClock())
-    assert isinstance(got, Port) and len(attempts) == 3
-
-
-def test_harvest_restarts_a_player_that_died_mid_run(tmp_path):
-    """The loop is the stimulus; without it every archived frame is of nothing."""
-
-    class Dead(Player):
-        """Player whose loop never stays up."""
-
-        def is_running(self):
-            return False
-
-    player = Dead()
-    run(Archive(tmp_path), player=player)
-    assert player.starts == 3, "once for the run, then once per program that found it down"
-
-
-class SwitchCap(Cap):
-    """Capture stub whose luma the session flips, so a canary can differ from a program."""
-
-    def __init__(self, box, calls=None):
-        super().__init__(calls=calls)
-        self.box = box
-
-    def read_native(self):
-        self.reads += 1
-        return frame(self.box["luma"])
-
-
-def dark_run(archive, *, canary_luma, programs=("Alpha", "Beta")):
-    """Harvest where every program is black and the canary reports ``canary_luma``."""
-    box = {"luma": 0}
-    port = Port(programs=programs)
-    capture = SwitchCap(box)
-
-    class Canary(Sess):
-        """Session stub that lifts the capture out of black only for the canary load."""
-
-        def load_program(self, name, *, park=True, link=None):
-            super().load_program(name, park=park, link=link)
-            box["luma"] = canary_luma if name == H.WEDGE_PROBE else 0
-
-    return H.harvest(
-        archive,
-        open_transport=lambda: port,
-        open_capture=lambda: capture,
-        config=CONFIG,
-        sleep=lambda _s: None,
-        clock=FakeClock(),
-        session_factory=Canary,
-    )
-
-
-def test_a_dark_program_is_discarded_when_the_canary_still_carries_the_source(tmp_path):
-    """One black program is legitimate, so the run keeps going."""
-    archive = Archive(tmp_path)
-    report = dark_run(archive, canary_luma=200)
-    assert report.blacked is False and report.stopped is False
-    assert [r.program for r in report.results] == ["Alpha", "Beta"], "every program was attempted"
-    assert all("discarded" in r.error for r in report.results)
-    assert report.frames == 0, "black frames are not counted as harvested"
-
-
-def test_black_output_with_a_dark_canary_stops_the_run(tmp_path):
-    """A passthrough that carries nothing means the rig, not the program, is dark."""
-    archive = Archive(tmp_path)
-    report = dark_run(archive, canary_luma=0)
-    assert report.blacked is True and report.stopped is True
-    assert report.wedged is False, "a black output is not a wedge, and needs its own diagnosis"
-    assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than archiving more"
-
-
-def test_a_discarded_program_has_its_archive_files_removed(tmp_path):
-    """Black frames must not stay committed, or a resume would skip re-probing them."""
-    archive = Archive(tmp_path)
-    for path in archive.paths("Alpha"):
-        path.write_bytes(b"stale")
-    dark_run(archive, canary_luma=200, programs=("Alpha",))
-    assert not any(path.exists() for path in archive.paths("Alpha"))
-
-
-def test_native_burst_drops_a_read_that_repeats_the_previous_frame():
-    """Measured, an unpaced 30-frame burst spanned 0.25s and held one distinct frame."""
-
-    class Stuck:
-        """Capture whose reads outrun the card and return the same buffer."""
-
-        def __init__(self):
-            self.reads = 0
-
-        def read_native(self):
-            """Read native."""
-            self.reads += 1
-            return frame(64)
-
-    clock = FakeClock()
-    capture = Stuck()
-    got = H.native_burst(capture, 5, settle=0, interval_s=0.1, sleep=clock.sleep, clock=clock)
-    assert len(got) == 1 and capture.reads == 5, "it kept reading, but stored one measurement"
-
-
-def test_native_burst_paces_itself_across_the_dwell():
-    """Unpaced, the burst samples the few milliseconds the reads take, not the setpoint."""
-    clock = FakeClock()
-    got = H.native_burst(Cap(), 8, settle=0, interval_s=0.05, sleep=clock.sleep, clock=clock)
-    assert len(got) == 8 and clock.now == pytest.approx(0.4), "one stored frame per interval"
-
-
-def test_a_program_whose_picture_never_moves_is_archived_and_flagged(tmp_path):
-    """A generator program is still by design: measured, five of six failed a motion gate."""
-
-    class Blank(Cap):
-        """Capture whose picture never moves before the sweep."""
-
-        def wait_for_content(self, timeout_s=15.0):
-            del timeout_s
-            return False
-
-    archive = Archive(tmp_path)
-    report = run(archive, capture=Blank())
-    assert not report.failures and report.frames == 8, "a still picture is still a measurement"
-    assert [r.program for r in report.unsettled] == ["Alpha", "Beta"]
-    assert "UNSETTLED" in str(report.results[0])
-
-
-def test_a_settled_program_is_not_flagged(tmp_path):
-    report = run(Archive(tmp_path))
-    assert not report.unsettled and "UNSETTLED" not in str(report.results[0])
-
-
-def test_rows_carry_the_commanded_state_not_only_the_swept_slots(tmp_path):
-    """P12 gates the output and is held open off-sweep, so a zero there misreads the state."""
-    archive = Archive(tmp_path)
-    run(archive)
-    parked = H.raw_params(Sess(None).working_point(INFO))[CROSSFADER_INDEX - 1]
-    assert parked, "the working point holds the crossfader open"
-    assert all(row[1][CROSSFADER_INDEX - 1] == parked for row in archive.rows["Alpha"])
-
-
-def test_a_failure_on_a_dark_rig_stops_the_run(tmp_path):
-    """A raising program on a faulted rig must be diagnosed, not repeated 49 times."""
-
-    class Dark(Cap):
-        """Capture that reads black, so the passthrough canary fails too."""
-
-        def read_native(self):
-            self.reads += 1
-            return frame(0)
-
-    class Failing(Sess):
-        """Session that cannot load the first program."""
-
-        def load_program(self, name, *, park=True, link=None):
-            super().load_program(name, park=park, link=link)
-            if name == "Alpha":
-                raise RuntimeError("that one is broken")
-
-    report = H.harvest(
-        Archive(tmp_path),
-        open_transport=Port,
-        open_capture=Dark,
-        session_factory=Failing,
-        config=CONFIG,
-        sleep=lambda _s: None,
-        clock=FakeClock(),
-    )
-    assert report.blacked and not report.wedged, "a dark rig is not a wedge"
-    assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than trying the rest"
-
-
-def test_a_failure_with_a_live_canary_carries_on(tmp_path):
-    """One broken program on a healthy rig must not stop the run."""
-
-    class Failing(Sess):
-        """Session that cannot load the first program."""
-
-        def load_program(self, name, *, park=True, link=None):
-            super().load_program(name, park=park, link=link)
-            if name == "Alpha":
-                raise RuntimeError("that one is broken")
-
-    report = H.harvest(
-        Archive(tmp_path),
-        open_transport=Port,
-        open_capture=Cap,
-        session_factory=Failing,
-        config=CONFIG,
-        sleep=lambda _s: None,
-        clock=FakeClock(),
-    )
-    assert not report.stopped and [r.program for r in report.results] == ["Alpha", "Beta"]
-
-
-def test_a_dark_program_is_not_probed_again_on_resume(tmp_path):
-    """Loads are the scarce resource: a program that is itself black has no archive to resume."""
-    archive = Archive(tmp_path)
-    dark_run(archive, canary_luma=200, programs=("Alpha",))
-    assert archive.marked == {"Alpha"}, "the verdict is recorded against the key"
-    report = dark_run(archive, canary_luma=200, programs=("Alpha",))
-    assert [r.cached for r in report.results] == [True] and report.frames == 0
-
-
-def test_a_dark_verdict_from_other_firmware_is_not_trusted(tmp_path):
-    archive = Archive(tmp_path)
-    archive.marked_key["Alpha"] = "0.9.0-digest"
-    report = dark_run(archive, canary_luma=200, programs=("Alpha",))
-    assert not report.results[0].cached, "a reflash re-probes it"

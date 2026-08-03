@@ -5,7 +5,7 @@ injected, so a probe run can be re-scored under a different metrics version.
 """
 
 from syncsummoner.probe import archive, codeframes, fit, harvest, patterns, plans, replay, runner, sim, store
-from syncsummoner.probe.archive import FrameArchive, FrameReader, FrameRow, FrameWriter
+from syncsummoner.probe.archive import FrameArchive, FrameReader, FrameRow
 from syncsummoner.probe.codeframes import (
     ChannelState,
     CodeLoop,
@@ -29,7 +29,6 @@ __all__ = [
     "FrameArchive",
     "FrameReader",
     "FrameRow",
-    "FrameWriter",
     "HarvestConfig",
     "HarvestReport",
     "KeyKind",
