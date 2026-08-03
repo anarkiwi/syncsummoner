@@ -24,15 +24,18 @@ from syncsummoner.device.recorder import (
 )
 
 
-def fake_popen(started, *, returncode=None):
+def fake_popen(started, *, returncode=None, says=b""):
     """Popen stand-in recording argv, with a process that stays up unless told otherwise."""
 
-    def make(argv, **kwargs):
+    def make(argv, *, stderr=None, **kwargs):
         del kwargs
         started.append(argv)
+        if says and stderr is not None:
+            stderr.write(says)
         return types.SimpleNamespace(
             stdin=types.SimpleNamespace(write=lambda b: None, flush=lambda: None, close=lambda: None),
             poll=lambda: returncode,
+            returncode=returncode,
             wait=lambda timeout=None: 0,
             kill=lambda: None,
         )
@@ -116,9 +119,18 @@ def test_recording_stops_the_encoder_and_checks_it_wrote(tmp_path):
     assert len(started) == 1
 
 
-def test_a_recorder_that_dies_at_once_is_an_error(tmp_path):
+def test_a_recorder_that_dies_at_once_reports_what_ffmpeg_said(tmp_path):
+    """A recorder that dies silently cannot be told apart from a rig gone dark."""
+    popen = fake_popen([], returncode=1, says=b"/dev/video0: Device or resource busy")
+    recorder = Recorder(popen=popen, sleep=lambda s: None)
+    with pytest.raises(RecorderError, match="Device or resource busy"):
+        with recorder.recording(tmp_path / "take.mkv"):
+            pass
+
+
+def test_a_recorder_that_says_nothing_still_names_the_device(tmp_path):
     recorder = Recorder(popen=fake_popen([], returncode=1), sleep=lambda s: None)
-    with pytest.raises(RecorderError, match="exited immediately"):
+    with pytest.raises(RecorderError, match="no diagnostic"):
         with recorder.recording(tmp_path / "take.mkv"):
             pass
 

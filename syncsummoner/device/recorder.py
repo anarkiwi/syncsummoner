@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -62,6 +63,16 @@ INSPECT_WIDTH = 160
 
 class RecorderError(RuntimeError):
     """The recording did not start, or did not produce a file."""
+
+
+def _diagnostic(errors: Any, *, limit: int = 400) -> str:
+    """The tail of what ffmpeg said, for an error that has to be actionable."""
+    try:
+        errors.seek(0)
+        said = errors.read().decode("utf-8", "replace").strip()
+    except (OSError, ValueError, AttributeError):
+        return "no diagnostic"
+    return said[-limit:] if said else "no diagnostic"
 
 
 class BlankTakeError(RuntimeError):
@@ -157,23 +168,33 @@ class Recorder:
     def recording(
         self, path: str | Path, *, seconds: float | None = None, settle_s: float = 1.5
     ) -> Iterator[Any]:
-        """Record for the duration of the block, yielding once it is running."""
-        proc = self._popen(
-            self.command(path, seconds=seconds),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self._sleep(settle_s)
-        if proc.poll() is not None:
-            raise RecorderError(f"the recorder exited immediately for {self.device}")
+        """Record for the duration of the block, yielding once it is running.
+
+        ffmpeg's diagnostics are kept rather than discarded: a recorder that dies
+        silently is a fault nobody can tell from a rig that has gone dark.
+        """
+        errors = tempfile.TemporaryFile()
         try:
-            yield proc
+            proc = self._popen(
+                self.command(path, seconds=seconds),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=errors,
+            )
+            self._sleep(settle_s)
+            if proc.poll() is not None:
+                raise RecorderError(
+                    f"the recorder exited {proc.returncode} for {self.device}: {_diagnostic(errors)}"
+                )
+            try:
+                yield proc
+            finally:
+                self.stop(proc)
+            written = Path(path)
+            if not written.exists() or not written.stat().st_size:
+                raise RecorderError(f"the recorder wrote nothing to {path}: {_diagnostic(errors)}")
         finally:
-            self.stop(proc)
-        written = Path(path)
-        if not written.exists() or not written.stat().st_size:
-            raise RecorderError(f"the recorder wrote nothing to {path}")
+            errors.close()
 
     def stop(self, proc: Any, *, timeout_s: float = 20.0) -> int:
         """Ask ffmpeg to finish the file, and wait for it to do so."""
