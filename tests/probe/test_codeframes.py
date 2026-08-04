@@ -120,7 +120,7 @@ def test_frame_contract(loop):
 
 def test_frames_clear_of_clipping(loop):
     """Frames clear of clipping."""
-    body = np.stack([loop.frame(k)[loop.strip_px :] for k in range(loop.count)])
+    body = np.stack([loop.frame(k)[: loop.body_height] for k in range(loop.count)])
     assert body.min() > 0.1 and body.max() < 0.9
 
 
