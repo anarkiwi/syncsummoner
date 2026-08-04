@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -31,6 +32,7 @@ __all__ = [
     "TakeReport",
     "die_with_parent",
     "inspect_take",
+    "require_ffmpeg",
     "settle",
 ]
 
@@ -68,6 +70,14 @@ INSPECT_WIDTH = 160
 
 class RecorderError(RuntimeError):
     """The recording did not start, or did not produce a file."""
+
+
+def require_ffmpeg(ffmpeg: str = "ffmpeg") -> str:
+    """Resolved path to the ffmpeg binary, or a helpful error before any rig time is spent."""
+    found = shutil.which(ffmpeg)
+    if found is None:
+        raise RecorderError(f"{ffmpeg!r} not found on PATH; install ffmpeg before running this command")
+    return found
 
 
 def die_with_parent() -> None:

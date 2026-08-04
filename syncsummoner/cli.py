@@ -162,11 +162,13 @@ def _probe_cmd(args: argparse.Namespace) -> int:
 def _refit_cmd(args: argparse.Namespace) -> int:
     """Fit profiles from an archived run, with no device and no rig time."""
     from syncsummoner import aesthetics
+    from syncsummoner.device.recorder import require_ffmpeg
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
     from syncsummoner.probe.replay import replay
     from syncsummoner.probe.store import slug
 
+    require_ffmpeg(args.ffmpeg)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     programs = None if args.program == "all" else args.program.split(",")
@@ -190,11 +192,12 @@ def _refit_cmd(args: argparse.Namespace) -> int:
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
     from syncsummoner.device.playout import LoopPlayer
-    from syncsummoner.device.recorder import FFV1, Recorder
+    from syncsummoner.device.recorder import FFV1, Recorder, require_ffmpeg
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.harvest import HarvestConfig, harvest
 
+    require_ffmpeg()
     config = HarvestConfig(
         width=args.width,
         height=args.height,
@@ -290,7 +293,9 @@ def _compose_cmd(args: argparse.Namespace) -> int:
 def _render_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose import render as render_mod
     from syncsummoner.compose.score import Score
+    from syncsummoner.device.recorder import require_ffmpeg
 
+    require_ffmpeg()
     score = Score.load(Path(args.score))
     profiles = _profiles_in(Path(args.profiles))
     config = (

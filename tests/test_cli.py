@@ -146,6 +146,7 @@ def harvested_fixture(monkeypatch):
     monkeypatch.setattr(transport_mod, "Transport", Port)
     monkeypatch.setattr(link_mod, "Link", Link)
     monkeypatch.setattr(recorder_mod, "Recorder", Rec)
+    monkeypatch.setattr(recorder_mod, "require_ffmpeg", lambda *a, **kw: "ffmpeg")
     monkeypatch.setattr(harvest_mod, "harvest", fake_harvest)
     return seen
 
@@ -173,7 +174,19 @@ def test_probe_archive_reports_a_wedged_device_as_a_failure(monkeypatch, tmp_pat
     monkeypatch.setattr(transport_mod, "Transport", Port)
     monkeypatch.setattr(link_mod, "Link", Link)
     monkeypatch.setattr(recorder_mod, "Recorder", Rec)
+    monkeypatch.setattr(recorder_mod, "require_ffmpeg", lambda *a, **kw: "ffmpeg")
     monkeypatch.setattr(harvest_mod, "harvest", lambda *a, **kw: harvest_mod.HarvestReport(wedged=True))
+    assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 1
+
+
+def test_probe_archive_fails_fast_with_no_ffmpeg_and_never_touches_the_rig(monkeypatch, tmp_path):
+    """A missing tool must be a clear error before any rig time is spent, not a bare traceback."""
+
+    def unreachable(*a, **kw):
+        raise AssertionError("the rig must not be touched before require_ffmpeg is checked")
+
+    monkeypatch.setattr(transport_mod, "Transport", SimpleNamespace(open=unreachable))
+    monkeypatch.setattr(recorder_mod.shutil, "which", lambda name: None)
     assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 1
 
 
