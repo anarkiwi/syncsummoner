@@ -102,3 +102,9 @@ position, not an absolute set.
 
 Program change costs a multi-second blackout. Batch every evaluation for a
 program together.
+
+An active VT on the Pi bleeds into every recording. `LoopPlayer` writes
+`/dev/fb0` directly, but if a getty or shell is the foreground console,
+`fbcon`'s cursor blink inverts its cell on top of that regardless, as a
+small fixed-position flickering square. `sudo chvt` to a VT with no getty
+before a session.
