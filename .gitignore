@@ -11,6 +11,7 @@ coverage.xml
 htmlcov/
 profiles/
 captures/
+archive/
 *.mkv
 *.mov
 *.yuv
