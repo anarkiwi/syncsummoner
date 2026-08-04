@@ -185,7 +185,7 @@ class CodeLoop:
 
     @property
     def body_height(self) -> int:
-        """Height of the coded area, below the gray-code strip."""
+        """Height of the coded area, above the gray-code strip."""
         return self.height - self.strip_px
 
     def angle(self, index: int) -> float:
@@ -204,7 +204,7 @@ class CodeLoop:
         green = luma - (float(LUMA[0]) * cr + float(LUMA[2]) * cb) / float(LUMA[1])
         body = np.stack([luma + cr, green, luma + cb], axis=-1)
         out = np.zeros((self.height, self.width, 3), dtype=np.float32)
-        out[self.strip_px :] = np.clip(body, 0.0, 1.0)
+        out[: self.body_height] = np.clip(body, 0.0, 1.0)
         return patterns.with_state_index(out, index, strip_px=self.strip_px)
 
     def frames(self) -> Iterator[np.ndarray]:

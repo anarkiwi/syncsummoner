@@ -241,7 +241,7 @@ def _gray_decode(code, bits):
 
 
 def with_state_index(frame, index, *, bits=8, strip_px=8):
-    """Burn ``index`` as a gray code into a high-contrast strip on the top edge.
+    """Burn ``index`` as a gray code into a high-contrast strip on the bottom edge.
 
     Cell 0 is a white reference and the last cell a black one, so the decoder can
     threshold against the strip's own midpoint under arbitrary gain and pedestal.
@@ -256,14 +256,14 @@ def with_state_index(frame, index, *, bits=8, strip_px=8):
     levels[-1] = 0.0
     levels[1:-1] = [(code >> (bits - 1 - b)) & 1 for b in range(bits)]
     for cell, level in enumerate(levels):
-        out[:strip_px, edges[cell] : edges[cell + 1], :] = level
+        out[height - strip_px :, edges[cell] : edges[cell + 1], :] = level
     return out
 
 
 def _sample_cells(frame, bits, strip_px):
     height, width = frame.shape[:2]
     strip_px = max(min(int(strip_px), height), 1)
-    luma = frame[:strip_px].mean(axis=2)
+    luma = frame[height - strip_px :].mean(axis=2)
     rows = luma[strip_px // 4 : strip_px - strip_px // 4] if strip_px >= 4 else luma
     n_cells = bits + _GUARD_CELLS
     centres = (np.arange(n_cells, dtype=np.float64) + 0.5) / n_cells
@@ -291,4 +291,5 @@ def read_state_index(frame, *, bits=8, strip_px=8, min_contrast=0.15):
 
 def crop_strip(frame, *, strip_px=8):
     """Remove the state-index strip before analysis."""
-    return np.asarray(frame)[int(strip_px) :]
+    frame = np.asarray(frame)
+    return frame[: frame.shape[0] - int(strip_px)]

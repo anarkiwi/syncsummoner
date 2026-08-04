@@ -20,6 +20,7 @@ from syncsummoner.device.recorder import (
     RecorderError,
     TakeReport,
     inspect_take,
+    require_ffmpeg,
     settle,
 )
 
@@ -74,6 +75,17 @@ class FakeRecorder:
         Path(path).write_bytes(b"probe")
         self.probes.append((str(path), seconds))
         yield None
+
+
+def test_require_ffmpeg_resolves_a_binary_on_path(monkeypatch):
+    monkeypatch.setattr(rec.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert require_ffmpeg("ffmpeg") == "/usr/bin/ffmpeg"
+
+
+def test_require_ffmpeg_names_the_missing_binary(monkeypatch):
+    monkeypatch.setattr(rec.shutil, "which", lambda name: None)
+    with pytest.raises(RecorderError, match="not-a-real-binary.*PATH"):
+        require_ffmpeg("not-a-real-binary")
 
 
 def test_the_recorder_asks_the_card_for_what_it_can_actually_deliver():

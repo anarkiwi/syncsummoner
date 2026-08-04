@@ -473,7 +473,8 @@ def test_a_real_recording_reads_back_frame_for_frame_in_colour(tmp_path):
         decoded = reader.frame(index)
         assert decoded.dtype == np.uint8 and decoded.shape == (32, 64, CHANNELS)
         for i, colour in enumerate(BLOCKS[index:] + BLOCKS[:index]):
-            assert decoded[16, i * 16 + 8] == pytest.approx(colour, abs=4)
+            # uint8 minus a Python int can underflow (NEP 50); widen before comparing.
+            assert decoded[16, i * 16 + 8].astype(int) == pytest.approx(colour, abs=4)
     assert [f.shape for f in reader.stream()] == [(32, 64, CHANNELS)] * 4
     assert [f.shape for f in reader.stream(width=32)] == [reader.shape(32)] * 4
 

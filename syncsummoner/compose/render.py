@@ -74,12 +74,12 @@ class Rig:
 
 
 def burn_timecode(frame: np.ndarray, index: int, *, bits: int = 16, strip_px: int = 8) -> np.ndarray:
-    """Write a gray-coded frame index into a croppable edge strip, behind a constant marker cell."""
+    """Write a gray-coded frame index into a croppable bottom edge strip, behind a marker cell."""
     out = np.array(frame, dtype=np.float32, copy=True)
     code = int(index) ^ (int(index) >> 1)
     cells = np.concatenate(([1.0], ((code >> np.arange(bits - 1, -1, -1)) & 1).astype(np.float32)))
     edges = np.round(np.linspace(0, out.shape[1], cells.size + 1)).astype(int)
-    out[:strip_px] = np.repeat(cells, np.diff(edges))[None, :, None]
+    out[out.shape[0] - strip_px :] = np.repeat(cells, np.diff(edges))[None, :, None]
     return out
 
 
@@ -87,7 +87,7 @@ def read_timecode(
     frame: np.ndarray, *, bits: int = 16, strip_px: int = 8, min_contrast: float = 0.25
 ) -> int | None:
     """Recover the frame index from the edge strip; ``None`` when the strip is absent or washed out."""
-    strip = np.asarray(frame[:strip_px], dtype=np.float64).mean(axis=(0, 2))
+    strip = np.asarray(frame[frame.shape[0] - strip_px :], dtype=np.float64).mean(axis=(0, 2))
     edges = np.round(np.linspace(0, strip.size, bits + 2)).astype(int)
     cells = np.add.reduceat(strip, edges[:-1]) / np.maximum(np.diff(edges), 1)
     if np.ptp(cells) < min_contrast or cells[0] < cells.mean():
@@ -98,7 +98,7 @@ def read_timecode(
 
 def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:
     """Remove the timecode strip before anything else looks at the frame."""
-    return frame[strip_px:]
+    return frame[: frame.shape[0] - strip_px]
 
 
 def schedule(auto: Automation, *, latency_s: float = 0.0, early_bias_s: float = EARLY_BIAS_S) -> Automation:

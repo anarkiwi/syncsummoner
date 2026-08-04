@@ -129,7 +129,7 @@ def test_gray_code_single_bit_transitions():
     centres = np.round((np.arange(10) + 0.5) * WIDTH / 10).astype(int)
     cells = np.array(
         [
-            patterns.with_state_index(base, i)[0, centres, 0] > 0.5
+            patterns.with_state_index(base, i)[-1, centres, 0] > 0.5
             for i in range(patterns.state_index_capacity(8))
         ]
     )
@@ -145,7 +145,7 @@ def test_strip_leaves_body_untouched():
     """Strip leaves body untouched."""
     base = frame()
     tagged = patterns.with_state_index(base, 42, strip_px=8)
-    assert np.array_equal(patterns.crop_strip(tagged, strip_px=8), base[8:])
+    assert np.array_equal(patterns.crop_strip(tagged, strip_px=8), base[:-8])
     assert patterns.crop_strip(tagged, strip_px=8).shape == (HEIGHT - 8, WIDTH, 3)
 
 

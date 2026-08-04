@@ -252,16 +252,25 @@ def window(setpoint, start, end):
     return H.Window(setpoint, tuple([setpoint] * 12), start, end)
 
 
-def test_sweep_excludes_the_crossfader_but_keeps_booleans():
-    """P12 only gates output and a CC offset is non-negative, so it cannot be closed."""
+def test_sweep_includes_the_crossfader_like_any_other_continuous_effect():
+    """Pinning P12 open produced false blank takes; it now sweeps 0..100% too."""
     vectors = H.sweep_vectors(INFO, CONFIG, np.random.default_rng(0))
-    assert vectors and all(CROSSFADER_INDEX not in v for v in vectors)
+    assert vectors and all(CROSSFADER_INDEX in v for v in vectors)
+    values = {v[CROSSFADER_INDEX] for v in vectors}
+    assert len(values) > 1, "a fixed value would be the same regression as pinning it open"
     booleans = {p.index for p in INFO.params if p.kind is ParamKind.BOOLEAN}
     assert booleans and all(booleans <= set(v) for v in vectors), "booleans change the picture"
 
 
-def test_sweep_of_a_program_with_no_used_parameters_is_one_empty_vector():
+def test_sweep_still_forces_the_crossfader_even_when_the_program_calls_every_slot_null():
+    """It gates output even where ``program info`` names it ``Null 12``."""
     info = ProgramInfo.from_json({"name": "Null", "parameters": [{"name": "-", "min": 0, "max": 100}] * 12})
+    vectors = H.sweep_vectors(info, CONFIG, np.random.default_rng(0))
+    assert vectors and all(set(v) == {CROSSFADER_INDEX} for v in vectors)
+
+
+def test_sweep_of_a_program_reporting_no_parameters_at_all_is_one_empty_vector():
+    info = ProgramInfo.from_json({"name": "Null", "parameters": []})
     assert H.sweep_vectors(info, CONFIG, np.random.default_rng(0)) == [{}]
 
 

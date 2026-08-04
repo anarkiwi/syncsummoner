@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
@@ -144,13 +144,12 @@ class HarvestReport:
 
 
 def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) -> list[dict]:
-    """Sobol vectors over every used parameter but the crossfader.
+    """Sobol vectors over every used parameter, the crossfader swept like any other.
 
-    The crossfader only gates output and a ``set_params`` offset is non-negative,
-    so it cannot be closed; ``ProgramInfo.sweepable`` is not used because it also
-    drops booleans, which do change the picture.
+    Pinning the crossfader open produced false blank takes (Bitcullis, Corollas);
+    it now sweeps 0..100% same as any other continuous effect.
     """
-    spec = [p for p in info.params if p.index != CROSSFADER_INDEX]
+    spec = [replace(p, kind=ParamKind.CONTINUOUS) if p.index == CROSSFADER_INDEX else p for p in info.params]
     if not any(p.kind is not ParamKind.UNUSED for p in spec):
         return [{}]
     return list(plans.sobol(spec, n=config.setpoints, rng=rng))
