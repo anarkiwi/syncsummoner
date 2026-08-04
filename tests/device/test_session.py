@@ -69,19 +69,19 @@ def test_park_drives_manual_and_zeroes_midi():
     session, _, _ = make_session(port)
     port.midi[:] = 400
     session.park()
-    assert np.all(port.manual[:-1] == 0)
+    assert np.all(port.manual == 0)
     assert np.all(port.midi == 0)
-    assert np.all(port.program_state()[:-1] == 0)
+    assert np.all(port.program_state() == 0)
     assert sum(1 for c in port.calls if c[0] == "manual") == PARAM_COUNT
 
 
-def test_park_leaves_the_crossfader_open():
-    """P12 gates the output; parking it at zero blacks out every measurement."""
+def test_park_zeroes_the_crossfader_too():
+    """A crossfader parked at max would clip every offset for it to zero."""
     port = FakeTransport(manual=[512] * PARAM_COUNT)
     session, _, _ = make_session(port)
     session.park()
-    assert port.manual[sess_mod.CROSSFADER_INDEX - 1] == PARAM_MAX
-    assert session.park_values[sess_mod.CROSSFADER_INDEX - 1] == PARAM_MAX
+    assert port.manual[sess_mod.CROSSFADER_INDEX - 1] == 0
+    assert session.park_values[sess_mod.CROSSFADER_INDEX - 1] == 0
 
 
 def test_park_verifies_readback():
@@ -328,7 +328,15 @@ def test_working_point_opens_the_output_and_skips_driven_slots():
     point = session.working_point(info, exclude=[1])
     assert 1 not in point and 3 not in point
     assert point[2] is False
-    assert point[sess_mod.CROSSFADER_INDEX] == 1.0
+    assert point[sess_mod.CROSSFADER_INDEX] == 0.5
+
+
+def test_working_point_forces_the_crossfader_even_when_the_program_calls_it_unused():
+    """It gates output even where ``program info`` names it ``Null 12``."""
+    info = _info([_spec(12, "-", ParamKind.UNUSED)])
+    port = FakeTransport()
+    session, _, _ = make_session(port)
+    assert session.working_point(info) == {sess_mod.CROSSFADER_INDEX: 0.5}
 
 
 def test_arm_modulation_binds_operators_and_disarm_clears_them():
