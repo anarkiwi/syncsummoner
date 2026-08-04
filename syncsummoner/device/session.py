@@ -28,14 +28,13 @@ STABLE_READS = 2
 
 
 def default_park() -> np.ndarray:
-    """Park reference: zero everywhere, crossfader open so the output stays live.
+    """Park reference: zero everywhere, so the additive sum equals the CC offset.
 
-    Parking the crossfader at zero blacks the output and makes every measurement
-    degenerate, which no amount of parameter sweeping recovers from.
+    A crossfader parked at max clips every offset for it to zero, since offsets
+    are non-negative; parking it at zero like everything else is what lets it
+    address its full range instead of sitting pinned open.
     """
-    park = np.full(PARAM_COUNT, PARK_REFERENCE, dtype=int)
-    park[CROSSFADER_INDEX - 1] = PARAM_MAX
-    return park
+    return np.full(PARAM_COUNT, PARK_REFERENCE, dtype=int)
 
 
 class DeviceError(RuntimeError):
@@ -184,19 +183,24 @@ class Session:
         return got
 
     def working_point(self, info: Any, *, exclude: Iterable[int] = ()) -> dict[int, float | bool]:
-        """A mid-scale operating point with the output open, excluding driven slots.
+        """A mid-scale operating point, excluding driven slots.
 
-        Parking is the right measurement reference but renders a degenerate
-        image, so a sweep needs somewhere sane to sit around it.
+        The crossfader is forced in at mid-scale like any other continuous
+        effect even where a program calls it unused, because it gates output
+        regardless of what the program reports.
         """
         skip = set(exclude)
         values: dict[int, float | bool] = {}
         for spec in info.params:
-            if spec.kind is ParamKind.UNUSED or spec.index in skip:
+            if spec.index in skip:
                 continue
-            if spec.kind is ParamKind.BOOLEAN:
+            if spec.index == CROSSFADER_INDEX:
+                values[spec.index] = 0.5
+            elif spec.kind is ParamKind.UNUSED:
+                continue
+            elif spec.kind is ParamKind.BOOLEAN:
                 values[spec.index] = False
-            elif spec.index == CROSSFADER_INDEX or "mix" in spec.name.lower():
+            elif "mix" in spec.name.lower():
                 values[spec.index] = 1.0
             else:
                 values[spec.index] = 0.5
