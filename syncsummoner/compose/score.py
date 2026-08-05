@@ -14,11 +14,24 @@ from typing import Any, Mapping
 import numpy as np
 import yaml
 
-from syncsummoner.device.profile import Axis, ProgramProfile
+from syncsummoner.device.profile import CROSSFADER_INDEX, PARAM_MAX, Axis, ProgramProfile
 from syncsummoner.compose.features import Section
 from syncsummoner.compose.vocabulary import GESTURES, Automation, GestureContext
 
 __all__ = ["Section", "GestureInstance", "Layer", "Score", "control_rate"]
+
+#: The crossfader gates output outright at its extremes, so every gesture is clamped to a blend band.
+CROSSFADER_BLEND_FRAC = (0.10, 0.50)
+
+
+def _clamp_crossfader(auto: Automation) -> Automation:
+    """Clip any crossfader (P12) automation into :data:`CROSSFADER_BLEND_FRAC`."""
+    mask = auto.indices == CROSSFADER_INDEX
+    if not mask.any():
+        return auto
+    lo, hi = (round(frac * PARAM_MAX) for frac in CROSSFADER_BLEND_FRAC)
+    values = np.where(mask, np.clip(auto.values, lo, hi), auto.values).astype(np.int32)
+    return replace(auto, values=values)
 
 
 def control_rate(fps: float) -> float:
@@ -195,7 +208,7 @@ class Score:
                 targets=inst.targets,
             )
             parts.append(gesture(profile, ctx))
-        return Automation.concat(parts)
+        return _clamp_crossfader(Automation.concat(parts))
 
     def automation(
         self, profiles: Mapping[str, ProgramProfile], *, rate: float | None = None
