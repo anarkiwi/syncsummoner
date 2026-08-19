@@ -73,6 +73,11 @@ class VideoFeatures:
     luma: np.ndarray
     chroma: np.ndarray
 
+    @property
+    def duration(self) -> float:
+        """Footage length in seconds."""
+        return self.n_frames / self.fps if self.fps > 0 else 0.0
+
 
 @dataclass(frozen=True, eq=False)
 class Features:
@@ -80,6 +85,12 @@ class Features:
 
     audio: AudioFeatures | None
     video: VideoFeatures | None
+
+    @property
+    def duration(self) -> float:
+        """Length both media cover: a render can be no longer than its shorter input."""
+        spans = [f.duration for f in (self.audio, self.video) if f is not None and f.duration > 0]
+        return min(spans) if spans else 0.0
 
 
 def load_audio(path: str | Path, *, sr: int = 22050) -> tuple[np.ndarray, int]:

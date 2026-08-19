@@ -284,52 +284,98 @@ def _compose_cmd(args: argparse.Namespace) -> int:
     if not profiles:
         raise ValueError(f"no profiles in {args.profiles}; run `syncsummoner probe run` first")
     features = analyze(args.clip, args.audio, rng=rng)
-    score = search(profiles, features, style=args.style, rng=rng, budget=args.budget, density=args.density)
+    score = search(
+        profiles,
+        features,
+        style=args.style,
+        rng=rng,
+        budget=args.budget,
+        density=args.density,
+        n_passes=args.passes,
+    )
     score.save(Path(args.output))
     print(f"{args.output}: {len(score.layers)} layers over {score.duration:.1f}s")
     return 0
 
 
+def _take_path(args: argparse.Namespace) -> str:
+    """Where the raw capture goes; ``--output`` names the finished clip, not the pass."""
+    if args.take:
+        return args.take
+    out = Path(args.output)
+    return str(out.with_name(f"{out.stem}.take{out.suffix or '.mkv'}"))
+
+
+def _fade(args: argparse.Namespace, edge: str) -> float:
+    """Fade for one edge: its own override, else ``--fade``, else the library default."""
+    from syncsummoner.compose.master import DEFAULT_FADE_S
+
+    value = getattr(args, edge)
+    value = args.fade if value is None else value
+    return DEFAULT_FADE_S if value is None else float(value)
+
+
 def _render_cmd(args: argparse.Namespace) -> int:
+    from syncsummoner.compose import master as master_mod
     from syncsummoner.compose import render as render_mod
     from syncsummoner.compose.score import Score
     from syncsummoner.device.recorder import require_ffmpeg
 
     require_ffmpeg()
     score = Score.load(Path(args.score))
+    if args.render_cmd == "audition":
+        score = score.window(args.start, args.start + args.seconds)
+        print(f"audition: {score.duration:.1f}s from {args.start:.1f}s")
     profiles = _profiles_in(Path(args.profiles))
     config = (
         render_mod.RenderConfig.for_format(args.format, source_host=args.source_host)
         if args.format
         else render_mod.RenderConfig(source_host=args.source_host)
     )
+    take, start = _take_path(args), getattr(args, "start", 0.0)
     if args.cut_programs:
         plan = render_mod.render_cuts(
             score,
             args.source,
-            args.output,
+            take,
             profiles=profiles,
             programs=[p.strip() for p in args.cut_programs.split(",") if p.strip()],
             config=config,
             scratch=args.scratch,
             prepared=args.prepared,
+            start=start,
             takes=args.takes,
         )
         for cut in plan:
             print(f"  {cut.start:7.2f}-{cut.end:7.2f}s  {cut.program}")
-        print(f"{args.output}: {len(plan)} cuts")
+        print(f"{take}: {len(plan)} cuts")
+    else:
+        report = render_mod.render_played(
+            score,
+            args.source,
+            take,
+            profiles=profiles,
+            config=config,
+            scratch=args.scratch,
+            prepared=args.prepared,
+            start=start,
+        )
+        print(f"{take}: {report}")
+        if not report.usable:
+            return 1
+    if args.no_master:
         return 0
-    report = render_mod.render_played(
-        score,
-        args.source,
+    seconds = master_mod.master(
+        take,
+        args.audio,
         args.output,
-        profiles=profiles,
-        config=config,
-        scratch=args.scratch,
-        prepared=args.prepared,
+        seconds=score.duration if args.render_cmd == "audition" else None,
+        fade_in=_fade(args, "fade_in"),
+        fade_out=_fade(args, "fade_out"),
+        audio_start=start,
     )
-    print(f"{args.output}: {report}")
-    return 0 if report.usable else 1
+    print(f"{args.output}: {seconds:.1f}s mastered from {take}")
+    return 0
 
 
 def _add_link_args(parser: argparse.ArgumentParser) -> None:
@@ -410,26 +456,39 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--seed", type=int, default=0)
     compose.add_argument("--budget", type=int, default=48)
     compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
+    compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
-    full = sub.add_parser("render", help="render the full pass")
-    full.add_argument("score")
-    full.add_argument("--source", required=True)
-    full.add_argument("--profiles", default="profiles/")
-    full.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
-    full.add_argument("-o", "--output", default="out.mkv")
-    full.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
-    full.add_argument(
-        "--played", action="store_true", help="play the source from the rig, at rate, for one pass"
-    )
-    full.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
-    full.add_argument("--prepared", action="store_true", help="take --scratch as an already timecoded clip")
-    full.add_argument(
-        "--cut-programs", help="cut between these programs on the score's sections, one pass each"
-    )
-    full.add_argument("--takes", default=".", help="where the per-program passes are written")
-    full.set_defaults(func=_render_cmd, render_cmd="render")
+    for name, help_text in (("render", "render the full pass"), ("audition", "render a short excerpt")):
+        node = sub.add_parser(name, help=help_text)
+        node.add_argument("score")
+        node.add_argument("--source", required=True)
+        node.add_argument("--audio", help="track to mux and fade; omitted leaves the clip silent")
+        node.add_argument("--profiles", default="profiles/")
+        node.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
+        node.add_argument("-o", "--output", default=f"{name}.mp4", help="the finished clip")
+        node.add_argument("--take", help="raw capture path (default: alongside --output)")
+        node.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
+        node.add_argument(
+            "--played", action="store_true", help="play the source from the rig, at rate, for one pass"
+        )
+        node.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
+        node.add_argument(
+            "--prepared", action="store_true", help="take --scratch as an already timecoded clip"
+        )
+        node.add_argument(
+            "--cut-programs", help="cut between these programs on the score's sections, one pass each"
+        )
+        node.add_argument("--takes", default=".", help="where the per-program passes are written")
+        node.add_argument("--fade", type=float, help="seconds of fade at each edge (default: 1)")
+        node.add_argument("--fade-in", type=float, help="override the fade in")
+        node.add_argument("--fade-out", type=float, help="override the fade out")
+        node.add_argument("--no-master", action="store_true", help="stop at the raw take")
+        node.set_defaults(func=_render_cmd, render_cmd=name)
+        if name == "audition":
+            node.add_argument("--seconds", type=float, default=30.0, help="excerpt length")
+            node.add_argument("--start", type=float, default=0.0, help="where the excerpt begins")
 
     return parser
 

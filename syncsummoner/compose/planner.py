@@ -408,6 +408,12 @@ def _mark_destroy(sections: Sequence[Section], audio, *, enabled: bool) -> list[
     return [replace(s, destroy=bool(h)) for s, h in zip(sections, hot)]
 
 
+def _clip_sections(sections: Sequence[Section], duration: float) -> list[Section]:
+    """Keep only what the render covers: sections past the end go, the last one is truncated."""
+    kept = [replace(s, end=min(s.end, duration)) for s in sections if s.start < duration]
+    return kept or [Section(start=0.0, end=duration, label="A")]
+
+
 def search(
     profiles: Mapping[str, ProgramProfile],
     features: Features,
@@ -433,11 +439,12 @@ def search(
     if audio is None:
         raise ValueError("planner.search requires audio features")
     style_weights = STYLES.get(style, STYLES["default"])
-    sections = _mark_destroy(audio.sections, audio, enabled=style in DESTROY_STYLES)
+    duration = features.duration or audio.duration
+    sections = _clip_sections(_mark_destroy(audio.sections, audio, enabled=style in DESTROY_STYLES), duration)
     base = Score(
         seed=int(rng.integers(1 << 30)),
         bpm=audio.tempo,
-        duration=audio.duration,
+        duration=duration,
         fps=fps,
         sections=list(sections),
         meta={"style": style, "density": density},

@@ -236,6 +236,8 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
                 "--takes",
             ],
         ),
+        ("render", ["--audio", "--fade", "--fade-in", "--fade-out", "--no-master", "--take"]),
+        ("audition", ["--seconds", "--start", "--audio", "--fade", "--cut-programs"]),
         ("compose", ["--density", "--style", "--budget"]),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe archive", ["--capture", "--setpoints", "--dwell", "--width", "--no-link"]),
@@ -248,3 +250,145 @@ def test_every_documented_flag_is_actually_registered(command, flags, capsys):
     text = capsys.readouterr().out
     missing = [flag for flag in flags if flag not in text]
     assert not missing, f"{command} is missing {missing}"
+
+
+def _render_stubs(monkeypatch, seen):
+    """Stand in for the rig and for ffmpeg, recording what each was asked to do."""
+    monkeypatch.setattr(recorder_mod, "require_ffmpeg", lambda *a, **k: "ffmpeg")
+    monkeypatch.setattr(cli, "_profiles_in", lambda directory: {"g": object()})
+
+    def fake_render(score, source, out, **kwargs):
+        seen["render"] = (score, source, out, kwargs)
+        Path(out).write_text("take", encoding="utf-8")
+        return SimpleNamespace(usable=True, __str__=lambda self: "ok")
+
+    def fake_master(take, audio, out, **kwargs):
+        seen["master"] = (take, audio, out, kwargs)
+        return kwargs.get("seconds") or 42.0
+
+    monkeypatch.setattr("syncsummoner.compose.render.render_played", fake_render)
+    monkeypatch.setattr("syncsummoner.compose.master.master", fake_master)
+
+
+def _score_file(tmp_path):
+    from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
+
+    score = Score(
+        duration=120.0,
+        sections=[Section(0.0, 120.0, "A")],
+        layers=[Layer("g", 0, [GestureInstance("hold", 10.0, 1.0)])],
+    )
+    path = tmp_path / "score.yaml"
+    score.save(path)
+    return str(path)
+
+
+def test_render_masters_the_take_into_the_output(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    out = tmp_path / "final.mp4"
+    assert (
+        cli.main(
+            [
+                "render",
+                _score_file(tmp_path),
+                "--source",
+                "clip.mkv",
+                "--audio",
+                "t.flac",
+                "-o",
+                str(out),
+                "--fade",
+                "2.5",
+            ]
+        )
+        == 0
+    )
+    take, audio, mastered, kwargs = seen["master"]
+    assert (Path(take).name, audio, mastered) == ("final.take.mp4", "t.flac", str(out))
+    assert (kwargs["fade_in"], kwargs["fade_out"], kwargs["seconds"]) == (2.5, 2.5, None)
+
+
+def test_render_can_stop_at_the_raw_take(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    take = tmp_path / "raw.mkv"
+    assert (
+        cli.main(
+            [
+                "render",
+                _score_file(tmp_path),
+                "--source",
+                "clip.mkv",
+                "--take",
+                str(take),
+                "--no-master",
+                "-o",
+                str(tmp_path / "final.mp4"),
+            ]
+        )
+        == 0
+    )
+    assert seen["render"][2] == str(take)
+    assert "master" not in seen
+
+
+def test_audition_windows_the_score_and_masters_that_length(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    assert (
+        cli.main(
+            [
+                "audition",
+                _score_file(tmp_path),
+                "--source",
+                "clip.mkv",
+                "--audio",
+                "t.flac",
+                "--seconds",
+                "20",
+                "--start",
+                "5",
+                "-o",
+                str(tmp_path / "aud.mp4"),
+            ]
+        )
+        == 0
+    )
+    assert seen["render"][0].duration == pytest.approx(20.0)
+    assert seen["master"][3]["seconds"] == pytest.approx(20.0)
+    assert seen["master"][3]["audio_start"] == pytest.approx(5.0)
+
+
+def test_a_blank_take_is_never_mastered(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    monkeypatch.setattr(
+        "syncsummoner.compose.render.render_played",
+        lambda *a, **k: SimpleNamespace(usable=False, __str__=lambda self: "blank"),
+    )
+    assert (
+        cli.main(["render", _score_file(tmp_path), "--source", "clip.mkv", "-o", str(tmp_path / "final.mp4")])
+        == 1
+    )
+    assert "master" not in seen
+
+
+def test_default_fades_come_from_the_library(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    from syncsummoner.compose.master import DEFAULT_FADE_S
+
+    cli.main(
+        [
+            "render",
+            _score_file(tmp_path),
+            "--source",
+            "clip.mkv",
+            "--fade-out",
+            "0",
+            "-o",
+            str(tmp_path / "final.mp4"),
+        ]
+    )
+    assert (seen["master"][3]["fade_in"], seen["master"][3]["fade_out"]) == (DEFAULT_FADE_S, 0.0)

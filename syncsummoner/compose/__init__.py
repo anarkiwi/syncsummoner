@@ -20,10 +20,11 @@ from syncsummoner.compose.planner import (
     search,
     thin,
 )
+from syncsummoner.compose.master import common_duration, master_command, probe_duration
 from syncsummoner.compose.render import RenderConfig, Rig, render_cuts, render_played, schedule
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, Gesture, GestureContext
-from syncsummoner.compose import features, planner, render, score, vocabulary
+from syncsummoner.compose import features, master, planner, render, score, vocabulary
 
 __all__ = [
     "GESTURES",
@@ -46,13 +47,17 @@ __all__ = [
     "analyze",
     "analyze_audio",
     "analyze_frames",
+    "common_duration",
     "render_cuts",
     "render_played",
     "control_rate",
     "evaluate",
     "features",
+    "master",
+    "master_command",
     "plan_automation",
     "planner",
+    "probe_duration",
     "proxy_render",
     "reachable",
     "render",

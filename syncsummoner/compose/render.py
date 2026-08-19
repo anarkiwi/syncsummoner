@@ -112,14 +112,20 @@ def schedule(auto: Automation, *, latency_s: float = 0.0, early_bias_s: float = 
 
 
 def write_timecoded(
-    source: Any, out: str | Path, *, config: RenderConfig, seconds: float | None = None
+    source: Any,
+    out: str | Path,
+    *,
+    config: RenderConfig,
+    seconds: float | None = None,
+    start: float = 0.0,
 ) -> int:
     """Write the source at session geometry with each frame's index burnt in.
 
     A clip the playout can identify frame by frame is what lets the source be
-    played from the other end, where it can run at rate.
+    played from the other end, where it can run at rate. ``start`` skips into it,
+    which is how an excerpt gets the footage it was composed against.
     """
-    total, frames = source_stream(source, config, seconds=seconds)
+    total, frames = source_stream(source, config, seconds=seconds, start=start)
     argv = [
         getattr(config, "ffmpeg", "ffmpeg"),
         "-loglevel",
@@ -195,6 +201,7 @@ def render_played(
     config: RenderConfig | None = None,
     scratch: str | Path = "timecoded.mkv",
     prepared: bool = False,
+    start: float = 0.0,
     recorder: Any = None,
 ) -> TakeReport:
     """Render one pass: the rig plays, ffmpeg records, the host only drives.
@@ -209,7 +216,7 @@ def render_played(
     owned = rig is None
     rig = open_rig(config, player=True, capture=False) if owned else rig
     if not prepared:
-        write_timecoded(source, scratch, config=config, seconds=score.duration)
+        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
     if recorder is None:
         from syncsummoner.device.recorder import Recorder
 
@@ -296,20 +303,30 @@ def render_cuts(
     config: RenderConfig | None = None,
     scratch: str | Path = "timecoded.mkv",
     prepared: bool = False,
+    start: float = 0.0,
     takes: str | Path = ".",
     pass_render: Callable[..., Any] | None = None,
 ) -> list[Cut]:
     """Render one pass per program and cut between them on the score's sections.
 
-    Returns the plan that was cut, so a caller can report what came from where.
+    A program the score already evolved a layer for is driven by that layer;
+    anything else falls back to the first. The timecoded source is built once and
+    replayed by every pass. Returns the plan that was cut.
     """
     config = RenderConfig() if config is None else config
     plan = cut_plan(score, programs)
     run = render_played if pass_render is None else pass_render
+    evolved = {layer.program: layer for layer in score.layers}
+    if not prepared:
+        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
+        prepared = True
     paths: dict[str, str] = {}
     for program in dict.fromkeys(cut.program for cut in plan):
+        source_layer = evolved.get(program) or (score.layers[0] if score.layers else None)
         layer = Layer(
-            index=0, program=program, gestures=list(score.layers[0].gestures) if score.layers else []
+            index=0,
+            program=program,
+            gestures=list(source_layer.gestures) if source_layer is not None else [],
         )
         take = str(Path(takes) / f"take-{program.replace(' ', '_')}.mkv")
         report = run(
@@ -358,7 +375,7 @@ def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True
     )
 
 
-def source_stream(source: Any, config: RenderConfig, *, seconds: float | None = None):
+def source_stream(source: Any, config: RenderConfig, *, seconds: float | None = None, start: float = 0.0):
     """Yield ``(total, frames)``: how many session frames a take is, and them one at a time.
 
     A long take is never held: 180s at 1080p30 is 134GB as a stack, and the pass
@@ -374,14 +391,17 @@ def source_stream(source: Any, config: RenderConfig, *, seconds: float | None = 
         return 0, iter(())
     src_fps = rate if rate > 0 else config.fps
     total = int(round((seconds or 0.0) * config.fps)) if seconds else 0
+    skip = max(0, int(round(start * src_fps)))
 
     def frames() -> Iterator[np.ndarray]:
         held, index = None, 0
         source_index = -1
         for _, frame in read_frames(source):
             source_index += 1
+            if source_index < skip:
+                continue
             held = frame
-            while index * src_fps / config.fps <= source_index:
+            while index * src_fps / config.fps + skip <= source_index:
                 yield _conform(np.asarray(held, dtype=np.float32)[None], config)[0]
                 index += 1
                 if total and index >= total:

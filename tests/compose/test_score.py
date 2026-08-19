@@ -104,3 +104,21 @@ def test_gesture_arrivals_land_on_the_declared_anchor():
     score = example_score()
     auto = score.render_layer(score.layers[0], make_profile())
     assert auto.times.max() == pytest.approx(8.0)
+
+
+def test_window_rebases_sections_and_gestures():
+    excerpt = example_score().window(5.0, 9.0)
+    assert excerpt.duration == pytest.approx(4.0)
+    assert [(s.start, s.end, s.label) for s in excerpt.sections] == [(0.0, 1.0, "A"), (1.0, 4.0, "B")]
+    assert [g.arrival for g in excerpt.layers[0].gestures] == pytest.approx([3.0])
+    assert not excerpt.layers[1].gestures
+
+
+def test_window_keeps_a_gesture_whose_span_reaches_into_it():
+    score = Score(duration=10.0, layers=[Layer("glitch", 0, [GestureInstance("ramp", 3.0, 2.0)])])
+    assert score.window(2.0, 6.0).layers[0].gestures
+    assert not score.window(4.0, 6.0).layers[0].gestures
+
+
+def test_window_cannot_run_past_the_score():
+    assert example_score().window(6.0, 100.0).duration == pytest.approx(6.0)
