@@ -329,6 +329,7 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
         profiles={},
         programs=["Good", "Other"],
         takes=tmp_path,
+        prepared=True,
         pass_render=fake_render,
     )
     assert [c.program for c in plan] == ["Good", "Other"] and len(calls) == 2
@@ -340,6 +341,7 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
             profiles={},
             programs=["Bad"],
             takes=tmp_path,
+            prepared=True,
             pass_render=fake_render,
         )
 
@@ -515,3 +517,75 @@ def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
     )
     assert calls[0] == ("load", "Teletext")
     assert calls[1][0] == "params" and calls[1][1] == {1: 0.5, 12: 1.0}, "the load is followed by a picture"
+
+
+def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_path):
+    """The planner evolves a layer per program; a cut that reused the first would throw that away."""
+    seen = {}
+
+    def fake_render(score, source, out, **kwargs):
+        del source, out, kwargs
+        layer = score.layers[0]
+        seen[layer.program] = [g.gesture for g in layer.gestures]
+        return R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4)
+
+    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    score = Score(
+        duration=20.0,
+        sections=[Section(0.0, 7.0, "A"), Section(7.0, 14.0, "B"), Section(14.0, 20.0, "C")],
+        layers=[
+            Layer(index=0, program="Good", gestures=[GestureInstance("ramp", 1.0, 1.0)]),
+            Layer(index=1, program="Other", gestures=[GestureInstance("hold", 2.0, 1.0)]),
+        ],
+    )
+    R.render_cuts(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        programs=["Good", "Other", "Unplanned"],
+        takes=tmp_path,
+        prepared=True,
+        pass_render=fake_render,
+    )
+    assert seen == {"Good": ["ramp"], "Other": ["hold"], "Unplanned": ["ramp"]}
+
+
+def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_path):
+    """Burning it per pass would cost minutes a program for a clip that never changes."""
+    built, passes = [], []
+    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "write_timecoded", lambda source, out, **kw: built.append(out) or 1)
+
+    def fake_render(score, source, out, **kwargs):
+        del score, source, out
+        passes.append(kwargs["prepared"])
+        return R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4)
+
+    score = Score(
+        duration=20.0,
+        sections=[Section(0.0, 10.0, "A"), Section(10.0, 20.0, "B")],
+        layers=[Layer("Good", 0, [])],
+    )
+    R.render_cuts(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        programs=["Good", "Other"],
+        takes=tmp_path,
+        scratch=tmp_path / "tc.mkv",
+        pass_render=fake_render,
+    )
+    assert built == [tmp_path / "tc.mkv"] and passes == [True, True]
+
+
+def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
+    """A windowed score played from frame zero would show the wrong 30 seconds."""
+    clip = [np.full((CONFIG.height, CONFIG.width, 3), i / 20, np.float32) for i in range(20)]
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
+    )
+    _, stream = R.source_stream("clip.mkv", CONFIG, seconds=0.5, start=1.0)
+    assert [round(float(f.mean()), 3) for f in stream] == [round(float(f.mean()), 3) for f in clip[10:15]]

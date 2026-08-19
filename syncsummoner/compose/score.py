@@ -186,6 +186,31 @@ class Score:
                 mask |= (times >= s.start) & (times < s.end)
         return mask
 
+    def window(self, start: float, end: float) -> "Score":
+        """Excerpt ``[start, end)`` rebased to zero, keeping whatever overlaps it.
+
+        An audition is the same score over a shorter span, not a different one: a
+        gesture spans back from its arrival, so it survives if that span intersects.
+        """
+        end = min(end, self.duration) if self.duration else end
+        sections = [
+            replace(s, start=max(s.start, start) - start, end=min(s.end, end) - start)
+            for s in self.sections
+            if s.start < end and s.end > start
+        ]
+        layers = [
+            replace(
+                layer,
+                gestures=[
+                    replace(g, arrival=g.arrival - start)
+                    for g in layer.gestures
+                    if g.arrival > start and g.arrival - g.duration < end
+                ],
+            )
+            for layer in self.layers
+        ]
+        return replace(self, duration=max(0.0, end - start), sections=sections, layers=layers)
+
     def with_layers(self, layers: list[Layer]) -> "Score":
         """Copy with a different set of layers."""
         return replace(self, layers=layers)

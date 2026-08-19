@@ -10,7 +10,7 @@ from scipy.io import wavfile
 
 from syncsummoner.compose import features as F
 
-from . import SEGMENT_KW, SR, click_track
+from . import SEGMENT_KW, SR, click_track, make_features
 
 
 def test_beat_track_recovers_known_tempo():
@@ -259,3 +259,19 @@ def test_streaming_video_analysis_of_an_empty_clip(monkeypatch):
     monkeypatch.setattr(cv2, "VideoCapture", EmptyCap)
     vf = F.analyze_video("fake.mkv")
     assert vf.n_frames == 0 and vf.fps == 30.0 and vf.motion_energy.size == 0
+
+
+def test_media_durations_bound_the_render():
+    video = F.VideoFeatures(
+        fps=25.0,
+        n_frames=50,
+        shot_boundaries=np.zeros(0, dtype=np.int64),
+        motion_energy=np.zeros(50),
+        luma=np.zeros(50),
+        chroma=np.zeros(50),
+    )
+    assert video.duration == pytest.approx(2.0)
+    audio = make_features(np.random.default_rng(0), seconds=8.0).audio
+    assert F.Features(audio=audio, video=video).duration == pytest.approx(2.0)
+    assert F.Features(audio=audio, video=None).duration == pytest.approx(audio.duration)
+    assert F.Features(audio=None, video=None).duration == 0.0

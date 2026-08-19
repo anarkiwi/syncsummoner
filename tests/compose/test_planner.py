@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from syncsummoner.compose import planner as P
-from syncsummoner.compose.features import Features, Section
+from syncsummoner.compose.features import Features, Section, VideoFeatures
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
 from syncsummoner.compose.vocabulary import Automation
 from syncsummoner.device.profile import Axis, Source
@@ -314,3 +314,23 @@ def test_a_program_with_nothing_to_drive_is_not_planned(features):
         budget=12,
     )
     assert both.layers and {layer.program for layer in both.layers} == {"glitch"}
+
+
+def test_score_runs_no_longer_than_the_shorter_input(features):
+    video = VideoFeatures(
+        fps=30.0,
+        n_frames=90,
+        shot_boundaries=np.zeros(0, dtype=np.int64),
+        motion_energy=np.zeros(90),
+        luma=np.zeros(90),
+        chroma=np.zeros(90),
+    )
+    both = Features(audio=features.audio, video=video)
+    score = P.search({"g": make_profile("g")}, both, rng=np.random.default_rng(5), budget=4, fps=FPS)
+    assert score.duration == pytest.approx(3.0)
+    assert score.sections[-1].end == pytest.approx(3.0)
+    assert max(g.arrival for g in score.layers[0].gestures) <= 3.0
+
+
+def test_clipping_leaves_at_least_one_section():
+    assert P._clip_sections([Section(4.0, 6.0, "A")], 3.0) == [Section(0.0, 3.0, "A")]

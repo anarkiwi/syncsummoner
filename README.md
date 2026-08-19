@@ -35,12 +35,17 @@ syncsummoner profile show | diff | atlas --program bitcrush_displace
 
 syncsummoner analyze clip.mp4 --audio track.wav -o features.json
 
-syncsummoner compose --profiles profiles/ --features features.json \
-                     --style glitchy --seed 7 -o score.yaml
+syncsummoner compose clip.mp4 --audio track.wav --profiles profiles/ \
+                     --style glitchy --seed 7 --passes 8 -o score.yaml
 
-syncsummoner audition score.yaml --seconds 30
-syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
+syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4
+syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
+                    --cut-programs Derez,Lorenz,Scramble --fade 1.5 -o final.mp4
 ```
+
+A render is the length both inputs cover, muxes the track back in, and fades up
+from black and silence and back down. [docs/workflow.md](docs/workflow.md) is the
+whole thing end to end, on the rig, through `docker run`.
 
 ## Layout
 
@@ -53,6 +58,7 @@ syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
 
 ## Docs
 
+- [docs/workflow.md](docs/workflow.md) — worked example: clip and track in, finished render out
 - [docs/design.md](docs/design.md) — the design being realized
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
 - [docs/signal-loss.md](docs/signal-loss.md) — video path, and diagnosis of the intermittent input fault
@@ -62,6 +68,7 @@ syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
 ## Development
 
 ```sh
+docker build --target runtime -t syncsummoner .   # the image the rig is driven from
 docker build --target lint .
 docker build --target test -t syncsummoner-test . && docker run --rm syncsummoner-test
 docker build --target test-aesthetics -t ss-aes . && docker run --rm ss-aes
