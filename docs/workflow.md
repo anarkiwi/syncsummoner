@@ -10,31 +10,26 @@ Everything below runs through `docker run`, on the rig described in
 ## The rig
 
 ```
-                    +--------------------------------------+
-                    |  workstation (runs syncsummoner)     |
-                    |                                      |
-                    |   /dev/ttyACM0   /dev/snd/midiC*D0   |
-                    |   /dev/video0    ssh                 |
-                    +--+--------+---------+-----------+----+
-                       |        |         |           |
-        USB-C (serial) |        | USB     | USB 3     | ethernet
-        CDC 16d0:14db  |        | MIDI    | UVC       | ssh, BatchMode
-                       |        |         |           |
-                       v        v         |           v
-             +---------+--------+---+     |    +------+-----------------+
-             |     LZX Videomancer  |     |    | Raspberry Pi 4B        |
-             |                      |     |    | "videopi"              |
-             |  HDMI IN  <----------+-----+----+ HDMI0  (/dev/fb0)      |
-             |                      |  HDMI    |                        |
-             |  6 knobs, 5 toggles, |  1080p30 | no compositor, DRM free|
-             |  crossfader (P12)    |          +------------------------+
-             |                      |
-             |  HDMI OUT  ----------+---> +--------------------------+
-             |                      |     | AVerMedia Live Gamer     |
-             |  CVBS/S-video (alt)  |     | Ultra 2.1  (UVC)         |
-             +----------------------+     +-----------+--------------+
-                                                      |
-                                       USB 3 to workstation /dev/video0
+   Raspberry Pi 4B "videopi"                     LZX Videomancer
+   +---------------------------+                +----------------------------+
+   | /dev/fb0, 1080p30         |     HDMI       | HDMI IN                    |
+   | no compositor, DRM free   |===============>|                            |
+   | plays the timecoded clip  |  source clip   | 6 knobs, 5 toggles,        |
+   +-------------+-------------+                | crossfader (P12)           |
+                 |                              |                            |
+                 | ethernet                     | HDMI OUT ------------------+---+
+                 | ssh, BatchMode:              | CVBS / S-video (alternate) |   |
+                 | playout and link blanking    +------+-------------+-------+   | HDMI
+                 |                                     |             |           | processed
+                 |                          USB (CDC)  |             | USB MIDI  v  picture
+                 |                       /dev/ttyACM0  |             |     +-----------------+
+                 |                       16d0:14db     |             |     | AVerMedia Live  |
+                 |                                     |             |     | Gamer Ultra 2.1 |
+                 v                                     v             v     +--------+--------+
+   +-------------------------------------------------------------------+            |
+   |  workstation:  docker run syncsummoner                            |<-----------+
+   |  /dev/video0   /dev/ttyACM0   /dev/snd/midiC*D0   ssh             |  USB 3 (UVC)
+   +-------------------------------------------------------------------+
 ```
 
 | Cable | From | To | Carries |
