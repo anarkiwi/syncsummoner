@@ -190,8 +190,8 @@ What happens, in order:
 3. The Pi plays the clip at rate while ffmpeg records the card and the host writes
    only the parameters that are due. Each program is driven by its own evolved
    layer; the take covers the whole timeline.
-4. The takes are cut together on the score's sections, in rotation, into
-   `final.take.mp4`.
+4. Each pass lands in `--takes` as `take-<program>.mkv`, and they are cut together
+   on the score's sections, in rotation, into `final.take.mp4`.
 5. Mastering: trim to the length both inputs cover, mux the track, fade the
    picture up from black and the audio up from silence over `--fade` seconds, and
    the same back down at the end.
@@ -202,7 +202,8 @@ the clip so they meet rather than overlap. `--no-master` stops at the raw take,
 and `--take` puts it somewhere other than beside the output.
 
 Without `--cut-programs` the render is a single pass through the score's first
-layer — one program for the whole piece, and about a quarter of the wall clock.
+layer: one program for the whole piece, and one pass of rig time instead of one
+per program.
 
 ## 5. Check what came out
 
