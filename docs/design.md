@@ -407,10 +407,11 @@ during bring-up and stored per firmware.
 
 ### 2. Session format is not a free choice
 
-Section 5 inherits "720p59.94 or 1080p30" from the predecessor. Measured on this
-rig, `1080p30`, `1080i60` and `480p` produce no signal at the capture card;
-only `NTSC` and `720p60` do. Playout is a Pi on composite at 720x480i, so the
-whole chain is NTSC. See `hardware.md`.
+Section 5 inherits "720p59.94 or 1080p30" from the predecessor. The device
+genlocks to its source and cannot convert, so the format is whatever both ends
+already run: the session is the Pi over HDMI at 1920x1080@30. What the card will
+accept depends on what it is genlocked to — under an NTSC genlock only `720p60`
+was usable. See `hardware.md`.
 
 ### 3. Parameters are additive, and heterogeneous
 
