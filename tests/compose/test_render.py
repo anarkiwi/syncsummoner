@@ -314,6 +314,7 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
         return R.TakeReport(frames=10, distinct=1 if blank else 9, blank=10 if blank else 0, luma=0.4)
 
     monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
     score = Score(
         seed=1,
         bpm=120.0,
@@ -530,6 +531,7 @@ def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_pa
         return R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4)
 
     monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
     score = Score(
         duration=20.0,
         sections=[Section(0.0, 7.0, "A"), Section(7.0, 14.0, "B"), Section(14.0, 20.0, "C")],
@@ -555,6 +557,7 @@ def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_
     """Burning it per pass would cost minutes a program for a clip that never changes."""
     built, passes = [], []
     monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
     monkeypatch.setattr(R, "write_timecoded", lambda source, out, **kw: built.append(out) or 1)
 
     def fake_render(score, source, out, **kwargs):
@@ -589,3 +592,166 @@ def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
     )
     _, stream = R.source_stream("clip.mkv", CONFIG, seconds=0.5, start=1.0)
     assert [round(float(f.mean()), 3) for f in stream] == [round(float(f.mean()), 3) for f in clip[10:15]]
+
+
+def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path):
+    """A load costs 12 to 19s, so a clip started before it has already run out by the take."""
+    order = []
+
+    class Player:
+        """ClipPlayer stand-in recording when playback starts and stops."""
+
+        def upload(self, path):
+            """Upload."""
+            order.append(f"upload:{path}")
+            return 1
+
+        @contextlib.contextmanager
+        def playing(self, *, fps):
+            """Play for the duration of the block."""
+            del fps
+            order.append("play")
+            yield self
+            order.append("stop")
+
+    class Session:
+        """Session recording the load only."""
+
+        def load_program(self, program, link=None):
+            """Load program."""
+            del link
+            order.append(f"load:{program}")
+
+        def set_params(self, values):
+            """Set params."""
+
+        def working_point(self, info):
+            """Working point."""
+            del info
+            return {}
+
+    class Rec:
+        """Recorder stand-in."""
+
+        def recording(self, path, seconds=None):
+            """Recording."""
+            del path, seconds
+            return contextlib.nullcontext()
+
+    monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle"))
+    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: R.TakeReport(300, 280, 0, 0.4))
+    monkeypatch.setattr(R, "drive", lambda *a, **k: order.append("drive") or 0)
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+    rig = R.Rig(
+        session=Session(),
+        capture=None,
+        playout=Player(),
+        transport=types.SimpleNamespace(program_info=lambda: None),
+    )
+    score = Score(duration=10.0, sections=[Section(0.0, 10.0, "A")], layers=[Layer("Passthru", 0, [])])
+    R.render_played(
+        score,
+        "clip.mkv",
+        tmp_path / "take.mkv",
+        profiles={},
+        rig=rig,
+        config=CONFIG,
+        prepared=True,
+        recorder=Rec(),
+    )
+    assert order == [
+        "upload:timecoded.mkv",
+        "play",
+        "load:Passthru",
+        "settle",
+        "stop",
+        "play",
+        "drive",
+        "stop",
+    ]
+
+
+def test_picture_start_finds_where_the_played_clip_begins(monkeypatch, tmp_path):
+    """A take opens on the previous play's last frame, which carries its own timecode."""
+    lead, config = 5, dataclasses.replace(CONFIG, lead_s=1.0)
+    stale = R.burn_timecode(
+        np.full((CONFIG.strip_px, CONFIG.width, 3), 0.5, np.float32),
+        299,
+        bits=CONFIG.bits,
+        strip_px=CONFIG.strip_px,
+    )
+    strips = [stale for _ in range(lead)]
+    strips += [
+        R.burn_timecode(
+            np.full((config.strip_px, config.width, 3), 0.5, np.float32),
+            i,
+            bits=config.bits,
+            strip_px=config.strip_px,
+        )
+        for i in range(4)
+    ]
+    raw = np.clip(np.stack(strips), 0, 1).astype(np.float32)
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda argv, **kw: types.SimpleNamespace(stdout=(raw * 255).astype(np.uint8).tobytes()),
+    )
+    assert R.picture_start(tmp_path / "take.mkv", config=config) == pytest.approx(lead / config.fps)
+
+
+def test_picture_start_survives_a_misread_strip(monkeypatch, tmp_path):
+    """One strip decoding to a wrong low value would otherwise move the whole clip."""
+    config = dataclasses.replace(CONFIG, lead_s=1.0)
+    plate = np.full((config.strip_px, config.width, 3), 0.5, np.float32)
+    codes = [299, 299, 1, 0, 1, 2, 3, 4, 5, 6]
+    raw = np.stack([R.burn_timecode(plate, c, bits=config.bits, strip_px=config.strip_px) for c in codes])
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda argv, **kw: types.SimpleNamespace(
+            stdout=(np.clip(raw, 0, 1) * 255).astype(np.uint8).tobytes()
+        ),
+    )
+    assert R.picture_start(tmp_path / "take.mkv", config=config) == pytest.approx(3 / config.fps)
+
+
+def test_picture_start_of_a_take_with_no_strip_is_zero(monkeypatch, tmp_path):
+    monkeypatch.setattr(R.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(stdout=b""))
+    assert R.picture_start(tmp_path / "take.mkv", config=CONFIG) == 0.0
+
+
+def test_a_cut_is_taken_past_each_takes_own_lead_in(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda argv, **kw: seen.append(argv) or types.SimpleNamespace(returncode=0, stderr=b""),
+    )
+    cuts = [R.Cut(0.0, 5.0, "Derez"), R.Cut(5.0, 9.0, "Lorenz")]
+    R.assemble(
+        cuts,
+        {"Derez": tmp_path / "d.mkv", "Lorenz": tmp_path / "l.mkv"},
+        tmp_path / "out.mkv",
+        starts={"Derez": 2.0},
+    )
+    argv = seen[0]
+    assert argv[argv.index("-ss") + 1] == "2.000" and argv[argv.index("-to") + 1] == "7.000"
+    assert argv[argv.index(str(tmp_path / "l.mkv")) - 3 : argv.index(str(tmp_path / "l.mkv"))] == [
+        "-to",
+        "9.000",
+        "-i",
+    ]
+
+
+def test_picture_start_reads_the_take_at_session_rate(monkeypatch, tmp_path):
+    """The card returns its own frame rate; an index only means a time at the session's."""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        del kw
+        seen["argv"] = argv
+        return types.SimpleNamespace(stdout=b"")
+
+    monkeypatch.setattr(R.subprocess, "run", fake_run)
+    R.picture_start(tmp_path / "take.mkv", config=CONFIG)
+    assert seen["argv"][seen["argv"].index("-vf") + 1].startswith(f"fps={CONFIG.fps},crop=")

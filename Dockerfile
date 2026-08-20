@@ -16,8 +16,8 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         black pylint pytest pytest-cov pytest-xdist import-linter \
     && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
-        "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" \
-        "pyvmancer>=0.2"
+        "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" \
+        "pyvmancer[serial]>=0.2"
 
 # The seam check (design SS2.7): only the aesthetics extra, no device stack.
 FROM base AS deps-aesthetics
@@ -29,13 +29,13 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
 
 # The image the rig is driven from: ffmpeg for capture and mastering, ssh for the Pi.
 FROM base AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg openssh-client \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg openssh-client libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
-        "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" \
-        "pyvmancer>=0.2"
+        "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" \
+        "pyvmancer[all]>=0.2"
 COPY . .
 RUN /venv/bin/pip install --no-deps -e .
 WORKDIR /work

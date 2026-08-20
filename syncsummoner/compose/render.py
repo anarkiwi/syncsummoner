@@ -20,12 +20,16 @@ from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_tak
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
+from syncsummoner.progress import LOG, human, stage, track
 
 
 class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
 
+#: Relock after a load was measured at 12 to 19s, against a settle budget that is
+#: a timeout; half the budget is what a pass is expected to wait, for estimates.
+EXPECTED_RELOCK_FRAC = 0.5
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
 #: whatever both ends already run at; 1080p30 is this rig, measured.
 SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
@@ -46,6 +50,8 @@ class RenderConfig:
     cc_budget_hz: float = 200.0
     #: Budget for the picture to return after a load; relock was measured at 12 to 19 seconds.
     settle_s: float = 40.0
+    #: Recorded before the clip is started, so the picture's own first frame is inside the take.
+    lead_s: float = 3.0
     #: Where the liveness probe is recorded before a take begins.
     probe_path: str = "/tmp/syncsummoner-probe.mkv"
     #: ssh target driving playout and the HDMI link; None takes the device layer's default.
@@ -94,6 +100,47 @@ def read_timecode(
         return None
     binary = np.bitwise_xor.accumulate((cells[1:] > cells.mean()).astype(np.int64))
     return int((binary * (1 << np.arange(bits - 1, -1, -1))).sum())
+
+
+def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | None = None) -> float:
+    """Seconds into a take at which the played clip's first frame lands.
+
+    Lead-in is not blank: it holds whatever the framebuffer last showed, which is
+    the previous play's final frame and carries that frame's own timecode. Played
+    at rate, every fresh frame has the same lag between where it sits in the take
+    and the frame it says it is, so the lag they agree on is the answer and one
+    misread strip cannot move it. The card returns frames at its own rate, so
+    they are resampled to the session's before an index means a time.
+    """
+    search = config.lead_s + 2.0 if search_s is None else search_s
+    argv = [
+        getattr(config, "ffmpeg", "ffmpeg"),
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-t",
+        f"{search:.3f}",
+        "-vf",
+        f"fps={config.fps},crop=iw:{config.strip_px}:0:ih-{config.strip_px}",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    data = subprocess.run(argv, check=False, capture_output=True).stdout
+    stride = config.width * config.strip_px * 3
+    strips = np.frombuffer(data[: len(data) - len(data) % stride], np.uint8)
+    if not strips.size:
+        return 0.0
+    strips = strips.reshape(-1, config.strip_px, config.width, 3).astype(np.float32) / 255.0
+    codes = [read_timecode(s, bits=config.bits, strip_px=config.strip_px) for s in strips]
+    lags = np.array([i - c for i, c in enumerate(codes) if c is not None], dtype=np.int64)
+    if not lags.size:
+        return 0.0
+    values, counts = np.unique(lags, return_counts=True)
+    return max(0.0, float(values[counts.argmax()]) / config.fps)
 
 
 def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:
@@ -156,13 +203,14 @@ def write_timecoded(
     )
     written = 0
     try:
-        for index, frame in enumerate(frames):
+        for index, frame in enumerate(track(frames, desc="timecoding", total=total or None, unit="frame")):
             stamped = burn_timecode(frame, index, bits=config.bits, strip_px=config.strip_px)
             proc.stdin.write(np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data)
             written = index + 1
     finally:
         proc.stdin.close()
         proc.wait()
+    LOG.info("timecoded %d frames into %s at %dx%d", written or total, out, config.width, config.height)
     return written or total
 
 
@@ -207,7 +255,11 @@ def render_played(
     """Render one pass: the rig plays, ffmpeg records, the host only drives.
 
     Nothing on the host touches a frame while the rig is running, which is what
-    a real-time capture needs and what a per-frame loop could never give it.
+    a real-time capture needs and what a per-frame loop could never give it. The
+    clip is played twice: once as the moving picture the load's liveness probe
+    needs, then again, inside the recording, for the take itself. The take opens
+    on lead-in the picture has not reached yet; :func:`picture_start` says where
+    it does.
     """
     layers = sorted(score.layers, key=lambda item: item.index)
     if not layers:
@@ -228,18 +280,22 @@ def render_played(
         early_bias_s=config.early_bias_s,
     )
     try:
-        rig.playout.upload(str(scratch))
+        with stage("upload", clip=str(scratch)) as sent:
+            sent["bytes"] = rig.playout.upload(str(scratch))
         with rig.playout.playing(fps=config.fps):
-            rig.session.load_program(layers[0].program, link=rig.link)
-            rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
-            settle(
-                recorder,
-                program=layers[0].program,
-                timeout_s=config.settle_s,
-                probe_path=config.probe_path,
-            )
-            with recorder.recording(out, seconds=score.duration):
-                drive(rig, auto, duration=score.duration)
+            with stage("load", program=layers[0].program):
+                rig.session.load_program(layers[0].program, link=rig.link)
+                rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
+                settle(
+                    recorder,
+                    program=layers[0].program,
+                    timeout_s=config.settle_s,
+                    probe_path=config.probe_path,
+                )
+        with stage("pass", program=layers[0].program, seconds=f"{score.duration:.1f}") as written:
+            with recorder.recording(out, seconds=score.duration + config.lead_s):
+                with rig.playout.playing(fps=config.fps):
+                    written["writes"] = drive(rig, auto, duration=score.duration)
     finally:
         if owned and rig.capture is not None:
             rig.capture.close()
@@ -274,18 +330,33 @@ def cut_plan(score: Score, programs: Sequence[str]) -> list[Cut]:
 
 
 def assemble(
-    cuts: Sequence[Cut], takes: Mapping[str, str | Path], out: str | Path, *, ffmpeg: str = "ffmpeg"
+    cuts: Sequence[Cut],
+    takes: Mapping[str, str | Path],
+    out: str | Path,
+    *,
+    ffmpeg: str = "ffmpeg",
+    starts: Mapping[str, float] | None = None,
 ) -> None:
     """Splice each cut's span out of its program's take, in order.
 
     Every take covers the whole timeline, so a span is the same span in each; the
-    cut is a choice of which one to show, not a re-timing.
+    cut is a choice of which one to show, not a re-timing. ``starts`` carries
+    where each take's picture begins, since a pass opens on lead-in.
     """
     if not cuts:
         raise ValueError("nothing to assemble")
+    offset = dict(starts or {})
     argv = [ffmpeg, "-loglevel", "error", "-y"]
     for cut in cuts:
-        argv += ["-ss", f"{cut.start:.3f}", "-to", f"{cut.end:.3f}", "-i", str(takes[cut.program])]
+        head = offset.get(cut.program, 0.0)
+        argv += [
+            "-ss",
+            f"{head + cut.start:.3f}",
+            "-to",
+            f"{head + cut.end:.3f}",
+            "-i",
+            str(takes[cut.program]),
+        ]
     joins = "".join(f"[{i}:v]" for i in range(len(cuts)))
     argv += ["-filter_complex", f"{joins}concat=n={len(cuts)}:v=1:a=0[v]", "-map", "[v]", str(out)]
     done = subprocess.run(argv, check=False, capture_output=True)
@@ -317,11 +388,22 @@ def render_cuts(
     plan = cut_plan(score, programs)
     run = render_played if pass_render is None else pass_render
     evolved = {layer.program: layer for layer in score.layers}
+    passes = len(dict.fromkeys(cut.program for cut in plan))
+    LOG.info(
+        "%d cuts over %d programs: %d passes of %s plus a relock each, about %s of rig time",
+        len(plan),
+        passes,
+        passes,
+        human(score.duration),
+        human(passes * (score.duration + config.settle_s * EXPECTED_RELOCK_FRAC)),
+    )
     if not prepared:
         write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
         prepared = True
     paths: dict[str, str] = {}
-    for program in dict.fromkeys(cut.program for cut in plan):
+    starts: dict[str, float] = {}
+    ordered = list(dict.fromkeys(cut.program for cut in plan))
+    for program in track(ordered, desc="passes", total=len(ordered), unit="program"):
         source_layer = evolved.get(program) or (score.layers[0] if score.layers else None)
         layer = Layer(
             index=0,
@@ -341,7 +423,10 @@ def render_cuts(
         if report is not None and not report.usable:
             raise BlankTakeError(f"{program}: {report}")
         paths[program] = take
-    assemble(plan, paths, out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+        starts[program] = picture_start(take, config=config)
+        LOG.info("%s: picture starts %.2fs into the take", program, starts[program])
+    with stage("assemble", cuts=len(plan), out=str(out)):
+        assemble(plan, paths, out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"), starts=starts)
     return plan
 
 
