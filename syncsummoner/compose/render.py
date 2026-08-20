@@ -262,8 +262,8 @@ def drive(
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
     start, cursor, written = clock(), 0, 0
-    with meter(duration, desc="pass") as bar:
-        report = lambda now: bar.to(now - start)  # pylint: disable=unnecessary-lambda-assignment
+    with meter(duration, desc="pass") as elapsed:
+        report = lambda now: elapsed.to(now - start)  # pylint: disable=unnecessary-lambda-assignment
         while cursor < times.size:
             _wait_until(start + float(times[cursor]), clock=clock, sleep=sleep, tick_s=tick_s, report=report)
             due = max(int(np.searchsorted(times, clock() - start, side="right")), cursor + 1)
@@ -273,7 +273,7 @@ def drive(
             written += due - cursor
             cursor = due
         _wait_until(start + duration, clock=clock, sleep=sleep, tick_s=tick_s, report=report)
-        bar.to(duration)
+        elapsed.to(duration)
     return written
 
 

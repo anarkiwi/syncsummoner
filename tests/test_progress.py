@@ -75,9 +75,9 @@ def test_a_failed_stage_says_so_rather_than_reporting_done(logs):
 
 
 def test_a_meter_logs_a_heartbeat_when_there_is_no_bar_to_draw(logs):
-    with progress.meter(300.0, desc="pass") as bar:
+    with progress.meter(300.0, desc="pass") as elapsed:
         for position in (5.0, 29.0, 31.0, 62.0):
-            bar.to(position)
+            elapsed.to(position)
     text = logs.getvalue()
     assert "pass 31/300s" in text and "pass 62/300s" in text
     assert "pass 5/300s" not in text, "a heartbeat is periodic, not per update"
@@ -102,9 +102,9 @@ def test_a_meter_draws_a_bar_on_a_terminal(monkeypatch):
     monkeypatch.setattr(progress.sys.stderr, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(progress, "tqdm", lambda **kwargs: drawn.setdefault("kw", kwargs) and Bar() or Bar())
     progress.configure(0)
-    with progress.meter(10.0, desc="pass") as bar:
-        bar.to(4.0)
-        bar.to(99.0)
+    with progress.meter(10.0, desc="pass") as elapsed:
+        elapsed.to(4.0)
+        elapsed.to(99.0)
     assert drawn["n"] == 10.0, "a meter cannot run past its total"
     assert drawn["closed"] and drawn["kw"]["desc"] == "pass"
     logging.getLogger("syncsummoner").handlers.clear()

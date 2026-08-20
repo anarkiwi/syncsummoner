@@ -71,15 +71,15 @@ class Meter:
     :data:`HEARTBEAT_S`, so a piped run is not silent for minutes at a time.
     """
 
-    def __init__(self, total: float, *, desc: str, bar: Any = None):
-        self.total, self.desc, self._bar, self._said = float(total), desc, bar, 0.0
+    def __init__(self, total: float, *, desc: str, drawn: Any = None):
+        self.total, self.desc, self._drawn, self._said = float(total), desc, drawn, 0.0
 
     def to(self, position: float) -> None:
         """Report having reached ``position`` of the total."""
         position = min(max(position, 0.0), self.total)
-        if self._bar is not None:
-            self._bar.n = position
-            self._bar.refresh()
+        if self._drawn is not None:
+            self._drawn.n = position
+            self._drawn.refresh()
         elif position - self._said >= HEARTBEAT_S:
             self._said = position
             LOG.info("%s %.0f/%.0fs", self.desc, position, self.total)
@@ -89,12 +89,12 @@ class Meter:
 def meter(total: float, *, desc: str, unit: str = "s") -> Iterator[Meter]:
     """A :class:`Meter` for ``total`` units of work, drawn when it can be."""
     drawable = tqdm is not None and sys.stderr.isatty() and LOG.isEnabledFor(logging.INFO)
-    bar = tqdm(total=float(total), desc=desc, unit=unit, leave=False, file=sys.stderr) if drawable else None
+    drawn = tqdm(total=float(total), desc=desc, unit=unit, leave=False, file=sys.stderr) if drawable else None
     try:
-        yield Meter(total, desc=desc, bar=bar)
+        yield Meter(total, desc=desc, drawn=drawn)
     finally:
-        if bar is not None:
-            bar.close()
+        if drawn is not None:
+            drawn.close()
 
 
 def track(iterable: Iterable, *, desc: str, total: int | None = None, unit: str = "it") -> Iterable:
