@@ -97,3 +97,16 @@ def test_master_raises_on_ffmpeg_failure(monkeypatch):
 def test_an_excerpt_seeks_the_track_to_where_it_was_taken_from():
     argv = M.master_command("take.mkv", "track.flac", "out.mp4", duration=30.0, audio_start=60.0)
     assert argv[argv.index("track.flac") - 3 : argv.index("track.flac")] == ["-ss", "60.000", "-i"]
+
+
+def test_the_takes_lead_in_is_trimmed_by_filter_not_by_seek():
+    """Capture timestamps are the card's, so a seek lands near the frame, not on it."""
+    argv = M.master_command("take.mkv", None, "out.mp4", duration=10.0, video_start=1.27)
+    chain = argv[argv.index("-vf") + 1]
+    assert chain.startswith("trim=start=1.270,setpts=PTS-STARTPTS,fade=t=in")
+    assert "-ss" not in argv
+
+
+def test_no_lead_in_leaves_the_chain_untrimmed():
+    argv = M.master_command("take.mkv", None, "out.mp4", duration=10.0, fade_in=0.0, fade_out=0.0)
+    assert "-vf" not in argv

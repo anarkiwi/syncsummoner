@@ -15,6 +15,8 @@ import numpy as np
 from scipy import ndimage, signal
 from scipy.io import wavfile
 
+from syncsummoner.progress import LOG, stage, track
+
 try:
     import librosa
 except ImportError:
@@ -407,7 +409,7 @@ def analyze_video(
     """
     fps, count, prev = 30.0, 0, None
     luma, chroma, diff = [], [], []
-    for fps, frame in read_frames(path, max_frames=max_frames):
+    for fps, frame in track(read_frames(path, max_frames=max_frames), desc="reading", unit="frame"):
         count += 1
         plane = frame.mean(axis=2)
         luma.append(plane.mean())
@@ -437,9 +439,23 @@ def analyze(
     """Analyze a source clip and its audio track into the planner's input structure."""
     audio = None
     if audio_path is not None:
-        y, out_sr = load_audio(audio_path, sr=sr)
-        audio = analyze_audio(y, out_sr, rng=rng, **audio_kw)
+        with stage("analyzing audio", path=str(audio_path)) as done:
+            y, out_sr = load_audio(audio_path, sr=sr)
+            audio = analyze_audio(y, out_sr, rng=rng, **audio_kw)
+            done.update(
+                seconds=f"{audio.duration:.1f}",
+                bpm=f"{audio.tempo:.1f}",
+                sections=len(audio.sections),
+            )
     video = None
     if video_path is not None:
-        video = analyze_video(video_path, max_frames=max_frames)
-    return Features(audio=audio, video=video)
+        with stage("analyzing video", path=str(video_path)) as done:
+            video = analyze_video(video_path, max_frames=max_frames)
+            done.update(
+                seconds=f"{video.duration:.1f}",
+                fps=f"{video.fps:.2f}",
+                shots=int(video.shot_boundaries.size),
+            )
+    features = Features(audio=audio, video=video)
+    LOG.info("render length is %.1fs, the shorter of what was given", features.duration)
+    return features

@@ -43,9 +43,12 @@ syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
                     --cut-programs Derez,Lorenz,Scramble --fade 1.5 -o final.mp4
 ```
 
-A render is the length both inputs cover, muxes the track back in, and fades up
-from black and silence and back down. [docs/workflow.md](docs/workflow.md) is the
-whole thing end to end, on the rig, through `docker run`.
+Every command logs each stage and its elapsed time to stderr (`-v` for detail,
+`-q` for silence) and draws a progress bar where the work is countable; stdout
+carries only what was written. A render is the length both inputs cover, muxes
+the track back in, and fades up from black and silence and back down.
+[docs/workflow.md](docs/workflow.md) is the whole thing end to end, on the rig,
+through `docker run`.
 
 ## Layout
 
@@ -61,7 +64,6 @@ whole thing end to end, on the rig, through `docker run`.
 - [docs/workflow.md](docs/workflow.md) — worked example: clip and track in, finished render out
 - [docs/design.md](docs/design.md) — the design being realized
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
-- [docs/signal-loss.md](docs/signal-loss.md) — video path, and diagnosis of the intermittent input fault
 - [docs/contracts.md](docs/contracts.md) — normative cross-package signatures
 - [docs/rig.md](docs/rig.md) — wiring, permissions, and bring-up
 

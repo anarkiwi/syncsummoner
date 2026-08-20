@@ -15,6 +15,8 @@ from typing import Any
 
 import numpy as np
 
+from syncsummoner.progress import LOG, configure
+
 
 def _device_cmd(args: argparse.Namespace) -> int:
     from pyvmancer.discovery import find_devices
@@ -177,7 +179,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         analyzer=aesthetics,
         programs=programs,
         jobs=args.jobs,
-        log=lambda message: print(message, flush=True),
+        log=LOG.info,
     )
     written = []
     for program, records in sorted(measured.items()):
@@ -185,7 +187,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         save_profile(fit_profile(records), path)
         save_measurements(records, out / f"{slug(program)}.parquet")
         written.append(str(path))
-    print(f"{len(written)} profiles in {out}")
+    LOG.info("%d profiles in %s", len(written), out)
     return 0 if written else 1
 
 
@@ -222,9 +224,11 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         link=_link(args),
         programs=None if args.program == "all" else args.program.split(","),
         config=config,
-        log=lambda message: print(message, flush=True),
+        log=LOG.info,
     )
-    print(f"{report.frames} frames from {len(report.results)} programs in {report.seconds / 60:.1f} min")
+    LOG.info(
+        "%d frames from %d programs in %.1f min", report.frames, len(report.results), report.seconds / 60
+    )
     return 1 if report.stopped else 0
 
 
@@ -279,10 +283,14 @@ def _compose_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose.features import analyze
     from syncsummoner.compose.planner import search
 
+    from syncsummoner.compose.render import SESSION_FORMATS
+
     rng = np.random.default_rng(args.seed)
     profiles = _profiles_in(Path(args.profiles))
     if not profiles:
         raise ValueError(f"no profiles in {args.profiles}; run `syncsummoner probe run` first")
+    fps = SESSION_FORMATS[args.format][2] if args.format else 60.0
+    LOG.info("%d profiles from %s", len(profiles), args.profiles)
     features = analyze(args.clip, args.audio, rng=rng)
     score = search(
         profiles,
@@ -292,9 +300,11 @@ def _compose_cmd(args: argparse.Namespace) -> int:
         budget=args.budget,
         density=args.density,
         n_passes=args.passes,
+        fps=fps,
     )
     score.save(Path(args.output))
-    print(f"{args.output}: {len(score.layers)} layers over {score.duration:.1f}s")
+    LOG.info("%s: %d layers over %.1fs", args.output, len(score.layers), score.duration)
+    print(args.output)
     return 0
 
 
@@ -325,14 +335,14 @@ def _render_cmd(args: argparse.Namespace) -> int:
     score = Score.load(Path(args.score))
     if args.render_cmd == "audition":
         score = score.window(args.start, args.start + args.seconds)
-        print(f"audition: {score.duration:.1f}s from {args.start:.1f}s")
+        LOG.info("audition: %.1fs from %.1fs", score.duration, args.start)
     profiles = _profiles_in(Path(args.profiles))
     config = (
         render_mod.RenderConfig.for_format(args.format, source_host=args.source_host)
         if args.format
         else render_mod.RenderConfig(source_host=args.source_host)
     )
-    take, start = _take_path(args), getattr(args, "start", 0.0)
+    take, start, lead = _take_path(args), getattr(args, "start", 0.0), 0.0
     if args.cut_programs:
         plan = render_mod.render_cuts(
             score,
@@ -347,8 +357,8 @@ def _render_cmd(args: argparse.Namespace) -> int:
             takes=args.takes,
         )
         for cut in plan:
-            print(f"  {cut.start:7.2f}-{cut.end:7.2f}s  {cut.program}")
-        print(f"{take}: {len(plan)} cuts")
+            LOG.info("  %7.2f-%7.2fs  %s", cut.start, cut.end, cut.program)
+        LOG.info("%s: %d cuts", take, len(plan))
     else:
         report = render_mod.render_played(
             score,
@@ -360,9 +370,11 @@ def _render_cmd(args: argparse.Namespace) -> int:
             prepared=args.prepared,
             start=start,
         )
-        print(f"{take}: {report}")
+        LOG.info("%s: %s", take, report)
         if not report.usable:
             return 1
+        lead = render_mod.picture_start(take, config=config)
+        LOG.info("picture starts %.2fs into the take", lead)
     if args.no_master:
         return 0
     seconds = master_mod.master(
@@ -373,8 +385,10 @@ def _render_cmd(args: argparse.Namespace) -> int:
         fade_in=_fade(args, "fade_in"),
         fade_out=_fade(args, "fade_out"),
         audio_start=start,
+        video_start=lead,
     )
-    print(f"{args.output}: {seconds:.1f}s mastered from {take}")
+    LOG.info("%s: %.1fs mastered from %s", args.output, seconds, take)
+    print(args.output)
     return 0
 
 
@@ -388,6 +402,8 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     """Construct the argument parser for every subcommand."""
     parser = argparse.ArgumentParser(prog="syncsummoner", description=__doc__)
     parser.add_argument("--serial", help="select a specific Videomancer by serial")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="log every stage in detail")
+    parser.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     device = sub.add_parser("device", help="discovery and status")
@@ -457,6 +473,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--budget", type=int, default=48)
     compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
     compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
+    compose.add_argument("--format", help="session format the score is written for, e.g. 1080p30")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
@@ -496,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and dispatch."""
     args = build_parser().parse_args(argv)
+    configure(-1 if args.quiet else args.verbose)
     try:
         return args.func(args)
     except Exception as err:

@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
+from syncsummoner.progress import LOG, track
 from syncsummoner.compose.features import Features, Section, information_content
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext
@@ -453,8 +454,18 @@ def search(
     programs = sorted(profiles)
     generations = max(1, budget // max(1, population * len(programs)))
     best: list[tuple[float, Layer, dict[str, float]]] = []
+    LOG.info(
+        "composing %.1fs over %d programs: %d %s of %d candidates, %d sections at %.1f bpm",
+        duration,
+        len(programs),
+        generations,
+        "generation" if generations == 1 else "generations",
+        population,
+        len(sections),
+        audio.tempo,
+    )
 
-    for program in programs:
+    for program in track(programs, desc="evolving", unit="program"):
         profile = profiles[program]
         if not any(spec.sensitivity > 0 for spec in profile.params):
             continue
@@ -497,11 +508,14 @@ def search(
             pop = elite + children
             ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: -p[0].total)
         obj, layer = ranked[0]
+        LOG.debug("%s: score %.3f over %d gestures", program, obj.total, len(layer.gestures))
         best.append((obj.total, layer, obj.terms))
 
     best.sort(key=lambda t: -t[0])
     base.layers = [replace(layer, index=i) for i, (_, layer, _) in enumerate(best[:n_passes])]
     base.meta["objective"] = [terms for _, _, terms in best[:n_passes]]
+    for layer, (total, _, _) in zip(base.layers, best):
+        LOG.info("kept %s: score %.3f, %d gestures", layer.program, total, len(layer.gestures))
     return base
 
 

@@ -157,7 +157,7 @@ def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tm
     assert isinstance(harvested["link"], Link) and harvested["player"] is not None
     assert harvested["config"].setpoints == 3 and harvested["config"].dwell_s == 2.5
     assert harvested["programs"] is None
-    assert "4 frames" in capsys.readouterr().out
+    assert "4 frames" in capsys.readouterr().err, "the run summary is a stage line, on stderr"
 
 
 def test_probe_archive_records_the_card_losslessly_with_the_hosts_own_clock(harvested, tmp_path):
@@ -238,7 +238,7 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ),
         ("render", ["--audio", "--fade", "--fade-in", "--fade-out", "--no-master", "--take"]),
         ("audition", ["--seconds", "--start", "--audio", "--fade", "--cut-programs"]),
-        ("compose", ["--density", "--style", "--budget"]),
+        ("compose", ["--density", "--style", "--budget", "--passes", "--format"]),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe archive", ["--capture", "--setpoints", "--dwell", "--width", "--no-link"]),
     ],
@@ -267,6 +267,7 @@ def _render_stubs(monkeypatch, seen):
         return kwargs.get("seconds") or 42.0
 
     monkeypatch.setattr("syncsummoner.compose.render.render_played", fake_render)
+    monkeypatch.setattr("syncsummoner.compose.render.picture_start", lambda path, **kw: 1.5)
     monkeypatch.setattr("syncsummoner.compose.master.master", fake_master)
 
 
@@ -307,6 +308,7 @@ def test_render_masters_the_take_into_the_output(monkeypatch, tmp_path):
     take, audio, mastered, kwargs = seen["master"]
     assert (Path(take).name, audio, mastered) == ("final.take.mp4", "t.flac", str(out))
     assert (kwargs["fade_in"], kwargs["fade_out"], kwargs["seconds"]) == (2.5, 2.5, None)
+    assert kwargs["video_start"] == 1.5, "the finished clip starts where the picture does"
 
 
 def test_render_can_stop_at_the_raw_take(monkeypatch, tmp_path):
