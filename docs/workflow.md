@@ -56,8 +56,13 @@ docker build --target runtime -t syncsummoner .
 ```sh
 ss() {
   docker run --rm -it --network host \
+    --user "$(id -u):$(id -g)" -e HOME="$HOME" \
+    -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+    --group-add "$(getent group dialout | cut -d: -f3)" \
+    --group-add "$(getent group audio | cut -d: -f3)" \
+    --group-add "$(getent group video | cut -d: -f3)" \
     --device /dev/video0 --device /dev/ttyACM0 --device /dev/snd \
-    -v "$PWD:/work" -v "$HOME/.ssh:/root/.ssh:ro" \
+    -v "$PWD:/work" -v "$HOME/.ssh:$HOME/.ssh:ro" \
     syncsummoner "$@"
 }
 ```
@@ -68,8 +73,10 @@ ss() {
 | `--device /dev/snd` | ALSA rawmidi, which is how parameters are driven |
 | `--device /dev/video0` | the capture card; ffmpeg inside the container records it |
 | `--network host` | reaches `videopi` by the name the host resolves it with |
-| `-v $HOME/.ssh:/root/.ssh:ro` | ssh runs `BatchMode=yes`, so the key must already work unattended |
+| `-v $HOME/.ssh:$HOME/.ssh:ro` | ssh runs `BatchMode=yes`, so the key must already work unattended |
 | `-v $PWD:/work` | media, profiles and outputs; `/work` is the image's working directory |
+| `--user`, `-e HOME`, `/etc/passwd` | ssh refuses a config or key it does not own, and root in the container owns none of yours. Running as yourself also leaves the renders owned by you rather than by root |
+| `--group-add` | the device nodes are group `dialout`, `audio` and `video`; as a non-root user those groups have to be carried in |
 
 Every command logs each stage it enters and how long that stage took, to stderr;
 `-v` adds per-program detail and `-q` leaves only warnings and errors. Where a
@@ -77,6 +84,11 @@ step has a known number of items — frames to timecode, programs to evolve or t
 render — it draws a progress bar with a rate and an ETA, which is what a
 half-hour render needs to be legible. The bar wants a terminal, hence `-it` in
 the wrapper; piped into a file it degrades to the stage lines.
+
+Run as yourself, not as root: ssh refuses a config or private key owned by
+someone else, so a container running as root against a mounted `~/.ssh` fails
+with `Bad owner or permissions`, and everything it does write into the work
+directory comes out owned by root. The wrapper above takes care of both.
 
 The Pi side has two requirements the workstation cannot supply for it: the ssh
 key must already work unattended (`BatchMode=yes` never prompts, so the host key
@@ -374,6 +386,8 @@ doing it twice, which is what the audition is for.
 | `Host key verification failed` | the mounted `known_hosts` has no entry for the Pi; `BatchMode` will not prompt for one |
 | `Permission denied (publickey)` | the mounted key is not the one the Pi authorizes |
 | `sudo: a password is required` | link blanking needs passwordless sudo on the Pi |
+| `Bad owner or permissions on ~/.ssh/config` | the container is running as root against your ssh config; use the `--user` form above |
+| `Permission denied` writing the scratch | files left by an earlier run as root; `sudo chown -R "$USER" .` in the work directory |
 | `error: no serial link is open` | the CDC tty was not passed in, or `pyvmancer` is installed without its serial extra |
 
 What the rig was measured to do, and why each of these follows from it, is in
