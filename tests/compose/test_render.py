@@ -3,6 +3,7 @@
 # pylint: disable=missing-function-docstring,protected-access
 
 import contextlib
+import io
 import dataclasses
 import sys
 import time
@@ -241,7 +242,11 @@ def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
             """Close."""
 
     monkeypatch.setattr(
-        R.subprocess, "Popen", lambda *a, **k: types.SimpleNamespace(stdin=Pipe(), wait=lambda: 0)
+        R.subprocess,
+        "Popen",
+        lambda *a, **k: types.SimpleNamespace(
+            stdin=Pipe(), stderr=io.BytesIO(b""), wait=lambda: 0, returncode=0
+        ),
     )
     total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG)
     assert total == len(written) == 6
@@ -755,3 +760,35 @@ def test_picture_start_reads_the_take_at_session_rate(monkeypatch, tmp_path):
     monkeypatch.setattr(R.subprocess, "run", fake_run)
     R.picture_start(tmp_path / "take.mkv", config=CONFIG)
     assert seen["argv"][seen["argv"].index("-vf") + 1].startswith(f"fps={CONFIG.fps},crop=")
+
+
+def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):
+    """Writing to a dead encoder raises a broken pipe, which says nothing about why."""
+    monkeypatch.setattr(
+        "syncsummoner.compose.features.read_frames",
+        lambda p, max_frames=None: iter([(CONFIG.fps, np.zeros((4, 4, 3), np.float32))] * 3),
+    )
+
+    class Pipe:
+        """Encoder stdin that has already gone away."""
+
+        def write(self, data):
+            """Write."""
+            del data
+            raise BrokenPipeError
+
+        def close(self):
+            """Close."""
+
+    monkeypatch.setattr(
+        R.subprocess,
+        "Popen",
+        lambda *a, **k: types.SimpleNamespace(
+            stdin=Pipe(),
+            stderr=io.BytesIO(b"Error opening output timecoded.mkv: Permission denied\n"),
+            wait=lambda: 1,
+            returncode=1,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG)

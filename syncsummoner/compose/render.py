@@ -170,7 +170,9 @@ def write_timecoded(
 
     A clip the playout can identify frame by frame is what lets the source be
     played from the other end, where it can run at rate. ``start`` skips into it,
-    which is how an excerpt gets the footage it was composed against.
+    which is how an excerpt gets the footage it was composed against. An encoder
+    that dies takes its own diagnosis with it, so that is what is raised rather
+    than the broken pipe writing to it produces.
     """
     total, frames = source_stream(source, config, seconds=seconds, start=start)
     argv = [
@@ -199,17 +201,24 @@ def write_timecoded(
         str(out),
     ]
     proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL
+        argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     written = 0
     try:
         for index, frame in enumerate(track(frames, desc="timecoding", total=total or None, unit="frame")):
             stamped = burn_timecode(frame, index, bits=config.bits, strip_px=config.strip_px)
-            proc.stdin.write(np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data)
+            try:
+                proc.stdin.write(np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data)
+            except BrokenPipeError:
+                break
             written = index + 1
     finally:
         proc.stdin.close()
+        said = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+        proc.stderr.close()
         proc.wait()
+    if proc.returncode:
+        raise RuntimeError(f"timecoding {out} failed: {said.splitlines()[-1] if said else 'no output'}")
     LOG.info("timecoded %d frames into %s at %dx%d", written or total, out, config.width, config.height)
     return written or total
 
