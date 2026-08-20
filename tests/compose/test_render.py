@@ -792,3 +792,44 @@ def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError, match="Permission denied"):
         R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG)
+
+
+def test_cut_render_makes_room_for_its_takes(monkeypatch, tmp_path):
+    """A pass that fails on a missing directory has already spent the load on it."""
+    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    takes = tmp_path / "takes"
+    R.render_cuts(
+        Score(duration=20.0, sections=[Section(0.0, 20.0, "A")], layers=[Layer("Good", 0, [])]),
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        programs=["Good"],
+        takes=takes,
+        prepared=True,
+        pass_render=lambda *a, **k: R.TakeReport(10, 9, 0, 0.4),
+    )
+    assert takes.is_dir()
+
+
+def test_programs_beyond_the_sections_are_reported_not_dropped(monkeypatch, tmp_path, caplog):
+    """Naming eight programs against three sections renders three; silence would read as eight."""
+    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    with caplog.at_level("WARNING", logger="syncsummoner"):
+        plan = R.render_cuts(
+            Score(
+                duration=20.0,
+                sections=[Section(0.0, 10.0, "A"), Section(10.0, 20.0, "B")],
+                layers=[Layer("Derez", 0, [])],
+            ),
+            "clip.mkv",
+            tmp_path / "out.mkv",
+            profiles={},
+            programs=["Derez", "Lorenz", "Scramble", "Sfumato"],
+            takes=tmp_path,
+            prepared=True,
+            pass_render=lambda *a, **k: R.TakeReport(10, 9, 0, 0.4),
+        )
+    assert len(plan) == 2
+    assert "Scramble, Sfumato" in caplog.text
