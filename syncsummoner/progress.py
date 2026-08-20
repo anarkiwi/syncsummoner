@@ -60,6 +60,43 @@ def stage(message: str, **fields: Any) -> Iterator[dict]:
     LOG.info("%s done in %s%s", message, human(time.monotonic() - start), f": {done}" if done else "")
 
 
+#: How often a metered wait reports itself when there is no bar to draw.
+HEARTBEAT_S = 30.0
+
+
+class Meter:
+    """Progress at an absolute position, for work measured in elapsed time.
+
+    With a terminal it moves a bar; without one it logs a line every
+    :data:`HEARTBEAT_S`, so a piped run is not silent for minutes at a time.
+    """
+
+    def __init__(self, total: float, *, desc: str, drawn: Any = None):
+        self.total, self.desc, self._drawn, self._said = float(total), desc, drawn, 0.0
+
+    def to(self, position: float) -> None:
+        """Report having reached ``position`` of the total."""
+        position = min(max(position, 0.0), self.total)
+        if self._drawn is not None:
+            self._drawn.n = position
+            self._drawn.refresh()
+        elif position - self._said >= HEARTBEAT_S:
+            self._said = position
+            LOG.info("%s %.0f/%.0fs", self.desc, position, self.total)
+
+
+@contextmanager
+def meter(total: float, *, desc: str, unit: str = "s") -> Iterator[Meter]:
+    """A :class:`Meter` for ``total`` units of work, drawn when it can be."""
+    drawable = tqdm is not None and sys.stderr.isatty() and LOG.isEnabledFor(logging.INFO)
+    drawn = tqdm(total=float(total), desc=desc, unit=unit, leave=False, file=sys.stderr) if drawable else None
+    try:
+        yield Meter(total, desc=desc, drawn=drawn)
+    finally:
+        if drawn is not None:
+            drawn.close()
+
+
 def track(iterable: Iterable, *, desc: str, total: int | None = None, unit: str = "it") -> Iterable:
     """Wrap a loop in a progress bar when there is a terminal and a tqdm to draw it."""
     if tqdm is None or not sys.stderr.isatty() or not LOG.isEnabledFor(logging.INFO):
