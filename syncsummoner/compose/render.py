@@ -391,12 +391,23 @@ def render_cuts(
 
     A program the score already evolved a layer for is driven by that layer;
     anything else falls back to the first. The timecoded source is built once and
-    replayed by every pass. Returns the plan that was cut.
+    replayed by every pass. Programs are assigned to sections in rotation, so
+    naming more than there are sections leaves the surplus unrendered, which is
+    said rather than silently done. Returns the plan that was cut.
     """
     config = RenderConfig() if config is None else config
     plan = cut_plan(score, programs)
     run = render_played if pass_render is None else pass_render
     evolved = {layer.program: layer for layer in score.layers}
+    Path(takes).mkdir(parents=True, exist_ok=True)
+    unused = [p for p in programs if p not in {cut.program for cut in plan}]
+    if unused:
+        LOG.warning(
+            "%d sections for %d programs, so %s never comes up; compose a longer span for more",
+            len(plan),
+            len(programs),
+            ", ".join(unused),
+        )
     passes = len(dict.fromkeys(cut.program for cut in plan))
     LOG.info(
         "%d cuts over %d programs: %d passes of %s plus a relock each, about %s of rig time",

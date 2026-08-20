@@ -316,6 +316,12 @@ def _take_path(args: argparse.Namespace) -> str:
     return str(out.with_name(f"{out.stem}.take{out.suffix or '.mkv'}"))
 
 
+def _make_room(*paths: str | Path) -> None:
+    """Create the directories a run writes into, so a pass fails on the rig and not on a path."""
+    for path in paths:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
 def _fade(args: argparse.Namespace, edge: str) -> float:
     """Fade for one edge: its own override, else ``--fade``, else the library default."""
     from syncsummoner.compose.master import DEFAULT_FADE_S
@@ -343,6 +349,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         else render_mod.RenderConfig(source_host=args.source_host)
     )
     take, start, lead = _take_path(args), getattr(args, "start", 0.0), 0.0
+    _make_room(take, args.output, args.scratch)
     if args.cut_programs:
         plan = render_mod.render_cuts(
             score,

@@ -235,7 +235,10 @@ is one program load plus 30 seconds. `--start` has to sit inside the score, so
 against the 60 s synthesized clip use something like `--start 20 --seconds 10`.
 
 To hear the cut as well as the effect, audition across programs — one pass each,
-so the cost scales with how many are named:
+so the cost scales with how many are named. Programs are assigned to the score's
+sections in rotation, so a 30 second window with three sections renders three of
+them however many are named; the surplus is reported rather than silently
+dropped:
 
 ```sh
 ss audition score.yaml --source source.mkv --audio track.flac \
@@ -388,6 +391,7 @@ doing it twice, which is what the audition is for.
 | `sudo: a password is required` | link blanking needs passwordless sudo on the Pi |
 | `Bad owner or permissions on ~/.ssh/config` | the container is running as root against your ssh config; use the `--user` form above |
 | `Permission denied` writing the scratch | files left by an earlier run as root; `sudo chown -R "$USER" .` in the work directory |
+| `more programs than sections, N never comes up` | cuts follow the score's sections; audition a longer span, or name fewer programs |
 | `error: no serial link is open` | the CDC tty was not passed in, or `pyvmancer` is installed without its serial extra |
 
 What the rig was measured to do, and why each of these follows from it, is in
