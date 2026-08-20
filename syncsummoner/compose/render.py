@@ -20,7 +20,7 @@ from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_tak
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
-from syncsummoner.progress import LOG, human, stage, track
+from syncsummoner.progress import LOG, human, meter, stage, track
 
 
 class UnsafeOutputError(RuntimeError):
@@ -30,6 +30,8 @@ class UnsafeOutputError(RuntimeError):
 #: Relock after a load was measured at 12 to 19s, against a settle budget that is
 #: a timeout; half the budget is what a pass is expected to wait, for estimates.
 EXPECTED_RELOCK_FRAC = 0.5
+#: A pass sleeps in ticks no longer than this, so its progress moves while it waits.
+DRIVE_TICK_S = 1.0
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
 #: whatever both ends already run at; 1080p30 is this rig, measured.
 SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
@@ -223,28 +225,55 @@ def write_timecoded(
     return written or total
 
 
-def drive(rig: Rig, auto: Automation, *, duration: float, clock=time.monotonic, sleep=time.sleep) -> int:
+def _wait_until(target: float, *, clock, sleep, tick_s: float, report=None) -> None:
+    """Sleep to a wall-clock instant in ticks, so a long wait still reports progress.
+
+    Each tick is timed against the clock rather than accumulated, so subdividing
+    a wait cannot drift; a clock that does not advance ends the wait rather than
+    spinning on it.
+    """
+    while True:
+        now = clock()
+        left = target - now
+        if left <= 0:
+            return
+        sleep(min(left, tick_s))
+        if clock() <= now:
+            return
+        if report is not None:
+            report(clock())
+
+
+def drive(
+    rig: Rig,
+    auto: Automation,
+    *,
+    duration: float,
+    clock=time.monotonic,
+    sleep=time.sleep,
+    tick_s: float = DRIVE_TICK_S,
+) -> int:
     """Write the automation on a wall clock while the recorder captures.
 
-    The host does nothing per frame: it wakes when a parameter is due, writes it,
-    and sleeps again, so the pass is paced by the score rather than by a loop.
+    The host does nothing per frame: it wakes when a parameter is due, or on a
+    tick to say how far through the pass it is, and sleeps again. The pass is
+    paced by the score rather than by a loop.
     """
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
     start, cursor, written = clock(), 0, 0
-    while cursor < times.size:
-        wait = start + float(times[cursor]) - clock()
-        if wait > 0:
-            sleep(wait)
-        due = max(int(np.searchsorted(times, clock() - start, side="right")), cursor + 1)
-        rig.session.set_params(
-            {int(k): float(v) / PARAM_MAX for k, v in zip(indices[cursor:due], values[cursor:due])}
-        )
-        written += due - cursor
-        cursor = due
-    remaining = start + duration - clock()
-    if remaining > 0:
-        sleep(remaining)
+    with meter(duration, desc="pass") as bar:
+        report = lambda now: bar.to(now - start)  # pylint: disable=unnecessary-lambda-assignment
+        while cursor < times.size:
+            _wait_until(start + float(times[cursor]), clock=clock, sleep=sleep, tick_s=tick_s, report=report)
+            due = max(int(np.searchsorted(times, clock() - start, side="right")), cursor + 1)
+            rig.session.set_params(
+                {int(k): float(v) / PARAM_MAX for k, v in zip(indices[cursor:due], values[cursor:due])}
+            )
+            written += due - cursor
+            cursor = due
+        _wait_until(start + duration, clock=clock, sleep=sleep, tick_s=tick_s, report=report)
+        bar.to(duration)
     return written
 
 

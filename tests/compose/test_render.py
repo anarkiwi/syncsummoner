@@ -833,3 +833,21 @@ def test_programs_beyond_the_sections_are_reported_not_dropped(monkeypatch, tmp_
         )
     assert len(plan) == 2
     assert "Scramble, Sfumato" in caplog.text
+
+
+def test_a_long_wait_reports_progress_while_it_waits():
+    """A five minute pass with one gesture would otherwise print nothing for five minutes."""
+    auto = Automation.of([0.0], 2, 500)
+    rig = R.Rig(session=FakeSession(), capture=None, playout=None)
+    clock = Clock()
+    assert R.drive(rig, auto, duration=5.0, clock=clock, sleep=clock.sleep, tick_s=1.0) == 1
+    assert clock.slept == pytest.approx([1.0] * 5), "it wakes each tick, not once at the end"
+
+
+def test_ticks_never_outrun_the_event_they_wait_for():
+    """Subdividing a wait must not move when a parameter lands."""
+    auto = Automation.of([0.0, 2.5], 2, [100, 900])
+    rig = R.Rig(session=FakeSession(), capture=None, playout=None)
+    clock = Clock()
+    R.drive(rig, auto, duration=2.5, clock=clock, sleep=clock.sleep, tick_s=1.0)
+    assert clock.slept == pytest.approx([1.0, 1.0, 0.5]), "the last tick is short, landing on the event"

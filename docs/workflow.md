@@ -82,8 +82,10 @@ Every command logs each stage it enters and how long that stage took, to stderr;
 `-v` adds per-program detail and `-q` leaves only warnings and errors. Where a
 step has a known number of items — frames to timecode, programs to evolve or to
 render — it draws a progress bar with a rate and an ETA, which is what a
-half-hour render needs to be legible. The bar wants a terminal, hence `-it` in
-the wrapper; piped into a file it degrades to the stage lines.
+half-hour render needs to be legible. A pass is a real-time capture with nothing
+to count, so it meters elapsed seconds against the score's length instead. The
+bars want a terminal, hence `-it` in the wrapper; piped into a file they become a
+line every 30 seconds, so a long pass is never silent.
 
 Run as yourself, not as root: ssh refuses a config or private key owned by
 someone else, so a container running as root against a mounted `~/.ssh` fails
