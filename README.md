@@ -70,7 +70,8 @@ through `docker run`.
 ## Development
 
 ```sh
-docker build --target runtime -t syncsummoner .   # the image the rig is driven from
+docker pull anarkiwi/syncsummoner                          # the released image
+docker build --target runtime -t anarkiwi/syncsummoner .   # the working tree over it
 docker build --target lint .
 docker build --target test -t syncsummoner-test . && docker run --rm syncsummoner-test
 docker build --target test-aesthetics -t ss-aes . && docker run --rm ss-aes

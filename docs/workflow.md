@@ -27,7 +27,7 @@ Everything below runs through `docker run`, on the rig described in
                  |                                     |             |     | Gamer Ultra 2.1 |
                  v                                     v             v     +--------+--------+
    +-------------------------------------------------------------------+            |
-   |  workstation:  docker run syncsummoner                            |<-----------+
+   |  workstation:  docker run anarkiwi/syncsummoner                   |<-----------+
    |  /dev/video0   /dev/ttyACM0   /dev/snd/midiC*D0   ssh             |  USB 3 (UVC)
    +-------------------------------------------------------------------+
 ```
@@ -49,12 +49,13 @@ at the end; nothing is recorded through the capture card but picture.
 
 ## The image
 
-```sh
-docker build --target runtime -t syncsummoner .
-```
+The released image is what the rig is driven from; building the working tree
+over the same name is how a change gets tried before it is tagged.
 
-Released tags are on Docker Hub, so `docker pull anarkiwi/syncsummoner` is the
-same image without the build.
+```sh
+docker pull anarkiwi/syncsummoner
+docker build --target runtime -t anarkiwi/syncsummoner .
+```
 
 ```sh
 ss() {
@@ -66,7 +67,7 @@ ss() {
     --group-add "$(getent group video | cut -d: -f3)" \
     --device /dev/video0 --device /dev/ttyACM0 --device /dev/snd \
     -v "$PWD:/work" -v "$HOME/.ssh:$HOME/.ssh:ro" \
-    syncsummoner "$@"
+    anarkiwi/syncsummoner "$@"
 }
 ```
 
@@ -134,7 +135,7 @@ track is deliberately longer than the clip, so the length rule has something to
 do:
 
 ```sh
-docker run --rm -v "$PWD:/work" --entrypoint /bin/sh syncsummoner -c '
+docker run --rm -v "$PWD:/work" --entrypoint /bin/sh anarkiwi/syncsummoner -c '
 for i in 0 1 2; do
   case $i in
     0) SRC="testsrc2=size=640x480:rate=25:duration=20";;
@@ -353,7 +354,7 @@ that failed:
 ```sh
 ss render --help    # every flag above
 
-docker run --rm -v "$PWD:/work" --entrypoint /venv/bin/python syncsummoner \
+docker run --rm -v "$PWD:/work" --entrypoint /venv/bin/python anarkiwi/syncsummoner \
   -m syncsummoner.aesthetics score final.mp4   # perceptual metrics, no device needed
 ```
 
