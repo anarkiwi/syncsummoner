@@ -79,6 +79,10 @@ docker build --target test-aesthetics -t ss-aes . && docker run --rm ss-aes
 The `test-aesthetics` target installs only the aesthetics extra. It failing is
 the early warning that the extraction seam has leaked.
 
+Pushing a `v*` tag runs the test target and publishes `runtime` to Docker Hub as
+`anarkiwi/syncsummoner`; it needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+repository secrets.
+
 ## License
 
 Apache-2.0

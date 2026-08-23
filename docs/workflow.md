@@ -53,6 +53,9 @@ at the end; nothing is recorded through the capture card but picture.
 docker build --target runtime -t syncsummoner .
 ```
 
+Released tags are on Docker Hub, so `docker pull anarkiwi/syncsummoner` is the
+same image without the build.
+
 ```sh
 ss() {
   docker run --rm -it --network host \
@@ -393,6 +396,7 @@ doing it twice, which is what the audition is for.
 | `sudo: a password is required` | link blanking needs passwordless sudo on the Pi |
 | `Bad owner or permissions on ~/.ssh/config` | the container is running as root against your ssh config; use the `--user` form above |
 | `Permission denied` writing the scratch | files left by an earlier run as root; `sudo chown -R "$USER" .` in the work directory |
+| `cannot cache function ... no locator available` | numba has nowhere to write librosa's jit cache; the image sets `NUMBA_CACHE_DIR`, so rebuild it, or pass `-e NUMBA_CACHE_DIR=/tmp/numba-cache` |
 | `more programs than sections, N never comes up` | cuts follow the score's sections; audition a longer span, or name fewer programs |
 | `error: no serial link is open` | the CDC tty was not passed in, or `pyvmancer` is installed without its serial extra |
 
