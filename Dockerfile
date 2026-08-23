@@ -3,6 +3,10 @@ ARG PYTHON_VERSION=3.12
 
 FROM python:${PYTHON_VERSION}-slim AS base
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
+# librosa jits with cache=True; numba has nowhere to write it when the container
+# runs as a user who owns neither /venv nor the mounted home, so name a path
+# every uid can write.
+ENV NUMBA_CACHE_DIR=/tmp/numba-cache
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 libasound2t64 libasound2-dev \
         build-essential gfortran pkg-config \

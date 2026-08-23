@@ -70,7 +70,8 @@ through `docker run`.
 ## Development
 
 ```sh
-docker build --target runtime -t syncsummoner .   # the image the rig is driven from
+docker pull anarkiwi/syncsummoner                          # the released image
+docker build --target runtime -t anarkiwi/syncsummoner .   # the working tree over it
 docker build --target lint .
 docker build --target test -t syncsummoner-test . && docker run --rm syncsummoner-test
 docker build --target test-aesthetics -t ss-aes . && docker run --rm ss-aes
@@ -78,6 +79,10 @@ docker build --target test-aesthetics -t ss-aes . && docker run --rm ss-aes
 
 The `test-aesthetics` target installs only the aesthetics extra. It failing is
 the early warning that the extraction seam has leaked.
+
+Pushing a `v*` tag runs the test target and publishes `runtime` to Docker Hub as
+`anarkiwi/syncsummoner`; it needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+repository secrets.
 
 ## License
 
