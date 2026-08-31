@@ -354,10 +354,19 @@ def _align(capture: np.ndarray, scale: float, rotation: float) -> np.ndarray:
 
 
 def _correlation(reference: np.ndarray, field: np.ndarray) -> float:
-    """Pearson correlation, zero where either field carries no variance."""
-    if float(field.std()) <= 0.0:
+    """Pearson correlation, zero where either field carries no variance or is not finite.
+
+    Summed rather than taken through ``corrcoef``: a degenerate similarity fit warps
+    the capture until its covariance underflows, and a deviation that is positive in
+    the input but zero in the product divides to ``nan`` instead of raising.
+    """
+    if not np.isfinite(field).all():
         return 0.0
-    return float(np.corrcoef(reference.ravel(), field.ravel())[0, 1])
+    a = np.asarray(reference, dtype=np.float64).ravel()
+    b = np.asarray(field, dtype=np.float64).ravel()
+    a, b = a - a.mean(), b - b.mean()
+    scale = float(np.sqrt(float(a @ a) * float(b @ b)))
+    return float(a @ b / scale) if scale > 0.0 else 0.0
 
 
 def register(frame: np.ndarray, loop: CodeLoop) -> Registration:

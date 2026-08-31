@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import yaml
 
 from syncsummoner.device.profile import (
     PARAM_MAX,
@@ -9,6 +10,7 @@ from syncsummoner.device.profile import (
     MeasurementRecord,
     ParamKind,
     ParamSpec,
+    ProgramProfile,
     Source,
 )
 from syncsummoner.probe import fit
@@ -77,6 +79,16 @@ def test_response_curve_and_sensitivity(profile):
     assert spec.response[0] == pytest.approx(0.0) and spec.response[-1] == pytest.approx(1.0)
     assert spec.sensitivity > 1.0
     assert param(profile, 7).sensitivity == 0.0
+
+
+def test_measured_proxy_metrics_are_kept_in_measured_units(profile):
+    """Proxy metrics are stored raw, per setpoint, for the metrics the records carry."""
+    spec = param(profile, 1)
+    assert set(spec.measured) == {"concentration", "spectral_slope", "clip_frac"}
+    assert all(len(v) == len(spec.values) for v in spec.measured.values())
+    assert spec.measured["concentration"] == pytest.approx([v / 1023 for v in GRID])
+    assert param(profile, 5).measured["clip_frac"] == pytest.approx([float(v >= 700) for v in GRID])
+    assert param(profile, 7).measured == {}
 
 
 def test_sensitivity_ranks_parameters_instead_of_saturating(profile):
@@ -302,6 +314,42 @@ def test_profile_yaml_roundtrip(tmp_path, profile):
     assert loaded.params[4].cliffs == profile.params[4].cliffs
     assert loaded.params[2].dead_zone == profile.params[2].dead_zone
     assert loaded.source is profile.source
+    assert loaded.params[0].measured == profile.params[0].measured
+    assert loaded.registered == profile.registered == 0.0
+
+
+def test_yaml_round_trip_preserves_measured_and_registered(tmp_path):
+    """Measured proxy values and the registration score survive a save/load cycle."""
+    spec = ParamSpec(
+        index=1, name="x", native_min=0, native_max=1, values=[0, 512], measured={"clip_frac": [0.0, 0.75]}
+    )
+    written = ProgramProfile(
+        program="p", firmware="1.0", analyzer="a", source=Source.HW, params=[spec], registered=0.42
+    )
+    path = tmp_path / "profile.yaml"
+    fit.save_profile(written, path)
+    loaded = fit.load_profile(path)
+    assert loaded.params[0].measured == {"clip_frac": [0.0, 0.75]}
+    assert loaded.registered == 0.42
+
+
+def test_a_profile_written_without_the_new_fields_still_loads(tmp_path):
+    """Older profiles carry neither field, so both fall back to empty."""
+    path = tmp_path / "old.yaml"
+    payload = {
+        "schema_version": 1,
+        "profile": {
+            "program": "p",
+            "firmware": "1.0",
+            "analyzer": "a",
+            "source": "hw",
+            "params": [{"index": 1, "name": "x", "native_min": 0.0, "native_max": 1.0}],
+        },
+    }
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    loaded = fit.load_profile(path)
+    assert loaded.params[0].measured == {}
+    assert loaded.registered == 0.0
 
 
 def test_profile_rejects_a_newer_schema(tmp_path, profile):

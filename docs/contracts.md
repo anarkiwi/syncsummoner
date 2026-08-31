@@ -156,7 +156,11 @@ class Link:                          # the HDMI link out of the stimulus source 
 
 `ParamSpec` / `ProgramProfile` and the measurement record schema live in
 `syncsummoner/device/profile.py` and are the serialization contract for
-`profiles/`.
+`profiles/`. `ParamSpec.measured` carries the measured value of each metric in
+`fit.PROXY_METRICS` at every visited setpoint, parallel to `values`; the compose
+proxy reads its objective back out of it rather than inferring it. A profile
+written before those curves existed loads with `measured == {}` and composes off
+the older inferences.
 
 ## `syncsummoner.probe`
 
@@ -173,6 +177,13 @@ plans.hysteresis(spec, index, *, n) -> Iterator[dict[int, float | bool]]
 
 runner.run_plan(session, capture, plan, *, program, analyzer) -> list[MeasurementRecord]
 fit.fit_profile(records, *, specs=None) -> ProgramProfile
+fit.PROXY_METRICS: tuple[str, ...]        # kept per setpoint on ParamSpec.measured
+
+behaviour.program_behaviour(archive, program, *, loop, seed, log) -> Behaviour
+behaviour.behaviours(archive, programs, *, loop, jobs, log) -> dict[str, Behaviour]
+# Behaviour is (registered, pointwise): what a refit can only read off the frames.
+# style is not per-program - it is a band over the whole library, from
+# style.measured_styles(pointwise_by_program, labelled).
 
 archive.FrameArchive(directory).scratch(program) -> Path        # record here, commit is a rename
 FrameArchive.commit(program, key, video, rows, *, width, height, fps) -> dict
@@ -193,6 +204,7 @@ harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
 features.analyze(video_path, audio_path, *, rng) -> Features
 vocabulary.GESTURES: dict[str, Gesture]
 planner.search(profiles, features, *, style, rng, budget) -> Score
+planner.STYLE_WEIGHTS: dict[str, ObjectiveWeights]   # naturalness is not a cost for every style
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change

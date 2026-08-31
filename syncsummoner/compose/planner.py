@@ -23,6 +23,13 @@ EPS = 1e-12
 CC_BUDGET_HZ = 200.0
 NATURAL_SLOPE_BAND = (-1.4, -1.0)
 SIM_DISCOUNT = 0.5
+#: Physical span of each metric the objective scores, so movement in one is
+#: comparable to movement in another and to the same metric in another program.
+#: The three fractions are bounded by construction; the slope's span is its
+#: measured range over every archived program.
+METRIC_SPAN = {"spectral_slope": 4.2, "concentration": 1.0, "clip_frac": 1.0, "illegal_frac": 1.0}
+#: A bar over which no measured metric moves by this fraction of its span is stasis.
+BOREDOM_FLOOR = 0.02
 
 SPAN_BARS: dict[Anchor, float] = {
     Anchor.BAR: 1.0,
@@ -73,6 +80,13 @@ class ObjectiveWeights:
 
 
 DEFAULT_WEIGHTS = ObjectiveWeights()
+#: Per-style objective weights. Naturalness is a cost only where the style wants a
+#: natural picture: ``glitchy`` exists to leave the natural slope band and to reach
+#: illegal levels, so scoring it against them penalizes the effect being asked for.
+#: The residual ``levels`` weight is what stops the search parking at full clip.
+STYLE_WEIGHTS: dict[str, ObjectiveWeights] = {
+    "glitchy": ObjectiveWeights(slope=0.0, levels=0.2, boredom=1.0),
+}
 
 
 @dataclass(frozen=True, eq=False)
@@ -186,6 +200,44 @@ def plan_automation(
     return out
 
 
+def _marginal(profile: ProgramProfile, raw: np.ndarray, name: str) -> np.ndarray | None:
+    """Superpose each parameter's measured curve for one metric over the timeline.
+
+    ``ParamSpec.measured`` holds a one-at-a-time marginal, so the first-order
+    prediction at an arbitrary parameter vector is the sum of each parameter's
+    departure from its own median. ``None`` where nothing measured the metric,
+    which is every profile fitted before it was recorded.
+    """
+    deltas, bases = [], []
+    for spec in profile.params:
+        curve = spec.measured.get(name)
+        if not curve or len(curve) != len(spec.values) or len(curve) < 2:
+            continue
+        values = np.asarray(spec.values, dtype=np.float64)
+        measured = np.asarray(curve, dtype=np.float64)
+        order = np.argsort(values)
+        base = float(np.median(measured))
+        deltas.append(np.interp(raw[:, spec.index - 1], values[order], measured[order]) - base)
+        bases.append(base)
+    if not deltas:
+        return None
+    return np.sum(deltas, axis=0) + float(np.mean(bases))
+
+
+def _cliff_fractions(profile: ProgramProfile, raw: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Clip and illegal fractions inferred from the cliff atlas, for profiles with no measured curves."""
+    clip, illegal = np.zeros(size), np.zeros(size)
+    for spec in profile.params:
+        for cliff in spec.cliffs:
+            crossed = (raw[:, spec.index - 1] >= cliff.at).astype(np.float64) * cliff.jump
+            if "clip_frac" in cliff.metrics:
+                clip += crossed
+            if "illegal_frac" in cliff.metrics:
+                illegal += crossed
+    n_cliffs = max(1, sum(len(p.cliffs) for p in profile.params))
+    return clip / n_cliffs, illegal / n_cliffs
+
+
 def proxy_render(
     auto: Automation,
     profile: ProgramProfile,
@@ -196,7 +248,12 @@ def proxy_render(
     slope_center: float = -1.2,
     slope_gain: float = 0.8,
 ) -> Trajectory:
-    """Predict per-frame metrics from measured response curves and the cliff atlas."""
+    """Predict per-frame metrics from the measured curves, the cliff atlas and the response.
+
+    Every metric the objective scores is read back from what the probe measured at
+    each setpoint. Where a profile predates those curves the older inferences stand
+    in, so an unrefitted profile still composes.
+    """
     times = np.arange(max(2, int(round(duration * fps)))) / fps
     raw = auto.hold(times)
     resp = np.zeros_like(raw)
@@ -209,30 +266,41 @@ def proxy_render(
         weights[col] = max(spec.sensitivity, EPS)
     weights /= weights.sum() + EPS
     energy = resp * weights
-    total = energy.sum(axis=1, keepdims=True) + EPS
-    share = energy / total
-    n_active = max(1, int((weights > EPS).sum()))
-    conc = (np.square(share).sum(axis=1) - 1.0 / n_active) / (1.0 - 1.0 / n_active + EPS)
-    activity = energy.sum(axis=1)
-    clip = np.zeros(times.size)
-    illegal = np.zeros(times.size)
-    for spec in profile.params:
-        for cliff in spec.cliffs:
-            crossed = (raw[:, spec.index - 1] >= cliff.at).astype(np.float64) * cliff.jump
-            if "clip_frac" in cliff.metrics:
-                clip += crossed
-            if "illegal_frac" in cliff.metrics:
-                illegal += crossed
-    n_cliffs = max(1, sum(len(p.cliffs) for p in profile.params))
+
+    measured = {name: _marginal(profile, raw, name) for name in METRIC_SPAN}
+    moved = [(m - np.median(m)) / METRIC_SPAN[name] for name, m in measured.items() if m is not None]
+    if moved:
+        activity = np.sqrt(np.mean(np.square(moved), axis=0))
+    else:
+        activity = energy.sum(axis=1)
+
+    if measured["concentration"] is not None:
+        conc = measured["concentration"]
+    else:
+        total = energy.sum(axis=1, keepdims=True) + EPS
+        share = energy / total
+        n_active = max(1, int((weights > EPS).sum()))
+        conc = (np.square(share).sum(axis=1) - 1.0 / n_active) / (1.0 - 1.0 / n_active + EPS)
+
+    slope = measured["spectral_slope"]
+    if slope is None:
+        slope = slope_center + slope_gain * (activity - activity.mean())
+
+    clip, illegal = measured["clip_frac"], measured["illegal_frac"]
+    if clip is None or illegal is None:
+        inferred_clip, inferred_illegal = _cliff_fractions(profile, raw, times.size)
+        clip = inferred_clip if clip is None else clip
+        illegal = inferred_illegal if illegal is None else illegal
+
     return Trajectory(
         times=times,
         state=resp,
         activity=activity,
         ic=information_content(activity, rng=rng),
         concentration=np.clip(conc, 0.0, 1.0),
-        slope=slope_center + slope_gain * (activity - activity.mean()),
-        clip_frac=clip / n_cliffs,
-        illegal_frac=illegal / n_cliffs,
+        slope=slope,
+        clip_frac=np.clip(clip, 0.0, 1.0),
+        illegal_frac=np.clip(illegal, 0.0, 1.0),
     )
 
 
@@ -252,8 +320,13 @@ def _motif_return(traj: Trajectory, sections: Sequence[Section]) -> float:
     return float(sim[same].mean() - sim[other].mean())
 
 
-def _boredom(traj: Trajectory, bar_duration: float, *, floor_frac: float) -> float:
-    """Worst-bar shortfall in activity variance, normalized by the floor."""
+def _boredom(traj: Trajectory, bar_duration: float, *, floor: float) -> float:
+    """Worst-bar shortfall in activity variance against an absolute floor.
+
+    The floor is fixed rather than a fraction of the trajectory's own spread: a
+    program that never moves has no spread, so a self-normalized floor collapses to
+    zero and scores stasis as perfect.
+    """
     if bar_duration <= 0:
         return 0.0
     index = np.floor(traj.times / bar_duration).astype(np.int64)
@@ -262,7 +335,6 @@ def _boredom(traj: Trajectory, bar_duration: float, *, floor_frac: float) -> flo
     mean = np.bincount(index, weights=traj.activity, minlength=n) / np.maximum(counts, 1)
     sq = np.bincount(index, weights=traj.activity**2, minlength=n) / np.maximum(counts, 1)
     std = np.sqrt(np.maximum(sq - mean**2, 0.0))[counts > 1]
-    floor = floor_frac * float(traj.activity.std())
     if std.size == 0 or floor <= EPS:
         return 0.0
     return float(np.max(np.maximum(floor - std, 0.0)) / floor)
@@ -275,7 +347,7 @@ def evaluate(
     *,
     weights: ObjectiveWeights = DEFAULT_WEIGHTS,
     natural_band: tuple[float, float] = NATURAL_SLOPE_BAND,
-    boredom_floor_frac: float = 0.25,
+    boredom_floor: float = BOREDOM_FLOOR,
     hit_sigma: float = 1.0,
     discount: float = 1.0,
 ) -> Objective:
@@ -295,7 +367,7 @@ def evaluate(
     terms["slope"] = float(dev[allowed].mean())
     terms["levels"] = float((traj.clip_frac + traj.illegal_frac)[legal].mean())
     terms["motif"] = _motif_return(traj, score.sections)
-    terms["boredom"] = _boredom(traj, audio.bar_duration, floor_frac=boredom_floor_frac)
+    terms["boredom"] = _boredom(traj, audio.bar_duration, floor=boredom_floor)
     total = discount * (
         weights.av_corr * terms["av_corr"]
         + weights.motif * terms["motif"]
@@ -450,7 +522,7 @@ def search(
         sections=list(sections),
         meta={"style": style, "density": density},
     )
-    weights = DEFAULT_WEIGHTS if weights is None else weights
+    weights = STYLE_WEIGHTS.get(style, DEFAULT_WEIGHTS) if weights is None else weights
     programs = sorted(profiles)
     generations = max(1, budget // max(1, population * len(programs)))
     best: list[tuple[float, Layer, dict[str, float]]] = []

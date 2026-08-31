@@ -334,3 +334,82 @@ def test_score_runs_no_longer_than_the_shorter_input(features):
 
 def test_clipping_leaves_at_least_one_section():
     assert P._clip_sections([Section(4.0, 6.0, "A")], 3.0) == [Section(0.0, 3.0, "A")]
+
+
+def _measured_profile(program="measured", **curves):
+    """A profile whose parameter 2 carries measured metric curves over its swept values."""
+    profile = make_profile(program=program)
+    spec = next(p for p in profile.params if p.index == 2)
+    spec.values = [0, 256, 512, 768, 1023]
+    spec.measured = {name: list(values) for name, values in curves.items()}
+    return profile
+
+
+def test_proxy_reads_the_measured_slope_instead_of_inferring_it():
+    profile = _measured_profile(spectral_slope=[-3.0, -2.5, -2.0, -1.5, -1.0])
+    traj = P.proxy_render(
+        Automation.of([0.0, 0.5], 2, [0, 1023]),
+        profile,
+        fps=FPS,
+        duration=1.0,
+        rng=np.random.default_rng(0),
+    )
+    assert traj.slope.min() == pytest.approx(-3.0, abs=0.05)
+    assert traj.slope.max() == pytest.approx(-1.0, abs=0.05)
+
+
+def test_proxy_falls_back_where_nothing_was_measured():
+    traj = P.proxy_render(
+        Automation.of([0.0], 2, 1000),
+        make_profile(),
+        fps=FPS,
+        duration=1.0,
+        rng=np.random.default_rng(0),
+    )
+    assert traj.slope.size == traj.times.size and np.isfinite(traj.slope).all()
+    assert traj.clip_frac.max() > 0.0
+
+
+def test_a_program_that_never_moves_is_maximally_bored(features):
+    times = np.arange(0, features.audio.duration, 1 / FPS)
+    score = Score(duration=features.audio.duration, fps=FPS, sections=list(features.audio.sections))
+    static = P.Trajectory(
+        times=times,
+        state=np.zeros((times.size, 12)),
+        activity=np.zeros(times.size),
+        ic=np.zeros(times.size),
+        concentration=np.zeros(times.size),
+        slope=np.full(times.size, -1.2),
+        clip_frac=np.zeros(times.size),
+        illegal_frac=np.zeros(times.size),
+    )
+    assert P.evaluate(static, features, score).terms["boredom"] == pytest.approx(1.0)
+
+
+def test_a_passthrough_does_not_outrank_a_program_that_does_something(features):
+    """The defect this whole layer existed to hide: doing nothing scored best."""
+    flat = [0.0] * 5
+    passthru = _measured_profile("passthru", spectral_slope=[-1.2] * 5, clip_frac=flat, illegal_frac=flat)
+    doer = _measured_profile(
+        "doer",
+        spectral_slope=[-3.4, -2.6, -1.8, -1.0, -0.2],
+        clip_frac=[0.0, 0.1, 0.3, 0.6, 0.9],
+        illegal_frac=[0.0, 0.2, 0.4, 0.7, 1.0],
+    )
+    score = P.search(
+        {"passthru": passthru, "doer": doer},
+        features,
+        style="glitchy",
+        rng=np.random.default_rng(3),
+        budget=48,
+        fps=FPS,
+        n_passes=2,
+    )
+    assert [layer.program for layer in score.layers][0] == "doer"
+
+
+def test_glitchy_does_not_pay_the_naturalness_penalties():
+    assert P.STYLE_WEIGHTS["glitchy"].slope == 0.0
+    assert P.STYLE_WEIGHTS["glitchy"].levels < P.DEFAULT_WEIGHTS.levels
+    assert P.STYLE_WEIGHTS["glitchy"].boredom > P.DEFAULT_WEIGHTS.boredom
+    assert P.STYLE_WEIGHTS.get("smooth", P.DEFAULT_WEIGHTS) is P.DEFAULT_WEIGHTS

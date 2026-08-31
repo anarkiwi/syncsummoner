@@ -311,3 +311,19 @@ def test_verdicts_map_onto_program_style():
     """Verdicts map onto program style."""
     assert cf.Verdict.MIXED.style is ProgramStyle.MIXED
     assert {v.style for v in cf.Verdict} <= set(ProgramStyle)
+
+
+# pylint: disable=protected-access
+def test_registration_of_an_obliterated_capture_is_a_number():
+    """A program that destroys the carrier must score zero, not nan.
+
+    ``nan <= 0.0`` is false, so guarding on variance alone let a degenerate
+    similarity fit carry a nan all the way into a saved profile.
+    """
+    loop = cf.build_loop(width=64, height=64, rng=np.random.default_rng(0), count=4)
+    blank = np.zeros((64, 64, 3), dtype=np.float32)
+    fit = cf.register(blank, loop)
+    assert np.isfinite(fit.correlation)
+    assert cf._correlation(loop.texture, np.full_like(loop.texture, np.nan)) == 0.0
+    assert cf._correlation(loop.texture, np.zeros_like(loop.texture)) == 0.0
+    assert cf._correlation(loop.texture, loop.texture * 1e-200) == 0.0
