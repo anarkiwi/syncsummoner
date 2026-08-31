@@ -410,6 +410,6 @@ def test_a_passthrough_does_not_outrank_a_program_that_does_something(features):
 
 def test_glitchy_does_not_pay_the_naturalness_penalties():
     assert P.STYLE_WEIGHTS["glitchy"].slope == 0.0
-    assert P.STYLE_WEIGHTS["glitchy"].levels < P.DEFAULT_WEIGHTS.levels
+    assert P.STYLE_WEIGHTS["glitchy"].levels == 0.0
     assert P.STYLE_WEIGHTS["glitchy"].boredom > P.DEFAULT_WEIGHTS.boredom
     assert P.STYLE_WEIGHTS.get("smooth", P.DEFAULT_WEIGHTS) is P.DEFAULT_WEIGHTS

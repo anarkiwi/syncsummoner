@@ -82,10 +82,15 @@ class ObjectiveWeights:
 DEFAULT_WEIGHTS = ObjectiveWeights()
 #: Per-style objective weights. Naturalness is a cost only where the style wants a
 #: natural picture: ``glitchy`` exists to leave the natural slope band and to reach
-#: illegal levels, so scoring it against them penalizes the effect being asked for.
-#: The residual ``levels`` weight is what stops the search parking at full clip.
+#: illegal levels, so scoring it against either penalizes the effect being asked for.
+#: ``levels`` is zero rather than merely small. Measured over 52 profiles, a residual
+#: 0.2 selected against every destructive program in the library and kept the mean
+#: pointwise fit at 0.90 — it excluded the programs the style exists to reach, since
+#: departing from legal levels is what they do. ``mud``, ``boredom`` and ``av_corr``
+#: are what keep the search from parking, and destroy-marked sections were already
+#: exempt, so the residual only ever applied to the calmer ones.
 STYLE_WEIGHTS: dict[str, ObjectiveWeights] = {
-    "glitchy": ObjectiveWeights(slope=0.0, levels=0.2, boredom=1.0),
+    "glitchy": ObjectiveWeights(slope=0.0, levels=0.0, boredom=1.0),
 }
 
 
