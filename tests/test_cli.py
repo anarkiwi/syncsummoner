@@ -394,3 +394,14 @@ def test_default_fades_come_from_the_library(monkeypatch, tmp_path):
         ]
     )
     assert (seen["master"][3]["fade_in"], seen["master"][3]["fade_out"]) == (DEFAULT_FADE_S, 0.0)
+
+
+def test_the_package_version_is_the_one_that_was_packaged():
+    """A release tag is checked against pyproject; this checks the import agrees."""
+    tomllib = pytest.importorskip("tomllib")  # 3.11+; the assertion holds on every version
+
+    import syncsummoner
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    packaged = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert syncsummoner.__version__ == packaged
