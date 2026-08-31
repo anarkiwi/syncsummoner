@@ -167,6 +167,11 @@ ss probe refit --archive archive/ --out profiles/          # profiles from the a
 ss profile show --profiles profiles/
 ```
 
+A profile fitted before 0.2.0 still composes, off the inferences the planner used
+to make for itself. It will not carry the measured curves the objective now scores
+against, nor `registered`, `pointwise` and `style`. Refitting is what picks those
+up, and it needs the archive rather than the rig, so it costs CPU and no rig time.
+
 ## 1. Hear what the composer hears
 
 ```sh
