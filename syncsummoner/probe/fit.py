@@ -30,6 +30,7 @@ from syncsummoner.probe.runner import STABILITY_ORDER
 __all__ = [
     "PROFILE_SCHEMA_VERSION",
     "AXIS_SIGNATURES",
+    "PROXY_METRICS",
     "fit_profile",
     "save_profile",
     "load_profile",
@@ -38,6 +39,9 @@ __all__ = [
 ]
 
 PROFILE_SCHEMA_VERSION = 1
+
+#: Metrics the compose proxy reads back per setpoint; measured, not inferred.
+PROXY_METRICS = ("spectral_slope", "concentration", "clip_frac", "illegal_frac")
 
 AXIS_SIGNATURES = {
     Axis.TEXTURE_SCALE: {"peak_scale": 1.0, "concentration": 0.6, "spectral_slope": 0.5, "ch_*": 0.3},
@@ -68,6 +72,7 @@ def _robust_scale(values, axis=0):
 
 
 def _metric_matrix(records):
+    """Standardized metric matrix, its per-metric span, and the (median, scale) that undo it."""
     names = sorted({k for r in records for k in r.metrics})
     raw = np.array([[r.metrics.get(n, np.nan) for n in names] for r in records], dtype=np.float64)
     medians = np.nanmedian(np.where(np.isfinite(raw), raw, np.nan), axis=0)
@@ -75,10 +80,11 @@ def _metric_matrix(records):
     keep = np.ptp(raw, axis=0) > 0
     raw, names = raw[:, keep], [n for n, k in zip(names, keep) if k]
     if not names:
-        return [], np.zeros((len(records), 0)), np.zeros(0)
-    standardized = (raw - np.median(raw, axis=0)) / _robust_scale(raw)
+        return [], np.zeros((len(records), 0)), np.zeros(0), np.zeros((2, 0))
+    unscale = np.stack([np.median(raw, axis=0), _robust_scale(raw)])
+    standardized = (raw - unscale[0]) / unscale[1]
     span = np.ptp(standardized, axis=0)
-    return names, standardized, np.where(span > 0, span, 1.0)
+    return names, standardized, np.where(span > 0, span, 1.0), unscale
 
 
 def _noise(params, metrics, *, noise_floor=0.05):
@@ -201,7 +207,7 @@ def _regression_effects(params, metrics, varying):
 
 
 def _fit_param(
-    index, spec, values, metrics, names, span, noise, *, monotonic_rho, cliff_iqr, axis_effect=None
+    index, spec, values, metrics, names, span, unscale, noise, *, monotonic_rho, cliff_iqr, axis_effect=None
 ):
     """Fill one ``ParamSpec`` from its one-at-a-time subset; returns the driving metric.
 
@@ -211,6 +217,12 @@ def _fit_param(
     replaces the marginal effect where the design never isolated the parameter.
     """
     unique, curve = _curve(values, metrics)
+    # Averaging is linear, so the standardized curve inverts exactly to measured units.
+    spec.measured = {
+        n: (curve[:, i] * unscale[1, i] + unscale[0, i]).tolist()
+        for i, n in enumerate(names)
+        if n in PROXY_METRICS
+    }
     effect = np.ptp(curve, axis=0)
     driver = int(np.argmax(effect / noise))
     response = curve[:, driver]
@@ -405,7 +417,7 @@ def fit_profile(
     if not records:
         raise ValueError("no measurement records to fit")
     params = np.array([r.params for r in records], dtype=np.int64)
-    names, metrics, span = _metric_matrix(records)
+    names, metrics, span, unscale = _metric_matrix(records)
     noise = _noise(params, metrics, noise_floor=noise_floor)
     varying = [j for j in range(PARAM_COUNT) if np.unique(params[:, j]).size > 1]
     modes = np.array([_mode(params[:, j]) for j in range(PARAM_COUNT)])
@@ -432,6 +444,7 @@ def fit_profile(
             metrics[rows],
             names,
             span,
+            unscale,
             noise,
             monotonic_rho=monotonic_rho,
             cliff_iqr=cliff_iqr,

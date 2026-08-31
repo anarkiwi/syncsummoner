@@ -87,6 +87,8 @@ class ParamSpec:
     steps: int | None = None
     response: list[float] = field(default_factory=list)
     values: list[int] = field(default_factory=list)
+    #: Measured value of each proxy metric at each visited setpoint, parallel to ``values``.
+    measured: dict[str, list[float]] = field(default_factory=dict)
     #: Effect on the driving metric in units of measurement noise; below 1 the
     #: parameter moves that metric less than the rig's own repeatability.
     sensitivity: float = 0.0
@@ -213,6 +215,10 @@ class ProgramProfile:
     non_settling: bool = False
     style: ProgramStyle = ProgramStyle.UNKNOWN
     pointwise: float = 0.0
+    #: Continuous magnitude of how strongly the program's output still correlates with
+    #: its input carrier, not a thresholded flag; 0 means the picture no longer
+    #: registers with the source.
+    registered: float = 0.0
     binary_hash: str = ""
 
     def by_axis(self, axis: Axis) -> list[ParamSpec]:
@@ -244,6 +250,7 @@ class ProgramProfile:
             non_settling=bool(data.get("non_settling", False)),
             style=ProgramStyle(data.get("style", "unknown")),
             pointwise=float(data.get("pointwise", 0.0)),
+            registered=float(data.get("registered", 0.0)),
             binary_hash=str(data.get("binary_hash", "")),
         )
 
@@ -269,6 +276,7 @@ def _param_from_dict(data: Mapping[str, Any]) -> ParamSpec:
         steps=data.get("steps"),
         response=list(data.get("response", ())),
         values=list(data.get("values", ())),
+        measured={k: [float(v) for v in vs] for k, vs in (data.get("measured") or {}).items()},
         sensitivity=data.get("sensitivity", 0.0),
         monotonic=data.get("monotonic", False),
         dead_zone=_as_pair(data.get("dead_zone")),

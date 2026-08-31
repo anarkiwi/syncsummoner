@@ -33,6 +33,7 @@ __all__ = [
     "discard_dark",
     "harvest",
     "harvest_program",
+    "stimulus_loop",
     "sweep",
     "sweep_vectors",
     "upload_stimulus",
@@ -292,17 +293,25 @@ def wait_healthy(
     raise HarvestError(f"no device would hold a program within {config.health_timeout_s}s")
 
 
+def stimulus_loop(config: HarvestConfig, rng: np.random.Generator | None = None) -> codeframes.CodeLoop:
+    """The loop a run plays out, rebuilt from the run's own seed at playout geometry.
+
+    The seed is the whole stimulus, so an archived run can be re-read against the
+    picture it was shown without keeping a copy of it.
+    """
+    generator = np.random.default_rng(config.loop_seed) if rng is None else rng
+    return codeframes.build_loop(
+        width=config.width, height=config.height, rng=generator, count=config.loop_frames
+    )
+
+
 def upload_stimulus(player: Any, config: HarvestConfig, rng: np.random.Generator | None = None) -> int:
     """Push the codeframe loop into the player's tmpfs; returns bytes sent.
 
     The loop is invariant across programs and setpoints, so it is paid for once
     per run rather than once per pass.
     """
-    generator = np.random.default_rng(config.loop_seed) if rng is None else rng
-    loop = codeframes.build_loop(
-        width=config.width, height=config.height, rng=generator, count=config.loop_frames
-    )
-    return player.upload(loop.frames())
+    return player.upload(stimulus_loop(config, rng).frames())
 
 
 def discard_dark(archive: Any, program: str, key: ProgramKey, result: ProgramResult) -> ProgramResult:

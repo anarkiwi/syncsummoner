@@ -166,25 +166,35 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     from syncsummoner import aesthetics
     from syncsummoner.device.recorder import require_ffmpeg
     from syncsummoner.probe.archive import FrameArchive
+    from syncsummoner.probe.behaviour import behaviours
     from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
     from syncsummoner.probe.replay import replay
     from syncsummoner.probe.store import slug
+    from syncsummoner.probe.style import measured_styles
 
     require_ffmpeg(args.ffmpeg)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     programs = None if args.program == "all" else args.program.split(",")
+    archive = FrameArchive(args.archive, ffmpeg=args.ffmpeg)
     measured = replay(
-        FrameArchive(args.archive, ffmpeg=args.ffmpeg),
+        archive,
         analyzer=aesthetics,
         programs=programs,
         jobs=args.jobs,
         log=LOG.info,
     )
+    found = behaviours(archive, sorted(measured), jobs=args.jobs, log=LOG.warning)
+    # A non-monotone value map kills the carrier as displacement does; only the fit tells them apart.
+    styles, band = measured_styles({name: b.pointwise for name, b in found.items()}, {})
+    LOG.info("analog above %.2f, digital below %.2f: no labels here, so the band is assumed", *band)
     written = []
     for program, records in sorted(measured.items()):
         path = out / f"{slug(program)}.yaml"
-        save_profile(fit_profile(records), path)
+        profile = fit_profile(records)
+        profile.registered, profile.pointwise = found[program]
+        profile.style = styles[program]
+        save_profile(profile, path)
         save_measurements(records, out / f"{slug(program)}.parquet")
         written.append(str(path))
     LOG.info("%d profiles in %s", len(written), out)
