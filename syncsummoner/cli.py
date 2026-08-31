@@ -372,6 +372,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
             prepared=args.prepared,
             start=start,
             takes=args.takes,
+            available=render_mod.device_programs(),
         )
         for cut in plan:
             LOG.info("  %7.2f-%7.2fs  %s", cut.start, cut.end, cut.program)

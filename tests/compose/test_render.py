@@ -851,3 +851,32 @@ def test_ticks_never_outrun_the_event_they_wait_for():
     clock = Clock()
     R.drive(rig, auto, duration=2.5, clock=clock, sleep=clock.sleep, tick_s=1.0)
     assert clock.slept == pytest.approx([1.0, 1.0, 0.5]), "the last tick is short, landing on the event"
+
+
+def test_unknown_programs_reports_what_the_device_will_not_load():
+    assert R.unknown_programs(["a", "b"], None) == []
+    assert R.unknown_programs(["a", "b"], ["a", "b"]) == []
+    assert R.unknown_programs(["a", "b"], ["a"]) == ["b"]
+    assert R.unknown_programs(["b", "b"], ["a"]) == ["b"]
+
+
+def test_a_program_the_device_dropped_costs_no_rig_time():
+    """Firmware moves under an archive; the pass must not be the thing that finds out."""
+    score = Score(duration=4.0, fps=30.0, sections=[Section(0.0, 4.0, "A")])
+    started = []
+
+    def never(*args, **_kwargs):
+        started.append(args)
+
+    with pytest.raises(R.UnknownProgramError, match="Flock"):
+        R.render_cuts(
+            score,
+            "source.mkv",
+            "out.mp4",
+            profiles={"Zollner": None, "Flock": None},
+            programs=["Zollner", "Flock"],
+            available=["Zollner"],
+            prepared=True,
+            pass_render=never,
+        )
+    assert not started
