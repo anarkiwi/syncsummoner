@@ -205,6 +205,10 @@ features.analyze(video_path, audio_path, *, rng) -> Features
 vocabulary.GESTURES: dict[str, Gesture]
 planner.search(profiles, features, *, style, rng, budget) -> Score
 planner.STYLE_WEIGHTS: dict[str, ObjectiveWeights]   # naturalness is not a cost for every style
+render.device_programs() -> list[str]                # what the attached device offers
+render.unknown_programs(programs, available) -> list[str]   # named but not offered; None checks nothing
+# render_cuts raises UnknownProgramError before the first pass, so firmware that
+# moved under the archive costs no rig time.
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change

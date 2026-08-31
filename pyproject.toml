@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syncsummoner"
-version = "0.2.2"
+version = "0.2.3"
 description = "Automated characterization of the LZX Videomancer and generative offline video rendering"
 readme = "README.md"
 license = "Apache-2.0"

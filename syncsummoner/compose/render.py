@@ -23,6 +23,10 @@ from syncsummoner.compose.vocabulary import Automation
 from syncsummoner.progress import LOG, human, meter, stage, track
 
 
+class UnknownProgramError(RuntimeError):
+    """A named program cannot be rendered, so no pass should be started."""
+
+
 class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
@@ -354,6 +358,31 @@ class Cut:
         return max(0.0, self.end - self.start)
 
 
+def device_programs() -> list[str]:
+    """Program names the attached device offers. Imported here so compose needs no hardware."""
+    from syncsummoner.device.transport import Transport
+
+    transport = Transport.open()
+    try:
+        return list(transport.programs())
+    finally:
+        transport.close()
+
+
+def unknown_programs(programs: Sequence[str], available: Sequence[str] | None) -> list[str]:
+    """Named programs the device does not offer, in the order they were asked for.
+
+    A program is loaded only when its turn comes and a pass costs minutes, so a name
+    that can never load is worth catching before the first one. Firmware moves under
+    an archive: a profile set fitted on an older release can name a program the
+    device has since dropped. ``None`` checks nothing, for a caller with no device.
+    """
+    if available is None:
+        return []
+    offered = set(available)
+    return [name for name in dict.fromkeys(programs) if name not in offered]
+
+
 def cut_plan(score: Score, programs: Sequence[str]) -> list[Cut]:
     """Assign programs to the score's sections in rotation.
 
@@ -414,6 +443,7 @@ def render_cuts(
     prepared: bool = False,
     start: float = 0.0,
     takes: str | Path = ".",
+    available: Sequence[str] | None = None,
     pass_render: Callable[..., Any] | None = None,
 ) -> list[Cut]:
     """Render one pass per program and cut between them on the score's sections.
@@ -425,6 +455,9 @@ def render_cuts(
     said rather than silently done. Returns the plan that was cut.
     """
     config = RenderConfig() if config is None else config
+    unknown = unknown_programs(programs, available)
+    if unknown:
+        raise UnknownProgramError(f"the device does not offer {', '.join(unknown)}")
     plan = cut_plan(score, programs)
     run = render_played if pass_render is None else pass_render
     evolved = {layer.program: layer for layer in score.layers}
