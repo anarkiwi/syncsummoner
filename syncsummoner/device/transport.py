@@ -26,6 +26,8 @@ ROLE_TO_KIND = {
     ParamRole.QUANTIZED: ParamKind.QUANTIZED,
     ParamRole.UNASSIGNED: ParamKind.UNUSED,
 }
+#: The first load after an author switch can take longer than the shell's default reply window.
+LOAD_TIMEOUT_S = 30.0
 #: Combined (Manual + Modulation + MIDI) output keys, in order of preference.
 COMBINED_KEYS = ("o", "out", "output", "combined")
 #: Stored manual value keys.
@@ -155,7 +157,13 @@ class Transport:
 
     def load_program(self, name: str) -> None:
         """Load an FPGA program without waiting; the caller absorbs the blackout."""
-        self._device.load_program(name, settle=0)
+        shell = self._shell
+        window = shell.timeout
+        shell.timeout = max(window, LOAD_TIMEOUT_S)
+        try:
+            self._device.load_program(name, settle=0)
+        finally:
+            shell.timeout = window
         self._loaded = name
 
     def program_info(self, name: str | None = None) -> ProgramInfo:
