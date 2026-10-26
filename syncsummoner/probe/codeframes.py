@@ -336,12 +336,16 @@ def _similarity(reference: np.ndarray, capture: np.ndarray) -> tuple[float, floa
     """Scale and rotation from the log-polar magnitude spectra (Fourier-Mellin).
 
     Both frames are cropped square and radially windowed first: on a rectangular
-    grid an image rotation is not a rotation of the sampled spectrum.
+    grid an image rotation is not a rotation of the sampled spectrum. A peak further
+    than half its axis from the origin (or not a number) cannot be a real shift, only a flat spectrum
+    correlating with noise; it reads as no similarity and the correlation scores it.
     """
     window = _radial_window(min(reference.shape))
     polar_ref, radius = _log_polar(_square(reference), window)
     polar_cap, _ = _log_polar(_square(capture), window)
     (d_rho, d_phi), _ = cv2.phaseCorrelate(polar_ref.astype(np.float64), polar_cap.astype(np.float64))
+    if not (abs(d_rho) <= POLAR_BINS[0] / 2 and abs(d_phi) <= POLAR_BINS[1] / 2):
+        return 1.0, 0.0
     scale = float(np.exp(-d_rho * np.log(radius) / POLAR_BINS[0]))
     return scale, float(2.0 * np.pi * d_phi / POLAR_BINS[1])
 

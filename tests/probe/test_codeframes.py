@@ -327,3 +327,11 @@ def test_registration_of_an_obliterated_capture_is_a_number():
     assert cf._correlation(loop.texture, np.full_like(loop.texture, np.nan)) == 0.0
     assert cf._correlation(loop.texture, np.zeros_like(loop.texture)) == 0.0
     assert cf._correlation(loop.texture, loop.texture * 1e-200) == 0.0
+
+
+@pytest.mark.parametrize("shift", [(-770.0, 3.0), (5.0, 900.0), (float("nan"), 0.0)])
+def test_a_phase_peak_outside_the_polar_axes_reads_as_no_similarity(monkeypatch, shift):
+    """An impossible scale once sent warpAffine into a reflect loop that never finished."""
+    monkeypatch.setattr(cv2, "phaseCorrelate", lambda *_: (shift, 0.0))
+    field = np.random.default_rng(0).random((64, 64)).astype(np.float32)
+    assert cf._similarity(field, field) == (1.0, 0.0)
