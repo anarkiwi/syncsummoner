@@ -4,6 +4,8 @@
 # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 # pylint: disable=protected-access  ; the dwell picker is the unit worth testing directly
 
+from concurrent.futures import ProcessPoolExecutor
+
 import cv2
 import numpy as np
 import pytest
@@ -179,6 +181,22 @@ def test_every_program_asked_for_is_keyed_even_where_it_could_not_be_read(loop):
     found = B.behaviours(archive, ["a", "b"], loop=loop, jobs=2)
     assert sorted(found) == ["a", "b"] and found["b"] == B.Behaviour()
     assert found["a"].pointwise > 0.9
+
+
+def test_worker_processes_return_what_threads_do_and_notes_reach_the_log(loop):
+    archive = Archive({"a": capture(loop, lambda f: f), "c": Reader([], [0] * DWELL)})
+    notes = []
+    found = B.behaviours(
+        archive,
+        ["a", "c"],
+        loop=loop,
+        jobs=2,
+        log=notes.append,
+        executor=ProcessPoolExecutor,
+    )
+    assert found == B.behaviours(archive, ["a", "c"], loop=loop)
+    assert found["a"].pointwise > 0.9 and found["c"] == B.Behaviour()
+    assert len(notes) == 1 and notes[0].startswith("c: loop behaviour not measured")
 
 
 def test_a_capture_at_another_resolution_is_matched_by_resampling_the_loop(loop):

@@ -10,9 +10,9 @@ registration is area-averaged, the chain having lowpassed the carrier away at na
 from __future__ import annotations
 
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import replace
-from itertools import groupby
+from itertools import groupby, repeat
 from typing import Any, Callable, Iterable, NamedTuple
 
 import cv2  # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
@@ -22,6 +22,7 @@ from syncsummoner.aesthetics.structure import pointwise_r2
 from syncsummoner.probe import codeframes
 from syncsummoner.probe.archive import GAP
 from syncsummoner.probe.harvest import HarvestConfig, stimulus_loop
+from syncsummoner.progress import LOG, track
 
 __all__ = ["BINS", "Behaviour", "behaviours", "program_behaviour"]
 
@@ -193,6 +194,12 @@ def program_behaviour(
         return Behaviour()
 
 
+def _measure(archive: Any, name: str, loop: codeframes.CodeLoop) -> tuple[str, Behaviour, list[str]]:
+    """One program's behaviour and the notes it made, so a worker process can hand both back."""
+    notes: list[str] = []
+    return name, program_behaviour(archive, name, loop=loop, log=notes.append), notes
+
+
 def behaviours(
     archive: Any,
     programs: Iterable[str],
@@ -200,17 +207,23 @@ def behaviours(
     loop: codeframes.CodeLoop | None = None,
     jobs: int = 1,
     log: Callable[[str], None] | None = None,
+    executor: Callable[..., Executor] = ThreadPoolExecutor,
 ) -> dict[str, Behaviour]:
     """Loop behaviour of every named program, keyed by name and defaulted where unread.
 
-    ``jobs`` reads that many programs at once, as the replay does: a decoder subprocess
-    and array work both drop the lock, so threads are enough to overlap them.
+    ``jobs`` reads that many programs at once. The array work holds the interpreter
+    lock for much of its time, so a caller that wants the cores passes a process pool
+    as ``executor``; the archive and loop must then pickle.
     """
     names = list(programs)
     reference = stimulus_loop(HarvestConfig()) if loop is None else loop
-
-    def measure(name: str) -> tuple[str, Behaviour]:
-        return name, program_behaviour(archive, name, loop=reference, log=log)
-
-    with ThreadPoolExecutor(max_workers=max(1, int(jobs))) as pool:
-        return dict(pool.map(measure, names))
+    out = {}
+    with executor(max_workers=max(1, int(jobs))) as pool:
+        results = pool.map(_measure, repeat(archive), names, repeat(reference))
+        for name, found, notes in track(results, desc="behaviour", total=len(names), unit="program"):
+            out[name] = found
+            for note in notes:
+                if log is not None:
+                    log(note)
+            LOG.info("%s: behaviour %d/%d", name, len(out), len(names))
+    return out

@@ -10,6 +10,7 @@ import argparse
 import dataclasses
 import json
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -197,7 +198,9 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         jobs=args.jobs,
         log=LOG.info,
     )
-    found = behaviours(archive, sorted(measured), jobs=args.jobs, log=LOG.warning)
+    found = behaviours(
+        archive, sorted(measured), jobs=args.jobs, log=LOG.warning, executor=ProcessPoolExecutor
+    )
     # A non-monotone value map kills the carrier as displacement does; only the fit tells them apart.
     styles, band = measured_styles({name: b.pointwise for name, b in found.items()}, {})
     LOG.info("analog above %.2f, digital below %.2f: no labels here, so the band is assumed", *band)
