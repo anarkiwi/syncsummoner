@@ -72,6 +72,29 @@ def test_program_info_skips_load_when_current(device):
     assert not device.calls
 
 
+def test_a_device_reporting_the_plain_name_does_not_stand_in_for_another_author(device):
+    port = tr.Transport(device)
+    assert port.current_program() == "Colorbars"
+    port.program_info("czartroniks/Colorbars")
+    assert ("load", "czartroniks/Colorbars", 0) in device.calls
+    assert port.current_program() == "czartroniks/Colorbars"
+
+
+def test_qualified_names_load_once_and_reload_when_the_author_changes(device):
+    port = tr.Transport(device)
+    port.load_program("czartroniks/Teletext")
+    device.calls.clear()
+    port.program_info("czartroniks/Teletext")
+    assert not device.calls
+    port.program_info("Teletext")
+    assert device.calls == [("load", "Teletext", 0)]
+
+
+def test_programs_are_passed_through_qualified(device):
+    device.programs = lambda: ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
+    assert tr.Transport(device).programs() == ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
+
+
 def test_current_program_falls_back_to_status(device):
     assert tr.Transport(device).current_program() == "Colorbars"
 

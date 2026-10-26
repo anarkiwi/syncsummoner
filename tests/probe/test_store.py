@@ -306,3 +306,44 @@ def test_store_reuses_the_parquet_helpers(store_at):
     assert len(rows) == 4
     assert rows[0]["program"] == "bitcrush"
     assert fit.fit_profile(store_at.get("bitcrush")).program == "bitcrush"
+
+
+@pytest.mark.parametrize(
+    "name,stem",
+    [
+        ("Teletext", "Teletext"),
+        ("Bitcullis", "Bitcullis"),
+        ("Colorbars RGB", "Colorbars_RGB-8f557c6a"),
+        ("Ramp Logic", "Ramp_Logic-7a8d678c"),
+    ],
+)
+def test_plain_names_keep_the_file_stems_existing_stores_were_written_under(name, stem):
+    """Stores written before qualified names must still be found."""
+    assert store.slug(name) == stem
+
+
+def test_qualified_names_never_share_a_stem_with_a_plain_one():
+    """Two authors shipping one name keep distinct, filesystem-safe stems."""
+    names = ["Teletext", "czartroniks/Teletext", "teletect/Teletext", "czartroniks_Teletext"]
+    stems = [store.slug(n) for n in names]
+    assert len(set(stems)) == len(names)
+    assert all("/" not in stem for stem in stems)
+    assert stems[1] == "czartroniks_Teletext-849d4169"
+
+
+def test_a_qualified_name_is_keyed_apart_from_the_plain_one():
+    """The same name under another author digests differently."""
+    plain = store.ProgramKey("Teletext", "fw")
+    qualified = store.ProgramKey("czartroniks/Teletext", "fw")
+    assert plain.digest != qualified.digest
+
+
+def test_qualified_names_round_trip_through_the_result_store(tmp_path):
+    """Results written under qualified names read back under them."""
+    results = store.ResultStore(tmp_path)
+    names = ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
+    for index, name in enumerate(names):
+        results.put(name, store.ProgramKey(name, "fw"), [record(name, index)])
+    assert sorted(results.committed()) == sorted(names)
+    for index, name in enumerate(names):
+        assert results.get(name, store.ProgramKey(name, "fw"))[0].params[0] == index

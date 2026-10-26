@@ -148,7 +148,7 @@ class Transport:
         return list(self._device.programs())
 
     def current_program(self) -> str | None:
-        """Name of the loaded program."""
+        """Name of the loaded program: as loaded here, else the device's plain name."""
         if self._loaded is None:
             self._loaded = self._shell.status().get("program")
         return self._loaded
@@ -159,8 +159,12 @@ class Transport:
         self._loaded = name
 
     def program_info(self, name: str | None = None) -> ProgramInfo:
-        """Parameter specs of a program, loading it first when it is not current."""
-        if name is not None and name != self.current_program():
+        """Parameter specs of a program, loading it first when it is not current.
+
+        The device reports a plain name that does not say which author it came
+        from, so only a program this transport loaded counts as current.
+        """
+        if name is not None and name != self._loaded:
             self.load_program(name)
         return ProgramInfo.from_json(self._shell.program_info())
 

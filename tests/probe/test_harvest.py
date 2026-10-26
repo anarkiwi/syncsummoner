@@ -14,7 +14,7 @@ from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import harvest as H
 from syncsummoner.probe.archive import GAP
-from syncsummoner.probe.store import KeyKind, ProgramKey
+from syncsummoner.probe.store import KeyKind, ProgramKey, slug
 from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport
 
 FIRMWARE = "1.0.0-rc.37"
@@ -150,11 +150,11 @@ class Archive:
         self.dark_luma[program] = luma
 
     def paths(self, program):
-        return tuple(self.directory / f"{program}{suffix}" for suffix in (".mkv", ".parquet", ".json"))
+        return tuple(self.directory / f"{slug(program)}{suffix}" for suffix in (".mkv", ".parquet", ".json"))
 
     def scratch(self, program):
         self.directory.mkdir(parents=True, exist_ok=True)
-        return self.directory / f"{program}.scratch.mkv"
+        return self.directory / f"{slug(program)}.scratch.mkv"
 
     def commit(self, program, key, video, rows, *, width, height, fps):
         assert Path(video).exists(), "the recording is published, not re-encoded"
@@ -459,6 +459,16 @@ def test_harvest_reflashed_firmware_invalidates_a_stored_archive(tmp_path):
     stale = ProgramKey("Alpha", "0.9.0", KeyKind.NAME_FIRMWARE)
     archive = Archive(tmp_path, stored=[("Alpha", stale)])
     assert not run(archive).results[0].cached
+
+
+def test_harvest_over_mixed_authors_keeps_each_program_distinct(tmp_path):
+    names = ("Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush")
+    archive = Archive(tmp_path)
+    report = run(archive, port=Port(programs=names))
+    assert sorted(r.program for r in report.results) == sorted(names)
+    assert set(archive.rows) == set(names)
+    assert len({archive.paths(n)[0] for n in names}) == 3
+    assert all(path.parent == tmp_path for n in names for path in archive.paths(n))
 
 
 def test_harvest_only_probes_the_programs_it_was_given(tmp_path):
