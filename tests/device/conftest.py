@@ -110,8 +110,8 @@ class FakeDevice:
         self.shell = FakeShell() if shell is None else shell
         self.midi = FakeMidi()
         self.has_midi = True
+        self.has_shell = True
         self.calls = []
-        self.load_windows = []
         self.closed = False
 
     def programs(self):
@@ -119,7 +119,6 @@ class FakeDevice:
 
     def load_program(self, name, settle=1.5):
         self.calls.append(("load", name, settle))
-        self.load_windows.append(self.shell.timeout)
         self.shell.program = name
 
     def set_param(self, index, value):
