@@ -283,6 +283,18 @@ def test_awkward_program_names_get_distinct_archives(tmp_path):
     assert len({archive.paths(n)[0] for n in ("a/b", "a b", "a_b")}) == 3
 
 
+def test_one_name_under_two_authors_gets_two_archives(tmp_path):
+    names = ("Teletext", "czartroniks/Teletext", "teletect/Teletext")
+    for name in names:
+        write_archive(tmp_path, 2, program=name, key=ProgramKey(name, "x"))
+    archive = archive_at(tmp_path, run=FakeDecoder(FPS, SIZE))
+    assert sorted(archive.committed()) == sorted(names)
+    assert len({archive.paths(n)[0] for n in names}) == 3
+    assert archive.paths("Teletext")[0].name == "Teletext.mkv"
+    assert all(archive.has(n, ProgramKey(n, "x")) for n in names)
+    assert all(p.parent == archive.directory for n in names for p in archive.paths(n))
+
+
 def test_reader_random_access_selects_the_named_frame(tmp_path):
     """Frame N decodes to frame N, in any order, without reading its neighbours."""
     archive, made, _ = write_archive(tmp_path, 5)
