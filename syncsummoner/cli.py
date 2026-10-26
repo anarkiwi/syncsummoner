@@ -39,6 +39,19 @@ def _device_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _manifest_cmd(args: argparse.Namespace) -> int:
+    from syncsummoner.device import manifest
+
+    report = manifest.rebuild(args.programs)
+    listed = report.manifest["programs"]
+    for name, files in sorted(report.shared_names.items()):
+        LOG.warning("%s is provided by %s", name, ", ".join(files))
+    if args.write:
+        LOG.info("wrote %s", manifest.write(args.programs, report))
+    print(json.dumps({"listed": len(listed), "excluded": report.errors}, indent=2))
+    return 0 if report.ok else 1
+
+
 def _as_mapping(obj) -> dict:
     """Dict view of a record that may be a dataclass, a slots class, or neither."""
     if dataclasses.is_dataclass(obj):
@@ -427,6 +440,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     device = sub.add_parser("device", help="discovery and status")
     device.add_argument("device_cmd", choices=["list", "ping", "programs"])
     device.set_defaults(func=_device_cmd)
+
+    manifest = sub.add_parser(
+        "manifest", help="rebuild a card's programs/manifest.json from its .vmprog files"
+    )
+    manifest.add_argument("programs", type=Path, help="the card's programs directory")
+    manifest.add_argument("--write", action="store_true", help="replace manifest.json (default: check only)")
+    manifest.set_defaults(func=_manifest_cmd)
 
     probe = sub.add_parser("probe", help="measure device behaviour")
     probe_sub = probe.add_subparsers(dest="probe_cmd", required=True)
