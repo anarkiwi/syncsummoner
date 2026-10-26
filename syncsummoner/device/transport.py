@@ -26,8 +26,9 @@ ROLE_TO_KIND = {
     ParamRole.QUANTIZED: ParamKind.QUANTIZED,
     ParamRole.UNASSIGNED: ParamKind.UNUSED,
 }
-#: The first load after an author switch can take longer than the shell's default reply window.
-LOAD_TIMEOUT_S = 30.0
+#: Seconds the shell may take to answer; a program load, or the first command after
+#: switching author, can outlast pyvmancer's default window.
+SHELL_TIMEOUT_S = 20.0
 #: Combined (Manual + Modulation + MIDI) output keys, in order of preference.
 COMBINED_KEYS = ("o", "out", "output", "combined")
 #: Stored manual value keys.
@@ -124,7 +125,10 @@ class Transport:
     @classmethod
     def open(cls, *, serial: str | None = None) -> "Transport":
         """Open both control links to an attached device."""
-        return cls(vm.Videomancer.open(serial_number=serial))
+        device = vm.Videomancer.open(serial_number=serial)
+        if device.has_shell:
+            device.shell.timeout = SHELL_TIMEOUT_S
+        return cls(device)
 
     @property
     def device(self) -> Any:
@@ -157,13 +161,7 @@ class Transport:
 
     def load_program(self, name: str) -> None:
         """Load an FPGA program without waiting; the caller absorbs the blackout."""
-        shell = self._shell
-        window = shell.timeout
-        shell.timeout = max(window, LOAD_TIMEOUT_S)
-        try:
-            self._device.load_program(name, settle=0)
-        finally:
-            shell.timeout = window
+        self._device.load_program(name, settle=0)
         self._loaded = name
 
     def program_info(self, name: str | None = None) -> ProgramInfo:
