@@ -95,6 +95,22 @@ def test_programs_are_passed_through_qualified(device):
     assert tr.Transport(device).programs() == ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
 
 
+def test_a_load_waits_longer_than_the_shell_default_and_restores_it(device):
+    tr.Transport(device).load_program("czartroniks/Teletext")
+    assert device.load_windows == [tr.LOAD_TIMEOUT_S]
+    assert device.shell.timeout == 5.0
+
+
+def test_a_failed_load_still_restores_the_shell_timeout(device):
+    def refuse(name, settle=1.5):
+        raise TimeoutError(name, settle)
+
+    device.load_program = refuse
+    with pytest.raises(TimeoutError):
+        tr.Transport(device).load_program("czartroniks/Teletext")
+    assert device.shell.timeout == 5.0
+
+
 def test_current_program_falls_back_to_status(device):
     assert tr.Transport(device).current_program() == "Colorbars"
 

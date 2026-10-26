@@ -40,6 +40,7 @@ class FakeShell:
         self.calls = []
         self.program = "Colorbars"
         self.state_shape = "flat"
+        self.timeout = 5.0
 
     def combined(self):
         return np.clip(self.manual + self.midi, 0, PARAM_MAX)
@@ -110,6 +111,7 @@ class FakeDevice:
         self.midi = FakeMidi()
         self.has_midi = True
         self.calls = []
+        self.load_windows = []
         self.closed = False
 
     def programs(self):
@@ -117,6 +119,7 @@ class FakeDevice:
 
     def load_program(self, name, settle=1.5):
         self.calls.append(("load", name, settle))
+        self.load_windows.append(self.shell.timeout)
         self.shell.program = name
 
     def set_param(self, index, value):
