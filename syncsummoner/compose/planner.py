@@ -360,7 +360,7 @@ def evaluate(
     audio = features.audio
     onset = np.interp(traj.times, audio.times, audio.onset_strength)
     terms = {"av_corr": _corr(traj.ic, onset)}
-    if audio.onset_ic.size > 1 and audio.beats.size >= audio.onset_ic.size:
+    if 1 < audio.onset_ic.size <= audio.beats.size:
         aic = np.interp(traj.times, audio.beats[: audio.onset_ic.size], audio.onset_ic)
         terms["av_corr"] = 0.5 * (terms["av_corr"] + _corr(traj.ic, aic))
     hits = onset >= onset.mean() + hit_sigma * onset.std()
