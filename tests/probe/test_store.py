@@ -323,6 +323,7 @@ def test_plain_names_keep_the_file_stems_existing_stores_were_written_under(name
 
 
 def test_qualified_names_never_share_a_stem_with_a_plain_one():
+    """Two authors shipping one name keep distinct, filesystem-safe stems."""
     names = ["Teletext", "czartroniks/Teletext", "teletect/Teletext", "czartroniks_Teletext"]
     stems = [store.slug(n) for n in names]
     assert len(set(stems)) == len(names)
@@ -331,12 +332,14 @@ def test_qualified_names_never_share_a_stem_with_a_plain_one():
 
 
 def test_a_qualified_name_is_keyed_apart_from_the_plain_one():
+    """The same name under another author digests differently."""
     plain = store.ProgramKey("Teletext", "fw")
     qualified = store.ProgramKey("czartroniks/Teletext", "fw")
     assert plain.digest != qualified.digest
 
 
 def test_qualified_names_round_trip_through_the_result_store(tmp_path):
+    """Results written under qualified names read back under them."""
     results = store.ResultStore(tmp_path)
     names = ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
     for index, name in enumerate(names):

@@ -284,6 +284,7 @@ def test_awkward_program_names_get_distinct_archives(tmp_path):
 
 
 def test_one_name_under_two_authors_gets_two_archives(tmp_path):
+    """One name under several authors never shares an archive."""
     names = ("Teletext", "czartroniks/Teletext", "teletect/Teletext")
     for name in names:
         write_archive(tmp_path, 2, program=name, key=ProgramKey(name, "x"))
