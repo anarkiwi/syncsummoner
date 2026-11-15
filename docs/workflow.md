@@ -388,6 +388,8 @@ doing it twice, which is what the audition is for.
 
 ## When it goes wrong
 
+`syncsummoner device doctor` checks most of these at once.
+
 | Symptom | Cause |
 | --- | --- |
 | take is uniform grey and "usable" | the card's "No Signal" splash, not the rig; check `ss device ping` |
@@ -404,6 +406,9 @@ doing it twice, which is what the audition is for.
 | `Permission denied` writing the scratch | files left by an earlier run as root; `sudo chown -R "$USER" .` in the work directory |
 | `cannot cache function ... no locator available` | numba has nowhere to write librosa's jit cache; the image sets `NUMBA_CACHE_DIR`, so rebuild it, or pass `-e NUMBA_CACHE_DIR=/tmp/numba-cache` |
 | `more programs than sections, N never comes up` | cuts follow the score's sections; audition a longer span, or name fewer programs |
+| `video status` holds `NTSC` (or another timing) with `overridden` while the source is fine | a front panel override: set SETTINGS > Vid Route Mode to Auto, SYSTEM > Pref. Timing to the session format, power-cycle |
+| recorder cannot open the session format; the card lists only SD YUYV/NV12 | the card enumerated on USB 2; plug it straight into a USB 3 port with a USB 3 cable |
+| device reports no input lock, Pi `fb0/blank` reads 4 | the Pi framebuffer was left powered down; `syncsummoner device doctor --fix` |
 | `error: no serial link is open` | the CDC tty was not passed in, or `pyvmancer` is installed without its serial extra |
 
 What the rig was measured to do, and why each of these follows from it, is in

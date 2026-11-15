@@ -25,6 +25,7 @@ python -m syncsummoner.aesthetics score clip.mp4
 
 ```sh
 syncsummoner device list | ping | programs
+syncsummoner device doctor [--format 1080p30] [--loop] [--fix]   # rig diagnostics, JSON report
 syncsummoner manifest /media/card/programs [--write]   # rebuild manifest.json from the .vmprog files
 
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/

@@ -9,16 +9,24 @@ are in [rig.md](rig.md); the render workflow is in [workflow.md](workflow.md).
 | Part | Value |
 | --- | --- |
 | Videomancer serial | `E464B0605F113625` |
-| Firmware | `1.0.0-rc.46` |
+| Firmware | `1.0.1` |
 | Programs installed | 56 |
 | MIDI node | ALSA rawmidi, discovered per enumeration (`midiC4D0`, `C5D0` and `C6D0` all observed) |
 | Serial node | `/dev/ttyACM0`, group `dialout`; needs `pyvmancer[serial]` |
-| Capture card | AVerMedia Live Gamer Ultra 2.1, `/dev/video0`, uvcvideo |
+| Capture card | AVerMedia Live Gamer Ultra 2.1, `/dev/video0`, uvcvideo; needs USB 3 |
 | Session format | 1920x1080 @ 30 over HDMI, genlocked to the Pi, no override |
 | Playout | Raspberry Pi 4B `pi@videopi`; this host has no usable HDMI output |
 
 Nothing about the device's own nodes is fixed: the rawmidi index moves across
 replugs, which is why discovery reads them rather than hardcoding them.
+
+## The capture card needs USB 3
+
+On a USB 2 link (480 Mbit/s) the card offers only SD uncompressed modes: no
+MJPEG and no 1080p, so the recorder cannot open the session format. On USB 3
+(5000 Mbit/s) it offers MJPEG up to 3840x2160. The card also carries a USB 2 hub
+of its own for its RGB lighting controller, which is normal; only the video
+function's link speed matters. `syncsummoner device doctor` checks both.
 
 ## The chroma pair arrives exchanged
 
