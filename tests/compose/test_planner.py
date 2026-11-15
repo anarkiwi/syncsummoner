@@ -413,3 +413,31 @@ def test_glitchy_does_not_pay_the_naturalness_penalties():
     assert P.STYLE_WEIGHTS["glitchy"].levels == 0.0
     assert P.STYLE_WEIGHTS["glitchy"].boredom > P.DEFAULT_WEIGHTS.boredom
     assert P.STYLE_WEIGHTS.get("smooth", P.DEFAULT_WEIGHTS) is P.DEFAULT_WEIGHTS
+
+
+def test_thin_defers_a_release_it_cannot_settle_rather_than_latching_the_toggle():
+    profile = make_profile()
+    profile.settle_frames[7] = 30
+    pulse = Automation.concat(
+        [Automation.of([1.0, 1.2], 7, np.array([1023, 0])), Automation.of([1.5, 1.6], 7, np.array([1023, 0]))]
+    )
+    thinned = P.thin(pulse, profile, fps=FPS)
+    assert thinned.values.tolist() == [1023, 0] and thinned.values[-1] == 0, "released, never latched"
+    assert thinned.times.tolist() == pytest.approx([1.0, 2.0])
+    assert P.reachable(thinned, profile, fps=FPS)
+    back = Automation.of([0.0, 0.1, 0.2], 7, np.array([1023, 0, 1023]))
+    assert P.thin(back, profile, fps=FPS).values.tolist() == [1023], "a change undone in time is no change"
+
+
+def test_the_style_sets_the_wet_range_and_the_caller_can_override_it(features):
+    profiles = {"glitch": make_profile("glitch")}
+    rng = np.random.default_rng(3)
+    glitchy = P.search(profiles, features, style="glitchy", rng=rng, budget=6, fps=FPS)
+    assert glitchy.wet == (P.DEFAULT_WET[0], 1.0)
+    calm = P.search(profiles, features, style="smooth", rng=rng, budget=6, fps=FPS)
+    assert calm.wet == P.DEFAULT_WET
+    chosen = P.search(profiles, features, style="smooth", rng=rng, budget=6, fps=FPS, wet=(0.3, 0.9))
+    assert chosen.wet == (0.3, 0.9)
+    fader = P.plan_automation(chosen, profiles)[0]
+    values = fader.values[fader.indices == 12]
+    assert values.size == 0 or (values.min() >= round(0.3 * 1023) and values.max() <= round(0.9 * 1023))

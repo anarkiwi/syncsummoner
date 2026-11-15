@@ -356,7 +356,11 @@ def test_profile_rejects_a_newer_schema(tmp_path, profile):
     """Profile rejects a newer schema."""
     path = tmp_path / "profile.yaml"
     fit.save_profile(profile, path)
-    path.write_text(path.read_text(encoding="utf-8").replace("schema_version: 1", "schema_version: 99"))
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            f"schema_version: {fit.PROFILE_SCHEMA_VERSION}", "schema_version: 99"
+        )
+    )
     with pytest.raises(ValueError, match="newer than"):
         fit.load_profile(path)
 

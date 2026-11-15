@@ -11,6 +11,7 @@ from .profile import (
     ParamKind,
     ParamSpec,
     ProgramProfile,
+    Role,
     Source,
     Tongue,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "PlayoutError",
     "ProgramInfo",
     "ProgramProfile",
+    "Role",
     "Session",
     "Source",
     "Tongue",

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from syncsummoner.device import transport as tr
-from syncsummoner.device.profile import PARAM_COUNT, ParamKind
+from syncsummoner.device.profile import PARAM_COUNT, ParamKind, Role
 
 from .conftest import COLORBARS_INFO, FakeDevice, FakeShell
 
@@ -26,6 +26,19 @@ def test_program_info_derives_kinds(device):
     assert all(k is ParamKind.BOOLEAN for k in kinds[6:11])
     assert [p.index for p in info.params] == list(range(1, PARAM_COUNT + 1))
     assert len(info.used) == 10
+
+
+def test_program_info_names_roles_and_keeps_the_wet_control_continuous(device):
+    port = tr.Transport(device)
+    info = port.program_info()
+    assert [p.role for p in info.params if p.role is not Role.EFFECT] == [Role.BYPASS, Role.WET]
+    assert info.params[10].name == "Bypass" and info.params[11].kind is ParamKind.CONTINUOUS
+    assert port.program_payload() == COLORBARS_INFO, "the reply is archived exactly as the device gave it"
+    unnamed = tr.ProgramInfo.from_json(
+        {"parameters": [{"name": f"Null {i}", "min": 0, "max": 100} for i in range(1, 13)]}
+    )
+    assert unnamed.params[11].role is Role.WET and unnamed.params[11].kind is ParamKind.CONTINUOUS
+    assert unnamed.params[11].steps is None and unnamed.params[10].kind is ParamKind.UNUSED
 
 
 def test_quantized_threshold_follows_sample_budget():

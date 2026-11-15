@@ -15,7 +15,7 @@ import pyvmancer as vm
 from pyvmancer.const import ParamRole, classify_param
 from pyvmancer.video import VideoStatus
 
-from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, Role, classify_role
 
 #: Native ranges no wider than a default OAT sweep are enumerable, not swept.
 DEFAULT_SAMPLE_STEPS = 32
@@ -78,8 +78,9 @@ class ProgramInfo:
         for index, entry in enumerate(data.get("parameters", ()), start=1):
             name = str(entry.get("name", ""))
             low, high = float(entry.get("min", 0)), float(entry.get("max", 0))
-            role, count = classify_param(name, low, high, sweep_steps=steps)
-            kind = ROLE_TO_KIND[role]
+            sampling, count = classify_param(name, low, high, sweep_steps=steps)
+            role = classify_role(index, name)
+            kind = ParamKind.CONTINUOUS if role is Role.WET else ROLE_TO_KIND[sampling]
             params.append(
                 ParamSpec(
                     index=index,
@@ -87,7 +88,8 @@ class ProgramInfo:
                     native_min=low,
                     native_max=high,
                     kind=kind,
-                    steps=count,
+                    steps=None if role is Role.WET else count,
+                    role=role,
                 )
             )
         return cls(name=str(data.get("name", "")), params=params, program_id=data.get("id"))
@@ -170,9 +172,13 @@ class Transport:
         The device reports a plain name that does not say which author it came
         from, so only a program this transport loaded counts as current.
         """
+        return ProgramInfo.from_json(self.program_payload(name))
+
+    def program_payload(self, name: str | None = None) -> dict[str, Any]:
+        """The device's own ``program info`` reply, unparsed, so it can be archived as is."""
         if name is not None and name != self._loaded:
             self.load_program(name)
-        return ProgramInfo.from_json(self._shell.program_info())
+        return dict(self._shell.program_info())
 
     def set_param(self, index: int, value: float | bool) -> None:
         """Send a MIDI CC for one parameter; the device adds it to the manual value."""

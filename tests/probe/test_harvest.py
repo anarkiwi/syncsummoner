@@ -64,10 +64,10 @@ def blind(monkeypatch, *, canary=True, take=DARK):
 class Port:
     """Transport stub: answers program queries, and can refuse to hold a program."""
 
-    def __init__(self, programs=("Alpha", "Beta"), *, holds=True, info=INFO):
+    def __init__(self, programs=("Alpha", "Beta"), *, holds=True, info=None):
         self.programs_list = list(programs)
         self.holds = holds
-        self.info = info
+        self.info = COLORBARS_INFO if info is None else info
         self.loads = []
         self.closed = False
         self.hashes = 0
@@ -81,11 +81,14 @@ class Port:
     def load_program(self, name):
         self.loads.append(name)
 
-    def program_info(self, name=None):
+    def program_payload(self, name=None):
         del name
         if not self.holds:
             raise RuntimeError("[3] no program loaded")
-        return self.info
+        return dict(self.info)
+
+    def program_info(self, name=None):
+        return ProgramInfo.from_json(self.program_payload(name))
 
     def file_hash(self, path):
         del path
@@ -131,6 +134,7 @@ class Archive:
         self.directory = Path(directory)
         self.stored = {program: key.digest for program, key in stored}
         self.rows = {}
+        self.infos = {}
         self.keys = {}
         self.commits = []
         self.geometry = {}
@@ -156,8 +160,9 @@ class Archive:
         self.directory.mkdir(parents=True, exist_ok=True)
         return self.directory / f"{slug(program)}.scratch.mkv"
 
-    def commit(self, program, key, video, rows, *, width, height, fps):
+    def commit(self, program, key, video, rows, *, width, height, fps, program_info=None):
         assert Path(video).exists(), "the recording is published, not re-encoded"
+        self.infos[program] = program_info
         self.keys[program] = key
         self.rows[program] = list(rows)
         self.geometry[program] = (width, height, fps)
@@ -415,6 +420,7 @@ def test_a_program_is_swept_into_exactly_one_recording(tmp_path):
     assert (result.frames, result.measured) == (PER_PROGRAM, MEASURED)
     assert result.seconds == pytest.approx(2.5) and result.report is LIVE and not result.dark
     assert len(session.vectors) == 1 + CONFIG.setpoints, "the working point, then every setpoint"
+    assert archive.infos["Alpha"] == COLORBARS_INFO, "the device's reply is archived with the frames"
 
 
 def test_every_captured_frame_is_archived_against_the_vector_it_was_captured_under(tmp_path):
@@ -637,6 +643,7 @@ def test_a_real_session_holds_the_link_down_across_the_whole_load(tmp_path):
     port.programs = lambda: ["Alpha"]
     port.firmware = lambda: FIRMWARE
     port.program_info = lambda name=None: INFO
+    port.program_payload = lambda name=None: dict(COLORBARS_INFO)
     port.close = lambda: calls.append("close")
     port.load_program = lambda name: calls.append(f"load {name}")
     report = run(

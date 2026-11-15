@@ -26,6 +26,7 @@ __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
     "DARK_SUFFIX",
     "GAP",
+    "PROGRAM_INFO",
     "ArchiveError",
     "FrameArchive",
     "FrameReader",
@@ -44,6 +45,8 @@ DARK_SUFFIX = ".dark.json"
 GAP = -1
 #: What the card is asked for; the recorder swaps the chroma pair back before encoding.
 CAPTURE_PIX_FMT = "yuyv422"
+#: Metadata key holding the device's own ``program info`` reply for the archived program.
+PROGRAM_INFO = "program_info"
 #: Planar 4:2:2 is the same samples deinterleaved into the canonical plane order.
 STORED_PIX_FMT = "yuv422p"
 #: Read back converted, so nothing downstream repeats a 4:2:2 upsample in Python.
@@ -319,11 +322,14 @@ class FrameArchive:
         width: int,
         height: int,
         fps: float = ARCHIVE_FPS,
+        program_info: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Publish a recording as this program's archive: video, sidecar, then marker.
 
         The metadata is written last and is the commit marker, as in the result
         store: a run killed mid-recording leaves at most an uncommitted temp file.
+        ``program_info`` is the device's reply for the program, kept so a refit
+        knows each parameter's name and native range.
         """
         if not rows:
             raise ArchiveError(f"no frames archived for {program!r}")
@@ -355,9 +361,24 @@ class FrameArchive:
             "data": data.name,
             "created": datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(),
         }
-        payload = json.dumps(meta, indent=2)
-        atomic_write(meta_path, lambda tmp: tmp.write_text(payload, encoding="utf-8"))
+        if program_info is not None:
+            meta[PROGRAM_INFO] = dict(program_info)
+        self._write_meta(meta_path, meta)
         return meta
+
+    def annotate(self, program: str, **fields: Any) -> dict[str, Any]:
+        """Merge ``fields`` into a committed archive's metadata, leaving its frames alone."""
+        meta = self.meta(program)
+        if meta is None:
+            raise ArchiveError(f"no committed archive for {program!r}")
+        meta.update(fields)
+        self._write_meta(self.paths(program)[2], meta)
+        return meta
+
+    @staticmethod
+    def _write_meta(path: Path, meta: Mapping[str, Any]) -> None:
+        payload = json.dumps(meta, indent=2)
+        atomic_write(path, lambda tmp: tmp.write_text(payload, encoding="utf-8"))
 
     def reader(self, program: str, key: ProgramKey | None = None) -> FrameReader | None:
         """Reader for a committed archive, or None when absent or keyed differently."""

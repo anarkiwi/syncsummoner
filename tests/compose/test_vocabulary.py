@@ -15,7 +15,16 @@ from syncsummoner.compose.vocabulary import (
     step_margin,
     targets,
 )
-from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
+from syncsummoner.device.profile import (
+    PARAM_MAX,
+    Axis,
+    Cliff,
+    ParamKind,
+    ParamSpec,
+    ProgramProfile,
+    Role,
+    Source,
+)
 
 from . import make_profile
 
@@ -139,7 +148,7 @@ def test_step_margin_tracks_the_probe_resolution():
 
 def test_targets_falls_back_when_the_axis_is_absent():
     profile = make_profile()
-    assert targets(profile, Axis.FEEDBACK_GAIN)[0].index == 12
+    assert targets(profile, Axis.FEEDBACK_GAIN)[0].index == 3
     assert targets(profile, Axis.MOTION_RATE)[0].index == 2
     assert targets(profile, Axis.NOISE, kinds=(ParamKind.BOOLEAN,))[0].index == 7
 
@@ -169,3 +178,46 @@ def test_automation_hold_is_zero_order():
 def test_gesture_values_clip_to_the_parameter_range():
     auto = Automation.of([0.0], 1, np.array([5000.0]))
     assert auto.values.tolist() == [PARAM_MAX]
+
+
+def roled(**roles):
+    """The shared profile with some slots given other roles, and a cliff on its boolean."""
+    profile = make_profile()
+    for spec in profile.params:
+        spec.role = roles.get(f"p{spec.index}", spec.role)
+        if spec.index == 7:
+            spec.cliffs = [Cliff(at=1023, jump=0.99, metrics=("clip_frac",))]
+    return profile
+
+
+@pytest.mark.parametrize("name", sorted(TABLE))
+def test_no_gesture_ever_writes_a_bypass(name):
+    profile = roled(p2=Role.BYPASS, p7=Role.BYPASS)
+    for intensity in np.linspace(0.0, 1.0, 11):
+        for chosen in ((), (2,), (7,)):
+            auto = GESTURES[name](profile, ctx(intensity=intensity, targets=chosen))
+            assert not set(auto.indices.tolist()) & {2, 7}
+
+
+def test_a_momentary_control_is_only_ever_pulsed():
+    profile = roled(p7=Role.MOMENTARY)
+    pulse = GESTURES["punch"](profile, ctx())
+    assert pulse.indices.tolist() == [7, 7] and pulse.values.tolist() == [PARAM_MAX, 0]
+    for name in sorted(set(TABLE) - {"punch"}):
+        assert 7 not in GESTURES[name](profile, ctx(targets=(7,))).indices.tolist(), name
+
+
+def test_only_morph_drives_the_wet_control_and_within_the_wet_range():
+    profile = make_profile()
+    auto = GESTURES["morph"](profile, ctx(wet=(0.25, 1.0)))
+    fader = auto.values[auto.indices == 12]
+    assert fader[0] == round(0.25 * PARAM_MAX) and fader[-1] == PARAM_MAX
+    for name in sorted(set(TABLE) - {"morph"}):
+        assert 12 not in GESTURES[name](profile, ctx(targets=(12,))).indices.tolist(), name
+    assert len(GESTURES["morph"](roled(p12=Role.EFFECT), ctx())) == 0, "no wet control, no morph"
+
+
+def test_cliff_cross_never_latches_a_toggle_across_its_cliff():
+    profile = roled()
+    for intensity in np.linspace(0.0, 1.0, 11):
+        assert 7 not in GESTURES["cliff_cross"](profile, ctx(intensity=intensity)).indices.tolist()

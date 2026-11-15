@@ -10,8 +10,10 @@ coverage.xml
 .pytest_cache/
 htmlcov/
 profiles/
+profiles-*/
 captures/
 archive/
+archive-*/
 *.mkv
 *.mov
 *.yuv

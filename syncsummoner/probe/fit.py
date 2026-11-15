@@ -24,6 +24,7 @@ from syncsummoner.device.profile import (
     ParamSpec,
     ProgramProfile,
     Tongue,
+    classify_role,
 )
 from syncsummoner.probe.runner import STABILITY_ORDER
 
@@ -38,7 +39,8 @@ __all__ = [
     "load_measurements",
 ]
 
-PROFILE_SCHEMA_VERSION = 1
+#: Version 2 adds each parameter's ``role``; a version 1 profile has it derived on load.
+PROFILE_SCHEMA_VERSION = 2
 
 #: Metrics the compose proxy reads back per setpoint; measured, not inferred.
 PROXY_METRICS = ("spectral_slope", "concentration", "clip_frac", "illegal_frac")
@@ -427,7 +429,13 @@ def fit_profile(
     for j in range(PARAM_COUNT):
         kind, steps = _infer_kind(params[:, j])
         spec = next((s for s in specs or [] if s.index == j + 1), None) or ParamSpec(
-            index=j + 1, name=f"p{j + 1}", native_min=0.0, native_max=1.0, kind=kind, steps=steps
+            index=j + 1,
+            name=f"p{j + 1}",
+            native_min=0.0,
+            native_max=1.0,
+            kind=kind,
+            steps=steps,
+            role=classify_role(j + 1, f"p{j + 1}"),
         )
         if j not in varying or not names:
             fitted.append(spec)
