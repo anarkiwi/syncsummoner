@@ -7,6 +7,7 @@ sequence. librosa is optional; scipy fallbacks cover every function.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -19,8 +20,10 @@ from syncsummoner.progress import LOG, stage, track
 
 try:
     import librosa
+    from soundfile import LibsndfileError
 except ImportError:
     librosa = None
+    LibsndfileError = RuntimeError
 
 EPS = 1e-12
 CV_BANDS = ((20.0, 120.0), (120.0, 600.0), (600.0, 3000.0), (3000.0, 12000.0))
@@ -95,12 +98,33 @@ class Features:
         return min(spans) if spans else 0.0
 
 
+def ffmpeg_decode(path: str | Path, *, sr: int, ffmpeg: str = "ffmpeg") -> np.ndarray:
+    """Decode anything ffmpeg can read to mono float32 at ``sr``."""
+    from syncsummoner.device.recorder import require_ffmpeg  # pylint: disable=import-outside-toplevel
+
+    cmd = [require_ffmpeg(ffmpeg), "-nostdin", "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(sr)]
+    proc = subprocess.run([*cmd, "-f", "f32le", "-"], capture_output=True, check=False)
+    if proc.returncode:
+        raise ValueError(f"ffmpeg could not decode {path}: {proc.stderr.decode(errors='replace').strip()}")
+    return np.frombuffer(proc.stdout, dtype="<f4").astype(np.float32)
+
+
 def load_audio(path: str | Path, *, sr: int = 22050) -> tuple[np.ndarray, int]:
-    """Read an audio file to mono float32 at ``sr``, via librosa when available."""
+    """Read an audio file to mono float32 at ``sr``.
+
+    librosa (libsndfile) reads what it can; anything else, AAC in .m4a/.mp4
+    among it, is decoded by ffmpeg.
+    """
     if librosa is not None:
-        y, out_sr = librosa.load(str(path), sr=sr, mono=True)
+        try:
+            y, out_sr = librosa.load(str(path), sr=sr, mono=True)
+        except LibsndfileError:
+            return ffmpeg_decode(path, sr=sr), int(sr)
         return np.asarray(y, dtype=np.float32), int(out_sr)
-    native_sr, data = wavfile.read(str(path))
+    try:
+        native_sr, data = wavfile.read(str(path))
+    except ValueError:
+        return ffmpeg_decode(path, sr=sr), int(sr)
     y = np.asarray(data, dtype=np.float32)
     if y.ndim > 1:
         y = y.mean(axis=1)
