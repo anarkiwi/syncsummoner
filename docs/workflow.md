@@ -314,13 +314,20 @@ What happens, in order:
 5. The Pi decodes and blits the clip at rate while ffmpeg records the card and the
    host writes only the parameters that are due. Each program is driven by its own
    evolved layer; the take covers the whole timeline.
-6. Each pass lands in `--takes` as `take-<program>.mkv`, and they are cut together
+6. Each pass lands in `--takes` as `take-<program>.mkv` (an `author/Name` program
+   becomes `take-author_Name-<digest>.mkv`, the archive's name for it), and they are cut together
    on the score's sections, in rotation, into `final.take.mp4`.
 7. The take opens on lead-in the picture has not reached yet, so its start is
    read back out of the timecode strip rather than assumed — that is what the
    strip is for — and reported as `picture starts N.NNs into the take`. The Pi's
    player takes a few frames to reach rate; the lag every later frame agrees on
-   is what the take is cut against, and the fade covers the ramp.
+   is what the take is cut against, and the fade covers the ramp. A program that
+   moves the picture geometrically can destroy the strip; that take is cut at the
+   median start of the run's other takes (the lag is the Pi's and the capture's,
+   which every pass shares) and the log says so:
+   `Pinwheel: timecode strip did not survive; using the run's median picture start 1.90s`.
+   If no take in the run kept its strip, the render stops rather than cut from
+   the take's first frame.
 8. Mastering: cut from where the picture starts, trim to the length both inputs
    cover, mux the track, fade the picture up from black and the audio up from
    silence over `--fade` seconds, and the same back down at the end.
@@ -334,6 +341,11 @@ finished clip is cut by time.
 hard cuts at both ends. On a clip shorter than two fades, each is clamped to half
 the clip so they meet rather than overlap. `--no-master` stops at the raw take,
 and `--take` puts it somewhere other than beside the output.
+
+`--reuse-takes` cuts from any `take-<program>.mkv` already in `--takes` instead
+of rendering it again (`<program>: reusing take <path>`), so a render can be
+re-cut, re-mastered or resumed after an interruption; with every take present the
+rig is never opened. Without `--cut-programs` it reuses `--take`.
 
 Without `--cut-programs` the render is a single pass through the score's first
 layer: one program for the whole piece, and one pass of rig time instead of one
@@ -397,7 +409,8 @@ doing it twice, which is what the audition is for.
 | small flickering square in every take | `fbcon` cursor blink on the Pi; disable it, `chvt` does not fix it |
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | picture never returns after a load | relock; the settle budget is 40 s, and `video status` is advisory |
-| output starts mid-clip, or holds one frame | the picture's start was not found; check the `picture starts` line and that the strip survives the program |
+| output starts mid-clip, or holds one frame | the picture's start was not found; check the `picture starts` line and that the strip survives the program; a `timecode strip did not survive` warning means that take was cut at the run's median start instead |
+| `timecode strip did not survive, so the picture start is unknown` | no take kept its strip; check the program, or that the pass recorded the clip at all |
 | pass dies uploading the clip | `/dev/shm` on the Pi is half its RAM; a long scratch at `crf 14` will not fit |
 | `Host key verification failed` | the mounted `known_hosts` has no entry for the Pi; `BatchMode` will not prompt for one |
 | `Permission denied (publickey)` | the mounted key is not the one the Pi authorizes |

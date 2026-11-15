@@ -234,6 +234,7 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
                 "--source",
                 "--cut-programs",
                 "--takes",
+                "--reuse-takes",
             ],
         ),
         ("render", ["--audio", "--fade", "--fade-in", "--fade-out", "--no-master", "--take"]),
@@ -374,6 +375,42 @@ def test_a_blank_take_is_never_mastered(monkeypatch, tmp_path):
         == 1
     )
     assert "master" not in seen
+
+
+def test_an_existing_take_is_remastered_without_a_pass(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    take = tmp_path / "raw.mkv"
+    take.write_bytes(b"take")
+    argv = ["render", _score_file(tmp_path), "--source", "clip.mkv", "--take", str(take)]
+    assert cli.main(argv + ["--reuse-takes", "-o", str(tmp_path / "final.mp4")]) == 0
+    assert "render" not in seen and seen["master"][0] == str(take)
+    assert seen["master"][3]["video_start"] == 1.5
+
+
+def test_a_take_with_no_legible_strip_is_not_mastered_from_its_lead_in(monkeypatch, tmp_path, capsys):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    monkeypatch.setattr("syncsummoner.compose.render.picture_start", lambda path, **kw: None)
+    argv = ["render", _score_file(tmp_path), "--source", "clip.mkv", "-o", str(tmp_path / "final.mp4")]
+    assert cli.main(argv) == 1
+    assert "master" not in seen and "timecode strip did not survive" in capsys.readouterr().err
+
+
+def test_a_cut_render_asks_the_device_for_programs_only_through_render_cuts(monkeypatch, tmp_path):
+    """Asking up front would open the device even when every take is reused."""
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+
+    def fake_cuts(*_args, **kwargs):
+        seen["cuts"] = kwargs
+        return []
+
+    monkeypatch.setattr("syncsummoner.compose.render.render_cuts", fake_cuts)
+    monkeypatch.setattr("syncsummoner.compose.render.device_programs", lambda: pytest.fail("device opened"))
+    argv = ["render", _score_file(tmp_path), "--source", "clip.mkv", "--cut-programs", "g"]
+    assert cli.main(argv + ["--reuse-takes", "--no-master", "-o", str(tmp_path / "final.mp4")]) == 0
+    assert seen["cuts"]["reuse"] and callable(seen["cuts"]["available"])
 
 
 def test_default_fades_come_from_the_library(monkeypatch, tmp_path):
