@@ -27,6 +27,10 @@ class UnknownProgramError(RuntimeError):
     """A named program cannot be rendered, so no pass should be started."""
 
 
+class LostTimecodeError(RuntimeError):
+    """No take in a run kept a legible timecode strip, so nothing says where its picture starts."""
+
+
 class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
@@ -108,7 +112,7 @@ def read_timecode(
     return int((binary * (1 << np.arange(bits - 1, -1, -1))).sum())
 
 
-def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | None = None) -> float:
+def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | None = None) -> float | None:
     """Seconds into a take at which the played clip's first frame lands.
 
     Lead-in is not blank: it holds whatever the framebuffer last showed, which is
@@ -139,12 +143,12 @@ def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | N
     stride = config.width * config.strip_px * 3
     strips = np.frombuffer(data[: len(data) - len(data) % stride], np.uint8)
     if not strips.size:
-        return 0.0
+        return None
     strips = strips.reshape(-1, config.strip_px, config.width, 3).astype(np.float32) / 255.0
     codes = [read_timecode(s, bits=config.bits, strip_px=config.strip_px) for s in strips]
     lags = np.array([i - c for i, c in enumerate(codes) if c is not None], dtype=np.int64)
     if not lags.size:
-        return 0.0
+        return None
     values, counts = np.unique(lags, return_counts=True)
     return max(0.0, float(values[counts.argmax()]) / config.fps)
 
@@ -358,6 +362,30 @@ class Cut:
         return max(0.0, self.end - self.start)
 
 
+def resolve_starts(measured: Mapping[str, float | None]) -> dict[str, float]:
+    """Fill in the picture start of any take whose strip did not survive.
+
+    The lag is the Pi player's and the capture's, which every pass in a run
+    shares, so the median of the takes that were read stands in for the rest.
+    With none read there is nothing to stand in, and cutting from the first
+    frame would splice lead-in into the output.
+    """
+    found = [value for value in measured.values() if value is not None]
+    if not found:
+        raise LostTimecodeError(
+            f"{', '.join(measured)}: the timecode strip did not survive, so the picture start "
+            "is unknown; check the program or the pass"
+        )
+    median = float(np.median(found))
+    for name in (name for name, value in measured.items() if value is None):
+        LOG.warning(
+            "%s: timecode strip did not survive; using the run's median picture start %.2fs",
+            name,
+            median,
+        )
+    return {name: median if value is None else value for name, value in measured.items()}
+
+
 def device_programs() -> list[str]:
     """Program names the attached device offers. Imported here so compose needs no hardware."""
     from syncsummoner.device.transport import Transport
@@ -443,8 +471,9 @@ def render_cuts(
     prepared: bool = False,
     start: float = 0.0,
     takes: str | Path = ".",
-    available: Sequence[str] | None = None,
+    available: Sequence[str] | Callable[[], Sequence[str]] | None = None,
     pass_render: Callable[..., Any] | None = None,
+    reuse: bool = False,
 ) -> list[Cut]:
     """Render one pass per program and cut between them on the score's sections.
 
@@ -452,17 +481,28 @@ def render_cuts(
     anything else falls back to the first. The timecoded source is built once and
     replayed by every pass. Programs are assigned to sections in rotation, so
     naming more than there are sections leaves the surplus unrendered, which is
-    said rather than silently done. Returns the plan that was cut.
+    said rather than silently done. With ``reuse``, a program whose take is
+    already in ``takes`` is measured and cut from that take without a pass, and
+    ``available`` (a list, or a callable asked only when a pass is due) is
+    consulted only for the programs still to render. Returns the plan that was cut.
     """
+    from syncsummoner.probe.store import slug
+
     config = RenderConfig() if config is None else config
-    unknown = unknown_programs(programs, available)
+    plan = cut_plan(score, programs)
+    ordered = list(dict.fromkeys(cut.program for cut in plan))
+    paths = {p: str(Path(takes) / f"take-{slug(p)}.mkv") for p in ordered}
+    fresh = [p for p in ordered if not (reuse and Path(paths[p]).is_file())]
+    if fresh and callable(available):
+        available = available()
+    pending = [p for p in programs if p in fresh or p not in paths]
+    unknown = unknown_programs(pending, available if fresh else None)
     if unknown:
         raise UnknownProgramError(f"the device does not offer {', '.join(unknown)}")
-    plan = cut_plan(score, programs)
     run = render_played if pass_render is None else pass_render
     evolved = {layer.program: layer for layer in score.layers}
     Path(takes).mkdir(parents=True, exist_ok=True)
-    unused = [p for p in programs if p not in {cut.program for cut in plan}]
+    unused = [p for p in programs if p not in paths]
     if unused:
         LOG.warning(
             "%d sections for %d programs, so %s never comes up; compose a longer span for more",
@@ -470,43 +510,44 @@ def render_cuts(
             len(programs),
             ", ".join(unused),
         )
-    passes = len(dict.fromkeys(cut.program for cut in plan))
     LOG.info(
         "%d cuts over %d programs: %d passes of %s plus a relock each, about %s of rig time",
         len(plan),
-        passes,
-        passes,
+        len(ordered),
+        len(fresh),
         human(score.duration),
-        human(passes * (score.duration + config.settle_s * EXPECTED_RELOCK_FRAC)),
+        human(len(fresh) * (score.duration + config.settle_s * EXPECTED_RELOCK_FRAC)),
     )
-    if not prepared:
+    if fresh and not prepared:
         write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
         prepared = True
-    paths: dict[str, str] = {}
-    starts: dict[str, float] = {}
-    ordered = list(dict.fromkeys(cut.program for cut in plan))
+    measured: dict[str, float | None] = {}
     for program in track(ordered, desc="passes", total=len(ordered), unit="program"):
-        source_layer = evolved.get(program) or (score.layers[0] if score.layers else None)
-        layer = Layer(
-            index=0,
-            program=program,
-            gestures=list(source_layer.gestures) if source_layer is not None else [],
-        )
-        take = str(Path(takes) / f"take-{program.replace(' ', '_')}.mkv")
-        report = run(
-            replace(score, layers=[layer]),
-            source,
-            take,
-            profiles=profiles,
-            config=config,
-            scratch=scratch,
-            prepared=prepared,
-        )
-        if report is not None and not report.usable:
-            raise BlankTakeError(f"{program}: {report}")
-        paths[program] = take
-        starts[program] = picture_start(take, config=config)
-        LOG.info("%s: picture starts %.2fs into the take", program, starts[program])
+        take = paths[program]
+        if program in fresh:
+            source_layer = evolved.get(program) or (score.layers[0] if score.layers else None)
+            layer = Layer(
+                index=0,
+                program=program,
+                gestures=list(source_layer.gestures) if source_layer is not None else [],
+            )
+            report = run(
+                replace(score, layers=[layer]),
+                source,
+                take,
+                profiles=profiles,
+                config=config,
+                scratch=scratch,
+                prepared=prepared,
+            )
+            if report is not None and not report.usable:
+                raise BlankTakeError(f"{program}: {report}")
+        else:
+            LOG.info("%s: reusing take %s", program, take)
+        measured[program] = picture_start(take, config=config)
+        if measured[program] is not None:
+            LOG.info("%s: picture starts %.2fs into the take", program, measured[program])
+    starts = resolve_starts(measured)
     with stage("assemble", cuts=len(plan), out=str(out)):
         assemble(plan, paths, out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"), starts=starts)
     return plan

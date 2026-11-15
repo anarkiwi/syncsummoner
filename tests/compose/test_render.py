@@ -4,6 +4,8 @@
 
 import contextlib
 import io
+import shutil
+import subprocess
 import dataclasses
 import sys
 import time
@@ -720,9 +722,31 @@ def test_picture_start_survives_a_misread_strip(monkeypatch, tmp_path):
     assert R.picture_start(tmp_path / "take.mkv", config=config) == pytest.approx(3 / config.fps)
 
 
-def test_picture_start_of_a_take_with_no_strip_is_zero(monkeypatch, tmp_path):
+def test_picture_start_of_a_take_ffmpeg_cannot_read_is_unknown(monkeypatch, tmp_path):
     monkeypatch.setattr(R.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(stdout=b""))
-    assert R.picture_start(tmp_path / "take.mkv", config=CONFIG) == 0.0
+    assert R.picture_start(tmp_path / "take.mkv", config=CONFIG) is None
+
+
+@pytest.mark.parametrize("flipped", [False, True])
+def test_a_program_that_turns_the_picture_over_leaves_its_start_unknown(tmp_path, flipped):
+    """A geometric program moves the strip off the edge; that is not a measured zero lag."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    lead = 4
+    plate = np.full((CONFIG.height, CONFIG.width, 3), 0.5, np.float32)
+    codes = [299] * lead + list(range(10))
+    frames = np.stack([R.burn_timecode(plate, i, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for i in codes])
+    frames = frames[:, ::-1] if flipped else frames
+    take = tmp_path / "take.mkv"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"]
+        + ["-s", f"{CONFIG.width}x{CONFIG.height}", "-r", str(CONFIG.fps), "-i", "pipe:0"]
+        + ["-c:v", "ffv1", "-pix_fmt", "bgr0", str(take)],
+        input=(np.clip(frames, 0, 1) * 255).astype(np.uint8).tobytes(),
+        check=True,
+    )
+    start = R.picture_start(take, config=dataclasses.replace(CONFIG, lead_s=1.0))
+    assert start is None if flipped else start == pytest.approx(lead / CONFIG.fps)
 
 
 def test_a_cut_is_taken_past_each_takes_own_lead_in(monkeypatch, tmp_path):

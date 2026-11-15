@@ -412,11 +412,14 @@ def _render_cmd(args: argparse.Namespace) -> int:
             prepared=args.prepared,
             start=start,
             takes=args.takes,
-            available=render_mod.device_programs(),
+            available=render_mod.device_programs,
+            reuse=args.reuse_takes,
         )
         for cut in plan:
             LOG.info("  %7.2f-%7.2fs  %s", cut.start, cut.end, cut.program)
         LOG.info("%s: %d cuts", take, len(plan))
+    elif args.reuse_takes and Path(take).is_file():
+        LOG.info("reusing take %s", take)
     else:
         report = render_mod.render_played(
             score,
@@ -431,7 +434,8 @@ def _render_cmd(args: argparse.Namespace) -> int:
         LOG.info("%s: %s", take, report)
         if not report.usable:
             return 1
-        lead = render_mod.picture_start(take, config=config)
+    if not args.cut_programs:
+        lead = render_mod.resolve_starts({take: render_mod.picture_start(take, config=config)})[take]
         LOG.info("picture starts %.2fs into the take", lead)
     if args.no_master:
         return 0
@@ -573,6 +577,9 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             "--cut-programs", help="cut between these programs on the score's sections, one pass each"
         )
         node.add_argument("--takes", default=".", help="where the per-program passes are written")
+        node.add_argument(
+            "--reuse-takes", action="store_true", help="cut from takes already on disk instead of a pass"
+        )
         node.add_argument("--fade", type=float, help="seconds of fade at each edge (default: 1)")
         node.add_argument("--fade-in", type=float, help="override the fade in")
         node.add_argument("--fade-out", type=float, help="override the fade out")
