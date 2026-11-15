@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind
+from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, Role
 
 #: Parking every manual value at zero makes the additive sum equal the MIDI offset.
 PARK_REFERENCE = 0
@@ -183,7 +183,7 @@ class Session:
         return got
 
     def working_point(self, info: Any, *, exclude: Iterable[int] = ()) -> dict[int, float | bool]:
-        """A mid-scale operating point, excluding driven slots.
+        """A mid-scale operating point with any bypass held off, excluding driven slots.
 
         The crossfader is forced in at mid-scale like any other continuous
         effect even where a program calls it unused, because it gates output
@@ -194,7 +194,9 @@ class Session:
         for spec in info.params:
             if spec.index in skip:
                 continue
-            if spec.index == CROSSFADER_INDEX:
+            if spec.role is Role.BYPASS:
+                values[spec.index] = False
+            elif spec.index == CROSSFADER_INDEX:
                 values[spec.index] = 0.5
             elif spec.kind is ParamKind.UNUSED:
                 continue

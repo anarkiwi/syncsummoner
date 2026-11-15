@@ -20,10 +20,17 @@ from syncsummoner.device.profile import (
     ParamKind,
     ParamSpec,
     ProgramProfile,
+    Role,
     Tongue,
 )
 
 CONTINUOUS_KINDS = (ParamKind.CONTINUOUS, ParamKind.QUANTIZED)
+#: Roles a gesture may drive freely; a bypass never, the wet control only through ``morph``.
+EFFECT_ROLES = (Role.EFFECT,)
+#: Roles a pulse may drive, being released again before it ends.
+PULSE_ROLES = (Role.EFFECT, Role.MOMENTARY)
+#: The whole wet range, as fractions of the control's travel.
+FULL_WET = (0.0, 1.0)
 
 
 class Anchor(enum.Enum):
@@ -113,6 +120,7 @@ class GestureContext:
     axis: Axis
     rng: np.random.Generator
     targets: tuple[int, ...] = ()
+    wet: tuple[float, float] = FULL_WET
 
 
 Renderer = Callable[[ProgramProfile, GestureContext], Automation]
@@ -172,11 +180,18 @@ def step_margin(spec: ParamSpec) -> int:
     return max(1, int(round(PARAM_MAX / (2 * (n - 1)))))
 
 
-def targets(profile: ProgramProfile, axis: Axis, *, kinds=CONTINUOUS_KINDS, n: int = 1) -> list[ParamSpec]:
-    """Most sensitive parameters on a canonical axis, falling back to any usable parameter."""
-    pool = [p for p in profile.by_axis(axis) if p.kind in kinds]
+def drivable(spec: ParamSpec, *, kinds=CONTINUOUS_KINDS, roles=EFFECT_ROLES) -> bool:
+    """Whether a gesture of this sort may write the parameter at all."""
+    return spec.kind in kinds and spec.role in roles
+
+
+def targets(
+    profile: ProgramProfile, axis: Axis, *, kinds=CONTINUOUS_KINDS, roles=EFFECT_ROLES, n: int = 1
+) -> list[ParamSpec]:
+    """Most sensitive drivable parameters on a canonical axis, falling back to any drivable one."""
+    pool = [p for p in profile.by_axis(axis) if drivable(p, kinds=kinds, roles=roles)]
     if not pool:
-        pool = [p for p in profile.params if p.kind in kinds]
+        pool = [p for p in profile.params if drivable(p, kinds=kinds, roles=roles)]
     return sorted(pool, key=lambda p: -p.sensitivity)[:n]
 
 
@@ -187,12 +202,16 @@ def _grid(ctx: GestureContext, span: float | None = None) -> np.ndarray:
     return np.linspace(ctx.arrival - span, ctx.arrival, n)
 
 
-def _pick(profile: ProgramProfile, ctx: GestureContext, kinds=CONTINUOUS_KINDS) -> ParamSpec | None:
+def _pick(
+    profile: ProgramProfile, ctx: GestureContext, kinds=CONTINUOUS_KINDS, roles=EFFECT_ROLES
+) -> ParamSpec | None:
     if ctx.targets:
-        chosen = [p for p in profile.params if p.index in ctx.targets and p.kind in kinds]
+        chosen = [
+            p for p in profile.params if p.index in ctx.targets and drivable(p, kinds=kinds, roles=roles)
+        ]
         if chosen:
             return chosen[0]
-    found = targets(profile, ctx.axis, kinds=kinds)
+    found = targets(profile, ctx.axis, kinds=kinds, roles=roles)
     return found[0] if found else None
 
 
@@ -217,11 +236,12 @@ def _ramp(profile: ProgramProfile, ctx: GestureContext) -> Automation:
 
 @_register("cliff_cross", Anchor.DOWNBEAT, "cliff_atlas")
 def _cliff_cross(profile: ProgramProfile, ctx: GestureContext) -> Automation:
-    atlas = profile.cliff_atlas()
+    specs = {p.index: p for p in profile.params if drivable(p)}
+    atlas = [(index, cliff) for index, cliff in profile.cliff_atlas() if index in specs]
     if not atlas:
         return Automation.empty()
     index, cliff = atlas[min(int(ctx.intensity * len(atlas)), len(atlas) - 1)]
-    spec = next(p for p in profile.params if p.index == index)
+    spec = specs[index]
     margin = step_margin(spec)
     approach = _grid(ctx)[:-1]
     below = np.linspace(cliff.at - 4 * margin, cliff.at - margin, approach.size)
@@ -234,8 +254,9 @@ def _cliff_cross(profile: ProgramProfile, ctx: GestureContext) -> Automation:
 
 
 def _best_tongue(profile: ProgramProfile) -> tuple[Any, Tongue] | None:
-    """Strongest measured lock region across every parameter pair."""
-    pairs = [(lock, tongue) for lock in profile.lock_maps for tongue in lock.tongues]
+    """Strongest measured lock region across every parameter pair whose driven slot is drivable."""
+    free = {p.index for p in profile.params if drivable(p)}
+    pairs = [(lock, tongue) for lock in profile.lock_maps if lock.b in free for tongue in lock.tongues]
     return max(pairs, key=lambda pair: pair[1].strength) if pairs else None
 
 
@@ -261,7 +282,7 @@ def _lock_snap(profile: ProgramProfile, ctx: GestureContext) -> Automation:
 
 @_register("punch", Anchor.ONSET, "effect_buttons")
 def _punch(profile: ProgramProfile, ctx: GestureContext) -> Automation:
-    spec = _pick(profile, ctx, kinds=(ParamKind.BOOLEAN,))
+    spec = _pick(profile, ctx, kinds=(ParamKind.BOOLEAN,), roles=PULSE_ROLES)
     if spec is None:
         return Automation.empty()
     dwell = max(ctx.duration, 2.0 / ctx.rate)
@@ -275,11 +296,11 @@ def _punch(profile: ProgramProfile, ctx: GestureContext) -> Automation:
 
 @_register("morph", Anchor.PHRASE, "crossfader")
 def _morph(profile: ProgramProfile, ctx: GestureContext) -> Automation:
-    fader = next((p for p in profile.params if p.index == PARAM_COUNT), None)
+    fader = next(iter(profile.by_role(Role.WET)), None)
     if fader is None:
         return Automation.empty()
     t = _grid(ctx)
-    parts = [Automation.of(t, fader.index, np.linspace(0, PARAM_MAX, t.size))]
+    parts = [Automation.of(t, fader.index, PARAM_MAX * np.linspace(*ctx.wet, t.size))]
     for spec in targets(profile, ctx.axis, n=2):
         lo, hi = safe_range(spec)
         parts.append(Automation.of([t[0]], spec.index, ctx.rng.integers(lo, hi)))
@@ -288,7 +309,7 @@ def _morph(profile: ProgramProfile, ctx: GestureContext) -> Automation:
 
 @_register("hysteresis_loop", Anchor.TWO_BAR, "hysteresis")
 def _hysteresis_loop(profile: ProgramProfile, ctx: GestureContext) -> Automation:
-    pool = [p for p in profile.params if p.hysteresis and p.kind in CONTINUOUS_KINDS]
+    pool = [p for p in profile.params if p.hysteresis and drivable(p)]
     spec = pool[0] if pool else _pick(profile, ctx)
     if spec is None:
         return Automation.empty()

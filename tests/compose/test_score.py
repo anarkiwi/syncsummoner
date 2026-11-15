@@ -6,13 +6,17 @@ import numpy as np
 import pytest
 
 from syncsummoner.compose.score import (
+    DEFAULT_WET,
     GestureInstance,
     Layer,
     Score,
     Section,
+    clamp_wet,
     control_rate,
     program_key,
 )
+from syncsummoner.compose.vocabulary import Automation
+from syncsummoner.device.profile import Role
 
 from . import make_profile
 
@@ -122,3 +126,18 @@ def test_window_keeps_a_gesture_whose_span_reaches_into_it():
 
 def test_window_cannot_run_past_the_score():
     assert example_score().window(6.0, 100.0).duration == pytest.approx(6.0)
+
+
+def test_only_the_wet_control_is_clamped_and_an_old_score_keeps_its_band():
+    profile = make_profile()
+    score = Score(duration=8.0, layers=[Layer("glitch", 0, [GestureInstance("morph", 4.0, 2.0)])])
+    assert score.wet == DEFAULT_WET
+    auto = score.render_layer(score.layers[0], profile)
+    fader = auto.values[auto.indices == 12]
+    assert fader.min() == round(DEFAULT_WET[0] * 1023) and fader.max() == round(DEFAULT_WET[1] * 1023)
+    renamed = make_profile()
+    renamed.params[-1].role = Role.EFFECT
+    free = Automation.of([0.0, 1.0], 12, np.array([0, 1023]))
+    assert clamp_wet(free, renamed, DEFAULT_WET).values.tolist() == [0, 1023], "a P12 effect is not a fader"
+    full = Score(duration=8.0, layers=score.layers, meta={"wet": [0.0, 1.0]})
+    assert full.render_layer(full.layers[0], profile).values.max() == 1023

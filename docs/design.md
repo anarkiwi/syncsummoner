@@ -182,7 +182,8 @@ analyzer: aesthetics 0.4.1
 source: hw
 params:
   - id: 3
-    name: threshold
+    name: threshold                # the device's own label, from program info
+    role: effect                   # effect | bypass | wet | momentary
     axis: color_destruction        # canonical axis assignment
     response: [...]                # metric vs value curve
     sensitivity: 0.82
@@ -249,8 +250,11 @@ Each primitive carries a musical anchor and consumes a specific profile field.
 | `cliff_cross` | downbeat | cliff atlas |
 | `detune_drift` | across N bars | tongue map, near-lock offset |
 | `lock_snap` | section boundary | tongue centers |
-| `punch` | onset | effect buttons, momentary |
-| `morph` | phrase | crossfader between two states |
+| `punch` | onset | effect buttons, momentary, pulsed and released |
+| `morph` | phrase | the wet control, across the score's wet range |
+
+No gesture drives a `bypass`; only `morph` drives the `wet` control; a
+`momentary` is only pulsed.
 | `hysteresis_loop` | 2-bar | path-dependent parameters |
 
 ### 4.4 Timing rules

@@ -31,6 +31,7 @@ syncsummoner manifest /media/card/programs [--write]   # rebuild manifest.json f
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/
 syncsummoner probe sim --program blur --image zoneplate.png
 syncsummoner probe archive --out archive/    # native frames for every program, resumable
+syncsummoner probe names --archive archive/   # add each program's program info to its archive
 syncsummoner probe refit --archive archive/ --out profiles/   # profiles from the archive, no device
 
 syncsummoner profile show | diff | atlas --program bitcrush_displace
@@ -38,7 +39,8 @@ syncsummoner profile show | diff | atlas --program bitcrush_displace
 syncsummoner analyze clip.mp4 --audio track.wav -o features.json
 
 syncsummoner compose clip.mp4 --audio track.wav --profiles profiles/ \
-                     --style glitchy --seed 7 --passes 8 -o score.yaml
+                     --style glitchy --seed 7 --passes 8 [--wet 0.1,1] -o score.yaml
+syncsummoner score show score.yaml --profiles profiles/   # what each layer drives, flagged
 
 syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4
 syncsummoner render score.yaml --source clip.mp4 --audio track.wav \

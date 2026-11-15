@@ -17,6 +17,7 @@ import numpy as np
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
 from syncsummoner.device.session import Session
+from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import codeframes, plans
 from syncsummoner.probe.archive import GAP, FrameRow
 from syncsummoner.probe.runner import raw_params
@@ -350,7 +351,8 @@ def harvest_program(
     session.load_program(program, park=True, link=link)
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
-    info = transport.program_info()
+    payload = transport.program_payload()
+    info = ProgramInfo.from_json(payload)
     base = session.working_point(info)
     session.set_params(base)
     settle(
@@ -383,6 +385,7 @@ def harvest_program(
             width=config.width,
             height=config.height,
             fps=config.capture_fps,
+            program_info=payload,
         )
     finally:
         video.unlink(missing_ok=True)

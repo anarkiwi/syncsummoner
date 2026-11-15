@@ -1,6 +1,6 @@
 """CLI wiring: the standing rule that every program load drops the source link."""
 
-# pylint: disable=missing-function-docstring
+# pylint: disable=missing-function-docstring,protected-access
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -239,8 +239,10 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ),
         ("render", ["--audio", "--fade", "--fade-in", "--fade-out", "--no-master", "--take"]),
         ("audition", ["--seconds", "--start", "--audio", "--fade", "--cut-programs"]),
-        ("compose", ["--density", "--style", "--budget", "--passes", "--format"]),
+        ("compose", ["--density", "--style", "--budget", "--passes", "--format", "--wet"]),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
+        ("probe names", ["--archive", "--program"]),
+        ("score show", ["--profiles"]),
         ("probe archive", ["--capture", "--setpoints", "--dwell", "--width", "--no-link"]),
     ],
 )
@@ -442,3 +444,19 @@ def test_the_package_version_is_the_one_that_was_packaged():
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
     packaged = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
     assert syncsummoner.__version__ == packaged
+
+
+def test_score_show_prints_the_audit_and_fails_on_a_flag(monkeypatch, tmp_path, capsys):
+    from syncsummoner.compose.score import Layer, Score
+
+    path = tmp_path / "score.yaml"
+    Score(duration=4.0, layers=[Layer("missing", 0, [])]).save(path)
+    monkeypatch.setattr(cli, "_profiles_in", lambda directory: {})
+    assert cli.main(["score", "show", str(path)]) == 1
+    assert "layer 0: missing  ! no profile" in capsys.readouterr().out
+
+
+def test_compose_wet_is_a_range_of_fractions():
+    assert cli._wet(None) is None and cli._wet("0.2,1") == (0.2, 1.0)
+    with pytest.raises(ValueError, match="--wet"):
+        cli._wet("0.9,0.1")

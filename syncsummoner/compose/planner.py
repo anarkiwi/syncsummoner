@@ -16,7 +16,7 @@ import numpy as np
 from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
 from syncsummoner.progress import LOG, track
 from syncsummoner.compose.features import Features, Section, information_content
-from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
+from syncsummoner.compose.score import DEFAULT_WET, GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext
 
 EPS = 1e-12
@@ -65,6 +65,9 @@ STYLES: dict[str, dict[str, float]] = {
     },
 }
 DESTROY_STYLES = frozenset({"glitchy"})
+#: Wet range per style, as fractions of the wet control's travel. Neither end blacks the
+#: output on any archived program, so the range is a look: ``glitchy`` reaches fully wet.
+STYLE_WET: dict[str, tuple[float, float]] = {"glitchy": (DEFAULT_WET[0], 1.0)}
 
 
 @dataclass(frozen=True)
@@ -155,34 +158,59 @@ def reachable(
     return True
 
 
+def _settled(times: np.ndarray, values: np.ndarray, settle: float) -> tuple[list[float], list[int]]:
+    """One parameter's writes no closer together than ``settle``, each the latest value asked for.
+
+    A write that comes too soon is deferred rather than dropped: dropping the release
+    of a pulse leaves the parameter latched wherever the pulse put it.
+    """
+    out_t: list[float] = []
+    out_v: list[int] = []
+    due, pending = -np.inf, None
+    for t, v in zip(times.tolist(), values.tolist()):
+        if pending is not None and due <= t:
+            out_t.append(due)
+            out_v.append(pending)
+            due, pending = due + settle, None
+        if t >= due:
+            if not out_v or v != out_v[-1]:
+                out_t.append(t)
+                out_v.append(v)
+                due = t + settle
+            pending = None
+        else:
+            pending = v if v != out_v[-1] else None
+    if pending is not None:
+        out_t.append(due)
+        out_v.append(pending)
+    return out_t, out_v
+
+
 def thin(
     auto: Automation, profile: ProgramProfile, *, fps: float, cc_budget_hz: float = CC_BUDGET_HZ
 ) -> Automation:
-    """Drop redundant and unreachable messages so the result satisfies the hard constraint."""
+    """Defer and drop messages so the result satisfies the hard constraint.
+
+    Writes a parameter cannot settle between are deferred to the latest value, so the
+    held state matches what the gestures asked for; the CC budget then drops the excess.
+    """
     if len(auto) == 0:
         return auto
-    keep = np.ones(len(auto), dtype=bool)
-    tol = 0.5 / fps
+    parts = []
     for idx in np.unique(auto.indices):
-        settle = profile.settle_frames.get(int(idx), 0) / fps - tol
-        last_t, last_v = -np.inf, None
-        for j in np.flatnonzero(auto.indices == idx):
-            v = int(auto.values[j])
-            if v == last_v or auto.times[j] < last_t + settle:
-                keep[j] = False
-            else:
-                last_t, last_v = float(auto.times[j]), v
-    times = auto.times[keep]
+        m = auto.indices == idx
+        t, v = _settled(auto.times[m], auto.values[m], profile.settle_frames.get(int(idx), 0) / fps)
+        parts.append(Automation(np.asarray(t), np.full(len(t), idx, np.int32), np.asarray(v, np.int32)))
+    auto = Automation.concat(parts)
     window: deque[float] = deque()
     quota = max(1, int(cc_budget_hz))
-    rate_ok = np.zeros(times.size, dtype=bool)
-    for i, t in enumerate(times):
+    keep = np.zeros(len(auto), dtype=bool)
+    for i, t in enumerate(auto.times.tolist()):
         while window and window[0] <= t - 1.0:
             window.popleft()
         if len(window) < quota:
-            window.append(float(t))
-            rate_ok[i] = True
-    keep[np.flatnonzero(keep)[~rate_ok]] = False
+            window.append(t)
+            keep[i] = True
     return Automation(auto.times[keep], auto.indices[keep], auto.values[keep])
 
 
@@ -499,6 +527,7 @@ def search(
     style: str = "default",
     rng: np.random.Generator,
     budget: int = 48,
+    wet: tuple[float, float] | None = None,
     fps: float = 60.0,
     n_passes: int = 1,
     population: int = 6,
@@ -525,7 +554,7 @@ def search(
         duration=duration,
         fps=fps,
         sections=list(sections),
-        meta={"style": style, "density": density},
+        meta={"style": style, "density": density, "wet": list(wet or STYLE_WET.get(style, DEFAULT_WET))},
     )
     weights = STYLE_WEIGHTS.get(style, DEFAULT_WEIGHTS) if weights is None else weights
     programs = sorted(profiles)

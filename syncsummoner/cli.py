@@ -206,6 +206,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.behaviour import behaviours
     from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
+    from syncsummoner.probe.names import archived_specs
     from syncsummoner.probe.replay import replay
     from syncsummoner.probe.store import slug
     from syncsummoner.probe.style import measured_styles
@@ -231,7 +232,10 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     written = []
     for program, records in sorted(measured.items()):
         path = out / f"{slug(program)}.yaml"
-        profile = fit_profile(records)
+        specs = archived_specs(archive.meta(program))
+        if specs is None:
+            LOG.warning("%s: no program info archived, so parameters stay unnamed", program)
+        profile = fit_profile(records, specs=specs)
         profile.registered, profile.pointwise = found[program]
         profile.style = styles[program]
         save_profile(profile, path)
@@ -239,6 +243,31 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         written.append(str(path))
     LOG.info("%d profiles in %s", len(written), out)
     return 0 if written else 1
+
+
+def _names_cmd(args: argparse.Namespace) -> int:
+    """Annotate archives with the device's ``program info``, resuming what is done."""
+    from syncsummoner.device.transport import Transport
+    from syncsummoner.probe.archive import FrameArchive
+    from syncsummoner.probe.names import backfill
+
+    transport = Transport.open(serial=args.serial)
+    try:
+        report = backfill(
+            FrameArchive(args.archive),
+            transport,
+            programs=None if args.program == "all" else args.program.split(","),
+            log=LOG.warning,
+        )
+    finally:
+        transport.close()
+    LOG.info(
+        "%d annotated, %d already were, %d failed",
+        len(report.annotated),
+        len(report.skipped),
+        len(report.failed),
+    )
+    return 1 if report.failed else 0
 
 
 def _harvest_cmd(args: argparse.Namespace) -> int:
@@ -307,6 +336,16 @@ def _profile_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _score_cmd(args: argparse.Namespace) -> int:
+    from syncsummoner.compose.audit import audit, format_audit
+    from syncsummoner.compose.score import Score
+
+    score = Score.load(Path(args.score))
+    layers = audit(score, _profiles_in(Path(args.profiles)))
+    print(format_audit(score, layers))
+    return 1 if any(layer.flags or any(p.flags for p in layer.params) for layer in layers) else 0
+
+
 def _analyze_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose.features import analyze
 
@@ -351,11 +390,22 @@ def _compose_cmd(args: argparse.Namespace) -> int:
         density=args.density,
         n_passes=args.passes,
         fps=fps,
+        wet=_wet(args.wet),
     )
     score.save(Path(args.output))
     LOG.info("%s: %d layers over %.1fs", args.output, len(score.layers), score.duration)
     print(args.output)
     return 0
+
+
+def _wet(text: str | None) -> tuple[float, float] | None:
+    """A ``LO,HI`` wet range in fractions of travel, or None to take the style's own."""
+    if not text:
+        return None
+    lo, hi = (float(part) for part in text.split(","))
+    if not 0.0 <= lo <= hi <= 1.0:
+        raise ValueError(f"--wet wants 0 <= LO <= HI <= 1, got {text!r}")
+    return lo, hi
 
 
 def _take_path(args: argparse.Namespace) -> str:
@@ -514,6 +564,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     refit.add_argument("--jobs", type=int, default=1, help="programs to read at once")
     refit.set_defaults(func=_refit_cmd)
 
+    names = probe_sub.add_parser("names", help="add the device's program info to archives that lack it")
+    names.add_argument("--program", default="all")
+    names.add_argument("--archive", default="archive/")
+    names.set_defaults(func=_names_cmd)
+
     collect = probe_sub.add_parser("archive", help="archive native frames for every program")
     collect.add_argument("--program", default="all")
     collect.add_argument("--capture", default="/dev/video0")
@@ -536,6 +591,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             node.add_argument("--program", required=True)
     profile.set_defaults(func=_profile_cmd)
 
+    score_cmd = sub.add_parser("score", help="inspect a composed score")
+    score_sub = score_cmd.add_subparsers(dest="score_cmd", required=True)
+    show = score_sub.add_parser("show", help="what each layer drives, by name and role, flagging misuse")
+    show.add_argument("score")
+    show.add_argument("--profiles", default="profiles/")
+    show.set_defaults(func=_score_cmd)
+
     analyze = sub.add_parser("analyze", help="extract audio and video features")
     analyze.add_argument("clip")
     analyze.add_argument("--audio")
@@ -553,6 +615,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
     compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
     compose.add_argument("--format", help="session format the score is written for, e.g. 1080p30")
+    compose.add_argument("--wet", help="LO,HI wet range, fractions of the wet control (default: per style)")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 

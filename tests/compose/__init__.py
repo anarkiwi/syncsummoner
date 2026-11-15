@@ -12,6 +12,7 @@ from syncsummoner.device.profile import (
     ProgramProfile,
     Source,
     Tongue,
+    classify_role,
 )
 
 SR = 22050
@@ -48,6 +49,7 @@ def _spec(index, axis, kind=ParamKind.CONTINUOUS, cliffs=(), hysteresis=False, d
         dead_zone=dead_zone,
         cliffs=list(cliffs),
         hysteresis=hysteresis,
+        role=classify_role(index, f"p{index}"),
     )
 
 

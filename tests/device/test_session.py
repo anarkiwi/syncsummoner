@@ -11,7 +11,7 @@ import pytest
 
 from syncsummoner.device import journal as jn
 from syncsummoner.device import session as sess_mod
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, Role
 from syncsummoner.device.session import (
     AddressingError,
     ParkError,
@@ -337,6 +337,13 @@ def test_working_point_forces_the_crossfader_even_when_the_program_calls_it_unus
     port = FakeTransport()
     session, _, _ = make_session(port)
     assert session.working_point(info) == {sess_mod.CROSSFADER_INDEX: 0.5}
+
+
+def test_working_point_holds_a_bypass_off_whatever_its_range():
+    bypass = ParamSpec(index=11, name="Bypass", native_min=0, native_max=4, kind=ParamKind.QUANTIZED)
+    bypass.role = Role.BYPASS
+    session, _, _ = make_session(FakeTransport())
+    assert session.working_point(_info([bypass]))[11] is False
 
 
 def test_arm_modulation_binds_operators_and_disarm_clears_them():

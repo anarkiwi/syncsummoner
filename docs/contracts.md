@@ -162,6 +162,15 @@ proxy reads its objective back out of it rather than inferring it. A profile
 written before those curves existed loads with `measured == {}` and composes off
 the older inferences.
 
+`ParamSpec.role` (`profile.Role`: `effect`, `bypass`, `wet`, `momentary`) is what a
+gesture may do with the parameter, from `classify_role(index, name)` over the
+label the device reports. Profile schema 2 stores it; a schema 1 profile loads with
+it derived from its stored name. `ProgramInfo.from_json` sets it and keeps a `wet`
+slot continuous whatever its native range. `Transport.program_payload()` is the
+unparsed `program info` reply, which `FrameArchive.commit(program_info=...)` and
+`FrameArchive.annotate(...)` store under `archive.PROGRAM_INFO` in the archive
+metadata, and `names.archived_specs(meta)` turns back into specs for a refit.
+
 ## `syncsummoner.probe`
 
 ```python

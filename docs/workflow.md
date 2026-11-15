@@ -167,6 +167,31 @@ ss probe refit --archive archive/ --out profiles/          # profiles from the a
 ss profile show --profiles profiles/
 ```
 
+An archive keeps the device's own `program info` reply beside its frames, and a
+refit carries it into every parameter's name, native range and role. An archive
+recorded before that is back-filled from the device without re-archiving: each
+program is loaded once and asked, a few seconds apiece, resumably. The SD card's
+manifest and `.vmprog` files cannot stand in for this, since firmware built-ins are
+absent from them and the card is only readable over the same serial link.
+
+```sh
+ss probe names --archive archive/      # program info into each archive, resumable
+ss probe refit --archive archive/ --out profiles/
+```
+
+Each parameter's `role` decides what the composer may do with it, and comes from
+the label its program gives it:
+
+| Role | Labelled | Composer |
+| --- | --- | --- |
+| `bypass` | `Bypass` | never driven, held off for the whole pass |
+| `wet` | P12 as `Mix`, `Blend`, `Fade`, `Wet` or left unnamed | driven only by `morph`, within the score's wet range |
+| `momentary` | `Reset`, `Trigger`, `Retrig`, `Serve`, `Fire`, `Impulse` | only pulsed by `punch`, and released |
+| `effect` | anything else | any gesture |
+
+A profile with unnamed parameters (`p1` to `p12`) has every slot an `effect`
+except P12, so it will drive a bypass blind: refit it from a named archive.
+
 A profile fitted before 0.2.0 still composes, off the inferences the planner used
 to make for itself. It will not carry the measured curves the objective now scores
 against, nor `registered`, `pointwise` and `style`. Refitting is what picks those
@@ -230,6 +255,34 @@ construction. What came out:
 ```sh
 grep -E '^(duration|bpm)' score.yaml
 ```
+
+The wet range is how far into the effect the wet control is driven, as fractions
+of its travel. Neither end blacks the output on any archived program, so it is a
+look rather than a limit: `default` and `smooth` stay within 0.10..0.50, `glitchy`
+reaches fully wet at 0.10..1.00, and `--wet 0.3,1` sets it outright. A score
+records its range; one written before it did renders within 0.10..0.50.
+
+Before spending rig time on it, see what the score will actually drive:
+
+```sh
+ss score show score.yaml --profiles profiles/
+```
+
+```
+wet range 0.10..1.00 (102..1023)
+layer 0: Breakout
+   P1  Ball Spd         effect    continuous   24 writes     0..1023 ends 898   hold x1, hysteresis_loop x3
+   ...
+   P11 Bypass           bypass    boolean    undriven
+   P12 Mix              wet       continuous   39 writes   102..1023 ends 1023  morph x3
+```
+
+Every layer lists all twelve parameters by name with their role, how many writes
+the render will send, the range they cover, where they end, and which gestures
+asked for them; that is the same plan the render plays. A line marked `!` is a
+bypass being driven or a toggle left on at the end of the pass; a layer marked
+`!` has no profile or drives nothing, and gestures that render nothing are
+listed under their layer. It exits 1 when anything is flagged.
 
 ## 3. Audition before committing the rig
 
