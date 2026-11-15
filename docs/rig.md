@@ -75,17 +75,39 @@ programs and setpoints, so that upload is paid once per run rather than per pass
 ## Bring-up checks
 
 ```sh
-vmancer devices                     # serial, rawmidi node, tty, usbfs
-vmancer shell "version"             # firmware; must match the profile archive
-vmancer shell "fpga status"         # state, configured, program, program_count
-vmancer shell "video status"        # source, timing, lock, output
-vmancer programs                    # installed FPGA programs
+syncsummoner device doctor                # read-only: Pi, capture card, device
+syncsummoner device doctor --loop         # also push bars through Passthru and capture them
+syncsummoner device doctor --fix          # unblank the Pi framebuffer, stop the cursor blink, recheck
 ```
 
-Then confirm the loop end to end: load `Passthru`, play a known pattern from the
-Pi, capture, and check the Gray-code strip decodes. `Passthru` reports all
-twelve parameters as `Null`, so anything wrong in that capture is the chain, not
-the program.
+Options: `--source-host pi@videopi`, `--format 1080p30`, `--capture /dev/video0`.
+The JSON report goes to stdout, one line per finding to stderr, and the exit
+status is 1 when anything fails. Each finding names its check and, on failure,
+the fix:
+
+| Check | What it reads |
+| --- | --- |
+| `ssh.reachable` | BatchMode ssh to the source host; host checks are skipped without it |
+| `source.fb_unblanked` | `/sys/class/graphics/fb0/blank` is 0; 4 means no HDMI source for the device |
+| `source.cursor_blink` | `/sys/class/graphics/fbcon/cursor_blink` is 0 |
+| `source.fb_geometry` | framebuffer `virtual_size` and 16 bpp match `--format` |
+| `source.mode` | `kmsprint` CRTC size and rate match `--format`; skipped without `kmsprint` |
+| `capture.usb_speed` | the card's video function is on a 5000 Mbit/s link |
+| `capture.mode` | the card offers MJPEG at the session size (`ffmpeg -f v4l2 -list_formats all`) |
+| `firmware.version` ... `video.output_connected` | pyvmancer's own device checks |
+| `device.format` | the device's output timing is `--format` |
+| `loop.signal`, `loop.index`, `loop.bars` | not the No Signal splash; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
+
+`--loop` changes state: it loads `Passthru` and overwrites the Pi framebuffer.
+`Passthru` reports all twelve parameters as `Null`, so anything wrong in that
+capture is the chain, not the program. The device alone is `vmancer doctor`
+(pyvmancer 0.5). Over the serial shell, `doctor` reads what these do by hand:
+
+```sh
+vmancer shell "version"             # firmware; must match the profile archive
+vmancer shell "fpga status"         # state, configured, program
+vmancer shell "video status"        # source, timing, lock, output
+```
 
 ## Gotchas
 

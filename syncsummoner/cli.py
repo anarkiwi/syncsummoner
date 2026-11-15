@@ -19,6 +19,30 @@ import numpy as np
 from syncsummoner.progress import LOG, configure
 
 
+def _doctor_cmd(args: argparse.Namespace) -> int:
+    from pyvmancer.diagnose import format_finding, report
+
+    from syncsummoner.compose.render import SESSION_FORMATS
+    from syncsummoner.device.doctor import Doctor, Format
+    from syncsummoner.device.host import DEFAULT_HOST
+    from syncsummoner.device.transport import Transport
+
+    if args.format not in SESSION_FORMATS:
+        raise ValueError(f"unknown format {args.format!r}; known: {', '.join(SESSION_FORMATS)}")
+    doctor = Doctor(
+        Format(args.format, *SESSION_FORMATS[args.format]),
+        host=args.source_host or DEFAULT_HOST,
+        capture=args.capture,
+        open_transport=lambda: Transport.open(serial=args.serial),
+    )
+    findings = doctor.run(loop=args.loop, fix=args.fix)
+    for finding in findings:
+        (LOG.info if finding.ok else LOG.error)("%s", format_finding(finding))
+    summary = report(findings)
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["ok"] else 1
+
+
 def _device_cmd(args: argparse.Namespace) -> int:
     from pyvmancer.discovery import find_devices
 
@@ -440,9 +464,19 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     parser.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    device = sub.add_parser("device", help="discovery and status")
-    device.add_argument("device_cmd", choices=["list", "ping", "programs"])
-    device.set_defaults(func=_device_cmd)
+    device = sub.add_parser("device", help="discovery, status and rig diagnostics")
+    device_sub = device.add_subparsers(dest="device_cmd", required=True)
+    for name in ("list", "ping", "programs"):
+        device_sub.add_parser(name).set_defaults(func=_device_cmd)
+    doctor = device_sub.add_parser("doctor", help="check the source host, capture card and device")
+    doctor.add_argument("--source-host", help="ssh target driving the stimulus and the HDMI link")
+    doctor.add_argument("--format", default="1080p30", help="session format the rig runs at")
+    doctor.add_argument("--capture", default="/dev/video0")
+    doctor.add_argument(
+        "--loop", action="store_true", help="also push bars through Passthru and capture them"
+    )
+    doctor.add_argument("--fix", action="store_true", help="apply safe source host fixes, then check again")
+    doctor.set_defaults(func=_doctor_cmd)
 
     manifest = sub.add_parser(
         "manifest", help="rebuild a card's programs/manifest.json from its .vmprog files"
