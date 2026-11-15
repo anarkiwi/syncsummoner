@@ -125,7 +125,7 @@ panel, one owner of `/dev/video0`, the capture card's "No Signal" splash — are
 ```
 work/
   source.mkv      the clip to process   (any format; it is conformed and padded, never stretched)
-  track.flac      the audio to drive it
+  track.flac      the audio to drive it  (any format ffmpeg reads: WAV, FLAC, MP3, AAC in .m4a/.mp4, ...)
   profiles/       fitted profiles, one YAML per program
 ```
 

@@ -2,6 +2,8 @@
 
 # pylint: disable=missing-function-docstring
 
+import shutil
+import subprocess
 import types
 
 import numpy as np
@@ -9,6 +11,7 @@ import pytest
 from scipy.io import wavfile
 
 from syncsummoner.compose import features as F
+from syncsummoner.device import recorder as recorder_mod
 
 from . import SEGMENT_KW, SR, click_track, make_features
 
@@ -98,6 +101,78 @@ def test_load_audio_resamples_and_normalizes(tmp_path):
     y, sr = F.load_audio(path, sr=SR)
     assert sr == SR and y.dtype == np.float32
     assert np.abs(y).max() < 1.01 and y.size == pytest.approx(22050, rel=0.01)
+
+
+@pytest.mark.parametrize("with_librosa", [True, False])
+def test_load_audio_decodes_aac_through_ffmpeg(tmp_path, monkeypatch, with_librosa):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    if with_librosa and F.librosa is None:
+        pytest.skip("librosa not installed")
+    if not with_librosa:
+        monkeypatch.setattr(F, "librosa", None)
+    path = tmp_path / "a.m4a"
+    tone = "sine=frequency=1000:sample_rate=44100:duration=2"
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        tone,
+        "-ac",
+        "2",
+        "-c:a",
+        "aac",
+        str(path),
+    ]
+    subprocess.run(cmd, check=True)
+    y, sr = F.load_audio(path, sr=SR)
+    assert sr == SR and y.dtype == np.float32 and y.ndim == 1
+    assert y.size == pytest.approx(2 * SR, rel=0.03)
+    spectrum = np.abs(np.fft.rfft(y * np.hanning(y.size)))
+    assert np.fft.rfftfreq(y.size, 1 / SR)[spectrum.argmax()] == pytest.approx(1000.0, abs=2.0)
+
+
+def test_load_audio_falls_back_to_ffmpeg_on_libsndfile_failure(monkeypatch):
+    def unreadable(path, sr, mono):
+        raise F.LibsndfileError(1)
+
+    expected = np.linspace(-1, 1, 7, dtype=np.float32)
+    calls = []
+
+    def run(cmd, **_):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, expected.astype("<f4").tobytes(), b"")
+
+    monkeypatch.setattr(F, "librosa", types.SimpleNamespace(load=unreadable))
+    monkeypatch.setattr(recorder_mod, "require_ffmpeg", lambda ffmpeg: f"/opt/{ffmpeg}")
+    monkeypatch.setattr(F.subprocess, "run", run)
+    y, sr = F.load_audio("track.m4a", sr=8000)
+    assert sr == 8000 and y.dtype == np.float32 and np.array_equal(y, expected)
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[0] == "/opt/ffmpeg" and cmd[cmd.index("-i") + 1] == "track.m4a"
+    assert cmd[cmd.index("-ac") + 1] == "1" and cmd[cmd.index("-ar") + 1] == "8000"
+    assert cmd[-3:] == ["-f", "f32le", "-"]
+
+    monkeypatch.setattr(
+        F.subprocess, "run", lambda cmd, **_: subprocess.CompletedProcess(cmd, 1, b"", b"bad data\n")
+    )
+    with pytest.raises(ValueError, match="track.m4a: bad data$"):
+        F.load_audio("track.m4a", sr=8000)
+
+
+def test_load_audio_does_not_swallow_other_errors(monkeypatch):
+    def broken(path, sr, mono):
+        raise TypeError("not a decode failure")
+
+    monkeypatch.setattr(F, "librosa", types.SimpleNamespace(load=broken))
+    monkeypatch.setattr(F.subprocess, "run", lambda *a, **k: pytest.fail("ffmpeg must not be tried"))
+    with pytest.raises(TypeError):
+        F.load_audio("track.wav", sr=8000)
 
 
 def test_librosa_paths_are_used_when_importable(monkeypatch):

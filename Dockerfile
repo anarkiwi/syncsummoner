@@ -15,6 +15,8 @@ WORKDIR /src
 
 # Dependency-only layers. Copying pyproject alone keeps these cached across source edits.
 FROM base AS deps-full
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         black pylint pytest pytest-cov pytest-xdist import-linter \
