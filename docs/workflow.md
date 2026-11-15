@@ -269,12 +269,17 @@ ss score show score.yaml --profiles profiles/
 ```
 
 ```
-wet range 0.10..1.00 (102..1023)
-layer 0: Breakout
-   P1  Ball Spd         effect    continuous   24 writes     0..1023 ends 898   hold x1, hysteresis_loop x3
+wet range 0.10..0.50 (102..512)
+layer 2: Breakout
+   P1  Ball Spd         effect    continuous   23 writes     0..1023 ends 898   hold x1, hysteresis_loop x3, morph x1
    ...
+   P7  Serve            momentary boolean       6 writes     0..1023 ends 0     punch x3
    P11 Bypass           bypass    boolean    undriven
-   P12 Mix              wet       continuous   39 writes   102..1023 ends 1023  morph x3
+   P12 Mix              wet       continuous   39 writes   102..512  ends 512   morph x3
+layer 4: Pinwheel
+   ...
+   P12 Chroma Crush     effect    continuous   84 writes   416..748  ends 748   cliff_cross x2
+   gestures that write nothing: morph x6
 ```
 
 Every layer lists all twelve parameters by name with their role, how many writes
