@@ -66,7 +66,7 @@ def test_a_uniform_field_is_dead_at_any_level(tmp_path, level):
     """Roll Shutter's dead output is video black at 16 on every frame, and is no picture."""
     report = judged(tmp_path, flat(level))
     assert report.frames == FRAMES and report.picture == 0 and report.spread == 0
-    assert not report.live and not report.usable and "no picture" in str(report)
+    assert not report.mostly_picture and not report.usable and "no picture" in str(report)
 
 
 @needs_ffmpeg
@@ -75,7 +75,7 @@ def test_dark_footage_with_highlights_is_a_moving_picture(tmp_path):
     report = judged(tmp_path, dark_footage(np.random.default_rng(0)))
     assert report.luma < 0.02, "dark enough that the old mean-level test called it blank"
     assert report.picture == FRAMES and report.spread > 200
-    assert report.live and not report.frozen and report.usable and report.motion > -0.5
+    assert report.mostly_picture and not report.frozen and report.usable and report.motion > -0.5
     assert "UNUSABLE" not in str(report)
 
 
@@ -83,21 +83,21 @@ def test_dark_footage_with_highlights_is_a_moving_picture(tmp_path):
 def test_a_paused_picture_with_grain_is_live_but_frozen(tmp_path):
     """Fresh noise every frame makes each MJPEG frame differ, which is not motion."""
     report = judged(tmp_path, dark_footage(np.random.default_rng(1), still=True))
-    assert report.live and report.frozen and not report.usable
+    assert report.mostly_picture and report.frozen and not report.usable
     assert abs(report.motion + 0.5) < 0.1 and "frozen" in str(report)
 
 
 @needs_ffmpeg
 def test_an_exactly_repeated_picture_is_live_but_frozen(tmp_path):
     report = judged(tmp_path, dark_footage(np.random.default_rng(2))[:1] * FRAMES)
-    assert report.live and report.frozen and report.motion is None and "motion n/a" in str(report)
+    assert report.mostly_picture and report.frozen and report.motion is None and "motion n/a" in str(report)
 
 
 @needs_ffmpeg
 def test_the_no_signal_splash_is_no_picture_despite_its_structure(tmp_path):
     report = judged(tmp_path, [no_signal_card()] * FRAMES)
     assert report.spread > 200, "it has more structure than any dark program"
-    assert report.splash == FRAMES and report.picture == 0 and not report.live
+    assert report.splash == FRAMES and report.picture == 0 and not report.mostly_picture
 
 
 @needs_ffmpeg
@@ -115,7 +115,7 @@ def test_inspection_is_sized_by_the_take_not_by_an_assumed_aspect(tmp_path):
 
 def test_an_unreadable_take_has_no_frames(tmp_path):
     report = inspect_take(tmp_path / "missing.mkv")
-    assert report == TakeReport() and not report.live and "0 frames" in str(report)
+    assert report == TakeReport() and not report.mostly_picture and "0 frames" in str(report)
 
 
 def test_structure_is_range_beyond_one_quantization_step():

@@ -106,8 +106,13 @@ class ProgramResult:
 
     @property
     def dark(self) -> bool:
-        """True when frames were archived but carry no moving picture."""
-        return self.report is not None and not self.report.usable
+        """True when frames were archived but none ever showed a picture.
+
+        The archive's standard is :attr:`TakeReport.ever_structured`, not a
+        render's :attr:`TakeReport.usable`: a sweep's flat setpoints and a held
+        picture are still data.
+        """
+        return self.report is not None and not self.report.ever_structured
 
     def __str__(self) -> str:
         if self.error:
@@ -253,6 +258,8 @@ def carries_stimulus(
 
     One program going dark is legitimate, so only a failing passthrough shows the
     device has stopped emitting while still answering and reporting source lock.
+    The passthrough carries the known chromatic stimulus, so it is held to the
+    load's :attr:`TakeReport.mostly_picture`, where a splash is evidence of a dead link.
     """
     session.load_program(program, park=True, link=link)
     if player is not None and not player.is_running():
@@ -324,7 +331,7 @@ def discard_dark(archive: Any, program: str, key: ProgramKey, result: ProgramRes
     del key
     for path in archive.paths(program):
         path.unlink(missing_ok=True)
-    return ProgramResult(program, error="discarded: archived only black frames", report=result.report)
+    return ProgramResult(program, error="discarded: archived only uniform frames", report=result.report)
 
 
 def harvest_program(
@@ -411,6 +418,7 @@ def harvest(
     rng: np.random.Generator | None = None,
     session_factory: Callable[..., Any] = Session,
     log: Callable[[str], None] | None = None,
+    retry_dark: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> HarvestReport:
@@ -418,7 +426,8 @@ def harvest(
 
     Archives are keyed on name and firmware rather than on the program binary,
     because hashing a binary runs over the serial shell at wire speed and this
-    device wedges under exactly that load.
+    device wedges under exactly that load. A resume skips programs marked dark
+    unless ``retry_dark``, which re-judges them under the current criterion.
     """
     config = HarvestConfig() if config is None else config
     rng = np.random.default_rng(config.seed) if rng is None else rng
@@ -440,7 +449,7 @@ def harvest(
                 sleep(config.startup_s)
             for name in names:
                 key = ProgramKey(name, firmware, KeyKind.NAME_FIRMWARE)
-                if archive.has(name, key) or archive.dark(name, key):
+                if archive.has(name, key) or (not retry_dark and archive.dark(name, key)):
                     results.append(ProgramResult(name))
                     note(str(results[-1]))
                     continue

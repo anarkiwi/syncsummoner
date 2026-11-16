@@ -10,13 +10,14 @@ import pytest
 from pyvmancer import CcMapError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
-from syncsummoner.device.recorder import BlankTakeError, TakeReport
+from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import harvest as H
 from syncsummoner.probe.archive import GAP
 from syncsummoner.probe.store import KeyKind, ProgramKey, slug
 from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport
+from tests.device.test_liveness import mjpeg, needs_ffmpeg
 
 FIRMWARE = "1.0.0-rc.37"
 INFO = ProgramInfo.from_json(COLORBARS_INFO)
@@ -606,6 +607,55 @@ def test_a_dark_verdict_from_other_firmware_is_not_trusted(tmp_path, monkeypatch
     assert not run(archive, programs=["Alpha"]).results[0].cached, "a reflash re-probes it"
 
 
+def test_a_dark_program_is_retried_and_rejudged_when_asked(tmp_path, monkeypatch):
+    """``retry_dark`` ignores the verdict, so a program a stricter criterion condemned runs again."""
+    blind(monkeypatch, canary=True)
+    archive = Archive(tmp_path)
+    run(archive, programs=["Alpha"])
+    monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: LIVE)
+    report = run(archive, programs=["Alpha"], retry_dark=True)
+    assert not report.results[0].cached and not report.results[0].dark
+    assert archive.commits == ["Alpha", "Alpha"] and archive.paths("Alpha")[0].exists()
+
+
+def sweep_take(tmp_path, uniform_every):
+    """MJPEG sweep of achromatic bars of varying pitch, every ``uniform_every``-th setpoint flat."""
+    width = np.arange(320)
+    frames = [
+        (
+            np.full((180, 320, 3), 16, np.uint8)
+            if uniform_every and i % uniform_every == 0
+            else np.repeat(
+                np.where((width // (8 + i)) % 2, 255, 0).astype(np.uint8)[None, :, None], 180, 0
+            ).repeat(3, 2)
+        )
+        for i in range(30)
+    ]
+    return inspect_take(mjpeg(tmp_path / "sweep.mkv", frames), samples=60)
+
+
+@needs_ffmpeg
+def test_a_sweep_with_flat_setpoints_and_achromatic_bars_is_archived_not_discarded(tmp_path, monkeypatch):
+    """A third of the setpoints flat and the rest bars the splash heuristic misreads: still data."""
+    take = sweep_take(tmp_path, uniform_every=3)
+    assert take.splash and not take.picture, "every bar reads as the splash"
+    assert not take.usable, "a render would reject it, which is not the archive's standard"
+    blind(monkeypatch, canary=True, take=take)
+    archive = Archive(tmp_path / "archive")
+    report = run(archive, programs=["Alpha"])
+    assert not report.results[0].dark and not report.results[0].error
+    assert archive.paths("Alpha")[0].exists() and not archive.marked
+
+
+@needs_ffmpeg
+def test_an_all_uniform_program_is_dark(tmp_path, monkeypatch):
+    take = sweep_take(tmp_path, uniform_every=1)
+    blind(monkeypatch, canary=True, take=take)
+    archive = Archive(tmp_path / "archive")
+    report = run(archive, programs=["Alpha"])
+    assert "discarded" in report.results[0].error and archive.marked == {"Alpha"}
+
+
 def test_results_report_what_the_take_actually_held():
     measured = H.ProgramResult("P", frames=10, measured=9, seconds=12.0, report=LIVE)
     assert not measured.dark and "9/10 frames measured in 12s" in str(measured)
@@ -613,6 +663,10 @@ def test_results_report_what_the_take_actually_held():
     assert H.ProgramResult("P", frames=10, report=DARK).dark and "UNUSABLE" in str(
         H.ProgramResult("P", frames=10, report=DARK)
     )
+    held_flat = TakeReport(frames=30, picture=1, frozen=True)
+    assert not held_flat.usable and not H.ProgramResult("P", frames=10, report=held_flat).dark
+    splash_only = TakeReport(frames=30, splash=30)
+    assert not H.ProgramResult("P", frames=10, report=splash_only).dark, "the splash heuristic cannot condemn"
     assert str(H.ProgramResult("P")) == "P: cached"
     assert "FAILED" in str(H.ProgramResult("P", error="RuntimeError: x"))
 

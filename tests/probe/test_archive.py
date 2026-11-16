@@ -422,6 +422,26 @@ def test_a_dark_verdict_does_not_make_the_program_look_archived(tmp_path):
     assert "bitcrush" not in archive.committed(), "a verdict is not an archive"
 
 
+def test_dark_verdicts_are_listed_by_program(tmp_path):
+    """What a resume skips is listed, so a run can say so."""
+    archive = archive_at(tmp_path)
+    assert not archive.darkened()
+    archive.mark_dark("bitcrush", KEY, 0.25)
+    archive.mark_dark("Roll Shutter", OTHER, 0.0)
+    (archive.directory / "torn.dark.json").write_text("{", encoding="utf-8")
+    listed = archive.darkened()
+    assert sorted(listed) == ["Roll Shutter", "bitcrush"], "an unreadable verdict is not listed"
+    assert listed["bitcrush"]["luma"] == 0.25 and listed["Roll Shutter"]["key_digest"] == OTHER.digest
+
+
+def test_committing_an_archive_supersedes_its_dark_verdict(tmp_path):
+    """A retried program that now shows picture must not stay marked dark."""
+    archive_at(tmp_path).mark_dark("bitcrush", KEY, 0.0)
+    archive, _, _ = write_archive(tmp_path)
+    assert archive.has("bitcrush", KEY) and not archive.dark("bitcrush", KEY)
+    assert not archive.darkened()
+
+
 BLOCKS = ((220, 30, 30), (30, 220, 30), (30, 30, 220), (200, 200, 200))
 
 

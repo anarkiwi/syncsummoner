@@ -283,6 +283,17 @@ class FrameArchive:
             return False
         return str(verdict.get("key_digest")) == key.digest
 
+    def darkened(self) -> dict[str, dict[str, Any]]:
+        """Every recorded dark verdict, keyed by program name."""
+        found = {}
+        for path in sorted(self.directory.glob(f"*{DARK_SUFFIX}")):
+            try:
+                verdict = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            found[str(verdict.get("program", path.name[: -len(DARK_SUFFIX)]))] = verdict
+        return found
+
     def committed(self) -> dict[str, dict[str, Any]]:
         """Metadata of every complete archive, keyed by program name."""
         found = {}
@@ -329,7 +340,8 @@ class FrameArchive:
         The metadata is written last and is the commit marker, as in the result
         store: a run killed mid-recording leaves at most an uncommitted temp file.
         ``program_info`` is the device's reply for the program, kept so a refit
-        knows each parameter's name and native range.
+        knows each parameter's name and native range. A committed archive
+        supersedes any earlier dark verdict for the program.
         """
         if not rows:
             raise ArchiveError(f"no frames archived for {program!r}")
@@ -364,6 +376,7 @@ class FrameArchive:
         if program_info is not None:
             meta[PROGRAM_INFO] = dict(program_info)
         self._write_meta(meta_path, meta)
+        self.dark_path(program).unlink(missing_ok=True)
         return meta
 
     def annotate(self, program: str, **fields: Any) -> dict[str, Any]:
