@@ -34,7 +34,7 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
         Format(args.format, *SESSION_FORMATS[args.format]),
         host=args.source_host or DEFAULT_HOST,
         capture=args.capture,
-        open_transport=lambda: Transport.open(serial=args.serial),
+        open_transport=lambda: Transport.open(serial=args.serial, stall=args.stall),
         latency_params=args.latency_params,
         latency_rates=args.latency_rates,
     )
@@ -55,7 +55,7 @@ def _device_cmd(args: argparse.Namespace) -> int:
         print(json.dumps([_as_mapping(d) for d in find_devices()], indent=2, default=str))
         return 0
 
-    dev = Transport.open(serial=args.serial)
+    dev = Transport.open(serial=args.serial, stall=args.stall)
     try:
         if args.device_cmd == "ping":
             status = dev.video_status()
@@ -140,7 +140,7 @@ def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tu
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.store import ResultStore, program_key
 
-    dev = Transport.open(serial=args.serial)
+    dev = Transport.open(serial=args.serial, stall=args.stall)
     store = ResultStore(args.store or Path(args.out))
     link, records = _link(args), []
     try:
@@ -255,7 +255,7 @@ def _names_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.names import backfill
 
-    transport = Transport.open(serial=args.serial)
+    transport = Transport.open(serial=args.serial, stall=args.stall)
     try:
         report = backfill(
             FrameArchive(args.archive),
@@ -303,7 +303,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         LOG.info("%s dark: %s", "retrying" if args.retry_dark else "skipping", ", ".join(dark))
     report = harvest(
         archive,
-        open_transport=lambda: Transport.open(serial=args.serial),
+        open_transport=lambda: Transport.open(serial=args.serial, stall=args.stall),
         recorder=Recorder(
             device=args.capture,
             width=config.width,
@@ -466,6 +466,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         "latency_s": None if args.latency_ms is None else args.latency_ms / 1e3,
         "measure_latency": args.measure_latency,
         "cc_budget_hz": args.cc_budget,
+        "stall_s": args.stall,
     }
     config = (
         render_mod.RenderConfig.for_format(args.format, **timing)
@@ -538,6 +539,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     """Construct the argument parser for every subcommand."""
     parser = argparse.ArgumentParser(prog="syncsummoner", description=__doc__)
     parser.add_argument("--serial", help="select a specific Videomancer by serial")
+    parser.add_argument(
+        "--stall",
+        type=float,
+        metavar="SECONDS",
+        help="opt-in for unattended runs: fail a device wait once nothing observable changes for this long "
+        "(default: loads wait for as long as the device stays on USB)",
+    )
     parser.add_argument("-v", "--verbose", action="count", default=0, help="log every stage in detail")
     parser.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
     sub = parser.add_subparsers(dest="cmd", required=True)

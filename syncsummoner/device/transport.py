@@ -7,7 +7,7 @@ speaks ``ParamSpec`` / ``ProgramInfo`` / numpy, never raw shell JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pyvmancer as vm
@@ -15,6 +15,8 @@ import pyvmancer as vm
 from pyvmancer.const import ParamRole, classify_param
 from pyvmancer.diagnose import diagnose_video
 from pyvmancer.video import VideoStatus
+
+from syncsummoner.progress import LOG
 
 from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, Role, classify_role
 
@@ -27,9 +29,6 @@ ROLE_TO_KIND = {
     ParamRole.QUANTIZED: ParamKind.QUANTIZED,
     ParamRole.UNASSIGNED: ParamKind.UNUSED,
 }
-#: Seconds the shell may take to answer; a program load, or the first command after
-#: switching author, can outlast pyvmancer's default window.
-SHELL_TIMEOUT_S = 20.0
 #: Combined (Manual + Modulation + MIDI) output keys, in order of preference.
 COMBINED_KEYS = ("o", "out", "output", "combined")
 #: Stored manual value keys.
@@ -145,11 +144,22 @@ class Transport:
         self._loaded: str | None = None
 
     @classmethod
-    def open(cls, *, serial: str | None = None) -> "Transport":
-        """Open both control links to an attached device."""
+    def open(
+        cls,
+        *,
+        serial: str | None = None,
+        report: Callable[[str], None] | None = LOG.info,
+        stall: float | None = None,
+    ) -> "Transport":
+        """Open both control links to an attached device.
+
+        Loads and other device-side work wait for as long as the device stays on
+        USB, reporting progress to ``report``; ``stall`` is pyvmancer's opt-in
+        guard, failing a wait once nothing observable changes for that long.
+        """
         device = vm.Videomancer.open(serial_number=serial)
         if device.has_shell:
-            device.shell.timeout = SHELL_TIMEOUT_S
+            device.shell.report, device.shell.stall = report, stall
         return cls(device)
 
     @property
@@ -167,6 +177,10 @@ class Transport:
         """CC messages one parameter write puts on the wire."""
         return 2 if self._device.has_midi and self._device.midi.high_resolution else 1
 
+    def watch(self, what: str) -> Any:
+        """A pyvmancer liveness ``Watch`` for a wait on the device, with the shell's report and stall."""
+        return self._shell.watch(what)
+
     def firmware(self) -> str:
         """Firmware version string, recorded into every measurement."""
         return self._shell.version()
@@ -182,7 +196,7 @@ class Transport:
         return self._loaded
 
     def load_program(self, name: str) -> None:
-        """Load an FPGA program without waiting; the caller absorbs the blackout."""
+        """Load an FPGA program, returning once the device runs it; the wait is on liveness."""
         self._device.load_program(name, settle=0)
         self._loaded = name
 

@@ -127,7 +127,7 @@ class Session:                       # settle timing, write rate limiting, state
     def __init__(self, transport, *, cc_budget_hz=CC_BUDGET_HZ): ...  # parameter writes per second
     def set_params(self, values: Mapping[int, float | bool]) -> None: ...  # one write per 1/cc_budget_hz, cached
     def park(self) -> None: ...      # drive every parameter to a known reference
-    def load_program(self, name, *, park=True, link=None) -> None: ...  # absorbs the load blackout
+    def load_program(self, name, *, park=True, link=None) -> None: ...  # returns once the device runs it
     def working_point(self, info, *, exclude=()) -> dict[int, float | bool]: ...
     def arm_modulation(self, info, operators, rng, *, exclude=(), count=5) -> list[str]: ...
     def disarm_modulation(self) -> None: ...
@@ -208,7 +208,7 @@ harvest.attribute(times, windows, program, *, base) -> list[FrameRow]   # frame 
 harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
                 programs=None, config=HarvestConfig(), session_factory=Session,
                 retry_dark=False) -> HarvestReport   # dark = no frame ever structured
-harvest.rig_fault(session, recorder, transport, *, config, wedge_first=True) -> str   # "" = rig healthy
+harvest.rig_fault(session, recorder, transport, *, config) -> str   # "" unless gone from USB or a black Passthru
 HarvestReport.summary() -> list[str]   # totals, each failed program with its error, the fault
 ```
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from pyvmancer.errors import DeviceGoneError, StallError
 
 from syncsummoner.device import recorder as rec
 from syncsummoner.device.recorder import (
@@ -16,12 +17,14 @@ from syncsummoner.device.recorder import (
     MJPEG,
     RAW_422,
     BlankTakeError,
+    InputRouteError,
     Recorder,
     RecorderError,
     SignalLostError,
     TakeReport,
     inspect_take,
     require_ffmpeg,
+    require_input,
     require_signal,
     settle,
 )
@@ -220,7 +223,7 @@ def wait(recorder, transport, clock, *, timeout_s=40.0, probe_path, **kw):
         transport,
         program="Teletext",
         timing="1080p30",
-        timeout_s=timeout_s,
+        probe_timeout_s=timeout_s,
         probe_path=probe_path,
         clock=clock,
         sleep=clock.sleep,
@@ -257,20 +260,48 @@ def test_settle_returns_a_uniform_probe_for_the_caller_to_judge(monkeypatch, tmp
     assert wait(FakeRecorder(), Transmitter(), clock, probe_path=tmp_path / "p.mkv") is flat
 
 
-@pytest.mark.parametrize(
-    ("payload", "said"),
-    [
-        (DEAD, "the transmitter is not driving 1080p30 within 1.0s of the load"),
-        (at("720p60"), "the transmitter is not driving 1080p30"),
-        (UNREPORTED, "the firmware reports no transmitter state"),
-    ],
-)
-def test_settle_fails_on_a_transmitter_that_never_drives_the_session_timing(tmp_path, clock, payload, said):
-    """The error carries the last ``video status``, and the card is never recorded."""
+def test_settle_waits_out_a_blackout_of_any_length(monkeypatch, tmp_path, clock):
+    """The transmitter coming back is the event; however long it takes, nothing gives up on it."""
+    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(frames=6))
+    transmitter = Transmitter(*blackout(2000))
+    assert wait(FakeRecorder(), transmitter, clock, timeout_s=1.0, probe_path=tmp_path / "p.mkv").frames
+    assert transmitter.polls == 2001
+
+
+def test_settle_fails_at_once_when_the_device_leaves_usb(tmp_path, clock):
+    """Losing the device is what ends the transmitter wait early, and the card is never recorded."""
+    recorder, transmitter = FakeRecorder(), Transmitter(DEAD)
+    transmitter.attached = (True, True, False)
+    with pytest.raises(DeviceGoneError, match="waiting for Teletext to transmit 1080p30 .transmitter down"):
+        wait(recorder, transmitter, clock, probe_path=tmp_path / "p.mkv")
+    assert transmitter.polls == 3 and not recorder.probes
+
+
+def test_settle_stalls_only_when_the_caller_opts_in(tmp_path, clock):
+    """A transmitter whose state never changes trips the stall guard when one is set."""
+    transmitter = Transmitter(at("720p60"))
+    transmitter.stall, transmitter.clock = 10.0, clock
+    with pytest.raises(StallError, match="nothing changed for 10.0s"):
+        wait(FakeRecorder(), transmitter, clock, probe_path=tmp_path / "p.mkv", poll_s=1.0)
+
+
+def test_settle_fails_on_firmware_that_reports_no_transmitter(tmp_path, clock):
+    """The event cannot be seen without transmitter state, so that is an error at once with the status."""
     recorder = FakeRecorder()
-    with pytest.raises(SignalLostError, match=said) as raised:
-        wait(recorder, Transmitter(payload), clock, timeout_s=1.0, probe_path=tmp_path / "p.mkv")
+    with pytest.raises(
+        SignalLostError, match="the firmware reports no transmitter state after the load"
+    ) as raised:
+        wait(recorder, Transmitter(UNREPORTED), clock, probe_path=tmp_path / "p.mkv")
     assert '"hdmi_connected": true' in str(raised.value) and not recorder.probes
+
+
+def test_require_input_names_the_input_the_device_fell_back_to():
+    """A device left on another input fails the check; None skips it."""
+    analog = dict(at("1080p30"), source="analog")
+    assert require_input(Transmitter(), program="P", source="hdmi").input_source == "hdmi"
+    assert require_input(Transmitter(analog), program="P", source=None).input_source == "analog"
+    with pytest.raises(InputRouteError, match="P: the device reads input 'analog', the session feeds 'HDMI'"):
+        require_input(Transmitter(analog), program="P", source="HDMI")
 
 
 def test_settle_gives_up_on_a_card_that_delivers_no_frames(monkeypatch, tmp_path):
@@ -285,7 +316,7 @@ def test_settle_gives_up_on_a_card_that_delivers_no_frames(monkeypatch, tmp_path
             Transmitter(),
             program="Dead",
             timing="1080p30",
-            timeout_s=1.0,
+            probe_timeout_s=1.0,
             probe_path=probe,
             probe_s=0.0,
             clock=lambda: next(ticks),

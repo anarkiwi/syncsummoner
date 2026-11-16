@@ -7,14 +7,15 @@ and one shell command per program, against an hour of capture to re-archive it.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
+
+from pyvmancer.errors import DeviceGoneError
 
 from syncsummoner.device.profile import ParamSpec
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe.archive import PROGRAM_INFO
-from syncsummoner.probe.harvest import WEDGED_NOTE, wedged
+from syncsummoner.probe.harvest import GONE_NOTE
 from syncsummoner.progress import track
 
 __all__ = ["NamesReport", "archived_specs", "backfill", "plain_name", "read_program_info"]
@@ -27,7 +28,7 @@ class NamesReport:
     annotated: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
-    wedged: bool = False
+    gone: bool = False
 
 
 def archived_specs(meta: Mapping[str, Any] | None) -> list[ParamSpec] | None:
@@ -41,29 +42,18 @@ def plain_name(program: str) -> str:
     return program.rpartition("/")[2]
 
 
-def read_program_info(
-    transport: Any,
-    program: str,
-    *,
-    timeout_s: float = 20.0,
-    poll_s: float = 0.5,
-    sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-) -> dict[str, Any]:
-    """Load ``program`` and return its ``program info`` reply once it names that program.
+def read_program_info(transport: Any, program: str) -> dict[str, Any]:
+    """Load ``program`` and return its ``program info`` reply, which must name that program.
 
-    A load returns before the device has switched, so a reply naming the previous
-    program is stale rather than wrong, and is asked again until the deadline.
+    The load returns only once the device runs the program and answers
+    ``program info``, so a reply naming another program is a wrong answer, not
+    a stale one.
     """
     transport.load_program(program)
-    deadline = clock() + timeout_s
-    while True:
-        payload = transport.program_payload()
-        if payload.get("name") == plain_name(program):
-            return payload
-        if clock() >= deadline:
-            raise LookupError(f"device still reports {payload.get('name')!r} after loading {program!r}")
-        sleep(poll_s)
+    payload = transport.program_payload()
+    if payload.get("name") != plain_name(program):
+        raise LookupError(f"device reports {payload.get('name')!r} after loading {program!r}")
+    return payload
 
 
 def backfill(
@@ -72,13 +62,12 @@ def backfill(
     *,
     programs: Iterable[str] | None = None,
     log: Callable[[str], None] | None = None,
-    **read: Any,
 ) -> NamesReport:
     """Annotate every committed archive that lacks ``program info``, resuming where one stopped.
 
     The metadata is rewritten only once the reply names its program, so an archive
-    either carries a reply or is asked again next run. A load that fails on a
-    device that will no longer hold any program ends the run, as it does an archive run.
+    either carries a reply or is asked again next run. The device leaving USB
+    ends the run, as it does an archive run.
     """
     note = log if log is not None else lambda _message: None
     committed = archive.committed()
@@ -89,13 +78,13 @@ def backfill(
             report.skipped.append(name)
             continue
         try:
-            archive.annotate(name, **{PROGRAM_INFO: read_program_info(transport, name, **read)})
+            archive.annotate(name, **{PROGRAM_INFO: read_program_info(transport, name)})
         except Exception as exc:
             report.failed[name] = f"{type(exc).__name__}: {exc}"
             note(f"{name}: {report.failed[name]}")
-            if wedged(transport):
-                report.wedged = True
-                note(WEDGED_NOTE)
+            if isinstance(exc, DeviceGoneError):
+                report.gone = True
+                note(GONE_NOTE)
                 break
             continue
         report.annotated.append(name)

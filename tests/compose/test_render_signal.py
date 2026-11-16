@@ -9,6 +9,7 @@ import pytest
 
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import Layer, Score, Section
+from syncsummoner.device.recorder import InputRouteError
 from tests import transmitter as tx
 from tests.compose import PROBED, rig_transport
 from tests.compose.test_render import CONFIG
@@ -44,8 +45,8 @@ def played(rig, tmp_path, recorded):
     ("video", "when", "takes"),
     [
         ([tx.DEAD], "as the pass began", 0),
-        ([tx.at(CONFIG.timing), tx.DEAD], "as the pass ended", 1),
-        ([tx.at(CONFIG.timing), tx.UNREPORTED], "the firmware reports no transmitter state", 1),
+        ([tx.at(CONFIG.timing), tx.at(CONFIG.timing), tx.DEAD], "as the pass ended", 1),
+        ([tx.at(CONFIG.timing)] * 2 + [tx.UNREPORTED], "the firmware reports no transmitter state", 1),
     ],
     ids=["dropped-before", "dropped-during", "unreported"],
 )
@@ -59,6 +60,17 @@ def test_a_transmitter_lost_at_a_pass_boundary_fails_the_pass(monkeypatch, tmp_p
     with pytest.raises(R.BlankTakeError, match=when):
         played(bare_rig(rig_transport(*video)), tmp_path, recorded)
     assert len(recorded) == takes
+
+
+def test_a_device_left_on_another_input_fails_the_pass_before_it_runs(monkeypatch, tmp_path):
+    """The selected input is verified after the load, before any picture is judged or recorded."""
+    monkeypatch.setattr(R, "settle", lambda *a, **k: R.TakeReport(frames=4))
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+    recorded = []
+    analog = dict(tx.at(CONFIG.timing), source="analog")
+    with pytest.raises(InputRouteError, match="Teletext: the device reads input 'analog'"):
+        played(bare_rig(rig_transport(analog)), tmp_path, recorded)
+    assert not recorded
 
 
 def test_a_program_driving_a_uniform_field_fails_before_the_pass(monkeypatch, tmp_path):

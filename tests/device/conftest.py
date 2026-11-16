@@ -15,7 +15,7 @@ from pyvmancer.transports.base import MidiTransport
 from pyvmancer.video import VideoStatus
 
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
-from tests.transmitter import LIVE
+from tests.transmitter import LIVE, Live
 
 COLORBARS_INFO = {
     "name": "Colorbars",
@@ -37,7 +37,7 @@ COLORBARS_INFO = {
 }
 
 
-class FakeShell:
+class FakeShell(Live):
     """Serial shell recording every verb and modelling the additive parameter sum.
 
     The CC map has live slots and settings keys that can disagree, as on 1.0.1: a key write
@@ -213,7 +213,7 @@ class FakeDevice:
         self.closed = True
 
 
-class FakeTransport:
+class FakeTransport(Live):
     """Transport stub for session tests: additive parameters, no pyvmancer."""
 
     msgs_per_param = 2

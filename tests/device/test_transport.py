@@ -243,9 +243,12 @@ def test_open_uses_pyvmancer(monkeypatch):
         return FakeDevice()
 
     monkeypatch.setattr(tr.vm.Videomancer, "open", staticmethod(fake_open))
-    port = tr.Transport.open(serial="E464B0605F113625")
+    lines = []
+    port = tr.Transport.open(serial="E464B0605F113625", report=lines.append, stall=300.0)
     assert seen["serial"] == "E464B0605F113625"
-    assert port.device.shell.timeout == tr.SHELL_TIMEOUT_S == 20.0
+    shell = port.device.shell
+    assert (shell.report, shell.stall) == (lines.append, 300.0)
+    assert port.watch("loading X").stall == 300.0
     assert port.program_info().name == COLORBARS_INFO["name"]
 
 

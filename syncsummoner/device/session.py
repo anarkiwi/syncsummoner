@@ -80,7 +80,6 @@ class Session:
         *,
         cc_budget_hz: float = CC_BUDGET_HZ,
         park_values: Sequence[int] | None = None,
-        load_blackout_s: float = 4.0,
         tolerance: int = DEFAULT_TOLERANCE,
         verify_settle_s: float = 0.25,
         sleep: Callable[[float], None] = time.sleep,
@@ -91,7 +90,6 @@ class Session:
             raise ValueError(f"cc_budget_hz must be positive, got {cc_budget_hz}")
         self.transport = transport
         self.cc_budget_hz = float(cc_budget_hz)
-        self.load_blackout_s = float(load_blackout_s)
         self.tolerance = int(tolerance)
         self.verify_settle_s = float(verify_settle_s)
         self._sleep = sleep
@@ -311,11 +309,13 @@ class Session:
         raise DeviceError(f"capture is not carrying content; power-cycle the device\n{trail}")
 
     def load_program(self, name: str, *, park: bool = True, link: Any = None) -> None:
-        """Load a program, absorb the multi-second output blackout, and re-park.
+        """Load a program and re-park.
 
         An optional source ``link`` is held down across the reconfiguration,
-        because the FPGA runs on the clock recovered from the incoming video.
-        The drop clears the source framebuffer: re-push any stimulus afterwards.
+        because the FPGA runs on the clock recovered from the incoming video;
+        the transport returns once the device runs the program, waiting on
+        liveness rather than a fixed blackout. The drop clears the source
+        framebuffer: re-push any stimulus afterwards.
         """
         self._note("load_program", program=name, link=link is not None)
         self._last_load = (name, link is not None)
@@ -323,7 +323,6 @@ class Session:
             if link is not None:
                 stack.enter_context(link.quiet())
             self.transport.load_program(name)
-            self._sleep(self.load_blackout_s)
         assignment = self.transport.cc_assignment
         if assignment is not None:
             LOG.info("%s: %s", name, assignment.summary())
