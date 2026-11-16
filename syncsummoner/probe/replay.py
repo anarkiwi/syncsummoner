@@ -10,7 +10,7 @@ from __future__ import annotations
 import importlib
 import multiprocessing
 import os
-from contextlib import closing
+from contextlib import closing, contextmanager
 from concurrent.futures import Executor, ProcessPoolExecutor, as_completed
 from types import ModuleType
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
@@ -32,6 +32,8 @@ __all__ = ["STIMULUS", "Replayed", "group", "program_records", "replay", "replay
 
 #: What the archive run plays out; the loop is invariant across programs and setpoints.
 STIMULUS = "codeframes"
+#: Thread pools a worker's native libraries size from the environment as they load.
+SINGLE_THREADED = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
 
 
 class Replayed(NamedTuple):
@@ -155,6 +157,21 @@ def replay_program(
     return Replayed(records, profile, found, notes)
 
 
+@contextmanager
+def _environment(values: dict[str, str]) -> Iterator[None]:
+    """Set ``values`` in the environment while the block runs, then put it back."""
+    saved = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _single_threaded() -> None:
     """Hold a worker's native libraries to one thread, the pool being the parallelism."""
     cv2.setNumThreads(1)  # pylint: disable=no-member
@@ -181,7 +198,8 @@ def replay(
     note = log if log is not None else lambda _message: None
     reference = stimulus_loop(HarvestConfig()) if loop is None else loop
     workers = max(1, min(int(jobs or len(os.sched_getaffinity(0))), len(names) or 1))
-    # A forked child inherits OpenCV's thread pool mid-state and can hang in it; a fresh one cannot.
+    # A forked child inherits OpenCV's thread pool mid-state and can hang in it; a fresh one, started
+    # under SINGLE_THREADED, also loads its BLAS without a pool per core.
     options = (
         {"initializer": _single_threaded, "mp_context": multiprocessing.get_context("forkserver")}
         if executor is ProcessPoolExecutor
@@ -189,7 +207,7 @@ def replay(
     )
     shipped = analyzer.__name__ if isinstance(analyzer, ModuleType) else analyzer
     out = {}
-    with executor(max_workers=workers, **options) as pool:
+    with _environment(SINGLE_THREADED), executor(max_workers=workers, **options) as pool:
         futures = {
             pool.submit(replay_program, archive, name, analyzer=shipped, loop=reference, **kwargs): name
             for name in names

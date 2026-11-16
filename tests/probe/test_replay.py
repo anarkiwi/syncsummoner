@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring
 
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
@@ -193,3 +194,21 @@ def test_worker_processes_return_what_threads_do(loop):
     for name, result in pooled.items():
         assert [r.metrics for r in result.records] == [r.metrics for r in threaded[name].records]
         assert result.behaviour == threaded[name].behaviour
+
+
+def test_workers_start_under_single_threaded_libraries_and_the_caller_keeps_its_own(monkeypatch):
+    """A worker sizes its BLAS pool from the environment it starts in, not the parent's."""
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "7")
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    seen = {}
+
+    class Recording(ThreadPoolExecutor):
+        """A pool that records the environment it was started in."""
+
+        def __init__(self, **kwargs):
+            seen.update({name: os.environ.get(name) for name in R.SINGLE_THREADED})
+            super().__init__(**kwargs)
+
+    R.replay(Archive({}), analyzer=FakeAnalyzer(), programs=[], executor=Recording)
+    assert seen == R.SINGLE_THREADED
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "7" and "OMP_NUM_THREADS" not in os.environ

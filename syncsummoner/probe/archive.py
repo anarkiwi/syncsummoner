@@ -54,8 +54,9 @@ STORED_PIX_FMT = "yuv422p"
 READ_PIX_FMT = "rgb24"
 CHANNELS = 3
 _PARAM_COLUMNS = tuple(f"p{i + 1}" for i in range(PARAM_COUNT))
-#: Raw RGB on a pipe, one output frame per decoded frame whatever the timestamps say.
-_RAW_OUT = ("-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", READ_PIX_FMT)
+#: Raw RGB on a pipe, one output frame per decoded frame whatever the timestamps say. A raw
+#: encoder is a copy, so it runs on one thread rather than a pool per core per output.
+_RAW_OUT = ("-threads", "1", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", READ_PIX_FMT)
 
 
 class ArchiveError(RuntimeError):
