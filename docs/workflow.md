@@ -406,6 +406,15 @@ of rendering it again (`<program>: reusing take <path>`), so a render can be
 re-cut, re-mastered or resumed after an interruption; with every take present the
 rig is never opened. Without `--cut-programs` it reuses `--take`.
 
+Writes are sent ahead of their cue by the device's write latency plus a 15 ms
+bias, so changes land on the beat rather than behind it; the default latency is
+one frame of `--format`, `--latency-ms` overrides it and `--measure-latency`
+measures it per program. `--cc-budget` caps parameter writes per second for both
+the planner and the session's pacing; writes due closer together than the budget
+allows are brought forward into their own slots, never sent late. See
+[hardware.md](hardware.md#midi-write-timing) for the measured figures and how to
+re-derive them with `device doctor --latency`.
+
 Without `--cut-programs` the render is a single pass through the score's first
 layer: one program for the whole piece, and one pass of rig time instead of one
 per program.

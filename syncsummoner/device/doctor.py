@@ -143,6 +143,33 @@ def latency_param(info: Any) -> int:
     )
 
 
+def write_latency(transport: Any, *, measure: Callable[..., Any] = measure_latency) -> float | None:
+    """Median CC write to readback latency on the loaded program, or ``None`` when unmeasured.
+
+    Single writes only, on :func:`latency_param`: the rate sweep is ``device doctor
+    --latency``'s. A refusal, a write that never converges or a missing MIDI link is
+    logged and gives ``None``, so the caller keeps its own figure.
+    """
+    device = transport.device
+    if not device.has_midi:
+        LOG.warning("write latency not measured: no MIDI link is open")
+        return None
+    try:
+        measured = measure(
+            device, params=(latency_param(transport.program_info()),), rates=(), report=LOG.info
+        )
+    except (ValueError, VmancerError) as err:
+        LOG.warning("write latency not measured: %s", err)
+        return None
+    if not measured.restored:
+        LOG.warning(
+            "P%s did not read back %s after the latency probe", list(measured.params), list(measured.prior)
+        )
+    if measured.single_median is None:
+        LOG.warning("write latency not measured: a write on P%s never read back", list(measured.params))
+    return measured.single_median
+
+
 class Doctor:
     """Runs the rig's checks; every endpoint is injected, and opened only when used.
 

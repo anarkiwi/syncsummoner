@@ -17,6 +17,7 @@ import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
 from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
+from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
@@ -43,6 +44,8 @@ DRIVE_TICK_S = 1.0
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
 #: whatever both ends already run at; 1080p30 is this rig, measured.
 SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
+#: Perceptual lead on top of the device latency (design 4.4): visuals may run early
+#: by far more than they may run late, so arrival is placed 10 to 20 ms ahead.
 EARLY_BIAS_S = 0.015
 
 
@@ -55,9 +58,13 @@ class RenderConfig:
     fps: float = 60.0
     strip_px: int = 8
     bits: int = 16
-    latency_s: float = 0.0
+    #: CC write to applied latency; None is one frame period, which docs/hardware.md records.
+    latency_s: float | None = None
+    #: Measure the latency on each loaded program instead, keeping ``latency_s`` as the fallback.
+    measure_latency: bool = False
     early_bias_s: float = EARLY_BIAS_S
-    cc_budget_hz: float = 200.0
+    #: Parameter writes per second, shared by the planner and the session's pacing.
+    cc_budget_hz: float = CC_BUDGET_HZ
     #: Budget for the picture to return after a load; relock was measured at 12 to 19 seconds.
     settle_s: float = 40.0
     #: Recorded before the clip is started, so the picture's own first frame is inside the take.
@@ -158,14 +165,50 @@ def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:
     return frame[: frame.shape[0] - strip_px]
 
 
-def schedule(auto: Automation, *, latency_s: float = 0.0, early_bias_s: float = EARLY_BIAS_S) -> Automation:
-    """Shift automation earlier by the measured latency plus a 10-20 ms bias.
+def schedule(
+    auto: Automation,
+    *,
+    latency_s: float = 0.0,
+    early_bias_s: float = EARLY_BIAS_S,
+    cc_budget_hz: float = CC_BUDGET_HZ,
+) -> Automation:
+    """Shift automation earlier by the device latency plus a 10-20 ms bias, paced to the budget.
 
     Audio leading video is detected at roughly 30-50 ms while the reverse
     tolerates over 100 ms, so the error budget is asymmetric: visuals must never
     run late. Gestures already end on their anchor, so arrival lands on the beat.
+
+    The session sends one write per ``1 / cc_budget_hz``, so writes closer than
+    that, as simultaneous ones are, would queue behind each other and land late.
+    Each is instead brought forward to the latest time that still leaves its
+    successors their slots, ``d[i] = min(t[i], d[i+1] - 1/r)``, and writes due
+    before the pass starts are paced from its start. The result is what the
+    session delivers when ``drive`` wakes for it, with no write later than asked.
     """
-    return auto.shift(-(latency_s + early_bias_s))
+    shifted = auto.shift(-(latency_s + early_bias_s))
+    order = np.argsort(shifted.times, kind="stable")
+    slot = np.arange(order.size) / cc_budget_hz
+    early = np.minimum.accumulate((shifted.times[order] - slot)[::-1])[::-1] + slot
+    paced = np.maximum.accumulate(np.maximum(early, 0.0) - slot) + slot
+    return Automation(paced, shifted.indices[order], shifted.values[order])
+
+
+def write_latency(config: RenderConfig, transport: Any) -> float:
+    """The latency writes are brought forward by: measured when asked, else the configured figure.
+
+    Unconfigured, it is one frame period of the session format. A measurement
+    that is refused or never converges falls back to that figure, logged.
+    """
+    fallback = 1.0 / config.fps if config.latency_s is None else float(config.latency_s)
+    if not config.measure_latency:
+        return fallback
+    from syncsummoner.device.doctor import write_latency as measure
+
+    measured = measure(transport)
+    if measured is None:
+        LOG.warning("using a write latency of %.1f ms", fallback * 1e3)
+        return fallback
+    return measured
 
 
 def write_timecoded(
@@ -320,17 +363,14 @@ def render_played(
 
         recorder = Recorder(width=config.width, height=config.height, fps=config.fps)
     autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
-    auto = schedule(
-        autos.get(layers[0].index, Automation.empty()),
-        latency_s=config.latency_s,
-        early_bias_s=config.early_bias_s,
-    )
     try:
         with stage("upload", clip=str(scratch)) as sent:
             sent["bytes"] = rig.playout.upload(str(scratch))
         with rig.playout.playing(fps=config.fps):
-            with stage("load", program=layers[0].program):
+            with stage("load", program=layers[0].program) as loaded:
                 rig.session.load_program(layers[0].program, link=rig.link)
+                latency = write_latency(config, rig.transport)
+                loaded["latency_ms"] = round(latency * 1e3, 1)
                 rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
                 settle(
                     recorder,
@@ -338,6 +378,12 @@ def render_played(
                     timeout_s=config.settle_s,
                     probe_path=config.probe_path,
                 )
+        auto = schedule(
+            autos.get(layers[0].index, Automation.empty()),
+            latency_s=latency,
+            early_bias_s=config.early_bias_s,
+            cc_budget_hz=config.cc_budget_hz,
+        )
         with stage("pass", program=layers[0].program, seconds=f"{score.duration:.1f}") as written:
             with recorder.recording(out, seconds=score.duration + config.lead_s):
                 with rig.playout.playing(fps=config.fps):

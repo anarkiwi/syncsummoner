@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, configure
 
 
@@ -450,10 +451,16 @@ def _render_cmd(args: argparse.Namespace) -> int:
         score = score.window(args.start, args.start + args.seconds)
         LOG.info("audition: %.1fs from %.1fs", score.duration, args.start)
     profiles = _profiles_in(Path(args.profiles))
+    timing = {
+        "source_host": args.source_host,
+        "latency_s": None if args.latency_ms is None else args.latency_ms / 1e3,
+        "measure_latency": args.measure_latency,
+        "cc_budget_hz": args.cc_budget,
+    }
     config = (
-        render_mod.RenderConfig.for_format(args.format, source_host=args.source_host)
+        render_mod.RenderConfig.for_format(args.format, **timing)
         if args.format
-        else render_mod.RenderConfig(source_host=args.source_host)
+        else render_mod.RenderConfig(**timing)
     )
     take, start, lead = _take_path(args), getattr(args, "start", 0.0), 0.0
     _make_room(take, args.output, args.scratch)
@@ -665,6 +672,20 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         node.add_argument("--fade-in", type=float, help="override the fade in")
         node.add_argument("--fade-out", type=float, help="override the fade out")
         node.add_argument("--no-master", action="store_true", help="stop at the raw take")
+        node.add_argument(
+            "--latency-ms", type=float, help="CC write latency to compensate (default: one frame of --format)"
+        )
+        node.add_argument(
+            "--measure-latency",
+            action="store_true",
+            help="measure the write latency on each loaded program, falling back to --latency-ms",
+        )
+        node.add_argument(
+            "--cc-budget",
+            type=float,
+            default=CC_BUDGET_HZ,
+            help="parameter writes per second, within `device doctor --latency`'s midi.backlog",
+        )
         node.set_defaults(func=_render_cmd, render_cmd=name)
         if name == "audition":
             node.add_argument("--seconds", type=float, default=30.0, help="excerpt length")

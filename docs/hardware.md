@@ -58,6 +58,31 @@ parsing is needed. A parameter with native range `0..7` has 8 meaningful
 positions, not 1024; sampling it at 32 steps wastes rig time. See
 `ParamSpec.sample_values`.
 
+## MIDI write timing
+
+Measured with pyvmancer 0.6.0 (`vmancer latency`, `syncsummoner device doctor
+--latency`) on firmware 1.0.1 at 1080p30:
+
+| Measure | Value |
+| --- | --- |
+| CC write to readback | about 33 ms, one frame period |
+| Backlog, one parameter | none at 80 sets/s (160 messages/s) |
+| Backlog, six parameters | none at 40 sets/s each, 240 sets/s (about 480 messages/s) |
+
+A set is one parameter write: two CC messages at high resolution (14-bit), one
+at low. The render budget, `--cc-budget`, is in sets per second at whatever
+resolution the transport runs; its default of 200 sits inside the measured
+clean range. To re-derive it, run `device doctor --latency` with
+`--latency-params` naming as many knobs as a score drives and take the
+`midi.backlog` finding's fastest clean rate times the parameter count.
+
+Render compensates the write latency by bringing every write forward by one
+frame period of the session format, plus the 15 ms perceptual bias of design
+4.4. `--latency-ms` overrides the figure; `--measure-latency` times single writes
+on each loaded program instead, and falls back to the figure, logged, when
+pyvmancer refuses the program's first knob (a toggle, or a modulated slot) or a
+write never reads back.
+
 ## Format is a session constant
 
 The device genlocks to its source and cannot convert. The card constrains what
