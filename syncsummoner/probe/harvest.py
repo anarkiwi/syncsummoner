@@ -375,6 +375,7 @@ def harvest_program(
                 sleep=sleep,
                 clock=clock,
             )
+        transport.verify_cc_map()
         rows = attribute(recorder.timestamps(video), windows, program, base=raw_params(base))
         report = inspect_take(video, ffmpeg=recorder.ffmpeg)
         archive.commit(

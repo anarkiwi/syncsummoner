@@ -166,6 +166,7 @@ def _probe_hardware(args: argparse.Namespace, rng, specs_by_program: dict) -> tu
                     firmware=firmware,
                     rng=rng,
                 )
+                dev.verify_cc_map()
                 if measured:
                     store.put(name, key, measured)
                 records += measured

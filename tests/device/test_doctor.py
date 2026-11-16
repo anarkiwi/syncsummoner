@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from pyvmancer import LatencyReport, RateResult, VmancerError
 from pyvmancer.latency import DEFAULT_RATES
+from pyvmancer.midi import MidiController
 
 from syncsummoner import cli
 from syncsummoner.device import doctor as dr
@@ -19,7 +20,7 @@ from syncsummoner.device.recorder import MJPEG, RecorderError
 from syncsummoner.device.transport import ProgramInfo, Transport
 from syncsummoner.probe.patterns import generate
 
-from .conftest import COLORBARS_INFO, FakeClock, FakeDevice, FakeShell
+from .conftest import COLORBARS_INFO, FakeClock, FakeDevice, FakeMidiPort, FakeShell
 
 FMT = Format("1080p30", 1920, 1080, 30.0)
 KMSPRINT = """Connector 0 (35) HDMI-A-1 (connected)
@@ -513,3 +514,25 @@ def test_cli_doctor_reports_json_and_exit_status(monkeypatch, rig, capsys):
     assert built["latency_params"] == (1, 2) and built["latency_rates"] == (5.0, 40.0)
     assert cli.main(["device", "doctor", "--format", "4k"]) == 1
     assert "unknown format" in capsys.readouterr().err
+
+
+def test_cli_doctor_fails_midi_cc_map_on_a_corrupted_map(monkeypatch, rig, capsys):
+    """A slot that learned P1's CC follows P1, so every take looks like passthrough."""
+    doc = rig()
+    monkeypatch.setattr(dr, "Doctor", lambda fmt, **kwargs: doc)
+    assert cli.main(["device", "doctor"]) == 0
+    assert "midi.cc_map" in capsys.readouterr().err
+    doc.dev.shell.live[11] = 0
+    assert cli.main(["device", "doctor"]) == 1
+    err = capsys.readouterr().err
+    assert "FAIL midi.cc_map" in err and "P12 on 0/32, want 11/43" in err
+    assert "vmancer cc-map --restore --yes" in err
+
+
+def test_midi_cc_map_is_checked_against_the_controller_in_use(rig):
+    doc = rig()
+    doc.dev.midi = MidiController(FakeMidiPort(doc.dev.shell), cc_map=range(20, 32))
+    found = by_check(doc.checks())
+    assert not found["midi.cc_map"].ok and "P1 on 0/32, want 20/52" in found["midi.cc_map"].detail
+    doc.dev.shell.live = list(range(20, 32))
+    assert by_check(doc.checks())["midi.cc_map"].ok

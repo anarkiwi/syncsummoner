@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pyvmancer import CcMapError
 
 from syncsummoner import cli
 from syncsummoner.device import capture as capture_mod
@@ -15,10 +16,13 @@ from syncsummoner.device import session as session_mod
 from syncsummoner.device import transport as transport_mod
 from syncsummoner.probe import harvest as harvest_mod
 from syncsummoner.probe import runner as runner_mod
+from syncsummoner.probe import store as store_mod
 
 
 class Port:
     """Transport stub carrying one program and no manifest."""
+
+    corrupt = False
 
     def __init__(self, serial=None):
         self.serial = serial
@@ -45,6 +49,11 @@ class Port:
         """Program info."""
         del name
         return type("Info", (), {"params": []})()
+
+    def verify_cc_map(self):
+        """Verify the CC map, failing once ``corrupt`` is set."""
+        if type(self).corrupt:
+            raise CcMapError("device CC map differs from the CCs sent")
 
     def close(self):
         """Close."""
@@ -99,6 +108,7 @@ class Link:
 def rig_fixture(monkeypatch):
     """Patch every hardware endpoint the probe path reaches for."""
     Sess.loads = []
+    Port.corrupt = False
     calls = {"plans": []}
     monkeypatch.setattr(transport_mod, "Transport", Port)
     monkeypatch.setattr(capture_mod, "Capture", Cap)
@@ -124,6 +134,18 @@ def test_probe_run_honours_an_explicit_source_host_and_opting_out(tmp_path):
     assert Sess.loads[0][1].host == "pi@other"
     cli.main(["probe", "run", "--out", str(tmp_path), "--no-link"])
     assert Sess.loads[1][1] is None
+
+
+@pytest.mark.usefixtures("rig")
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_probe_run_stores_nothing_measured_under_a_changed_cc_map(tmp_path, monkeypatch, capsys, corrupt):
+    stored = []
+    monkeypatch.setattr(store_mod.ResultStore, "put", lambda _store, name, *_a: stored.append(name))
+    monkeypatch.setattr(runner_mod, "run_plan", lambda *a, **kw: ["record"])
+    Port.corrupt = corrupt
+    cli.main(["probe", "run", "--out", str(tmp_path)])
+    assert stored == ([] if corrupt else ["Colorbars"])
+    assert ("CC map differs" in capsys.readouterr().err) is corrupt
 
 
 def test_probe_run_measures_through_the_capture_and_archives_nothing(rig, tmp_path):

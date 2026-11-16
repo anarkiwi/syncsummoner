@@ -478,6 +478,7 @@ doing it twice, which is what the audition is for.
 | recorder exits immediately | something else holds `/dev/video0`; only one process may |
 | small flickering square in every take | `fbcon` cursor blink on the Pi; disable it, `chvt` does not fix it |
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
+| take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
 | picture never returns after a load | relock; the settle budget is 40 s, and `video status` is advisory |
 | output starts mid-clip, or holds one frame | the picture's start was not found; check the `picture starts` line and that the strip survives the program; a `timecode strip did not survive` warning means that take was cut at the run's median start instead |
 | `timecode strip did not survive, so the picture start is unknown` | no take kept its strip; check the program, or that the pass recorded the clip at all |

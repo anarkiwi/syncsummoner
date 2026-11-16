@@ -4,11 +4,14 @@
 
 import numpy as np
 import pytest
+from pyvmancer import CcMapError
+from pyvmancer.ccmap import encode_setting
+from pyvmancer.const import CC_MAP_UNASSIGNED
 
 from syncsummoner.device import transport as tr
 from syncsummoner.device.profile import PARAM_COUNT, ParamKind, Role
 
-from .conftest import COLORBARS_INFO, FakeDevice, FakeShell
+from .conftest import COLORBARS_INFO, FakeDevice, FakeShell, videomancer
 
 
 def test_program_info_derives_kinds(device):
@@ -271,3 +274,48 @@ def test_source_locked_follows_the_selected_input():
 
     assert not tr.VideoStatus.from_json({"source": "hdmi", "locked": False}).source_locked
     assert tr.VideoStatus.from_json({"source": "analog", "locked": True}).source_locked
+
+
+def settings_writes(shell):
+    return [c[1:] for c in shell.calls if c[0] == "setting"]
+
+
+def test_every_load_rewrites_the_whole_cc_map_even_when_it_is_already_right():
+    """A key can hold its target while its live slot differs, so no load trusts the map."""
+    port = tr.Transport(videomancer())
+    shell = port.device.shell
+    for program in ("Isotherm", "Colorbars"):
+        before = len(settings_writes(shell))
+        port.load_program(program)
+        writes = settings_writes(shell)[before:]
+        assert writes[::2] == [(key, CC_MAP_UNASSIGNED) for key in range(200, 200 + PARAM_COUNT)]
+        assert writes[1::2] == [(200 + i, encode_setting(i)) for i in range(PARAM_COUNT)]
+        assert port.cc_assignment.summary() == "cc-map: assigned P1..P12 -> CC0..11 (was: ok)"
+    assert shell.live == list(range(PARAM_COUNT))
+
+
+def test_a_load_repairs_a_live_map_its_settings_keys_do_not_show():
+    port = tr.Transport(videomancer())
+    port.device.shell.live[11] = 0
+    port.load_program("Isotherm")
+    assert port.device.shell.live == list(range(PARAM_COUNT))
+    assert port.cc_assignment.before.mismatched == (12,)
+    port.verify_cc_map()
+
+
+def test_a_map_that_does_not_take_after_the_write_raises():
+    port = tr.Transport(videomancer())
+    shell = port.device.shell
+    shell.live[3], shell.stuck = 50, True
+    with pytest.raises(CcMapError, match="P4 CC50"):
+        port.load_program("Isotherm")
+    with pytest.raises(CcMapError):
+        port.verify_cc_map()
+
+
+def test_the_sink_cc_is_one_no_slot_listens_on():
+    port = tr.Transport(videomancer())
+    port.consume_midi_assign()
+    sink = port.device.shell.calls[-1]
+    assert sink == ("cc", 119) and 119 not in port.device.shell.live
+    assert port.reassert_cc_map() is None

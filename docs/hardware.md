@@ -83,6 +83,30 @@ on each loaded program instead, and falls back to the figure, logged, when
 pyvmancer refuses the program's first knob (a toggle, or a modulated slot) or a
 write never reads back.
 
+## The MIDI CC map must be checked
+
+On firmware 1.0.1 a program load with the source HDMI link dropped, which is how
+`Session.load_program(..., link=...)` loads, can arm MIDI Assign (MIDI learn) on
+one modulator slot with no button pressed. The next CC received is learned onto
+that slot. Park's first write is CC0, so the slot then follows P1 and every take
+looks like plain passthrough. The arming happens after the load returns: a sink
+CC sent during the load, with the link still down, is too early. The live map
+can also differ from settings keys 200..211, which a capture does not change.
+
+syncsummoner, through pyvmancer, therefore:
+
+- rewrites the whole map on every load (each key cleared, then set) and reads
+  `modulation cc-map` back, logging and journalling the assignment;
+- sends a sink CC that no slot listens on immediately before park's first CC;
+- reasserts the map after park: a slot that captured the sink is reassigned and
+  recorded in `Session.assign_events` with the program, slots and whether the
+  load dropped the link; any other change raises `CcMapError`;
+- reads the map back at the end of every render, audition and probe pass, and
+  fails the pass on any change.
+
+Check it with `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map`;
+repair it by hand with `vmancer cc-map --restore --yes`.
+
 ## Format is a session constant
 
 The device genlocks to its source and cannot convert. The card constrains what
@@ -233,8 +257,10 @@ A destructive program mangles individual strips: inside a `Derez` take, frames
 decode correctly either side of ones that decode to nonsense. Alignment therefore
 takes the lag a take's frames agree on rather than trusting any single frame.
 
-## `settings export` and `settings get` hang the serial shell
+## `settings export` and `settings get` hung the serial shell before 1.0.1
 
-Both verbs return no response and leave the command processor unresponsive to
-every subsequent command; MIDI and video output continue, `USBDEVFS_RESET` does
-not recover it, and a power cycle is required. The harness must not issue them.
+On earlier firmware both verbs returned no response and left the command
+processor unresponsive to every subsequent command; MIDI and video output
+continued, `USBDEVFS_RESET` did not recover it, and a power cycle was required.
+On 1.0.1 `settings get <key>` answers `{"key":k,"type":"uint32","value":v}`, and
+the CC-map assignment on every load relies on it for keys 200..211.
