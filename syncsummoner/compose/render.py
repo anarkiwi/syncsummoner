@@ -129,15 +129,41 @@ def read_timecode(
     return int((binary * (1 << np.arange(bits - 1, -1, -1))).sum())
 
 
+def steady_lag(codes: Sequence[int | None], *, bits: int) -> int | None:
+    """The lag held by the frames that count up one per frame; ``None`` when none do.
+
+    Played at rate, consecutive frames decode to consecutive indices, so a real
+    alignment is a run of frames sharing one lag. A held frame keeps its index
+    while its lag grows, and a misread lands anywhere, so neither forms runs. A
+    run of ``k`` agreeing frames arises by chance with odds ``2**-(bits * (k - 1))``,
+    so among ``n`` frames only runs longer than ``1 + log2(n) / bits`` count, which
+    puts the expected number of chance runs under one. The lag with the most
+    frames in such runs wins.
+    """
+    n = len(codes)
+    if not n:
+        return None
+    known = np.array([c is not None for c in codes])
+    lags = np.arange(n) - np.array([0 if c is None else c for c in codes], dtype=np.int64)
+    breaks = np.flatnonzero(np.r_[True, ~(known[1:] & known[:-1] & (lags[1:] == lags[:-1]))])
+    lengths = np.diff(np.r_[breaks, n])
+    real = known[breaks] & (lengths > 1 + np.log2(n) / bits)
+    if not real.any():
+        return None
+    values, which = np.unique(lags[breaks[real]], return_inverse=True)
+    return int(values[np.bincount(which, weights=lengths[real]).argmax()])
+
+
 def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | None = None) -> float | None:
     """Seconds into a take at which the played clip's first frame lands.
 
     Lead-in is not blank: it holds whatever the framebuffer last showed, which is
     the previous play's final frame and carries that frame's own timecode. Played
     at rate, every fresh frame has the same lag between where it sits in the take
-    and the frame it says it is, so the lag they agree on is the answer and one
-    misread strip cannot move it. The card returns frames at its own rate, so
-    they are resampled to the session's before an index means a time.
+    and the frame it says it is; :func:`steady_lag` finds the run of frames that
+    agree on it, so neither that held frame nor a misread strip can move it. The
+    card returns frames at its own rate, so they are resampled to the session's
+    before an index means a time.
     """
     search = config.lead_s + 2.0 if search_s is None else search_s
     argv = [
@@ -162,12 +188,10 @@ def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | N
     if not strips.size:
         return None
     strips = strips.reshape(-1, config.strip_px, config.width, 3).astype(np.float32) / 255.0
-    codes = [read_timecode(s, bits=config.bits, strip_px=config.strip_px) for s in strips]
-    lags = np.array([i - c for i, c in enumerate(codes) if c is not None], dtype=np.int64)
-    if not lags.size:
-        return None
-    values, counts = np.unique(lags, return_counts=True)
-    return max(0.0, float(values[counts.argmax()]) / config.fps)
+    lag = steady_lag(
+        [read_timecode(s, bits=config.bits, strip_px=config.strip_px) for s in strips], bits=config.bits
+    )
+    return None if lag is None else max(0.0, lag / config.fps)
 
 
 def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:

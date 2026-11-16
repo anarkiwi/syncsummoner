@@ -3,8 +3,10 @@
 # pylint: disable=missing-function-docstring
 
 import json
+import shutil
 import subprocess
 
+import numpy as np
 import pytest
 
 from syncsummoner.compose import master as M
@@ -110,3 +112,47 @@ def test_the_takes_lead_in_is_trimmed_by_filter_not_by_seek():
 def test_no_lead_in_leaves_the_chain_untrimmed():
     argv = M.master_command("take.mkv", None, "out.mp4", duration=10.0, fade_in=0.0, fade_out=0.0)
     assert "-vf" not in argv
+
+
+def test_the_timecode_strip_is_blanked_without_resampling():
+    """The strip is cropped and padded back in black, so the frame keeps its size."""
+    argv = M.master_command("take.mkv", None, "out.mp4", duration=10.0, video_start=1.0, strip_px=8)
+    chain = argv[argv.index("-vf") + 1]
+    assert chain.startswith("trim=start=1.000,setpts=PTS-STARTPTS,crop=iw:ih-8:0:0,pad=iw:ih+8:0:0:black,")
+    assert "scale" not in chain
+
+
+def test_blanking_the_strip_alone_still_filters():
+    argv = M.master_command("take.mkv", None, "out.mp4", duration=10.0, fade_in=0.0, fade_out=0.0, strip_px=4)
+    assert argv[argv.index("-vf") + 1] == "crop=iw:ih-4:0:0,pad=iw:ih+4:0:0:black"
+
+
+def test_master_passes_the_strip_through(monkeypatch):
+    seen = []
+    monkeypatch.setattr(subprocess, "run", _fake_run(seen=seen))
+    M.master("take.mkv", None, "out.mp4", seconds=3.0, strip_px=8)
+    assert "crop=iw:ih-8:0:0" in seen[0][seen[0].index("-vf") + 1]
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_a_mastered_frame_has_no_strip_and_keeps_its_picture(tmp_path):
+    width, height, strip = 64, 48, 8
+    frame = np.full((height, width, 3), 128, np.uint8)
+    frame[-strip:, ::2] = 255
+    take, out = tmp_path / "take.mkv", tmp_path / "out.mp4"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}"]
+        + ["-r", "10", "-i", "pipe:0", "-c:v", "ffv1", str(take)],
+        input=np.repeat(frame[None], 5, 0).tobytes(),
+        check=True,
+    )
+    argv = M.master_command(take, None, out, duration=0.5, fade_in=0.0, fade_out=0.0, strip_px=strip)
+    subprocess.run(argv, check=True)
+    got = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", str(out), "-frames:v", "1", "-f", "rawvideo"]
+        + ["-pix_fmt", "gray", "pipe:1"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    luma = np.frombuffer(got, np.uint8).reshape(height, width)
+    assert luma[-strip:].max() <= 16 and np.ptp(luma[:-strip]) <= 2
