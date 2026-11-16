@@ -573,6 +573,8 @@ doing it twice, which is what the audition is for.
 | recorder cannot open the session format; the card lists only SD YUYV/NV12 | the card enumerated on USB 2; plug it straight into a USB 3 port with a USB 3 cable |
 | device reports no input lock, Pi `fb0/blank` reads 4 | the Pi framebuffer was left powered down; `syncsummoner device doctor --fix` |
 | `error: no serial link is open` | the CDC tty was not passed in, or `pyvmancer` is installed without its serial extra |
+| `... is held by another process` (`PortBusyError`; `device doctor` fails `device.port_free`) | the shell serves one client at a time and pyvmancer holds the tty exclusively: close the other client (`fuser /dev/ttyACM0` names it), e.g. a `vmancer shell` or another syncsummoner run. Archive stops at once rather than waiting out its health deadline |
+| `ReplyShapeError: reply @... lacks fields ...` | a reply of the wrong shape for its command: a broken or misattributed reply, never read as a missing feature. Rerun; if it persists, check nothing else is talking to the serial port |
 
 What the rig was measured to do, and why each of these follows from it, is in
 [hardware.md](hardware.md).

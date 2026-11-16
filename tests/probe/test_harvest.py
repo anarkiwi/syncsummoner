@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from pyvmancer import CcMapError, DeviceGoneError, ProgramLoadError, ShellError
+from pyvmancer import CcMapError, DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device import recorder as recorder_mod
@@ -408,6 +408,19 @@ def test_wait_healthy_tolerates_a_transport_that_will_not_even_open():
 
     got = H.wait_healthy(opener, config=CONFIG, sleep=lambda _s: None, clock=FakeClock())
     assert isinstance(got, Port) and len(attempts) == 3
+
+
+def test_wait_healthy_stops_at_a_port_another_process_holds():
+    """A held tty is not a power cycle, so waiting out the health deadline would only hide it."""
+    attempts = []
+
+    def opener():
+        attempts.append(1)
+        raise PortBusyError("/dev/ttyACM0")
+
+    with pytest.raises(PortBusyError):
+        H.wait_healthy(opener, config=CONFIG, sleep=lambda _s: None, clock=FakeClock())
+    assert len(attempts) == 1
 
 
 def test_the_canary_loads_a_passthrough_and_watches_for_the_picture():

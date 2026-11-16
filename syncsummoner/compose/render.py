@@ -511,8 +511,10 @@ def render_played(
             f"{program}: the program outputs no picture ({report}), while Passthru on the same rig does"
         )
     finally:
-        if owned and rig.capture is not None:
-            rig.capture.close()
+        if owned:
+            if rig.capture is not None:
+                rig.capture.close()
+            rig.transport.close()
 
 
 @dataclass(frozen=True)
@@ -554,7 +556,10 @@ def resolve_starts(measured: Mapping[str, float | None]) -> dict[str, float]:
 
 
 def device_programs() -> Offered:
-    """Program names the attached device offers, and its authors. Imported here so compose needs no hardware."""
+    """Program names the attached device offers, and its authors.
+
+    The device layer is imported here, so compose needs no hardware.
+    """
     from syncsummoner.device.transport import Transport
 
     transport = Transport.open()

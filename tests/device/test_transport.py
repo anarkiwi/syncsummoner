@@ -6,9 +6,9 @@ import contextlib
 
 import numpy as np
 import pytest
-from pyvmancer import CcMapError, ShellError, ShellTimeoutError, VmancerError
+from pyvmancer import CcMapError, ReplyShapeError, ShellError, VmancerError
 from pyvmancer.ccmap import encode_setting
-from pyvmancer.const import CC_MAP_UNASSIGNED
+from pyvmancer.const import CC_MAP_UNASSIGNED, ShellErrorCode
 from pyvmancer.shell import Reply
 
 from syncsummoner.device import transport as tr
@@ -454,7 +454,7 @@ def test_firmware_without_authors_loads_plain_names_without_enumerating():
 
     def authors():
         device.shell.calls.append(("authors",))
-        raise ShellError(2, "unknown command")
+        raise ShellError(ShellErrorCode.PARSE_ERROR, "usage: programs authors")
 
     device.shell.authors = authors
     port = tr.Transport(device)
@@ -464,7 +464,10 @@ def test_firmware_without_authors_loads_plain_names_without_enumerating():
     assert [c for c in device.shell.calls if c[0] in ("authors", "enumerate")] == [("authors",)]
 
 
-@pytest.mark.parametrize("error", [ShellError(3, "busy"), ShellTimeoutError("programs authors", 5)])
+@pytest.mark.parametrize(
+    "error",
+    [ShellError(ShellErrorCode.SERVICE_UNAVAILABLE, "busy"), ReplyShapeError("programs", "{}", ["authors"])],
+)
 def test_an_authors_failure_is_never_read_as_firmware_without_authors(error):
     """Loading a plain name unenumerated would load the active author's program of that name."""
     device = FakeDevice()
@@ -491,7 +494,7 @@ def test_firmware_without_authors_reports_none():
     device = FakeDevice()
 
     def authors():
-        raise ShellError(1, "unknown command")
+        raise ShellError(ShellErrorCode.UNKNOWN_COMMAND, "unknown command")
 
     device.shell.authors = authors
     assert tr.Transport(device).authors() is None

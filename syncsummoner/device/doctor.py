@@ -19,7 +19,7 @@ from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.const import ParamKind as Control
 from pyvmancer.const import param_kind
 from pyvmancer.diagnose import Finding, diagnose, diagnose_latency
-from pyvmancer.errors import VmancerError
+from pyvmancer.errors import PortBusyError, VmancerError
 from pyvmancer.latency import DEFAULT_RATES, measure_latency
 
 from syncsummoner.probe.patterns import generate, read_state_index, state_index_capacity, with_state_index
@@ -461,6 +461,15 @@ class Doctor:
         found = self.source() + self.card()
         try:
             transport = self._open_transport()
+        except PortBusyError as err:
+            return found + [
+                Finding(
+                    "device.port_free",
+                    False,
+                    str(err),
+                    "close the other client holding the serial port, then rerun",
+                )
+            ]
         except Exception as err:
             return found + [
                 Finding(

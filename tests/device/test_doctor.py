@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import pytest
-from pyvmancer import LatencyReport, RateResult, VmancerError
+from pyvmancer import LatencyReport, PortBusyError, RateResult, VmancerError
 from pyvmancer.latency import DEFAULT_RATES
 from pyvmancer.midi import MidiController
 
@@ -307,6 +307,19 @@ def test_device_unreachable(rig):
     found = by_check(doc.checks(loop=True))
     assert not found["device.reachable"].ok and "dialout" in found["device.reachable"].fix
     assert found["ssh.reachable"].ok
+
+
+def test_a_port_held_elsewhere_is_named_rather_than_read_as_unreachable(rig):
+    """The shell serves one client, so a held tty is another process to close, not a cable."""
+    doc = rig()
+
+    def busy():
+        raise PortBusyError("/dev/ttyACM0")
+
+    doc._open_transport = busy  # pylint: disable=protected-access
+    found = by_check(doc.checks())
+    assert "device.reachable" not in found
+    assert not found["device.port_free"].ok and "fuser /dev/ttyACM0" in found["device.port_free"].detail
 
 
 def swap_rb(frame):

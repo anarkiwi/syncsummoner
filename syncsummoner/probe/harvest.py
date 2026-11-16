@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 from pyvmancer.const import ROUTE_HDMI_IN
-from pyvmancer.errors import DeviceGoneError, ProgramLoadError, ShellError
+from pyvmancer.errors import DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import (
@@ -389,7 +389,7 @@ def wait_healthy(
     """Block until an attached device will hold a program, reopening across a power cycle.
 
     The deadline is on the device appearing and taking a load at all; each
-    load itself waits on liveness.
+    load itself waits on liveness. A port another process holds raises at once.
     """
     deadline = clock() + config.health_timeout_s
     while clock() < deadline:
@@ -398,6 +398,8 @@ def wait_healthy(
             if holds_program(transport):
                 return transport
             transport.close()
+        except PortBusyError:
+            raise
         except Exception:
             pass
         sleep(config.health_poll_s)

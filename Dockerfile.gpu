@@ -41,7 +41,7 @@ COPY pyproject.toml README.md LICENSE ./
 RUN python3 -c "import tomllib; p = tomllib.load(open('pyproject.toml', 'rb'))['project']; \
 print('\n'.join(p['dependencies'] + p['optional-dependencies']['audio']))" > /tmp/requirements.txt \
     && python3 -m venv /venv \
-    && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt "pyvmancer[all]>=0.6.3"
+    && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt "pyvmancer[all]>=0.6.5"
 
 FROM deps AS runtime
 COPY . .

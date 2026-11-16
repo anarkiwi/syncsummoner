@@ -227,14 +227,15 @@ class Transport:
     def _has_authors(self) -> bool:
         """Whether the firmware enumerates program authors, asked once per transport.
 
-        Only an unknown-command or usage error means it does not; any other failure raises.
+        Only an unknown-command or usage error means it does not; any other failure raises,
+        a malformed reply (``ReplyShapeError``) included.
         """
         if self._authored is None:
             try:
                 self._shell.authors()
                 self._authored = True
             except vm.ShellError as err:
-                if isinstance(err, vm.ShellTimeoutError) or err.code not in ABSENT_COMMAND_CODES:
+                if err.code not in ABSENT_COMMAND_CODES:
                     raise
                 self._authored = False
         return self._authored

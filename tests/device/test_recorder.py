@@ -405,6 +405,8 @@ def test_rig_state_names_route_input_and_transmitter_and_never_raises():
     )
 
     class Gone(Transmitter):
+        """A device that left USB."""
+
         def video_status(self):
             raise OSError("device left USB")
 
@@ -416,8 +418,6 @@ def test_require_route_names_the_reading_and_the_panel_setting():
     assert require_route(Transmitter(), program="P", route=1) == 1
     assert require_route(types.SimpleNamespace(), program="P", route=None) is None
     port = Transmitter()
-    port.routed = 3
-    with pytest.raises(
-        RouteError, match=r"P: Vid Route Mode reads 3 \(unconfirmed mode\), the session needs 1"
-    ):
+    port.routed = 2
+    with pytest.raises(RouteError, match=r"P: Vid Route Mode reads 2 \(Dual In\), the session needs 1 "):
         require_route(port, program="P", route=1)

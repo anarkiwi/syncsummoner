@@ -173,3 +173,14 @@ def test_the_route_check_can_be_skipped(monkeypatch, tmp_path):
         )
         == PROBED
     )
+
+
+def test_a_pass_closes_the_transport_it_opened(monkeypatch, tmp_path):
+    """The tty is held exclusively, so a transport left open fails the next pass's open."""
+    closed = []
+    transport = rig_transport(route=lambda: 4, close=lambda: closed.append(True))
+    monkeypatch.setattr(R, "open_rig", lambda *a, **k: bare_rig(transport))
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+    with pytest.raises(RouteError):
+        played(None, tmp_path, [])
+    assert closed == [True]

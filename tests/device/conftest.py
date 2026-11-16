@@ -16,6 +16,7 @@ from pyvmancer.const import (
     CC_MSB_MASK,
     DEFAULT_CC_MSB,
     ROUTE_SETTING_KEY,
+    ShellErrorCode,
 )
 from pyvmancer.errors import ShellError
 from pyvmancer.midi import MidiController, lsb_partner
@@ -70,7 +71,6 @@ class FakeShell(Live):
         self.calls = []
         self.program = "Colorbars"
         self.state_shape = "flat"
-        self.timeout = 5.0
         self.live = list(DEFAULT_CC_MSB)
         self.keys = [encode_setting(m) for m in self.live]
         self.armed = None
@@ -86,13 +86,21 @@ class FakeShell(Live):
             ]
         }
 
+    @staticmethod
+    def _cc_slot(key, command):
+        """The CC map slot of settings ``key``; any other key answers not found."""
+        slot = key - CC_MAP_SETTING_KEY
+        if not 0 <= slot < PARAM_COUNT:
+            raise ShellError(ShellErrorCode.FILE_NOT_FOUND, "key not found", command)
+        return slot
+
     def get_setting(self, key):
-        value = self.routed if key == ROUTE_SETTING_KEY else self.keys[key - CC_MAP_SETTING_KEY]
+        value = self.routed if key == ROUTE_SETTING_KEY else self.keys[self._cc_slot(key, "settings get")]
         return json.dumps({"key": key, "type": "uint32", "value": value})
 
     def set_setting(self, key, value):
         self.calls.append(("setting", key, value))
-        slot = key - CC_MAP_SETTING_KEY
+        slot = self._cc_slot(key, "settings set")
         if value != self.keys[slot]:
             self.keys[slot] = value
             if not self.stuck:
@@ -114,8 +122,8 @@ class FakeShell(Live):
     def loads(self):
         return [call[1] for call in self.calls if call[0] == "load"]
 
-    def command(self, *parts, timeout=None, watch=None):
-        del timeout, watch
+    def command(self, *parts, watch=None):
+        del watch
         verb = " ".join(map(str, parts[:2]))
         if verb == "program load":
             self.calls.append(("load", parts[2], self.link_up))
