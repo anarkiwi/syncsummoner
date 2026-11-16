@@ -326,7 +326,7 @@ def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
 
 
 def test_reading_a_timecode_only_touches_the_strip():
-    """Converting the whole frame to float64 to read eight rows cost 12ms a frame."""
+    """Only the strip rows are converted, never the whole frame."""
     frame = np.random.random((1080, 1920, 3)).astype(np.float32)
     stamped = R.burn_timecode(frame, 4242, bits=16, strip_px=8)
     assert R.read_timecode(stamped, bits=16, strip_px=8) == 4242
@@ -664,7 +664,7 @@ def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_
 
 
 def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
-    """A windowed score played from frame zero would show the wrong 30 seconds."""
+    """A windowed score plays the footage at its own start, not from frame zero."""
     clip = [np.full((CONFIG.height, CONFIG.width, 3), i / 20, np.float32) for i in range(20)]
     monkeypatch.setattr(
         "syncsummoner.compose.features.read_frames",
@@ -681,10 +681,6 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
     The CC map is read back once the pass is driven, and a changed map fails the pass.
     """
     order = []
-
-    def signal():
-        order.append("signal")
-        return tx.Transmitter(tx.at(CONFIG.timing)).video_status()
 
     def verify():
         order.append("verify")
@@ -744,7 +740,10 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=rig_transport(verify_cc_map=verify, video_status=signal),
+        transport=rig_transport(
+            verify_cc_map=verify,
+            video_status=lambda: order.append("signal") or rig_transport().video_status(),
+        ),
     )
     score = Score(duration=10.0, sections=[Section(0.0, 10.0, "A")], layers=[Layer("Passthru", 0, [])])
     with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
