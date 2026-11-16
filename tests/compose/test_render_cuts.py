@@ -18,7 +18,7 @@ def _cut_run(monkeypatch, tmp_path, starts, *, reuse=False, **kwargs):
         del source, kw
         seen["rendered"].append(score.layers[0].program)
         Path(out).write_bytes(b"take")
-        return R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4)
+        return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
 
     monkeypatch.setattr(R, "picture_start", lambda path, **kw: starts[Path(path).name])
     monkeypatch.setattr(R, "assemble", lambda plan, paths, out, **kw: seen.update(kw, paths=paths))

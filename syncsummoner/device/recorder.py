@@ -1,14 +1,13 @@
 """Capture recorded by ffmpeg, so nothing on the host competes with the rig.
 
-Reading frames into the host per frame cannot hold a session's rate: measured, a
-Python loop managed 7.7 frames a second with a lossless encoder in the same
-process and 25 without it, against 59.8 for ffmpeg reading the card in MJPEG.
+Reading frames into the host per frame cannot hold a session's rate, while
+ffmpeg reading the card in MJPEG can (docs/hardware.md).
 """
 
 from __future__ import annotations
 
 import ctypes
-import hashlib
+import math
 import shutil
 import signal
 import subprocess
@@ -21,16 +20,19 @@ from typing import Any, Callable, Iterator
 
 import numpy as np
 
+from .capture import QUANTUM, Capture
+
 __all__ = [
-    "BLANK_LEVEL",
     "FFV1",
     "MJPEG",
     "RAW_422",
     "BlankTakeError",
     "Recorder",
     "RecorderError",
+    "SIGMA",
     "TakeReport",
     "die_with_parent",
+    "held",
     "inspect_take",
     "require_ffmpeg",
     "settle",
@@ -62,10 +64,13 @@ FFV1 = (
 )
 #: Linux prctl option tying a child's lifetime to its parent's.
 PR_SET_PDEATHSIG = 1
-#: Mean level below which a captured frame carries no picture.
-BLANK_LEVEL = 0.02
-#: Width every take is judged at; a blank frame is blank at any scale.
-INSPECT_WIDTH = 160
+#: Size every take is judged at, point-sampled so each sample is a pixel the card
+#: delivered: blending would invent mid-tones in the bilevel splash and average
+#: away the noise the motion test is calibrated against.
+INSPECT_SIZE = (160, 90)
+#: Standard errors within which a statistic counts as equal to its null value:
+#: the conventional three-sigma bound, a 0.27% chance of rejecting a true null.
+SIGMA = 3.0
 
 
 class RecorderError(RuntimeError):
@@ -104,29 +109,78 @@ def _diagnostic(errors: Any, *, limit: int = 400) -> str:
 
 
 class BlankTakeError(RuntimeError):
-    """The device never returned a picture, so the take would have been black."""
+    """The device never returned a picture, or the take held none that moved."""
 
 
 @dataclass(frozen=True)
 class TakeReport:
-    """What a finished take actually holds, so a blank one is caught here and not on playback."""
+    """What a finished take actually holds, so a dead one is caught here and not on playback.
 
-    frames: int
-    distinct: int
-    blank: int
-    luma: float
+    ``picture`` counts frames with spatial structure that are not the card's
+    splash, ``splash`` the splash, and the rest are uniform fields. ``spread`` is
+    the median frame's luma range in 8-bit steps, and ``motion`` the mean
+    correlation of consecutive frame differences, -0.5 for a held picture.
+    """
+
+    frames: int = 0
+    picture: int = 0
+    splash: int = 0
+    spread: int = 0
+    motion: float = math.nan
+    frozen: bool = True
+    luma: float = 0.0
+
+    @property
+    def live(self) -> bool:
+        """Whether most frames carry a picture, moving or not; what a load waits for."""
+        return 2 * self.picture > self.frames
 
     @property
     def usable(self) -> bool:
-        """Whether the take carries picture at all."""
-        return bool(self.frames) and self.blank < self.frames // 2 and self.distinct > 1
+        """Whether the take carries a picture that is not held still."""
+        return self.live and not self.frozen
 
     def __str__(self) -> str:
+        verdict = "" if self.usable else "  UNUSABLE: " + ("frozen" if self.live else "no picture")
+        motion = "n/a" if math.isnan(self.motion) else f"{self.motion:+.2f}"
         return (
-            f"{self.frames} frames, {self.distinct} distinct, "
-            f"{self.blank} blank, mean luma {self.luma:.3f}"
-            f"{'' if self.usable else '  UNUSABLE'}"
+            f"{self.frames} frames: {self.picture} picture, {self.splash} splash, "
+            f"{self.frames - self.picture - self.splash} uniform; luma range {self.spread}, "
+            f"motion {motion}, mean luma {self.luma:.3f}{verdict}"
         )
+
+
+def held(frames: np.ndarray) -> tuple[float, bool]:
+    """Mean correlation of consecutive frame differences, and whether they show one picture held.
+
+    A held picture is one image plus noise independent from frame to frame, so
+    consecutive differences ``n[t+1] - n[t]`` and ``n[t+2] - n[t+1]`` share one
+    noise term with opposite sign and correlate at exactly -1/2, whatever the
+    noise's size or spatial texture: the take is its own noise floor. Motion
+    correlates them positively, flicker towards -1. Snow also gives -1/2, but
+    shares no picture across frames, which a one-way analysis of variance over
+    pixels tells apart: a held picture's temporal mean varies across the frame
+    by more than averaging its residuals could. Exact repeats carry no
+    evidence either way and are dropped; fewer than four distinct frames
+    cannot show motion.
+    """
+    if len(frames) < 4:
+        return math.nan, True
+    flat = frames.reshape(len(frames), -1)
+    flat = flat[np.r_[True, np.any(flat[1:] != flat[:-1], axis=1)]]
+    if len(flat) < 4:
+        return math.nan, True
+    step = np.diff(flat, axis=0)
+    norm = np.linalg.norm(step, axis=1)
+    corr = np.einsum("ij,ij->i", step[:-1], step[1:]) / (norm[:-1] * norm[1:])
+    motion = float(corr.mean())
+    noise = abs(motion + 0.5) <= SIGMA * corr.std(ddof=1) / math.sqrt(len(corr))
+    count, pixels = flat.shape
+    mean = flat.mean(axis=0)
+    within = float(np.square(flat - mean).sum()) / (pixels * (count - 1))
+    ratio = count * float(mean.var(ddof=1)) / within
+    shared = ratio > 1.0 + SIGMA * math.sqrt(2.0 / (pixels - 1) + 2.0 / (pixels * (count - 1)))
+    return motion, bool(noise and shared)
 
 
 class Recorder:
@@ -269,8 +323,16 @@ class Recorder:
 
 
 def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240) -> TakeReport:
-    """Measure a finished take, so a blank one is caught here and not on playback."""
-    height = INSPECT_WIDTH * 9 // 16
+    """Judge a finished take by structure and motion, never by brightness.
+
+    A frame is picture when its luma ranges over more than one
+    :data:`~syncsummoner.device.capture.QUANTUM`, the uniform-field bound
+    :func:`~syncsummoner.device.capture.structured` applies, and it is not the
+    card's splash; whether the take moves is :func:`held`.
+    """
+    from syncsummoner.aesthetics.levels import LUMA_709  # keeps scipy off the device import path
+
+    width, height = INSPECT_SIZE
     argv = [
         ffmpeg,
         "-loglevel",
@@ -278,24 +340,34 @@ def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240
         "-i",
         str(path),
         "-vf",
-        f"scale={INSPECT_WIDTH}:-2,fps=source_fps/{max(1, samples // 60)}",
+        f"scale={width}:{height}:flags=neighbor,fps=source_fps/{max(1, samples // 60)}",
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "gray",
+        "rgb24",
         "pipe:1",
     ]
     data = subprocess.run(argv, check=False, capture_output=True).stdout
-    stride = INSPECT_WIDTH * height
-    frames = [data[i : i + stride] for i in range(0, len(data) - stride + 1, stride)]
-    if not frames:
-        return TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
-    levels = np.frombuffer(b"".join(frames), np.uint8).reshape(len(frames), stride).mean(axis=1) / 255.0
+    stride = width * height * 3
+    count = len(data) // stride
+    if not count:
+        return TakeReport()
+    rgb = np.frombuffer(data, np.uint8, count * stride).reshape(count, height, width, 3)
+    weights = (LUMA_709 / 255.0).astype(np.float32)
+    luma = np.einsum("...c,c->...", rgb, weights, dtype=np.float32, casting="unsafe")
+    steps = np.rint(np.ptp(luma.reshape(count, -1), axis=1) / QUANTUM)
+    card = Capture()
+    splash = np.array([card.is_no_signal(rgb[i] / np.float32(255.0)) for i in np.flatnonzero(steps > 1)])
+    picture = int(np.count_nonzero(steps > 1)) - int(np.count_nonzero(splash))
+    motion, frozen = held(luma)
     return TakeReport(
-        frames=len(frames),
-        distinct=len({hashlib.blake2b(f, digest_size=8).digest() for f in frames}),
-        blank=int((levels < BLANK_LEVEL).sum()),
-        luma=float(levels.mean()),
+        frames=count,
+        picture=picture,
+        splash=int(np.count_nonzero(splash)),
+        spread=int(np.median(steps)),
+        motion=motion,
+        frozen=frozen,
+        luma=float(luma.mean()),
     )
 
 
@@ -311,14 +383,14 @@ def settle(
 ) -> TakeReport:
     """Wait for the picture to come back after a load, by recording a short probe.
 
-    Liveness is judged the same way a take is, because judging it any other way
-    is how a working rig gets called faulted. A load drops the source link and the
+    Liveness is judged the way a take is, by :attr:`TakeReport.live`: a picture,
+    moving or not, because a paused source is still a working rig. A load drops the source link and the
     card has no mode to open until it relocks, so a recorder that will not start
     yet is part of what this waits through rather than a failure.
     """
     deadline = clock() + timeout_s
     probe = Path(str(probe_path))
-    report = TakeReport(frames=0, distinct=0, blank=0, luma=0.0)
+    report = TakeReport()
     said = ""
     try:
         while clock() < deadline:
@@ -329,7 +401,7 @@ def settle(
                 said = str(exc)
                 continue
             report = inspect_take(probe, ffmpeg=recorder.ffmpeg)
-            if report.usable:
+            if report.live:
                 return report
     finally:
         probe.unlink(missing_ok=True)

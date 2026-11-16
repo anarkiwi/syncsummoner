@@ -33,8 +33,8 @@ CONFIG = H.HarvestConfig(
     loop_frames=2,
 )
 #: A take that carries a moving picture, and one that is black however long it ran.
-LIVE = TakeReport(frames=30, distinct=24, blank=0, luma=0.42)
-DARK = TakeReport(frames=30, distinct=1, blank=30, luma=0.001)
+LIVE = TakeReport(frames=30, picture=30, spread=240, motion=0.6, frozen=False, luma=0.42)
+DARK = TakeReport(frames=30, luma=0.063)
 #: Frames per program at ``capture_fps`` over two dwells and their settles.
 PER_PROGRAM = 10
 MEASURED = 9
@@ -583,7 +583,7 @@ def test_a_dark_verdict_from_other_firmware_is_not_trusted(tmp_path, monkeypatch
 def test_results_report_what_the_take_actually_held():
     measured = H.ProgramResult("P", frames=10, measured=9, seconds=12.0, report=LIVE)
     assert not measured.dark and "9/10 frames measured in 12s" in str(measured)
-    assert "24 distinct" in str(measured)
+    assert "30 picture" in str(measured) and "motion +0.60" in str(measured)
     assert H.ProgramResult("P", frames=10, report=DARK).dark and "UNUSABLE" in str(
         H.ProgramResult("P", frames=10, report=DARK)
     )

@@ -20,7 +20,7 @@ from pyvmancer.diagnose import Finding, diagnose
 from syncsummoner.probe.patterns import generate, read_state_index, state_index_capacity, with_state_index
 from syncsummoner.progress import LOG, stage
 
-from .capture import Capture
+from .capture import Capture, structured
 from .host import DEFAULT_HOST, HostCommandError, Runner, ssh_runner
 from .link import DEFAULT_BLANK, UNBLANK, Link
 from .playout import Playout
@@ -301,20 +301,16 @@ class Doctor:
             self._playout.show(with_state_index(bars, index))
             frame = self._grab(index)
             result["captured"] = frame is not None
-        splash = Capture().is_no_signal(frame)
-        found = [
-            _check(
-                "loop.signal",
-                not splash,
-                (
-                    "picture captured"
-                    if not splash
-                    else "nothing captured" if frame is None else "the card shows its No Signal splash"
-                ),
-                "the card sees no HDMI from the device: check that cable, and `video status`",
-            )
-        ]
-        if splash:
+        if frame is None or Capture().is_no_signal(frame):
+            said = "nothing captured" if frame is None else "the card shows its No Signal splash"
+            hint = "the card sees no HDMI from the device: check that cable, and `video status`"
+        elif not structured(frame):
+            said = "the device outputs a uniform field"
+            hint = "the device sends video but no picture: check its input and that Passthru loaded"
+        else:
+            said, hint = "picture captured", ""
+        found = [_check("loop.signal", not hint, said, hint)]
+        if hint:
             return found
         read, want = bar_names(bar_channels(frame)), bar_names(bar_channels(bars))
         return found + [

@@ -318,7 +318,7 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
         del source, kwargs
         calls.append((score.layers[0].program, out))
         blank = score.layers[0].program == "Bad"
-        return R.TakeReport(frames=10, distinct=1 if blank else 9, blank=10 if blank else 0, luma=0.4)
+        return R.TakeReport(frames=10, picture=0 if blank else 10, frozen=blank, luma=0.4)
 
     monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
     monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
@@ -398,11 +398,13 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
     def fake_settle(recorder, **kwargs):
         del recorder
         order.append(("settle", kwargs))
-        return R.TakeReport(4, 4, 0, 0.4)
+        return R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
 
     monkeypatch.setattr(R, "settle", fake_settle)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
-    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: R.TakeReport(4, 4, 0, 0.4))
+    monkeypatch.setattr(
+        R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
+    )
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
     config = dataclasses.replace(CONFIG, settle_s=7.5, probe_path=str(tmp_path / "probe.mkv"))
     score = Score(
@@ -494,7 +496,9 @@ def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(R, "settle", lambda *a, **k: None)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
-    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: R.TakeReport(4, 4, 0, 0.4))
+    monkeypatch.setattr(
+        R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
+    )
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
 
     class Rec:
@@ -535,7 +539,7 @@ def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_pa
         del source, out, kwargs
         layer = score.layers[0]
         seen[layer.program] = [g.gesture for g in layer.gestures]
-        return R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4)
+        return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
 
     monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
     monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
@@ -570,7 +574,7 @@ def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_
     def fake_render(score, source, out, **kwargs):
         del score, source, out
         passes.append(kwargs["prepared"])
-        return R.TakeReport(frames=10, distinct=9, blank=0, luma=0.4)
+        return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
 
     score = Score(
         duration=20.0,
@@ -646,7 +650,9 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path):
             return contextlib.nullcontext()
 
     monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle"))
-    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: R.TakeReport(300, 280, 0, 0.4))
+    monkeypatch.setattr(
+        R, "inspect_take", lambda *a, **k: R.TakeReport(frames=300, picture=300, frozen=False, luma=0.4)
+    )
     monkeypatch.setattr(R, "drive", lambda *a, **k: order.append("drive") or 0)
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
     rig = R.Rig(
@@ -831,7 +837,7 @@ def test_cut_render_makes_room_for_its_takes(monkeypatch, tmp_path):
         programs=["Good"],
         takes=takes,
         prepared=True,
-        pass_render=lambda *a, **k: R.TakeReport(10, 9, 0, 0.4),
+        pass_render=lambda *a, **k: R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4),
     )
     assert takes.is_dir()
 
@@ -853,7 +859,7 @@ def test_programs_beyond_the_sections_are_reported_not_dropped(monkeypatch, tmp_
             programs=["Derez", "Lorenz", "Scramble", "Sfumato"],
             takes=tmp_path,
             prepared=True,
-            pass_render=lambda *a, **k: R.TakeReport(10, 9, 0, 0.4),
+            pass_render=lambda *a, **k: R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4),
         )
     assert len(plan) == 2
     assert "Scramble, Sfumato" in caplog.text

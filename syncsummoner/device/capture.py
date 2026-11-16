@@ -1,7 +1,7 @@
 """Long-lived V4L2 capture session.
 
-Lock costs ~3.2 s on a timing change and ~0.5 s on reopen, so the stream is
-opened once for a whole sweep and never per sample. The card advertises YUYV
+Locking is slow next to any per-sample dwell (docs/hardware.md), so the stream
+is opened once for a whole sweep and never per sample. The card advertises YUYV
 and delivers YVYU, so every frame is decoded with the chroma pair exchanged.
 """
 
@@ -19,10 +19,12 @@ import numpy as np
 #: HSV saturation 60/255, the threshold the no-signal splash was measured against.
 CHROMA_LEVEL = 60.0 / 255.0
 #: Samples the splash test estimates its area fractions from. They are fractions,
-#: so a decimated sample answers them; every pixel costs 3x a 30fps frame budget.
+#: so a decimated sample answers them at a bounded cost per frame.
 SPLASH_SAMPLES = 50_000
-#: Spatial variation below this is a dead output, however unlike the splash it looks.
-MIN_SIGNAL_STD = 0.005
+#: One step of the 8-bit samples every frame is decoded from. A uniform field is
+#: one DC level per block, which JPEG and resampling reproduce exactly, so its
+#: spatial range is zero up to the rounding of a single step.
+QUANTUM = 1.0 / 255.0
 #: The one format V4L2 enumerates, and what it must be asked for; the bytes are YVYU.
 NATIVE_FOURCC = "YUYV"
 
@@ -38,6 +40,17 @@ def yvyu_to_bgr(frame: np.ndarray) -> np.ndarray:
     own ``Colorbars`` decodes to SMPTE order only once the pair is put back.
     """
     return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YVYU)
+
+
+def structured(frame: np.ndarray) -> bool:
+    """Whether a frame holds spatial structure rather than one uniform field.
+
+    A dead output is a constant, black or not, which survives capture exactly, so
+    any channel ranging over more than one whole :data:`QUANTUM` is picture however dark it
+    is. Brightness says nothing: dark footage carries full-range structure.
+    """
+    flat = frame.reshape(-1, frame.shape[2] if frame.ndim == 3 else 1)
+    return bool(np.rint(np.ptp(flat, axis=0).max() / QUANTUM) > 1)
 
 
 def bgr_to_rgb(frame: np.ndarray) -> np.ndarray:
@@ -124,7 +137,7 @@ class Capture:
         """Fraction of pixels carrying meaningful chroma (HSV saturation above ``level``).
 
         Estimated from a strided sample: it is an area fraction, and reading
-        every pixel of a 1080p frame costs three times a 30fps frame budget.
+        every pixel of a large frame would not keep up with the card.
         """
         view = self._decimate(frame, samples)
         peak = view.max(axis=2)
@@ -175,16 +188,15 @@ class Capture:
             if poll_s:
                 self._sleep(poll_s)
 
-    def wait_for_lock(
-        self, timeout_s: float = 10.0, *, poll_s: float = 0.05, min_std: float = MIN_SIGNAL_STD
-    ) -> bool:
+    def wait_for_lock(self, timeout_s: float = 10.0, *, poll_s: float = 0.05) -> bool:
         """Block until a frame arrives carrying picture, not a grab failure or the splash.
 
-        A dead output is black, which is neither, so spatial variance is the
-        test: a still stimulus has it even when nothing is moving.
+        A dead output is a uniform field, which is neither, so spatial structure
+        is the test: a still stimulus has it even when nothing is moving. A
+        strided view keeps a uniform field uniform, so the decimated frame answers.
         """
         return any(
-            frame is not None and float(self._decimate(frame).std()) >= min_std
+            frame is not None and structured(self._decimate(frame))
             for frame in self._stream(timeout_s, poll_s=poll_s)
         )
 

@@ -338,6 +338,15 @@ def test_loop_reports_the_no_signal_splash(rig, captured):
     assert found[0].detail == "the card shows its No Signal splash"
 
 
+def test_loop_reports_a_uniform_field_as_no_picture(rig, captured):
+    """Video black at 16 is a link carrying nothing: not the splash, and not the bars."""
+    doc = rig()
+    captured(doc, lambda frame: np.full((FMT.height, FMT.width, 3), 16 / 255, np.float32))
+    found = doc.loop(Transport(doc.dev))
+    assert [f.check for f in found] == ["loop.signal"] and not found[0].ok
+    assert found[0].detail == "the device outputs a uniform field" and "Passthru" in found[0].fix
+
+
 def test_loop_with_nothing_captured(rig, captured):
     doc = rig(recorder=FakeRecorder(fail=10**6))
     captured(doc)
