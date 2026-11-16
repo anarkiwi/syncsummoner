@@ -2,7 +2,7 @@
 
 # pylint: disable=missing-function-docstring
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -882,7 +882,7 @@ def test_harvest_restarts_a_player_that_died_mid_run(tmp_path):
     assert player.starts == 3, "once for the run, then once per program that found it down"
 
 
-def test_a_real_session_holds_the_link_down_across_the_whole_load(tmp_path):
+def test_a_real_session_holds_the_link_down_for_the_load_command_only(tmp_path):
     """End to end against the real Session: the link must be down for the load itself."""
     calls = []
 
@@ -908,7 +908,13 @@ def test_a_real_session_holds_the_link_down_across_the_whole_load(tmp_path):
     port.program_info = lambda name=None: INFO
     port.program_payload = lambda name=None: dict(COLORBARS_INFO)
     port.close = lambda: calls.append("close")
-    port.load_program = lambda name: calls.append(f"load {name}")
+
+    def load(name, hold=None):
+        with nullcontext() if hold is None else hold():
+            calls.append(f"load {name}")
+        calls.append(f"running {name}")
+
+    port.load_program = load
     report = run(
         Archive(tmp_path),
         port=port,
@@ -918,4 +924,9 @@ def test_a_real_session_holds_the_link_down_across_the_whole_load(tmp_path):
     )
     assert report.frames and not report.failures
     start = calls.index("down")
-    assert calls[start : start + 3] == ["down", "load Alpha", "up"], "down for the whole load"
+    assert calls[start : start + 4] == [
+        "down",
+        "load Alpha",
+        "up",
+        "running Alpha",
+    ], "down for the command only"

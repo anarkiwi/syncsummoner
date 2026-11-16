@@ -6,14 +6,16 @@ speaks ``ParamSpec`` / ``ProgramInfo`` / numpy, never raw shell JSON.
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, ContextManager, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import pyvmancer as vm
 
 from pyvmancer.const import ParamRole, classify_param
 from pyvmancer.diagnose import diagnose_video
+from pyvmancer.shell import DEFAULT_AUTHOR
 from pyvmancer.video import VideoStatus
 
 from syncsummoner.progress import LOG
@@ -61,6 +63,10 @@ def _vector(payload: Any, keys: Sequence[str]) -> np.ndarray | None:
         elif all(isinstance(slot, (int, float)) for slot in value):
             return np.asarray(value, dtype=int)
     return None
+
+
+class HeldLinkError(RuntimeError):
+    """A liveness wait ran while the source link was held down, which no device state can outlast."""
 
 
 def transmitting(status: VideoStatus, timing: str) -> bool | None:
@@ -142,6 +148,8 @@ class Transport:
     def __init__(self, device: Any):
         self._device = device
         self._loaded: str | None = None
+        self._held: str | None = None
+        self._authored: bool | None = None
 
     @classmethod
     def open(
@@ -157,10 +165,16 @@ class Transport:
         USB, reporting progress to ``report``; ``stall`` is pyvmancer's opt-in
         guard, failing a wait once nothing observable changes for that long.
         """
-        device = vm.Videomancer.open(serial_number=serial)
-        if device.has_shell:
-            device.shell.report, device.shell.stall = report, stall
-        return cls(device)
+        transport = cls(vm.Videomancer.open(serial_number=serial))
+        if transport.device.has_shell:
+            transport.device.shell.report, transport.device.shell.stall = transport.annotate(report), stall
+        return transport
+
+    def annotate(self, report: Callable[[str], None] | None) -> Callable[[str], None] | None:
+        """``report``, with each progress line naming the link a hold has down."""
+        if report is None:
+            return None
+        return lambda line: report(line if self._held is None else f"{line}, link down")
 
     @property
     def device(self) -> Any:
@@ -178,8 +192,46 @@ class Transport:
         return 2 if self._device.has_midi and self._device.midi.high_resolution else 1
 
     def watch(self, what: str) -> Any:
-        """A pyvmancer liveness ``Watch`` for a wait on the device, with the shell's report and stall."""
-        return self._shell.watch(what)
+        """A pyvmancer liveness ``Watch`` for a wait on device state, with the shell's report and stall.
+
+        Device state follows the source link, so the watch refuses to start or to
+        observe while a hold has the link down: such a wait could never end.
+        """
+        self._refuse_held(what)
+        watch = self._shell.watch(what)
+        observe = watch.observe
+
+        def guarded(label: str, evidence: Any = None) -> None:
+            self._refuse_held(what)
+            observe(label, evidence)
+
+        watch.observe = guarded
+        return watch
+
+    def _refuse_held(self, what: str) -> None:
+        """Raise :class:`HeldLinkError` while a hold has the source link down."""
+        if self._held is not None:
+            raise HeldLinkError(f"{what}: started while the link is held down for {self._held}")
+
+    @contextmanager
+    def _holding(self, name: str, hold: Callable[[], ContextManager[Any]]) -> Iterator[None]:
+        """Run the block inside ``hold()``, marking the link down for ``name`` until it is restored."""
+        self._held = name
+        try:
+            with hold():
+                yield
+        finally:
+            self._held = None
+
+    def _has_authors(self) -> bool:
+        """Whether the firmware enumerates program authors, asked once per transport."""
+        if self._authored is None:
+            try:
+                self._shell.authors()
+                self._authored = True
+            except vm.ShellError:
+                self._authored = False
+        return self._authored
 
     def firmware(self) -> str:
         """Firmware version string, recorded into every measurement."""
@@ -195,9 +247,31 @@ class Transport:
             self._loaded = self._shell.status().get("program")
         return self._loaded
 
-    def load_program(self, name: str) -> None:
-        """Load an FPGA program, returning once the device runs it; the wait is on liveness."""
-        self._device.load_program(name, settle=0)
+    def load_program(self, name: str, hold: Callable[[], ContextManager[Any]] | None = None) -> None:
+        """Load ``Name`` or ``author/Name``, returning once the device runs it with its CC map assigned.
+
+        ``hold`` brackets only the ``program load`` command up to its reply, which
+        commits the load. The program runs on the clock recovered from the source
+        link a hold takes down, so the run, ``program info`` and the CC map are
+        awaited on liveness after ``hold`` has restored it, never inside it.
+        """
+        author, slash, plain = name.partition("/")
+        if not slash:
+            author, plain = DEFAULT_AUTHOR, name
+        shell, device = self._shell, self._device
+        reply = shell.watch(f"loading {name}")
+        if slash or self._has_authors():
+            shell.enumerate_author(author, reply)
+        self._loaded = None
+        with self._holding(name, hold) if hold is not None else nullcontext():
+            answer = shell.command("program", "load", plain, watch=reply)
+        if not answer.ok:
+            raise vm.VmancerError(f"expected ok from 'program load {plain}', got {answer.payload!r}")
+        shell.wait_loaded(plain, watch=self.watch(f"loading {name}"))
+        device.program = name
+        device.consume_midi_assign()
+        device.parameters(refresh=True)
+        device.assign_cc_map("load")
         self._loaded = name
 
     @property
