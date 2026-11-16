@@ -18,11 +18,14 @@ from syncsummoner.device.recorder import (
     BlankTakeError,
     Recorder,
     RecorderError,
+    SignalLostError,
     TakeReport,
     inspect_take,
     require_ffmpeg,
+    require_signal,
     settle,
 )
+from tests.transmitter import DEAD, UNREPORTED, Transmitter, at, blackout
 
 
 def fake_popen(started, *, returncode=None, says=b""):
@@ -211,35 +214,77 @@ def test_a_live_paused_picture_settles_but_is_not_a_usable_take():
     assert TakeReport(frames=10, picture=5).mostly_picture is False, "half is not most"
 
 
-def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path):
-    """A guard built on the discarded per-frame loop failed on a perfectly good picture."""
-    reports = iter([TakeReport(frames=10), TakeReport(frames=10, picture=10, frozen=True)])
-    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": next(reports))
-    ticks = iter([0.0, 0.0, 1.0, 2.0])
-    recorder = FakeRecorder()
-    probe = tmp_path / "probe.mkv"
-    got = settle(
+def wait(recorder, transport, clock, *, timeout_s=40.0, probe_path, **kw):
+    return settle(
         recorder,
+        transport,
         program="Teletext",
-        timeout_s=40.0,
-        probe_path=probe,
-        probe_s=0.5,
-        clock=lambda: next(ticks),
-        sleep=lambda s: None,
+        timing="1080p30",
+        timeout_s=timeout_s,
+        probe_path=probe_path,
+        clock=clock,
+        sleep=clock.sleep,
+        **kw,
     )
-    assert got.mostly_picture and len(recorder.probes) == 2, "a still picture is back; it need not move"
+
+
+def test_settle_waits_out_a_load_blackout_before_recording(monkeypatch, tmp_path, clock):
+    """Nothing is recorded while the transmitter is off; the first probe after it returns is judged."""
+    recorder = FakeRecorder()
+    polled = []
+
+    class Watched(Transmitter):
+        """Notes how many probes had been recorded at each poll."""
+
+        def video_status(self):
+            polled.append(len(recorder.probes))
+            return super().video_status()
+
+    held = TakeReport(frames=10, picture=10, frozen=True)
+    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": held)
+    probe = tmp_path / "probe.mkv"
+    got = wait(recorder, Watched(*blackout(5)), clock, probe_path=probe, probe_s=0.5, poll_s=0.25)
+    assert got is held and len(recorder.probes) == 1, "a still picture is back; it need not move"
+    assert polled == [0] * 6 and clock.slept[:5] == [0.25] * 5
     assert recorder.probes[0] == (str(probe), 0.5)
     assert not probe.exists(), "the probe never outlives the wait it was recorded for"
 
 
-def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
-    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(frames=6, splash=6))
+def test_settle_returns_a_uniform_probe_for_the_caller_to_judge(monkeypatch, tmp_path, clock):
+    """With the transmitter up a flat field is the program's own output, not a signal still to come."""
+    flat = TakeReport(frames=6)
+    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": flat)
+    assert wait(FakeRecorder(), Transmitter(), clock, probe_path=tmp_path / "p.mkv") is flat
+
+
+@pytest.mark.parametrize(
+    ("payload", "said"),
+    [
+        (DEAD, "the transmitter is not driving 1080p30 within 1.0s of the load"),
+        (at("720p60"), "the transmitter is not driving 1080p30"),
+        (UNREPORTED, "the firmware reports no transmitter state"),
+    ],
+)
+def test_settle_fails_on_a_transmitter_that_never_drives_the_session_timing(tmp_path, clock, payload, said):
+    """The error carries the last ``video status``, and the card is never recorded."""
+    recorder = FakeRecorder()
+    with pytest.raises(SignalLostError, match=said) as raised:
+        wait(recorder, Transmitter(payload), clock, timeout_s=1.0, probe_path=tmp_path / "p.mkv")
+    assert '"hdmi_connected": true' in str(raised.value) and not recorder.probes
+
+
+def test_settle_gives_up_on_a_card_that_delivers_no_frames(monkeypatch, tmp_path):
+    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport())
     ticks = iter([0.0, 0.0, 99.0])
     probe = tmp_path / "probe.mkv"
-    with pytest.raises(BlankTakeError, match="no picture within 1.0s"):
+    with pytest.raises(
+        BlankTakeError, match="transmitting 1080p30 but nothing captured within 1.0s.*0 frames"
+    ):
         settle(
             FakeRecorder(),
+            Transmitter(),
             program="Dead",
+            timing="1080p30",
             timeout_s=1.0,
             probe_path=probe,
             probe_s=0.0,
@@ -249,22 +294,12 @@ def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
     assert not probe.exists(), "a failed wait cleans up after itself as well"
 
 
-def test_settling_past_the_deadline_never_records(monkeypatch, tmp_path):
-    """A budget already spent buys no probe, and the report says nothing was seen."""
-    monkeypatch.setattr(
-        rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(frames=9, picture=9, frozen=False)
+def test_require_signal_passes_a_driving_transmitter_and_names_a_dropped_one():
+    assert (
+        require_signal(Transmitter(), program="P", timing="1080p30", when="then").output_timing == "1080p30"
     )
-    recorder = FakeRecorder()
-    with pytest.raises(BlankTakeError, match="0 frames"):
-        settle(
-            recorder,
-            program="Dead",
-            timeout_s=0.0,
-            probe_path=tmp_path / "probe.mkv",
-            clock=lambda: 5.0,
-            sleep=lambda s: None,
-        )
-    assert not recorder.probes
+    with pytest.raises(SignalLostError, match="P: the transmitter is not driving 1080p30 as it ended"):
+        require_signal(Transmitter(DEAD), program="P", timing="1080p30", when="as it ended")
 
 
 def test_settle_waits_through_a_recorder_that_cannot_open_the_card_yet(tmp_path, monkeypatch, clock):
@@ -290,14 +325,7 @@ def test_settle_waits_through_a_recorder_that_cannot_open_the_card_yet(tmp_path,
     live = TakeReport(frames=8, picture=8, frozen=False, luma=0.4)
     monkeypatch.setattr(rec, "inspect_take", lambda *a, **k: live)
     recorder = Recorder(popen=popen, sleep=clock.sleep)
-    report = settle(
-        recorder,
-        program="Teletext",
-        timeout_s=40.0,
-        probe_path=tmp_path / "probe.mkv",
-        clock=clock,
-        sleep=clock.sleep,
-    )
+    report = wait(recorder, Transmitter(), clock, probe_path=tmp_path / "probe.mkv")
     assert report is live and len(attempts) == 3
 
 
@@ -306,14 +334,7 @@ def test_settle_reports_the_recorder_error_when_the_card_never_opens(tmp_path, c
     popen = fake_popen([], returncode=1, says=b"/dev/video0: Device or resource busy")
     recorder = Recorder(popen=popen, sleep=clock.sleep)
     with pytest.raises(BlankTakeError, match="Device or resource busy"):
-        settle(
-            recorder,
-            program="Teletext",
-            timeout_s=6.0,
-            probe_path=tmp_path / "probe.mkv",
-            clock=clock,
-            sleep=clock.sleep,
-        )
+        wait(recorder, Transmitter(), clock, timeout_s=6.0, probe_path=tmp_path / "probe.mkv")
 
 
 def test_the_recorder_is_asked_to_die_with_the_harness(tmp_path):

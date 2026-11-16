@@ -18,6 +18,8 @@ from pyvmancer import CcMapError
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
 from syncsummoner.compose.vocabulary import Automation
+from tests import transmitter as tx
+from tests.compose import PROBED, rig_transport
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
 
@@ -461,10 +463,10 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
             order.append(("record",))
             return contextlib.nullcontext()
 
-    def fake_settle(recorder, **kwargs):
-        del recorder
+    def fake_settle(recorder, transport, **kwargs):
+        del recorder, transport
         order.append(("settle", kwargs))
-        return R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
+        return PROBED
 
     monkeypatch.setattr(R, "settle", fake_settle)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
@@ -485,7 +487,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
             session=Session(),
             capture=None,
             playout=Player(),
-            transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=lambda: None),
+            transport=rig_transport(),
         ),
         config=config,
         scratch=tmp_path / "tc.mkv",
@@ -495,6 +497,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
     assert [step[0] for step in order] == ["load", "settle", "record"]
     assert order[1][1] == {
         "program": "Teletext",
+        "timing": CONFIG.timing,
         "timeout_s": 7.5,
         "probe_path": config.probe_path,
     }
@@ -558,9 +561,9 @@ def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=lambda: None),
+        transport=rig_transport(),
     )
-    monkeypatch.setattr(R, "settle", lambda *a, **k: None)
+    monkeypatch.setattr(R, "settle", lambda *a, **k: PROBED)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
     monkeypatch.setattr(
         R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
@@ -679,6 +682,10 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
     """
     order = []
 
+    def signal():
+        order.append("signal")
+        return tx.Transmitter(tx.at(CONFIG.timing)).video_status()
+
     def verify():
         order.append("verify")
         if corrupted:
@@ -724,7 +731,7 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
             del path, seconds
             return contextlib.nullcontext()
 
-    monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle"))
+    monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle") or PROBED)
     monkeypatch.setattr(
         R,
         "inspect_take",
@@ -737,7 +744,7 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=verify),
+        transport=rig_transport(verify_cc_map=verify, video_status=signal),
     )
     score = Score(duration=10.0, sections=[Section(0.0, 10.0, "A")], layers=[Layer("Passthru", 0, [])])
     with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
@@ -757,11 +764,12 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
         "load:Passthru",
         "settle",
         "stop",
+        "signal",
         "play",
         "drive",
         "stop",
         "verify",
-        *(() if corrupted else ("inspect",)),
+        *(() if corrupted else ("signal", "inspect")),
     ]
 
 

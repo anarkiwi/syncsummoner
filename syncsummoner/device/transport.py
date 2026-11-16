@@ -13,6 +13,7 @@ import numpy as np
 import pyvmancer as vm
 
 from pyvmancer.const import ParamRole, classify_param
+from pyvmancer.diagnose import diagnose_video
 from pyvmancer.video import VideoStatus
 
 from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, Role, classify_role
@@ -61,6 +62,25 @@ def _vector(payload: Any, keys: Sequence[str]) -> np.ndarray | None:
         elif all(isinstance(slot, (int, float)) for slot in value):
             return np.asarray(value, dtype=int)
     return None
+
+
+def transmitting(status: VideoStatus, timing: str) -> bool | None:
+    """Whether the HDMI transmitter drives active video at ``timing``; None when the firmware does not say.
+
+    The capture card exposes no signal state and its only input is this output,
+    so the transmitter is the rig's one signal source. pyvmancer's
+    ``video.output_active`` (a sink attached, ``hdmi_tx`` with a nonzero VIC and
+    data enable) is the driving test; it is skipped when the firmware omits those
+    fields, which leaves the answer unknown rather than true. A sink reported
+    absent is a definite no.
+    """
+    found = {finding.check: finding.ok for finding in diagnose_video(status)}
+    if found.get("video.output_connected") is False:
+        return False
+    active = found.get("video.output_active")
+    if active is None:
+        return None
+    return active and str(status.output_timing).lower() == str(timing).lower()
 
 
 @dataclass(frozen=True)

@@ -331,18 +331,34 @@ def test_loop_reports_a_stale_frame(rig, captured):
     assert found["loop.signal"].ok and not found["loop.index"].ok
 
 
-def test_loop_reports_the_no_signal_splash(rig, captured):
-    doc = rig()
-    splash = np.zeros((FMT.height, FMT.width, 3), np.float32)
-    splash[400:600, 600:1300] = 1.0
-    captured(doc, lambda frame: splash)
+@pytest.mark.parametrize(
+    ("transmitter", "detail"),
+    [
+        ({"de": "000000", "vic": 0}, "the device is not transmitting 1080p30"),
+        (None, "the device reports no transmitter state"),
+    ],
+)
+def test_loop_judges_the_signal_by_the_transmitter_not_the_picture(rig, captured, transmitter, detail):
+    """A dead transmitter fails the loop even while the card hands back a structured frame."""
+    video = {k: v for k, v in VIDEO.items() if k != "hdmi_tx"}
+    doc = rig(shell=RigShell(video if transmitter is None else dict(video, hdmi_tx=transmitter)))
+    captured(doc)
     found = doc.loop(Transport(doc.dev))
     assert [f.check for f in found] == ["loop.signal"] and not found[0].ok
-    assert found[0].detail == "the card shows its No Signal splash"
+    assert found[0].detail == detail and "video status" in found[0].fix
+
+
+def test_loop_takes_achromatic_high_contrast_as_picture(rig, captured):
+    """Grey bars carry no chroma at all; with the transmitter up they are picture, only miscoloured."""
+    doc = rig()
+    captured(doc, lambda frame: np.repeat(frame.mean(axis=2, keepdims=True), 3, axis=2))
+    found = by_check(doc.loop(Transport(doc.dev)))
+    assert found["loop.signal"].ok and found["loop.signal"].detail == "picture captured"
+    assert found["loop.index"].ok and not found["loop.bars"].ok
 
 
 def test_loop_reports_a_uniform_field_as_no_picture(rig, captured):
-    """Video black at 16 is a link carrying nothing: not the splash, and not the bars."""
+    """Video black at 16 with the transmitter up is a program carrying nothing, not the bars."""
     doc = rig()
     captured(doc, lambda frame: np.full((FMT.height, FMT.width, 3), 16 / 255, np.float32))
     found = doc.loop(Transport(doc.dev))

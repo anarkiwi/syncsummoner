@@ -276,17 +276,22 @@ def _names_cmd(args: argparse.Namespace) -> int:
 
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
+    from syncsummoner.compose.render import SESSION_FORMATS
     from syncsummoner.device.playout import LoopPlayer
     from syncsummoner.device.recorder import FFV1, Recorder, require_ffmpeg
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.harvest import HarvestConfig, harvest
 
+    if args.format not in SESSION_FORMATS:
+        raise ValueError(f"unknown format {args.format!r}; known: {', '.join(SESSION_FORMATS)}")
     require_ffmpeg()
+    width, height, fps = SESSION_FORMATS[args.format]
     config = HarvestConfig(
-        width=args.width,
-        height=args.height,
-        capture_fps=args.capture_fps,
+        width=width,
+        height=height,
+        capture_fps=round(fps),
+        timing=args.format,
         setpoints=args.setpoints,
         dwell_s=args.dwell,
         seed=args.seed,
@@ -603,9 +608,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--program", default="all")
     collect.add_argument("--capture", default="/dev/video0")
     collect.add_argument("--out", default="archive/")
-    collect.add_argument("--width", type=int, default=1920)
-    collect.add_argument("--height", type=int, default=1080)
-    collect.add_argument("--capture-fps", type=int, default=30)
+    collect.add_argument("--format", default="1080p30", help="session format the rig runs at")
     collect.add_argument("--setpoints", type=int, default=32)
     collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
     collect.add_argument("--seed", type=int, default=11)

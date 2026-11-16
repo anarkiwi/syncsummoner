@@ -24,12 +24,13 @@ from pyvmancer.latency import DEFAULT_RATES, measure_latency
 from syncsummoner.probe.patterns import generate, read_state_index, state_index_capacity, with_state_index
 from syncsummoner.progress import LOG, stage
 
-from .capture import Capture, structured
+from .capture import structured
 from .host import DEFAULT_HOST, HostCommandError, Runner, ssh_runner
 from .link import DEFAULT_BLANK, UNBLANK, Link
 from .playout import Playout
 from .profile import ParamKind
 from .recorder import MJPEG, Recorder, RecorderError, require_ffmpeg
+from .transport import transmitting
 
 CURSOR_BLINK = "/sys/class/graphics/fbcon/cursor_blink"
 FB_SIZE = "/sys/class/graphics/fb0/virtual_size"
@@ -396,9 +397,15 @@ class Doctor:
             self._playout.show(with_state_index(bars, index))
             frame = self._grab(index)
             result["captured"] = frame is not None
-        if frame is None or Capture().is_no_signal(frame):
-            said = "nothing captured" if frame is None else "the card shows its No Signal splash"
-            hint = "the card sees no HDMI from the device: check that cable, and `video status`"
+            sending = transmitting(transport.video_status(), fmt.name)
+            result["transmitting"] = sending
+        if not sending:
+            state = "reports no transmitter state" if sending is None else f"is not transmitting {fmt.name}"
+            said = f"the device {state}"
+            hint = "the device sends no video: check `video status` and the device.format check"
+        elif frame is None:
+            said = "nothing captured"
+            hint = "the device transmits but the card delivers nothing: check that HDMI cable and the card"
         elif not structured(frame):
             said = "the device outputs a uniform field"
             hint = "the device sends video but no picture: check its input and that Passthru loaded"

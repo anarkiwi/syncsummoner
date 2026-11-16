@@ -16,11 +16,9 @@ import numpy as np
 
 # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 
-#: HSV saturation 60/255, the threshold the no-signal splash was measured against.
-CHROMA_LEVEL = 60.0 / 255.0
-#: Samples the splash test estimates its area fractions from. They are fractions,
-#: so a decimated sample answers them at a bounded cost per frame.
-SPLASH_SAMPLES = 50_000
+#: Samples the uniform-field test reads: a strided view of a uniform field is
+#: uniform, so a decimated frame answers it at a bounded cost per frame.
+STRUCTURE_SAMPLES = 50_000
 #: One step of the 8-bit samples every frame is decoded from. A uniform field is
 #: one DC level per block, which JPEG and resampling reproduce exactly, so its
 #: spatial range is zero up to the rounding of a single step.
@@ -125,71 +123,30 @@ class Capture:
         return None if frame is None else bgr_to_rgb(frame)
 
     @staticmethod
-    def _decimate(frame: np.ndarray, samples: int = SPLASH_SAMPLES) -> np.ndarray:
-        """Strided view holding about ``samples`` pixels, for area statistics."""
+    def _decimate(frame: np.ndarray, samples: int = STRUCTURE_SAMPLES) -> np.ndarray:
+        """Strided view holding about ``samples`` pixels."""
         pixels = frame.shape[0] * frame.shape[1]
         step = max(1, int(np.sqrt(pixels / max(samples, 1))))
         return frame[::step, ::step]
 
-    def chroma_fraction(
-        self, frame: np.ndarray, *, level: float = CHROMA_LEVEL, samples: int = SPLASH_SAMPLES
-    ) -> float:
-        """Fraction of pixels carrying meaningful chroma (HSV saturation above ``level``).
-
-        Estimated from a strided sample: it is an area fraction, and reading
-        every pixel of a large frame would not keep up with the card.
-        """
-        view = self._decimate(frame, samples)
-        peak = view.max(axis=2)
-        span = peak - view.min(axis=2)
-        return float(np.count_nonzero(span > level * np.maximum(peak, 1e-6)) / span.size)
-
-    def is_no_signal(
-        self,
-        frame: np.ndarray,
-        *,
-        max_chroma_frac: float = 0.01,
-        min_bright_frac: float = 0.02,
-        max_mid_frac: float = 0.10,
-        dark: float = 0.15,
-        bright: float = 0.85,
-    ) -> bool:
-        """True for the card's synthesized "No Signal" splash rather than real content.
-
-        The splash is achromatic and bilevel while far from uniformly black;
-        variance-based liveness tests score it as content, which silently
-        corrupts a sweep.
-        """
-        from syncsummoner.aesthetics.levels import luma_709  # keeps scipy off the device import path
-
-        if frame is None:
-            return True
-        if self.chroma_fraction(frame) > max_chroma_frac:
-            return False
-        luma = luma_709(self._decimate(frame))
-        bright_frac = float(np.count_nonzero(luma >= bright) / luma.size)
-        mid_frac = float(np.count_nonzero((luma > dark) & (luma < bright)) / luma.size)
-        return bright_frac >= min_bright_frac and mid_frac <= max_mid_frac
-
     def _stream(self, timeout_s: float, *, poll_s: float = 0.0) -> Iterator[np.ndarray | None]:
-        """Yield every read until ``timeout_s`` elapses, None where it was unusable.
+        """Yield every read until ``timeout_s`` elapses, None where the grab failed.
 
-        Bounded on purpose: a read-until-good loop hangs forever whenever the
-        splash test rejects everything, which is how a stimulus that happens to
-        look achromatic stalls a whole sweep.
+        Bounded on purpose: a read-until-good loop hangs forever on a card that
+        never delivers.
         """
         self.open()
         deadline = self._clock() + timeout_s
         while True:
             frame = self.read()
-            yield None if frame is None or self.is_no_signal(frame) else frame
+            yield frame
             if self._clock() >= deadline:
                 return
             if poll_s:
                 self._sleep(poll_s)
 
     def wait_for_lock(self, timeout_s: float = 10.0, *, poll_s: float = 0.05) -> bool:
-        """Block until a frame arrives carrying picture, not a grab failure or the splash.
+        """Block until a frame arrives carrying picture, not a grab failure.
 
         A dead output is a uniform field, which is neither, so spatial structure
         is the test: a still stimulus has it even when nothing is moving. A
@@ -201,10 +158,10 @@ class Capture:
         )
 
     def wait_for_content(self, timeout_s: float = 15.0, *, run: int = 10, min_motion: float = 1e-4) -> bool:
-        """Block until frames are both past the splash and actually moving.
+        """Block until frames are both arriving and actually moving.
 
         A program change blacks the output out and the card needs seconds to
-        re-lock, so a fixed dwell samples the splash. The drop this rig is prone
+        re-lock, so a fixed dwell samples the blackout. The drop this rig is prone
         to freezes the output instead, which only the motion test catches.
         """
         recent: list[np.ndarray] = []

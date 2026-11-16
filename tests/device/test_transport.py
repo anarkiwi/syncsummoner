@@ -10,6 +10,7 @@ from pyvmancer.const import CC_MAP_UNASSIGNED
 
 from syncsummoner.device import transport as tr
 from syncsummoner.device.profile import PARAM_COUNT, ParamKind, Role
+from tests.transmitter import DEAD, LIVE, UNREPORTED, at
 
 from .conftest import COLORBARS_INFO, FakeDevice, FakeShell, videomancer
 
@@ -319,3 +320,37 @@ def test_the_sink_cc_is_one_no_slot_listens_on():
     sink = port.device.shell.calls[-1]
     assert sink == ("cc", 119) and 119 not in port.device.shell.live
     assert port.reassert_cc_map() is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "timing", "expected"),
+    [
+        (LIVE, "1080p30", True),
+        (LIVE, "1080P30", True),
+        (at("NTSC"), "ntsc", True),
+        (DEAD, "1080p30", False),
+        (dict(LIVE, hdmi_tx={"vic": 34, "de": "000000"}), "1080p30", False),
+        (dict(LIVE, hdmi_tx={"vic": 0, "de": "2FE90F"}), "1080p30", False),
+        (at("720p60"), "1080p30", False),
+        (dict(LIVE, output={"timing": "1080p30", "hdmi_connected": False}), "1080p30", False),
+        (UNREPORTED, "1080p30", None),
+        (dict(LIVE, hdmi_tx={"vic": 34}), "1080p30", None),
+        ({k: v for k, v in LIVE.items() if k != "output"}, "1080p30", None),
+    ],
+    ids=[
+        "driving",
+        "case-blind",
+        "named-timing",
+        "dead",
+        "no-data-enable",
+        "no-vic",
+        "wrong-timing",
+        "no-sink",
+        "no-hdmi-tx",
+        "partial-hdmi-tx",
+        "no-output",
+    ],
+)
+def test_transmitting_needs_an_active_transmitter_at_the_session_timing(payload, timing, expected):
+    """Missing fields leave the signal unknown; it is never assumed to be there."""
+    assert tr.transmitting(tr.VideoStatus.from_json(payload), timing) is expected

@@ -75,10 +75,9 @@ class FakeSession:
 class FakeCapture:
     """Replays a scripted frame sequence; ``None`` models a dropped read."""
 
-    def __init__(self, frames, *, no_signal=()):
+    def __init__(self, frames):
         """init  ."""
         self.frames = list(frames)
-        self.no_signal = {id(f) for f in no_signal}
         self.reads = 0
 
     def read(self):
@@ -87,10 +86,6 @@ class FakeCapture:
             return None
         self.reads += 1
         return self.frames.pop(0)
-
-    def is_no_signal(self, frame):
-        """Is no signal."""
-        return id(frame) in self.no_signal
 
 
 def base_frame(seed=0):
@@ -159,14 +154,11 @@ def test_passthrough_distance_recorded_against_reference():
     assert records[0].metrics["passthrough_distance"] == pytest.approx(0.0, abs=1e-6)
 
 
-def test_no_signal_frames_are_skipped():
-    """No signal frames are skipped."""
-    splash = tagged(0, seed=99)
-    frames = [splash, tagged(0, seed=0), tagged(0, seed=1)]
-    capture = FakeCapture(frames, no_signal=[splash])
+def test_failed_grabs_are_skipped():
+    """A failed grab is skipped, not analysed, and the frames around it still count."""
+    capture = FakeCapture([None, tagged(0, seed=0), None, tagged(0, seed=1)])
     _, records = run(capture, plan(1))
-    assert len(records) == 1
-    assert records[0].metrics["luma_mean"] != pytest.approx(float(splash.mean()))
+    assert len(records) == 1 and capture.reads == 4
 
 
 def test_duplicated_frames_are_collapsed():

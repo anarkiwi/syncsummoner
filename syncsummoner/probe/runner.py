@@ -1,8 +1,8 @@
 """Execute a plan against the device, identify frames by gray code, log records.
 
 Frames self-identify by their burnt-in state index, so no dwell timing is assumed
-anywhere: dropped and duplicated frames are tolerated, and capture-card "no signal"
-splashes are skipped rather than analyzed.
+anywhere: dropped and duplicated frames are tolerated, and failed grabs are
+skipped rather than analyzed.
 """
 
 from __future__ import annotations
@@ -165,7 +165,7 @@ def _collect(capture, expected, *, bits, strip_px, frames_per_point, max_wait_fr
         if len(samples) >= frames_per_point:
             break
         frame = capture.read()
-        if frame is None or capture.is_no_signal(frame):
+        if frame is None:
             continue
         index = None if allow_untagged else patterns.read_state_index(frame, bits=bits, strip_px=strip_px)
         if index is None and not allow_untagged:

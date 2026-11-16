@@ -10,12 +10,14 @@ import pytest
 from pyvmancer import CcMapError, ShellError, TransportError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
+from syncsummoner.device import recorder as recorder_mod
 from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import harvest as H
 from syncsummoner.probe.archive import GAP
 from syncsummoner.probe.store import KeyKind, ProgramKey, slug
+from tests import transmitter as tx
 from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport
 from tests.device.test_liveness import mjpeg, needs_ffmpeg
 
@@ -46,17 +48,22 @@ BASE = tuple(range(12))
 @pytest.fixture(autouse=True)
 def no_ffmpeg(monkeypatch):
     """No rig and no ffmpeg: the picture always returns, and every take carries one."""
-    monkeypatch.setattr(H, "settle", lambda recorder, **kwargs: LIVE)
+    monkeypatch.setattr(H, "settle", lambda recorder, transport, **kwargs: LIVE)
     monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: LIVE)
 
 
-def blind(monkeypatch, *, canary=True, take=DARK):
-    """Every take reads black; ``canary`` says whether the passthrough still carries one."""
+def blind(monkeypatch, *, canary=True, take=DARK, canary_probe=None):
+    """Every take reads black; ``canary`` says whether the passthrough still carries one.
+
+    A dark canary fails its settle, unless ``canary_probe`` is what its settle returns.
+    """
     monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: take)
 
-    def probe(recorder, *, program, **kwargs):
-        del recorder, kwargs
+    def probe(recorder, transport, *, program, **kwargs):
+        del recorder, transport, kwargs
         if program == H.WEDGE_PROBE and not canary:
+            if canary_probe is not None:
+                return canary_probe
             raise BlankTakeError(f"{program}: no picture")
         return LIVE
 
@@ -66,7 +73,8 @@ def blind(monkeypatch, *, canary=True, take=DARK):
 class Port:
     """Transport stub: answers program queries, and can refuse to hold a program."""
 
-    def __init__(self, programs=("Alpha", "Beta"), *, holds=True, info=None):
+    def __init__(self, programs=("Alpha", "Beta"), *, holds=True, info=None, video=()):
+        self.transmitter = tx.Transmitter(*video)
         self.programs_list = list(programs)
         self.holds = holds
         self.info = COLORBARS_INFO if info is None else info
@@ -84,6 +92,9 @@ class Port:
 
     def programs(self):
         return list(self.programs_list)
+
+    def video_status(self):
+        return self.transmitter.video_status()
 
     def firmware(self):
         return FIRMWARE
@@ -417,12 +428,26 @@ def test_the_canary_restarts_the_stimulus_before_blaming_the_rig():
     assert player.starts == 1 and player.running
 
 
-def test_the_canary_is_false_when_the_picture_never_comes_back(monkeypatch):
-    """A passthrough that carries nothing means the rig, not the program, is dark."""
-    blind(monkeypatch, canary=False)
+@pytest.mark.parametrize("probe", [None, DARK], ids=["no-signal", "uniform"])
+def test_the_canary_is_false_when_the_picture_never_comes_back(monkeypatch, probe):
+    """A passthrough with no transmitter, or one driving a flat field, means the rig is dark."""
+    blind(monkeypatch, canary=False, canary_probe=probe)
     clock = FakeClock()
     port = Port()
     assert not H.carries_stimulus(Sess(port), Rec(clock), port, config=CONFIG, sleep=clock.sleep, clock=clock)
+
+
+def test_the_canary_judges_the_stimulus_only_once_the_transmitter_drives_it(monkeypatch):
+    """The real settle: a passthrough whose transmitter never returns carries nothing."""
+    monkeypatch.setattr(H, "settle", recorder_mod.settle)
+    monkeypatch.setattr(recorder_mod, "inspect_take", lambda path, **kwargs: LIVE)
+    clock = FakeClock()
+    alive, dead = Port(video=tx.blackout(3)), Port(video=[tx.DEAD])
+    for port, carried in ((alive, True), (dead, False)):
+        recorder = Rec(clock)
+        got = H.carries_stimulus(Sess(port), recorder, port, config=CONFIG, sleep=clock.sleep, clock=clock)
+        assert got is carried and len(recorder.recordings) == int(carried)
+    assert alive.transmitter.polls == 4
 
 
 def test_a_program_is_swept_into_exactly_one_recording(tmp_path):
@@ -548,6 +573,42 @@ def test_a_cc_map_changed_by_the_end_of_a_sweep_fails_the_program_unarchived(tmp
     assert report.failures[0].error.startswith("CcMapError")
     assert archive.commits == ["Beta"] and port.verified == 2
     assert not report.wedged and not report.blacked
+
+
+@pytest.mark.parametrize(
+    ("video", "when"),
+    [([tx.DEAD], "as the sweep began"), ([tx.LIVE, tx.at("720p60"), tx.LIVE], "as the sweep ended")],
+    ids=["dropped-before", "dropped-during"],
+)
+def test_a_transmitter_lost_at_a_sweep_boundary_fails_the_program_unarchived(tmp_path, video, when):
+    """Frames recorded while the transmitter was down are the card's, never the program's."""
+    port, archive = Port(video=video), Archive(tmp_path)
+    report = run(archive, port=port, programs=["Alpha"])
+    assert report.failures[0].error.startswith("SignalLostError") and when in report.failures[0].error
+    assert not archive.commits and not archive.paths("Alpha")[0].exists()
+    assert not report.stopped, "the canary is what decides whether the rig is dark"
+
+
+def test_harvest_records_nothing_until_the_transmitter_is_back(tmp_path, monkeypatch):
+    """The real settle waits out a load blackout over serial before the card is read at all."""
+    monkeypatch.setattr(H, "settle", recorder_mod.settle)
+    monkeypatch.setattr(recorder_mod, "inspect_take", lambda path, **kwargs: LIVE)
+    clock = FakeClock()
+    port = Port(video=tx.blackout(4))
+
+    class Watched(Rec):
+        """Notes how many status polls preceded each recording."""
+
+        polls = []
+
+        def recording(self, path, **kwargs):
+            self.polls.append(port.transmitter.polls)
+            return super().recording(path, **kwargs)
+
+    recorder = Watched(clock)
+    report = run(Archive(tmp_path), port=port, recorder=recorder, clock=clock, programs=["Alpha"])
+    assert not report.failures and report.results[0].frames
+    assert recorder.polls[0] == 5, "the probe waited for the fifth poll, the first to see the transmitter"
 
 
 def test_a_failure_with_a_live_canary_carries_on(tmp_path):
@@ -729,9 +790,9 @@ def sweep_take(tmp_path, uniform_every):
 
 @needs_ffmpeg
 def test_a_sweep_with_flat_setpoints_and_achromatic_bars_is_archived_not_discarded(tmp_path, monkeypatch):
-    """A third of the setpoints flat and the rest bars the splash heuristic misreads: still data."""
+    """A third of the setpoints flat and the rest black-and-white bars: still data."""
     take = sweep_take(tmp_path, uniform_every=3)
-    assert take.splash and not take.picture, "every bar reads as the splash"
+    assert take.picture == 20 and take.ever_structured, "achromatic bars are picture"
     assert not take.usable, "a render would reject it, which is not the archive's standard"
     blind(monkeypatch, canary=True, take=take)
     archive = Archive(tmp_path / "archive")
@@ -758,8 +819,6 @@ def test_results_report_what_the_take_actually_held():
     )
     held_flat = TakeReport(frames=30, picture=1, frozen=True)
     assert not held_flat.usable and not H.ProgramResult("P", frames=10, report=held_flat).dark
-    splash_only = TakeReport(frames=30, splash=30)
-    assert not H.ProgramResult("P", frames=10, report=splash_only).dark, "the splash heuristic cannot condemn"
     assert str(H.ProgramResult("P")) == "P: cached"
     assert "FAILED" in str(H.ProgramResult("P", error="RuntimeError: x"))
 

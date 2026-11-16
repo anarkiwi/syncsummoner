@@ -16,7 +16,7 @@ from .profile import (
     Tongue,
 )
 from .session import AddressingError, DeviceError, ParkError, Session, to_device
-from .transport import ProgramInfo, Transport, VideoStatus
+from .transport import ProgramInfo, Transport, VideoStatus, transmitting
 
 __all__ = [
     "AddressingError",
@@ -45,4 +45,5 @@ __all__ = [
     "VideoStatus",
     "to_device",
     "to_fb565",
+    "transmitting",
 ]
