@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from pyvmancer import CcMapError
+from pyvmancer import CcMapError, ShellError, TransportError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take
@@ -75,6 +75,7 @@ class Port:
         self.hashes = 0
         self.corrupt = False
         self.verified = 0
+        self.load_errors = {}
 
     def verify_cc_map(self):
         self.verified += 1
@@ -89,6 +90,8 @@ class Port:
 
     def load_program(self, name):
         self.loads.append(name)
+        if self.load_errors.get(name):
+            raise self.load_errors[name].pop(0)
 
     def program_payload(self, name=None):
         del name
@@ -157,6 +160,10 @@ class Archive:
     def dark(self, program, key):
         return self.marked_key.get(program) == key.digest
 
+    def clear_dark(self, program):
+        self.marked.discard(program)
+        self.marked_key.pop(program, None)
+
     def mark_dark(self, program, key, luma):
         self.marked.add(program)
         self.marked_key[program] = key.digest
@@ -221,7 +228,7 @@ class Player:
 
 
 class Sess:
-    """Session stub recording loads, their link, and every parameter vector."""
+    """Session stub recording loads, their link and every parameter vector, raising the port's load errors."""
 
     def __init__(self, transport, **kwargs):
         self.transport = transport
@@ -231,6 +238,8 @@ class Sess:
 
     def load_program(self, name, *, park=True, link=None):
         self.loads.append((name, park, link))
+        if self.transport.load_errors.get(name):
+            raise self.transport.load_errors[name].pop(0)
 
     def working_point(self, info):
         return {p.index: 0.5 for p in info.params if p.kind is not ParamKind.UNUSED}
@@ -344,6 +353,19 @@ def test_attribution_of_a_recording_that_holds_no_frames():
 def test_wedged_distinguishes_a_live_device_from_one_that_holds_nothing():
     assert not H.wedged(Port(), sleep=lambda _s: None)
     assert H.wedged(Port(holds=False), sleep=lambda _s: None)
+
+
+def test_a_load_misread_before_it_completes_is_not_a_wedge():
+    """The verdict is ``program info`` after the settle, not a shell error from the load itself."""
+    port = Port()
+    port.load_errors[H.WEDGE_PROBE] = [ShellError(3, "no program loaded", "program info")]
+    assert not H.wedged(port, sleep=lambda _s: None)
+    port = Port(holds=False)
+    port.load_errors[H.WEDGE_PROBE] = [ShellError(3, "no program loaded", "program info")]
+    assert H.wedged(port, sleep=lambda _s: None)
+    port = Port()
+    port.load_errors[H.WEDGE_PROBE] = [TransportError("device gone")]
+    assert H.wedged(port, sleep=lambda _s: None), "a device that has gone holds nothing"
 
 
 def test_wait_healthy_reopens_the_transport_across_a_power_cycle():
@@ -542,6 +564,77 @@ def test_a_failure_with_a_live_canary_carries_on(tmp_path):
     report = run(Archive(tmp_path), session_factory=Failing)
     assert not report.stopped and [r.program for r in report.results] == ["Alpha", "Beta"]
     assert report.failures and report.results[1].frames == PER_PROGRAM
+
+
+def blank_once(monkeypatch, program):
+    """``program`` shows no picture after its load; everything else, the passthrough included, does."""
+
+    def probe(recorder, *, program: str, **kwargs):
+        del recorder, kwargs
+        if program == blank:
+            raise BlankTakeError(f"{program}: no picture within 40.0s of the load")
+        return LIVE
+
+    blank = program
+    monkeypatch.setattr(H, "settle", probe)
+
+
+def test_a_passthrough_load_that_raises_on_a_healthy_device_does_not_end_the_run(tmp_path, monkeypatch):
+    """A blank program, then a passthrough load misread before it completed: the next program still runs."""
+    blank_once(monkeypatch, "Alpha")
+    port = Port(programs=("Alpha", "Beta"))
+    port.load_errors[H.WEDGE_PROBE] = [ShellError(3, "no program loaded", "program info")] * 3
+    said = []
+    report = run(Archive(tmp_path), port=port, log=said.append)
+    assert not report.stopped and not report.fault
+    assert [r.program for r in report.results] == ["Alpha", "Beta"] and report.results[
+        1
+    ].frames == PER_PROGRAM
+    assert report.failures[0].error.startswith("BlankTakeError")
+    assert any("Passthru check raised ShellError" in line for line in said)
+
+
+def test_a_passthrough_that_raises_on_a_device_holding_nothing_is_a_wedge(tmp_path, monkeypatch):
+    """The device that went away mid-check is a rig fault, and the run stops there."""
+    blank_once(monkeypatch, "Alpha")
+
+    class Vanishing(Sess):
+        """Session whose passthrough load finds the device gone."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            if name == H.WEDGE_PROBE:
+                self.transport.holds = False
+                raise TransportError("device gone")
+
+    report = run(Archive(tmp_path), port=Port(programs=("Alpha", "Beta")), session_factory=Vanishing)
+    assert report.wedged and report.fault == H.WEDGED_NOTE
+    assert [r.program for r in report.results] == ["Alpha"]
+
+
+def test_a_failed_program_loses_its_dark_verdict_so_a_resume_retries_it(tmp_path, monkeypatch):
+    """A retried dark program that now fails has no verdict, and the next plain resume runs it."""
+    archive = Archive(tmp_path)
+    archive.mark_dark("Alpha", KEY, 0.0)
+    blank_once(monkeypatch, "Alpha")
+    report = run(archive, programs=["Alpha"], retry_dark=True)
+    assert report.failures and not archive.marked
+    monkeypatch.setattr(H, "settle", lambda recorder, **kwargs: LIVE)
+    assert run(archive, programs=["Alpha"]).results[0].frames == PER_PROGRAM
+
+
+def test_the_summary_lists_each_failed_program_with_its_error_and_the_fault(tmp_path, monkeypatch):
+    """Dark discards are verdicts, not failures; a rig fault is named last."""
+    blank_once(monkeypatch, "Alpha")
+    report = run(Archive(tmp_path), port=Port(programs=("Alpha", "Beta")))
+    assert report.summary() == [
+        f"{PER_PROGRAM} frames from 2 programs in {report.seconds / 60:.1f} min, 1 failed",
+        "  Alpha: BlankTakeError: Alpha: no picture within 40.0s of the load",
+    ]
+    blind(monkeypatch, canary=False)
+    report = run(Archive(tmp_path / "b"), port=Port(programs=("Alpha", "Beta")))
+    assert report.summary()[-1].startswith(f"stopped: {H.BLACKED_NOTE} (Passthru: no picture")
+    assert ", 0 failed" in report.summary()[0], "a dark discard is not a failure"
 
 
 def test_a_failure_on_a_dark_rig_stops_the_run(tmp_path, monkeypatch):

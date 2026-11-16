@@ -207,6 +207,8 @@ harvest.attribute(times, windows, program, *, base) -> list[FrameRow]   # frame 
 harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
                 programs=None, config=HarvestConfig(), session_factory=Session,
                 retry_dark=False) -> HarvestReport   # dark = no frame ever structured
+harvest.rig_fault(session, recorder, transport, *, config, wedge_first=True) -> str   # "" = rig healthy
+HarvestReport.summary() -> list[str]   # totals, each failed program with its error, the fault
 ```
 
 ## `syncsummoner.compose`

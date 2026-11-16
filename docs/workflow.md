@@ -181,6 +181,13 @@ ss probe archive --out archive/ --source-host pi@videopi --retry-dark
 ss probe archive --out archive/ --source-host pi@videopi --retry-dark --program Lumarian
 ```
 
+A program that fails (no picture after its load, a CC map that changed, a shell
+error) is logged as `FAILED` with its error, leaves no archive and no dark verdict,
+and is retried on the next resume; the run goes on. Only a rig fault ends a run:
+a device that will hold no program or has gone, or a Passthru that shows no picture
+(which a lost capture card also produces). The closing summary lists every failed
+program with its error and names the fault, if any.
+
 An archive keeps the device's own `program info` reply beside its frames, and a
 refit carries it into every parameter's name, native range and role. An archive
 recorded before that is back-filled from the device without re-archiving: each

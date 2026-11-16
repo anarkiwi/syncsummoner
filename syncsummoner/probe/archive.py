@@ -275,6 +275,10 @@ class FrameArchive:
         self.directory.mkdir(parents=True, exist_ok=True)
         atomic_write(self.dark_path(program), lambda tmp: tmp.write_text(payload, encoding="utf-8"))
 
+    def clear_dark(self, program: str) -> None:
+        """Drop any dark verdict for ``program``, so a resume runs it again."""
+        self.dark_path(program).unlink(missing_ok=True)
+
     def dark(self, program: str, key: ProgramKey) -> bool:
         """True when ``program`` was measured dark under ``key``, so it need not run again."""
         try:

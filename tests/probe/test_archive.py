@@ -434,6 +434,15 @@ def test_dark_verdicts_are_listed_by_program(tmp_path):
     assert listed["bitcrush"]["luma"] == 0.25 and listed["Roll Shutter"]["key_digest"] == OTHER.digest
 
 
+def test_clearing_a_dark_verdict_makes_a_resume_run_the_program(tmp_path):
+    """A failed program must not stay skipped as dark on the next resume."""
+    archive = archive_at(tmp_path)
+    archive.mark_dark("bitcrush", KEY, 0.0)
+    archive.clear_dark("bitcrush")
+    archive.clear_dark("never-marked")
+    assert not archive.dark("bitcrush", KEY) and not archive.darkened()
+
+
 def test_committing_an_archive_supersedes_its_dark_verdict(tmp_path):
     """A retried program that now shows picture must not stay marked dark."""
     archive_at(tmp_path).mark_dark("bitcrush", KEY, 0.0)

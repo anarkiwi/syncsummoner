@@ -314,9 +314,8 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         log=LOG.info,
         retry_dark=args.retry_dark,
     )
-    LOG.info(
-        "%d frames from %d programs in %.1f min", report.frames, len(report.results), report.seconds / 60
-    )
+    for line in report.summary():
+        LOG.info("%s", line)
     return 1 if report.stopped else 0
 
 
