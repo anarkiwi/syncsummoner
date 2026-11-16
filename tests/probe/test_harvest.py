@@ -630,10 +630,10 @@ def test_a_failure_with_a_live_canary_carries_on(tmp_path):
 def blank_once(monkeypatch, program):
     """``program`` shows no picture after its load; everything else, the passthrough included, does."""
 
-    def probe(recorder, *, program: str, **kwargs):
-        del recorder, kwargs
+    def probe(recorder, transport, *, program: str, **kwargs):
+        del recorder, transport, kwargs
         if program == blank:
-            raise BlankTakeError(f"{program}: no picture within 40.0s of the load")
+            raise BlankTakeError(f"{program}: transmitting 1080p30 but nothing captured within 40.0s")
         return LIVE
 
     blank = program
@@ -680,7 +680,7 @@ def test_a_failed_program_loses_its_dark_verdict_so_a_resume_retries_it(tmp_path
     blank_once(monkeypatch, "Alpha")
     report = run(archive, programs=["Alpha"], retry_dark=True)
     assert report.failures and not archive.marked
-    monkeypatch.setattr(H, "settle", lambda recorder, **kwargs: LIVE)
+    monkeypatch.setattr(H, "settle", lambda recorder, transport, **kwargs: LIVE)
     assert run(archive, programs=["Alpha"]).results[0].frames == PER_PROGRAM
 
 
@@ -690,7 +690,7 @@ def test_the_summary_lists_each_failed_program_with_its_error_and_the_fault(tmp_
     report = run(Archive(tmp_path), port=Port(programs=("Alpha", "Beta")))
     assert report.summary() == [
         f"{PER_PROGRAM} frames from 2 programs in {report.seconds / 60:.1f} min, 1 failed",
-        "  Alpha: BlankTakeError: Alpha: no picture within 40.0s of the load",
+        "  Alpha: BlankTakeError: Alpha: transmitting 1080p30 but nothing captured within 40.0s",
     ]
     blind(monkeypatch, canary=False)
     report = run(Archive(tmp_path / "b"), port=Port(programs=("Alpha", "Beta")))
