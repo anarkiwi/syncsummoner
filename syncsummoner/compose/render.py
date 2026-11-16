@@ -95,7 +95,7 @@ class RenderConfig:
 class Rig:
     """The real-time endpoints a pass drives, injectable so render stays testable.
 
-    ``link`` is the source HDMI link, held down across every program change; None
+    ``link`` is the source HDMI link, held down for every program load command; None
     leaves it alone, which only a rig without link control should do.
     """
 

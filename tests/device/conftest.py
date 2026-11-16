@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring
 
+import contextlib
 import json
 
 import mido
@@ -10,7 +11,9 @@ import pytest
 from pyvmancer import Videomancer
 from pyvmancer.ccmap import encode_setting
 from pyvmancer.const import CC_MAP_SETTING_KEY, CC_MAP_UNASSIGNED, CC_MSB_MASK, DEFAULT_CC_MSB
+from pyvmancer.errors import ShellError
 from pyvmancer.midi import MidiController, lsb_partner
+from pyvmancer.shell import Reply, ShellClient
 from pyvmancer.transports.base import MidiTransport
 from pyvmancer.video import VideoStatus
 
@@ -43,7 +46,15 @@ class FakeShell(Live):
     The CC map has live slots and settings keys that can disagree, as on 1.0.1: a key write
     reaches its slot only when the value changes, unless ``stuck``, and an ``armed`` slot learns
     the next CC received.
+
+    A ``program load`` commits on its reply; the program then runs only once ``fpga status`` is
+    polled with ``link_up``, since the FPGA clock is recovered from the source link. More than
+    ``max_polls`` polls for one load is a wait that cannot end, and raises rather than spinning.
     """
+
+    link_up = True
+    max_polls = 16
+    load_error = None
 
     def __init__(self, manual=None, info=None):
         self.manual = np.zeros(PARAM_COUNT, dtype=int) if manual is None else np.asarray(manual, dtype=int)
@@ -58,6 +69,8 @@ class FakeShell(Live):
         self.keys = [encode_setting(m) for m in self.live]
         self.armed = None
         self.stuck = False
+        self.pending = None
+        self.polls = 0
 
     def cc_map(self):
         return {
@@ -83,9 +96,48 @@ class FakeShell(Live):
         if self.armed is not None:
             self.live[self.armed - 1], self.armed = cc, None
 
-    def load_program(self, name, settle=1.5):
-        self.calls.append(("load", name, settle))
-        self.program = name
+    def authors(self):
+        return ["lzx", "czartroniks"]
+
+    def enumerate_author(self, author, watch=None):
+        del watch
+        self.calls.append(("enumerate", author))
+
+    @property
+    def loads(self):
+        return [call[1] for call in self.calls if call[0] == "load"]
+
+    def command(self, *parts, timeout=None, watch=None):
+        del timeout, watch
+        verb = " ".join(map(str, parts[:2]))
+        if verb == "program load":
+            self.calls.append(("load", parts[2], self.link_up))
+            if self.load_error is not None:
+                raise ShellError(self.load_error, "load failed", "program load")
+            self.pending, self.polls = parts[2], 0
+            return Reply("program", "ok")
+        if verb == "fpga status":
+            self.polls += 1
+            if self.polls > self.max_polls:
+                raise AssertionError(f"{self.polls} fpga status polls with link_up={self.link_up}: deadlock")
+            if self.pending is not None and self.link_up:
+                self.program, self.pending = self.pending, None
+            running = self.pending is None
+            return Reply(
+                "fpga",
+                json.dumps(
+                    {
+                        "state": "running" if running else "idle",
+                        "configured": running,
+                        "program": self.program if running else "",
+                    }
+                ),
+            )
+        assert verb == "program info", verb
+        return Reply("program", json.dumps(self.program_info()))
+
+    def wait_loaded(self, program=None, watch=None):
+        return ShellClient.wait_loaded(self, program, watch=watch, sleep=lambda _s: None)
 
     def close(self):
         self.calls.append(("close",))
@@ -143,6 +195,24 @@ class FakeShell(Live):
         self.calls.append(("video_timing", timing))
 
 
+class GatedLink:
+    """Source link stub that gates a :class:`FakeShell`'s FPGA clock, as the real link does."""
+
+    def __init__(self, shell):
+        self.shell = shell
+        self.calls = []
+
+    @contextlib.contextmanager
+    def quiet(self):
+        self.shell.link_up = False
+        self.calls.append("down")
+        try:
+            yield self
+        finally:
+            self.shell.link_up = True
+            self.calls.append("up")
+
+
 class FakeMidiPort(MidiTransport):
     """MIDI port delivering every control change to a :class:`FakeShell`."""
 
@@ -179,6 +249,7 @@ class FakeDevice:
         self.calls = []
         self.closed = False
         self.cc_assignment = None
+        self.program = None
 
     def consume_midi_assign(self):
         self.calls.append(("sink",))
@@ -192,9 +263,11 @@ class FakeDevice:
     def programs(self):
         return ["Colorbars", "Isotherm", "Passthru"]
 
-    def load_program(self, name, settle=1.5):
-        self.calls.append(("load", name, settle))
-        self.shell.program = name
+    def parameters(self, refresh=False):
+        self.calls.append(("parameters", refresh))
+
+    def assign_cc_map(self, phase="assign"):
+        self.calls.append(("assign", phase))
 
     def set_param(self, index, value):
         self.calls.append(("set_param", index, value))
@@ -266,9 +339,11 @@ class FakeTransport(Live):
     def program_state(self):
         return np.clip(self.manual + self.midi * self.gain + self.bias, 0, PARAM_MAX).astype(int)
 
-    def load_program(self, name):
+    def load_program(self, name, hold=None):
+        with contextlib.nullcontext() if hold is None else hold():
+            self.calls.append(("load", name))
         self.loaded = name
-        self.calls.append(("load", name))
+        self.calls.append(("running", name))
 
 
 class FakeCapture:

@@ -21,7 +21,7 @@ from syncsummoner.device.session import (
 )
 from syncsummoner.device.transport import Transport
 
-from .conftest import FakeCapture, FakeClock, FakeTransport, videomancer
+from .conftest import FakeCapture, FakeClock, FakeTransport, GatedLink, videomancer
 
 _TICK = iter(float(n) for n in range(1, 100000))
 
@@ -199,11 +199,11 @@ def logging_session(port, clock, **kwargs):
     return Session(port, sleep=sleep, clock=clock, **kwargs)
 
 
-def test_load_program_holds_the_link_down_across_the_whole_reconfiguration():
+def test_load_program_holds_the_link_down_for_the_load_command_only():
     port, clock = FakeTransport(), FakeClock()
     session = logging_session(port, clock)
     session.load_program("Isotherm", link=FakeLink(port.calls), park=False)
-    assert port.calls[:3] == [("link", "down"), ("load", "Isotherm"), ("link", "up")]
+    assert port.calls[:4] == [("link", "down"), ("load", "Isotherm"), ("link", "up"), ("running", "Isotherm")]
 
 
 def test_load_program_waits_for_settled_state_before_parking():
@@ -241,8 +241,9 @@ def test_wait_state_settled_gives_up_on_a_state_that_never_stops_moving():
 def test_load_program_restores_the_link_when_the_load_fails():
     port, clock = FakeTransport(), FakeClock()
 
-    def boom(_name):
-        raise RuntimeError("serial died")
+    def boom(_name, hold):
+        with hold():
+            raise RuntimeError("serial died")
 
     port.load_program = boom
     session = logging_session(port, clock)
@@ -254,7 +255,7 @@ def test_load_program_restores_the_link_when_the_load_fails():
 def test_load_program_without_a_link_touches_nothing_extra():
     port, clock = FakeTransport(), FakeClock()
     logging_session(port, clock).load_program("Isotherm", park=False)
-    assert port.calls == [("load", "Isotherm")]
+    assert port.calls == [("load", "Isotherm"), ("running", "Isotherm")]
 
 
 def test_load_program_journals_whether_the_link_was_used():
@@ -512,3 +513,14 @@ def test_a_load_whose_cc_map_does_not_take_raises():
     shell.live[0], shell.stuck = 7, True
     with pytest.raises(CcMapError):
         session.load_program("Isotherm")
+
+
+def test_a_link_dropped_load_on_a_device_that_runs_only_with_the_link_completes_and_parks():
+    """The program runs only once the source returns, so the session must restore it before waiting."""
+    device = videomancer()
+    link = GatedLink(device.shell)
+    session, _, _ = make_session(Transport(device))
+    session.load_program("Passthru", link=link)
+    assert link.calls == ["down", "up"]
+    assert device.shell.program == "Passthru" and device.shell.link_up
+    assert np.all(device.shell.combined() == 0)

@@ -308,6 +308,17 @@ transmitter's return after it is waited for the same way. The capture probe that
 follows keeps a budget, `probe_timeout_s`, because that is the card and recorder,
 not the device.
 
+## A link-dropped load holds the link down for the command only
+
+`Session.load_program(..., link=...)` drops the source link while the device
+takes `program load`, and restores it once `@program:ok` commits the load. The
+FPGA runs on the clock the receiver recovers from that link, so a program cannot
+reach running while it is down: waiting for `fpga status` to run the program, or
+for the transmitter or a picture, inside the drop is a circular wait that only an
+unblank ends. Those waits therefore start only after the link is back, and
+`Transport.watch` raises `HeldLinkError` if one starts or polls while the link is
+held down. Progress lines written during the drop end in `link down`.
+
 ## Vid Route Mode Auto can strand the input
 
 Under SETTINGS > Vid Route Mode Auto, dropping the source HDMI link made the

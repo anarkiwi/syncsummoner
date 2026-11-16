@@ -2,17 +2,20 @@
 
 # pylint: disable=missing-function-docstring
 
+import contextlib
+
 import numpy as np
 import pytest
-from pyvmancer import CcMapError
+from pyvmancer import CcMapError, ShellError, VmancerError
 from pyvmancer.ccmap import encode_setting
 from pyvmancer.const import CC_MAP_UNASSIGNED
+from pyvmancer.shell import Reply
 
 from syncsummoner.device import transport as tr
 from syncsummoner.device.profile import PARAM_COUNT, ParamKind, Role
 from tests.transmitter import DEAD, LIVE, UNREPORTED, at
 
-from .conftest import COLORBARS_INFO, FakeDevice, FakeShell, videomancer
+from .conftest import COLORBARS_INFO, FakeDevice, FakeShell, GatedLink, videomancer
 
 
 def test_program_info_derives_kinds(device):
@@ -78,7 +81,9 @@ def test_slot_names(name, kind):
 def test_program_info_loads_when_not_current(device):
     port = tr.Transport(device)
     port.program_info("Isotherm")
-    assert ("load", "Isotherm", 0) in device.calls
+    assert device.shell.loads == ["Isotherm"]
+    assert device.program == "Isotherm"
+    assert device.calls[-3:] == [("sink",), ("parameters", True), ("assign", "load")]
 
 
 def test_program_info_skips_load_when_current(device):
@@ -93,18 +98,22 @@ def test_a_device_reporting_the_plain_name_does_not_stand_in_for_another_author(
     port = tr.Transport(device)
     assert port.current_program() == "Colorbars"
     port.program_info("czartroniks/Colorbars")
-    assert ("load", "czartroniks/Colorbars", 0) in device.calls
+    assert device.shell.loads == ["Colorbars"]
+    assert ("enumerate", "czartroniks") in device.shell.calls
     assert port.current_program() == "czartroniks/Colorbars"
 
 
 def test_qualified_names_load_once_and_reload_when_the_author_changes(device):
     port = tr.Transport(device)
     port.load_program("czartroniks/Teletext")
-    device.calls.clear()
+    device.shell.calls.clear()
     port.program_info("czartroniks/Teletext")
-    assert not device.calls
+    assert not device.shell.loads
     port.program_info("Teletext")
-    assert device.calls == [("load", "Teletext", 0)]
+    assert [c[:2] for c in device.shell.calls if c[0] in ("enumerate", "load")] == [
+        ("enumerate", "lzx"),
+        ("load", "Teletext"),
+    ]
 
 
 def test_programs_are_passed_through_qualified(device):
@@ -247,7 +256,8 @@ def test_open_uses_pyvmancer(monkeypatch):
     port = tr.Transport.open(serial="E464B0605F113625", report=lines.append, stall=300.0)
     assert seen["serial"] == "E464B0605F113625"
     shell = port.device.shell
-    assert (shell.report, shell.stall) == (lines.append, 300.0)
+    shell.report("still loading X")
+    assert lines == ["still loading X"] and shell.stall == 300.0
     assert port.watch("loading X").stall == 300.0
     assert port.program_info().name == COLORBARS_INFO["name"]
 
@@ -357,3 +367,98 @@ def test_the_sink_cc_is_one_no_slot_listens_on():
 def test_transmitting_needs_an_active_transmitter_at_the_session_timing(payload, timing, expected):
     """Missing fields leave the signal unknown; it is never assumed to be there."""
     assert tr.transmitting(tr.VideoStatus.from_json(payload), timing) is expected
+
+
+def test_a_link_gated_load_restores_the_link_on_the_reply_then_waits_for_the_run():
+    device = FakeDevice()
+    link = GatedLink(device.shell)
+    port = tr.Transport(device)
+    port.load_program("Passthru", hold=link.quiet)
+    assert ("load", "Passthru", False) in device.shell.calls, "the command runs with the link down"
+    assert link.calls == ["down", "up"] and device.shell.program == "Passthru"
+    assert port.current_program() == "Passthru"
+    assert device.calls[-2:] == [("parameters", True), ("assign", "load")]
+
+
+def test_waiting_for_the_run_inside_the_hold_never_ends():
+    """The fake's dependency is real: a run awaited with the link down is a deadlock."""
+    shell = FakeShell()
+    with GatedLink(shell).quiet():
+        shell.command("program", "load", "Passthru")
+        with pytest.raises(AssertionError, match="link_up=False: deadlock"):
+            shell.wait_loaded("Passthru", watch=shell.watch("loading Passthru"))
+
+
+def test_a_liveness_wait_cannot_run_while_the_link_is_held_down():
+    device = FakeDevice()
+    port = tr.Transport(device)
+    early = port.watch("waiting for the transmitter")
+
+    @contextlib.contextmanager
+    def hold():
+        with GatedLink(device.shell).quiet():
+            yield
+            with pytest.raises(tr.HeldLinkError, match="held down for Passthru"):
+                early.observe("dead")
+            port.watch("waiting for picture")
+
+    with pytest.raises(tr.HeldLinkError, match="waiting for picture"):
+        port.load_program("Passthru", hold=hold)
+    assert device.shell.link_up
+    port.watch("waiting for picture").observe("live")
+
+
+def test_a_load_refused_with_the_link_down_still_restores_it():
+    device = FakeDevice()
+    device.shell.load_error = 7
+    link = GatedLink(device.shell)
+    port = tr.Transport(device)
+    with pytest.raises(ShellError):
+        port.load_program("Passthru", hold=link.quiet)
+    assert link.calls == ["down", "up"] and device.shell.link_up
+    assert port.current_program() == "Colorbars"
+    port.watch("waiting for picture").observe("live")
+
+
+def test_a_load_answering_other_than_ok_raises_after_restoring_the_link():
+    device = FakeDevice()
+    command = device.shell.command
+    device.shell.command = lambda *parts, **kw: (
+        Reply("program", "busy") if parts[1] == "load" else command(*parts, **kw)
+    )
+    link = GatedLink(device.shell)
+    with pytest.raises(VmancerError, match="busy"):
+        tr.Transport(device).load_program("Passthru", hold=link.quiet)
+    assert link.calls == ["down", "up"]
+
+
+def test_progress_lines_say_when_the_link_is_down():
+    device = FakeDevice()
+    port = tr.Transport(device)
+    lines = []
+    report = port.annotate(lines.append)
+
+    @contextlib.contextmanager
+    def hold():
+        report("still loading Passthru")
+        yield
+
+    report("still loading Passthru")
+    port.load_program("Passthru", hold=hold)
+    assert lines == ["still loading Passthru", "still loading Passthru, link down"]
+    assert port.annotate(None) is None
+
+
+def test_firmware_without_authors_loads_plain_names_without_enumerating():
+    device = FakeDevice()
+
+    def authors():
+        device.shell.calls.append(("authors",))
+        raise ShellError(2, "unknown command")
+
+    device.shell.authors = authors
+    port = tr.Transport(device)
+    port.load_program("Passthru")
+    port.load_program("Colorbars")
+    assert device.shell.loads == ["Passthru", "Colorbars"]
+    assert [c for c in device.shell.calls if c[0] in ("authors", "enumerate")] == [("authors",)]

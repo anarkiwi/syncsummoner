@@ -320,7 +320,7 @@ def test_loop_passes_on_a_clean_chain(rig, captured):
     found = by_check(doc.run(loop=True))
     assert found["loop.signal"].ok and found["loop.index"].ok and found["loop.bars"].ok
     assert found["loop.bars"].detail == "bars read white yellow cyan green magenta red blue"
-    assert ("load", "Passthru", 0) in doc.dev.calls
+    assert doc.dev.shell.loads == ["Passthru"]
     assert doc._link.calls[:2] == ["down", "up"]  # pylint: disable=protected-access
 
 

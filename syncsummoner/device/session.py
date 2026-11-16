@@ -7,7 +7,6 @@ manual value, so absolute addressing only exists relative to a parked reference.
 from __future__ import annotations
 
 import time
-from contextlib import ExitStack
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -311,18 +310,16 @@ class Session:
     def load_program(self, name: str, *, park: bool = True, link: Any = None) -> None:
         """Load a program and re-park.
 
-        An optional source ``link`` is held down across the reconfiguration,
-        because the FPGA runs on the clock recovered from the incoming video;
-        the transport returns once the device runs the program, waiting on
-        liveness rather than a fixed blackout. The drop clears the source
-        framebuffer: re-push any stimulus afterwards.
+        An optional source ``link`` is held down while the device takes the
+        ``program load`` command, and restored once it answers. The FPGA runs on
+        the clock recovered from the incoming video, so the transport waits for
+        the program to run only after that, on liveness rather than a fixed
+        blackout. The drop clears the source framebuffer: re-push any stimulus
+        afterwards.
         """
         self._note("load_program", program=name, link=link is not None)
         self._last_load = (name, link is not None)
-        with ExitStack() as stack:
-            if link is not None:
-                stack.enter_context(link.quiet())
-            self.transport.load_program(name)
+        self.transport.load_program(name, hold=None if link is None else link.quiet)
         assignment = self.transport.cc_assignment
         if assignment is not None:
             LOG.info("%s: %s", name, assignment.summary())
