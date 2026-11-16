@@ -626,7 +626,7 @@ def test_one_pass_never_waits_on_the_native_pipe(tmp_path):
     held = {}
     got = list(archive.reader("bitcrush", KEY).passes(width=64, native=[3, 30, 31], into=held))
     assert len(got) == len(made) and sorted(held) == [3, 30, 31]
-    assert all(int(held[i][0, 0, 0]) == pytest.approx(16 * (i % 12), abs=2) for i in held)
+    assert all(int(full[0, 0, 0]) == pytest.approx(16 * (i % 12), abs=2) for i, full in held.items())
 
 
 def test_a_scratch_recording_names_a_container_the_recorder_can_infer(tmp_path):
