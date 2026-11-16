@@ -90,7 +90,7 @@ def test_a_paused_picture_with_grain_is_live_but_frozen(tmp_path):
 @needs_ffmpeg
 def test_an_exactly_repeated_picture_is_live_but_frozen(tmp_path):
     report = judged(tmp_path, dark_footage(np.random.default_rng(2))[:1] * FRAMES)
-    assert report.live and report.frozen and np.isnan(report.motion) and "motion n/a" in str(report)
+    assert report.live and report.frozen and report.motion is None and "motion n/a" in str(report)
 
 
 @needs_ffmpeg

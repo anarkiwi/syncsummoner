@@ -119,14 +119,15 @@ class TakeReport:
     ``picture`` counts frames with spatial structure that are not the card's
     splash, ``splash`` the splash, and the rest are uniform fields. ``spread`` is
     the median frame's luma range in 8-bit steps, and ``motion`` the mean
-    correlation of consecutive frame differences, -0.5 for a held picture.
+    correlation of consecutive frame differences, -0.5 for a held picture, and
+    None when too few distinct frames define one.
     """
 
     frames: int = 0
     picture: int = 0
     splash: int = 0
     spread: int = 0
-    motion: float = math.nan
+    motion: float | None = None
     frozen: bool = True
     luma: float = 0.0
 
@@ -142,7 +143,7 @@ class TakeReport:
 
     def __str__(self) -> str:
         verdict = "" if self.usable else "  UNUSABLE: " + ("frozen" if self.live else "no picture")
-        motion = "n/a" if math.isnan(self.motion) else f"{self.motion:+.2f}"
+        motion = "n/a" if self.motion is None else f"{self.motion:+.2f}"
         return (
             f"{self.frames} frames: {self.picture} picture, {self.splash} splash, "
             f"{self.frames - self.picture - self.splash} uniform; luma range {self.spread}, "
@@ -150,7 +151,7 @@ class TakeReport:
         )
 
 
-def held(frames: np.ndarray) -> tuple[float, bool]:
+def held(frames: np.ndarray) -> tuple[float | None, bool]:
     """Mean correlation of consecutive frame differences, and whether they show one picture held.
 
     A held picture is one image plus noise independent from frame to frame, so
@@ -165,11 +166,11 @@ def held(frames: np.ndarray) -> tuple[float, bool]:
     cannot show motion.
     """
     if len(frames) < 4:
-        return math.nan, True
+        return None, True
     flat = frames.reshape(len(frames), -1)
     flat = flat[np.r_[True, np.any(flat[1:] != flat[:-1], axis=1)]]
     if len(flat) < 4:
-        return math.nan, True
+        return None, True
     step = np.diff(flat, axis=0)
     norm = np.linalg.norm(step, axis=1)
     corr = np.einsum("ij,ij->i", step[:-1], step[1:]) / (norm[:-1] * norm[1:])
