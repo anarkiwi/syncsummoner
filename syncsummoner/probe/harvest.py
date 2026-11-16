@@ -7,9 +7,12 @@ afterwards from the card's own capture times, so nothing paces or samples a loop
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
@@ -33,7 +36,7 @@ from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import codeframes, plans
 from syncsummoner.probe.archive import GAP, FrameRow
 from syncsummoner.probe.runner import raw_params
-from syncsummoner.probe.store import KeyKind, ProgramKey
+from syncsummoner.probe.store import KeyKind, ProgramKey, atomic_write
 
 __all__ = [
     "HarvestConfig",
@@ -48,9 +51,11 @@ __all__ = [
     "discard_dark",
     "harvest",
     "harvest_program",
+    "prepare_footage",
     "prove_passthrough",
     "rig_fault",
     "route_fault",
+    "run_stimulus",
     "stimulus_loop",
     "sweep",
     "sweep_vectors",
@@ -104,6 +109,8 @@ class HarvestConfig:
     health_poll_s: float = 10.0
     seed: int = 11
     loop_seed: int = 7
+    #: A prepared timecoded clip played in place of the codeframe loop; None plays the loop.
+    footage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -419,12 +426,66 @@ def stimulus_loop(config: HarvestConfig, rng: np.random.Generator | None = None)
 
 
 def upload_stimulus(player: Any, config: HarvestConfig, rng: np.random.Generator | None = None) -> int:
-    """Push the codeframe loop into the player's tmpfs; returns bytes sent.
+    """Push the footage clip, else the codeframe loop, into the player's tmpfs; returns bytes sent.
 
-    The loop is invariant across programs and setpoints, so it is paid for once
-    per run rather than once per pass.
+    The stimulus is invariant across programs and setpoints, so it is paid for
+    once per run rather than once per pass.
     """
+    if config.footage:
+        return player.upload(config.footage)
     return player.upload(stimulus_loop(config, rng).frames())
+
+
+def _sha256(path: Path) -> str:
+    """Hex digest of a file, read in chunks."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def prepare_footage(
+    source: Any,
+    directory: str | Path,
+    *,
+    render: Any,
+    write: Callable[..., int],
+    start: float = 0.0,
+    seconds: float | None = None,
+) -> dict[str, Any]:
+    """Write ``source`` with ``write`` as a timecoded clip at ``render``'s geometry, and its record.
+
+    The clip goes to ``stimulus.mkv`` and the record, written last as the commit
+    marker, to ``stimulus.json``; a record for the same excerpt whose clip still
+    hashes the same is reused, so a resumed run plays the picture it began with.
+    """
+    folder = Path(directory)
+    clip, marker = folder / "stimulus.mkv", folder / "stimulus.json"
+    wanted = {"source": str(source), "start": start, "seconds": seconds, "fps": render.fps}
+    try:
+        held = json.loads(marker.read_text(encoding="utf-8"))
+        if all(held.get(k) == v for k, v in wanted.items()) and held.get("sha256") == _sha256(clip):
+            return held
+    except (OSError, ValueError):
+        pass
+    folder.mkdir(parents=True, exist_ok=True)
+    frames = write(source, clip, config=render, seconds=seconds, start=start)
+    record = {
+        "kind": "footage",
+        "clip": clip.name,
+        "sha256": _sha256(clip),
+        "frames": int(frames),
+        "bits": render.bits,
+        "strip_px": render.strip_px,
+        **wanted,
+    }
+    atomic_write(marker, lambda tmp: tmp.write_text(json.dumps(record, indent=2), encoding="utf-8"))
+    return record
+
+
+def run_stimulus(config: HarvestConfig) -> dict[str, Any]:
+    """The record of what a run plays: the footage clip's own, else the codeframe loop's seed."""
+    if config.footage:
+        return json.loads(Path(config.footage).with_name("stimulus.json").read_text(encoding="utf-8"))
+    return {"kind": "codeframes", "loop_seed": config.loop_seed, "loop_frames": config.loop_frames}
 
 
 def discard_dark(archive: Any, program: str, key: ProgramKey, result: ProgramResult) -> ProgramResult:
@@ -451,6 +512,7 @@ def harvest_program(
     rng: np.random.Generator,
     link: Any = None,
     player: Any = None,
+    stimulus: dict[str, Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> ProgramResult:
@@ -458,7 +520,7 @@ def harvest_program(
 
     The load drops the source link and blacks the output, so the transmitter is
     waited for before the recording starts rather than measured through it, and
-    confirmed again at both ends of the recording.
+    confirmed again at both ends of the recording. ``stimulus`` defaults to :func:`run_stimulus`.
     """
     start = clock()
     session.load_program(program, park=True, link=link)
@@ -507,6 +569,7 @@ def harvest_program(
             height=config.height,
             fps=config.capture_fps,
             program_info=payload,
+            stimulus=run_stimulus(config) if stimulus is None else stimulus,
         )
     finally:
         video.unlink(missing_ok=True)
@@ -549,6 +612,7 @@ def harvest(
     rng = np.random.default_rng(config.seed) if rng is None else rng
     note = log if log is not None else lambda _message: None
     archive.directory.mkdir(parents=True, exist_ok=True)
+    stimulus = run_stimulus(config)
     if player is not None:
         upload_stimulus(player, config)
     note("waiting for a device that will hold a program")
@@ -568,14 +632,23 @@ def harvest(
                 sleep(config.startup_s)
             for name in () if fault else names:
                 key = ProgramKey(name, firmware, KeyKind.NAME_FIRMWARE)
-                if archive.has(name, key) or (not retry_dark and archive.dark(name, key)):
+                if archive.has(name, key, stimulus=stimulus) or (not retry_dark and archive.dark(name, key)):
                     results.append(ProgramResult(name))
                     note(str(results[-1]))
                     continue
                 try:
                     results.append(
                         harvest_program(
-                            session, recorder, archive, transport, name, key, config=config, rng=rng, **live
+                            session,
+                            recorder,
+                            archive,
+                            transport,
+                            name,
+                            key,
+                            config=config,
+                            rng=rng,
+                            stimulus=stimulus,
+                            **live,
                         )
                     )
                 except Exception as exc:

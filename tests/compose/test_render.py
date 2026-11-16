@@ -64,6 +64,18 @@ class FakeRig(R.Rig):
         return self.last
 
 
+@pytest.fixture(autouse=True)
+def _unjudged(monkeypatch):
+    """Takes here are stand-ins with no picture to judge; the check has tests of its own."""
+    from syncsummoner.compose import takecheck
+
+    monkeypatch.setattr(
+        takecheck,
+        "check_takes",
+        lambda score, plan, takes, clip, **kw: takecheck.CheckReport(cuts=list(plan)),
+    )
+
+
 def source_stack(n=12, h=24, w=32):
     rng = np.random.default_rng(0)
     return rng.uniform(0.1, 0.9, (n, h, w, 3)).astype(np.float32)
@@ -358,23 +370,6 @@ def test_a_score_with_no_sections_cuts_once():
         R.cut_plan(score, [])
 
 
-def test_assembling_takes_each_span_from_its_own_pass(monkeypatch, tmp_path):
-    seen = {}
-
-    def run(argv, check=False, capture_output=False):
-        del check, capture_output
-        seen["argv"] = argv
-        return types.SimpleNamespace(returncode=0, stderr=b"")
-
-    monkeypatch.setattr(R.subprocess, "run", run)
-    cuts = [R.Cut(0.0, 5.0, "X"), R.Cut(5.0, 9.0, "Y"), R.Cut(9.0, 12.0, "X")]
-    R.assemble(cuts, {"X": tmp_path / "x.mkv", "Y": tmp_path / "y.mkv"}, tmp_path / "out.mkv")
-    argv = seen["argv"]
-    assert argv.count("-i") == 3, "one input per cut, from that cut's take"
-    assert argv[argv.index("-ss") + 1] == "0.000" and "concat=n=3" in " ".join(argv)
-    assert str(tmp_path / "y.mkv") in argv, "the middle span comes from the other program"
-
-
 def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypatch, tmp_path):
     """A blank pass must not be spliced into a demo as though it were footage."""
     calls = []
@@ -385,8 +380,7 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
         blank = score.layers[0].program == "Bad"
         return R.TakeReport(frames=10, picture=0 if blank else 10, frozen=blank, luma=0.4)
 
-    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     score = Score(
         seed=1,
         bpm=120.0,
@@ -607,8 +601,7 @@ def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_pa
         seen[layer.program] = [g.gesture for g in layer.gestures]
         return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
 
-    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     score = Score(
         duration=20.0,
         sections=[Section(0.0, 7.0, "A"), Section(7.0, 14.0, "B"), Section(14.0, 20.0, "C")],
@@ -633,8 +626,7 @@ def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_pa
 def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_path):
     """Burning it per pass would cost minutes a program for a clip that never changes."""
     built, passes = [], []
-    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     monkeypatch.setattr(R, "write_timecoded", lambda source, out, **kw: built.append(out) or 1)
 
     def fake_render(score, source, out, **kwargs):
@@ -770,29 +762,6 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
     ]
 
 
-def test_a_cut_is_taken_past_each_takes_own_lead_in(monkeypatch, tmp_path):
-    seen = []
-    monkeypatch.setattr(
-        R.subprocess,
-        "run",
-        lambda argv, **kw: seen.append(argv) or types.SimpleNamespace(returncode=0, stderr=b""),
-    )
-    cuts = [R.Cut(0.0, 5.0, "Derez"), R.Cut(5.0, 9.0, "Lorenz")]
-    R.assemble(
-        cuts,
-        {"Derez": tmp_path / "d.mkv", "Lorenz": tmp_path / "l.mkv"},
-        tmp_path / "out.mkv",
-        starts={"Derez": 2.0},
-    )
-    argv = seen[0]
-    assert argv[argv.index("-ss") + 1] == "2.000" and argv[argv.index("-to") + 1] == "7.000"
-    assert argv[argv.index(str(tmp_path / "l.mkv")) - 3 : argv.index(str(tmp_path / "l.mkv"))] == [
-        "-to",
-        "9.000",
-        "-i",
-    ]
-
-
 def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):
     """Writing to a dead encoder raises a broken pipe, which says nothing about why."""
     monkeypatch.setattr(
@@ -827,8 +796,7 @@ def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):
 
 def test_cut_render_makes_room_for_its_takes(monkeypatch, tmp_path):
     """A pass that fails on a missing directory has already spent the load on it."""
-    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     takes = tmp_path / "takes"
     R.render_cuts(
         Score(duration=20.0, sections=[Section(0.0, 20.0, "A")], layers=[Layer("Good", 0, [])]),
@@ -845,8 +813,7 @@ def test_cut_render_makes_room_for_its_takes(monkeypatch, tmp_path):
 
 def test_programs_beyond_the_sections_are_reported_not_dropped(monkeypatch, tmp_path, caplog):
     """Naming eight programs against three sections renders three; silence would read as eight."""
-    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     with caplog.at_level("WARNING", logger="syncsummoner"):
         plan = R.render_cuts(
             Score(
@@ -926,8 +893,7 @@ def offering(*listings):
 
 def cut_render(monkeypatch, tmp_path, available):
     """Render cuts for Quilt and Pinwheel against ``available``, with passes that succeed at once."""
-    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     score = Score(duration=4.0, fps=30.0, sections=[Section(0.0, 2.0, "A"), Section(2.0, 4.0, "B")])
     return R.render_cuts(
         score,

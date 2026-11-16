@@ -420,3 +420,59 @@ def test_a_sweep_that_never_isolates_a_parameter_still_separates_them():
     axes = {s.index: s.axis for s in profile.params}
     assert axes[1] is Axis.COLOR_DESTRUCTION, "the chroma driver is not a texture parameter"
     assert axes[2] is Axis.MOTION_RATE, "the motion driver is not a texture parameter"
+
+
+def sobol_records(seed, n=256):
+    """A scrambled Sobol sweep of every parameter: a gentle response to p1, a strong one to p2."""
+    from scipy.stats import qmc  # pylint: disable=import-outside-toplevel
+
+    raw = np.rint(qmc.Sobol(d=12, scramble=True, seed=seed).random(n) * PARAM_MAX).astype(int)
+    noise = np.random.default_rng(seed).standard_normal(n)
+    unit = raw / PARAM_MAX
+    level = 0.2 * np.sin(np.pi * unit[:, 0]) + 2 * unit[:, 1] + 0.02 * noise
+    rows = [
+        a_record(params=tuple(int(v) for v in vector), metrics={"concentration": float(y)})
+        for vector, y in zip(raw, level)
+    ]
+    return rows, raw
+
+
+def test_a_sobol_sweep_gives_each_parameter_its_own_smooth_marginal():
+    """The raw per-value curve of p1 carries p2's swing; the conditional mean does not."""
+    tracking = []
+    for seed in range(5):
+        rows, raw = sobol_records(seed)
+        spec = fit.fit_profile(rows).params[0]
+        values = np.asarray(spec.values)
+        curve = np.asarray(spec.measured["concentration"])
+        order = np.argsort(raw[:, 0], kind="stable")
+        per_value = np.array([rows[i].metrics["concentration"] for i in order])
+        assert np.array_equal(values, np.unique(raw[:, 0]))
+        assert np.abs(np.diff(curve)).sum() < 0.1 * np.abs(np.diff(per_value)).sum()
+        tracking.append(np.corrcoef(curve, np.sin(np.pi * values / PARAM_MAX))[0, 1])
+    assert min(tracking) > 0.5 and np.median(tracking) > 0.8
+
+
+def test_a_boolean_parameter_keeps_its_per_value_means():
+    """Replicates at two values support no width wider than zero, so each value's mean stands."""
+    rng = np.random.default_rng(2)
+    levels = {0: 0.2, PARAM_MAX: 0.8}
+    rows = [
+        record({7: v}, {"clip_frac": levels[v] + 0.01 * rng.standard_normal()}) for v in (0, PARAM_MAX) * 6
+    ]
+    spec = fit.fit_profile(rows).params[6]
+    means = [np.mean([r.metrics["clip_frac"] for r in rows if r.params[6] == v]) for v in (0, PARAM_MAX)]
+    assert spec.values == [0, PARAM_MAX]
+    assert spec.measured["clip_frac"] == pytest.approx(means)
+
+
+def test_survival_metrics_are_kept_as_measured_curves():
+    """The planner reads what a program keeps of footage from the same curves as the rest."""
+    rows = [
+        record({1: v}, {"si_ratio": 1.0 - v / 2046, "ti_ratio": 1.0 - v / 1023, "motion_follow": 0.9})
+        for v in GRID
+    ]
+    rows[0].metrics["motion_follow"] = 0.8
+    spec = fit.fit_profile(rows).params[0]
+    assert {"si_ratio", "ti_ratio", "motion_follow"} <= set(spec.measured)
+    assert spec.measured["ti_ratio"][0] > spec.measured["ti_ratio"][-1]

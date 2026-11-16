@@ -25,18 +25,28 @@ from syncsummoner.probe.store import ProgramKey, atomic_write, slug
 
 __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
+    "CODEFRAMES",
     "DARK_SUFFIX",
     "DECODERS",
     "GAP",
     "PROGRAM_INFO",
+    "READABLE_SCHEMAS",
+    "STIMULUS",
     "ArchiveError",
     "FrameArchive",
     "FrameReader",
     "FrameRow",
+    "is_footage",
+    "same_stimulus",
+    "stimulus_of",
 ]
 
-#: Version 3 is recorded by ffmpeg with the chroma pair put back; 1 and 2 stored it exchanged.
-ARCHIVE_SCHEMA_VERSION = 3
+#: 4 names its stimulus (3 played the codeframe loop); 3 put the chroma pair back, 1 and 2 swapped it.
+ARCHIVE_SCHEMA_VERSION = 4
+READABLE_SCHEMAS = frozenset({3, ARCHIVE_SCHEMA_VERSION})
+#: Metadata key naming what was played while an archive was recorded.
+STIMULUS = "stimulus"
+CODEFRAMES = {"kind": "codeframes"}
 #: Fallback container rate; the capture time of every frame is in the sidecar.
 ARCHIVE_FPS = 30
 CONTAINER = "matroska"
@@ -76,6 +86,22 @@ DECODERS = {
 }
 #: Frames the automatic choice decodes both ways before trusting the GPU with an archive.
 PROBE_FRAMES = 8
+
+
+def stimulus_of(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """What an archive was recorded against: its metadata's own record, else the codeframe loop."""
+    return dict(meta.get(STIMULUS) or CODEFRAMES)
+
+
+def is_footage(meta: Mapping[str, Any]) -> bool:
+    """Whether an archive was recorded against a timecoded footage clip."""
+    return stimulus_of(meta).get("kind") == "footage"
+
+
+def same_stimulus(stored: Mapping[str, Any], asked: Mapping[str, Any]) -> bool:
+    """Whether two stimulus records name the same picture: one kind, and for footage one clip digest."""
+    fields = ("kind", "sha256") if asked.get("kind") == "footage" else ("kind",)
+    return all(stored.get(name) == asked.get(name) for name in fields)
 
 
 class ArchiveError(RuntimeError):
@@ -137,6 +163,19 @@ def _drain(pipe: Any, shape: tuple, positions: Sequence[int], into: dict) -> Non
         into[position] = np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape)
 
 
+def _drain_all(pipe: Any, shape: tuple, into: list) -> None:
+    """Read every frame of ``shape`` off ``pipe`` into ``into``, until it ends."""
+    size = int(np.prod(shape))
+    while len(buf := pipe.read(size)) == size:
+        into.append(np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape))
+
+
+def _drained(fd: int, drain: Callable[[Any], None]) -> None:
+    """Run ``drain`` on the read end of a pipe, closing it after."""
+    with os.fdopen(fd, "rb") as pipe:
+        drain(pipe)
+
+
 def _last_line(stderr: bytes | str | None) -> str:
     """The last thing a decoder said, which is where it says why it stopped."""
     text = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr or ""
@@ -186,11 +225,12 @@ class FrameReader:
         """Frames in the stream."""
         return int(self.meta["frames"])
 
-    def shape(self, width: int | None = None) -> tuple[int, int, int]:
-        """Shape frames come back in, at full size or scaled to ``width``."""
+    def shape(self, width: int | None = None, strip_px: int = 0) -> tuple[int, int, int]:
+        """Shape frames come back in, at full size or scaled to ``width``, less ``strip_px`` native rows."""
+        height = self.height - int(strip_px)
         if not width or width >= self.width:
-            return (self.height, self.width, CHANNELS)
-        return (2 * round(self.height * width / self.width / 2), int(width), CHANNELS)
+            return (height, self.width, CHANNELS)
+        return (2 * round(height * width / self.width / 2), int(width), CHANNELS)
 
     def command(self, *, start: int = 0, count: int = 1, width: int | None = None) -> list[str]:
         """Decoder argv emitting ``count`` frames from ``start`` as RGB on stdout.
@@ -220,41 +260,65 @@ class FrameReader:
         return f"scale={int(width)}:-2" if width and width < self.width else "null"
 
     def passes(
-        self, *, width: int | None = None, native: Iterable[int] = (), into: dict | None = None
+        self,
+        *,
+        width: int | None = None,
+        native: Iterable[int] = (),
+        into: dict | None = None,
+        strip_px: int = 0,
+        strips: list | None = None,
     ) -> Iterator[np.ndarray]:
         """Yield every frame at ``width`` in stream order, keeping those at ``native`` full size.
 
-        One decoder feeds both through a split filter graph, so the archive is read
-        once. The full-size frames land in ``into`` by stream position, complete once
-        the iterator ends; a thread drains them, since a decoder writing two pipes
-        stalls whichever one is not being read.
+        One decoder feeds every output through a split filter graph, so the archive is read once;
+        each side output is drained by its own thread, a decoder writing several pipes stalling on
+        whichever is not read. ``strip_px`` crops the strip off what is yielded; ``strips`` keeps it.
         """
         keep = sorted({int(i) for i in native if 0 <= int(i) < self.count})
-        argv = [*self._head(), "-i", str(self.video)]
-        if not keep:
-            argv += [
-                "-filter_complex",
-                f"[0:v]{self._download}{self._scale(width)}[s]",
-                "-map",
-                "[s]",
-                *_RAW_OUT,
-                "pipe:1",
-            ]
-            yield from self._frames(argv, self.shape(width), self.count, ())
-            return
-        picked = "+".join(f"eq(n\\,{i})" for i in keep)
-        graph = f"[0:v]{self._download}split[a][b];[a]{self._scale(width)}[s];[b]select='{picked}'[n]"
-        read_fd, write_fd = os.pipe()
-        argv += ["-filter_complex", graph, "-map", "[s]", *_RAW_OUT, "pipe:1"]
-        argv += ["-map", "[n]", *_RAW_OUT, f"pipe:{write_fd}"]
-        held = {} if into is None else into
-        with os.fdopen(read_fd, "rb") as side:
-            drain = threading.Thread(target=_drain, args=(side, self.shape(), keep, held), daemon=True)
-            try:
-                yield from self._frames(argv, self.shape(width), self.count, (write_fd,), started=drain.start)
-            finally:
-                if drain.is_alive():
-                    drain.join()
+        crop = int(strip_px) if strip_px and strip_px > 0 else 0
+        sides = []
+        if keep:
+            picked = "+".join(f"eq(n\\,{i})" for i in keep)
+            held = {} if into is None else into
+            sides.append((f"select='{picked}'", lambda pipe: _drain(pipe, self.shape(), keep, held)))
+        if crop and strips is not None:
+            shape = (crop, self.width, CHANNELS)
+            sides.append((f"crop=iw:{crop}:0:ih-{crop}", lambda pipe: _drain_all(pipe, shape, strips)))
+        body = (f"crop=iw:ih-{crop}:0:0," if crop else "") + self._scale(width)
+        heads = "".join(f"[o{i}]" for i in range(len(sides) + 1))
+        graph = (
+            f"[0:v]{self._download}" + (f"split={len(sides) + 1}{heads};[o0]" if sides else "") + f"{body}[s]"
+        )
+        graph += "".join(f";[o{i + 1}]{chain}[x{i}]" for i, (chain, _) in enumerate(sides))
+        argv = [
+            *self._head(),
+            "-i",
+            str(self.video),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[s]",
+            *_RAW_OUT,
+            "pipe:1",
+        ]
+        fds, threads = [], []
+        for i, (_, drain) in enumerate(sides):
+            read_fd, write_fd = os.pipe()
+            argv += ["-map", f"[x{i}]", *_RAW_OUT, f"pipe:{write_fd}"]
+            fds.append(write_fd)
+            threads.append(threading.Thread(target=_drained, args=(read_fd, drain), daemon=True))
+        try:
+            yield from self._frames(
+                argv,
+                self.shape(width, crop),
+                self.count,
+                tuple(fds),
+                started=lambda: [t.start() for t in threads],
+            )
+        finally:
+            for thread in threads:
+                if thread.is_alive():
+                    thread.join()
 
     def _frames(
         self,
@@ -360,14 +424,20 @@ class FrameArchive:
             return None
         if str(meta.get("pix_fmt")) != CAPTURE_PIX_FMT:
             return None
-        if int(meta.get("schema_version", 0)) != ARCHIVE_SCHEMA_VERSION:
+        if int(meta.get("schema_version", 0)) not in READABLE_SCHEMAS:
             return None
         return meta if video.exists() and data.exists() else None
 
-    def has(self, program: str, key: ProgramKey) -> bool:
-        """True when a committed archive for ``program`` was keyed on ``key``."""
+    def has(self, program: str, key: ProgramKey, stimulus: Mapping[str, Any] | None = None) -> bool:
+        """True when a committed archive for ``program`` was keyed on ``key``.
+
+        With ``stimulus`` it must also have been recorded against the same one:
+        the same kind and, for footage, the same clip by digest.
+        """
         meta = self.meta(program)
-        return meta is not None and meta.get("key_digest") == key.digest
+        if meta is None or meta.get("key_digest") != key.digest:
+            return False
+        return stimulus is None or same_stimulus(stimulus_of(meta), stimulus)
 
     def dark_path(self, program: str) -> Path:
         """Where a program's dark verdict is recorded."""
@@ -454,14 +524,15 @@ class FrameArchive:
         height: int,
         fps: float = ARCHIVE_FPS,
         program_info: Mapping[str, Any] | None = None,
+        stimulus: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Publish a recording as this program's archive: video, sidecar, then marker.
 
         The metadata is written last and is the commit marker, as in the result
         store: a run killed mid-recording leaves at most an uncommitted temp file.
         ``program_info`` is the device's reply for the program, kept so a refit
-        knows each parameter's name and native range. A committed archive
-        supersedes any earlier dark verdict for the program.
+        knows each parameter's name and native range, and ``stimulus`` names what was
+        played. A committed archive supersedes any earlier dark verdict for the program.
         """
         if not rows:
             raise ArchiveError(f"no frames archived for {program!r}")
@@ -495,6 +566,8 @@ class FrameArchive:
         }
         if program_info is not None:
             meta[PROGRAM_INFO] = dict(program_info)
+        if stimulus is not None:
+            meta[STIMULUS] = dict(stimulus)
         self._write_meta(meta_path, meta)
         self.dark_path(program).unlink(missing_ok=True)
         return meta

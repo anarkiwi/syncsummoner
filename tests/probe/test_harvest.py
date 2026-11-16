@@ -16,7 +16,7 @@ from syncsummoner.device.recorder import BlankTakeError, InputRouteError, TakeRe
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import harvest as H
-from syncsummoner.probe.archive import GAP
+from syncsummoner.probe.archive import CODEFRAMES, GAP, same_stimulus
 from syncsummoner.probe.store import KeyKind, ProgramKey, slug
 from tests import transmitter as tx
 from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport
@@ -164,6 +164,7 @@ class Archive:
     def __init__(self, directory, stored=()):
         self.directory = Path(directory)
         self.stored = {program: key.digest for program, key in stored}
+        self.stimuli = {}
         self.rows = {}
         self.infos = {}
         self.keys = {}
@@ -173,8 +174,9 @@ class Archive:
         self.marked_key = {}
         self.dark_luma = {}
 
-    def has(self, program, key):
-        return self.stored.get(program) == key.digest
+    def has(self, program, key, stimulus=None):
+        held = self.stimuli.get(program, CODEFRAMES)
+        return self.stored.get(program) == key.digest and (stimulus is None or same_stimulus(held, stimulus))
 
     def dark(self, program, key):
         return self.marked_key.get(program) == key.digest
@@ -195,8 +197,9 @@ class Archive:
         self.directory.mkdir(parents=True, exist_ok=True)
         return self.directory / f"{slug(program)}.scratch.mkv"
 
-    def commit(self, program, key, video, rows, *, width, height, fps, program_info=None):
+    def commit(self, program, key, video, rows, *, width, height, fps, program_info=None, stimulus=None):
         assert Path(video).exists(), "the recording is published, not re-encoded"
+        self.stimuli[program] = dict(stimulus or CODEFRAMES)
         self.infos[program] = program_info
         self.keys[program] = key
         self.rows[program] = list(rows)
@@ -215,16 +218,19 @@ class Player:
         self.running = running
         self.starts = 0
         self.stopped = 0
+        self.sent = None
+        self.rates = []
 
     def upload(self, frames):
-        self.uploaded += len(list(frames))
+        self.uploaded += 1 if isinstance(frames, str) else len(list(frames))
+        self.sent = frames
         return self.uploaded
 
     def is_running(self):
         return self.running
 
     def start(self, *, fps):
-        del fps
+        self.rates.append(fps)
         self.starts += 1
         self.running = True
         return 1

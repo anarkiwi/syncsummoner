@@ -53,7 +53,7 @@ def test_a_vulkan_one_pass_graph_downloads_once_ahead_of_the_split(tmp_path):
             list(reader.passes(width=16, native=native))
     graphs = [argv[argv.index("-filter_complex") + 1] for argv in seen]
     assert graphs[0] == f"[0:v]{DOWNLOAD},scale=16:-2[s]"
-    assert graphs[1].startswith(f"[0:v]{DOWNLOAD},split[a][b];") and graphs[1].count("hwdownload") == 1
+    assert graphs[1].startswith(f"[0:v]{DOWNLOAD},split=2[o0][o1];") and graphs[1].count("hwdownload") == 1
 
 
 def test_the_download_is_to_the_format_the_archive_stored(tmp_path):

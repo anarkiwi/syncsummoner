@@ -190,6 +190,34 @@ def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tm
     assert "Roll Shutter: BlankTakeError: no picture" in err, "every failed program is named with its error"
 
 
+def test_probe_archive_without_footage_plays_the_codeframe_loop(harvested, tmp_path):
+    from syncsummoner.device.playout import LoopPlayer
+
+    assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 0
+    assert isinstance(harvested["player"], LoopPlayer) and harvested["config"].footage is None
+
+
+def test_probe_archive_with_footage_loops_the_prepared_clip_at_the_session_rate(
+    harvested, tmp_path, monkeypatch, capsys
+):
+    from syncsummoner.device.playout import ClipPlayer
+
+    asked = []
+
+    def fake_prepare(source, directory, **kwargs):
+        asked.append((source, directory, kwargs["start"], kwargs["seconds"], kwargs["render"].timing))
+        return {"clip": "stimulus.mkv", "frames": 90, "fps": 30.0, "source": source, "sha256": "f00d" * 16}
+
+    monkeypatch.setattr(harvest_mod, "prepare_footage", fake_prepare)
+    argv = ["probe", "archive", "--out", str(tmp_path), "--footage", "film.mp4", "--footage-start", "4"]
+    assert cli.main(argv + ["--footage-seconds", "3"]) == 0
+    assert asked == [("film.mp4", str(tmp_path), 4.0, 3.0, "1080p30")]
+    player, config = harvested["player"], harvested["config"]
+    assert isinstance(player, ClipPlayer) and player.loop
+    assert config.footage == str(tmp_path / "stimulus.mkv") and config.loop_fps == 30.0
+    assert "90 frames (3.0s) of film.mp4, sha256 f00df00df00d" in capsys.readouterr().err
+
+
 def test_the_stall_guard_is_off_unless_asked_for(harvested, tmp_path):
     """Device waits run on liveness; ``--stall`` is the opt-in guard an unattended run may set."""
     assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 0
@@ -301,7 +329,18 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe names", ["--archive", "--program"]),
         ("score show", ["--profiles"]),
-        ("probe archive", ["--capture", "--setpoints", "--dwell", "--format", "--no-link"]),
+        (
+            "probe archive",
+            [
+                "--capture",
+                "--setpoints",
+                "--dwell",
+                "--format",
+                "--no-link",
+                "--footage",
+                "--footage-seconds",
+            ],
+        ),
     ],
 )
 def test_every_documented_flag_is_actually_registered(command, flags, capsys):
@@ -539,3 +578,63 @@ def test_render_timing_flags_reach_the_config(monkeypatch, tmp_path):
     assert cli.main(argv + ["--latency-ms", "25", "--measure-latency", "--cc-budget", "150"]) == 0
     config = seen["render"][3]["config"]
     assert (config.latency_s, config.measure_latency, config.cc_budget_hz) == (0.025, True, 150.0)
+
+
+def _check_stubs(monkeypatch, seen, *, failed=False):
+    """Stand in for the take check and the splice, recording what each was handed."""
+    import numpy as np
+
+    from syncsummoner.compose import render as render_mod
+    from syncsummoner.compose import takecheck
+
+    def check(score, plan, takes, clip, **kw):
+        del score
+        seen["check"] = (list(plan), dict(takes), clip, kw)
+        traces = {name: takecheck.Trace(np.arange(3), None, None, None, None, "strip") for name in takes}
+        dead = [takecheck.DeadSpan(plan[0].program, 0.0, 1.0, takecheck.Fault.FLAT, None)] if failed else []
+        covered = [render_mod.Cut(0.0, 120.0, "Covering")]
+        return takecheck.CheckReport(cuts=covered, spans=dead, traces=traces)
+
+    monkeypatch.setattr(takecheck, "check_takes", check)
+    monkeypatch.setattr(
+        render_mod,
+        "splice",
+        lambda cuts, takes, picked, out, **kw: seen.update(splice=(cuts, picked, out, kw)),
+    )
+
+
+def test_a_master_is_checked_on_the_identity_clock(monkeypatch, tmp_path, capsys):
+    from syncsummoner.probe.footage import ClockModel
+
+    seen = {}
+    _check_stubs(monkeypatch, seen, failed=True)
+    argv = [
+        "check",
+        _score_file(tmp_path),
+        "--source",
+        "clip.mkv",
+        "--master",
+        "m.mp4",
+        "--cut-programs",
+        "A,B",
+    ]
+    assert cli.main(argv) == 1
+    plan, takes, clip, kw = seen["check"]
+    assert takes == {"master": "m.mp4"} and clip == "clip.mkv" and [c.program for c in plan] == ["master"]
+    assert kw["models"] == {"master": ClockModel.identity(60.0)} and "splice" not in seen
+    assert cli.main(argv + ["--splice", "x.mp4"]) == 1
+    assert "--splice cuts takes, not a master" in capsys.readouterr().err
+
+
+def test_check_splices_the_covered_plan_or_the_plan_as_rendered(monkeypatch, tmp_path):
+    seen = {}
+    _check_stubs(monkeypatch, seen)
+    out = str(tmp_path / "v3.mp4")
+    argv = ["check", _score_file(tmp_path), "--source", "clip.mkv", "--takes", "t", "--cut-programs", "A"]
+    assert cli.main(argv + ["--splice", out]) == 0
+    cuts, picked, written, kw = seen["splice"]
+    assert [c.program for c in cuts] == ["Covering"] and written == out and set(picked) == {"A"}
+    assert (kw["config"].width, kw["config"].fps) == (1920, 60.0)
+    assert seen["check"][1] == {"A": str(Path("t") / "take-A.mkv")}
+    assert cli.main(argv + ["--splice", out, "--as-planned"]) == 0
+    assert [c.program for c in seen["splice"][0]] == ["A"]

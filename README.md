@@ -31,6 +31,7 @@ syncsummoner manifest /media/card/programs [--write]   # rebuild manifest.json f
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/
 syncsummoner probe sim --program blur --image zoneplate.png
 syncsummoner probe archive --out archive/    # native frames for every program, resumable
+syncsummoner probe archive --footage source.mkv --out archive/   # the same, against looped real footage
 syncsummoner probe names --archive archive/   # add each program's program info to its archive
 syncsummoner probe refit --archive archive/ --out profiles/   # profiles from the archive, no device
 
@@ -45,6 +46,9 @@ syncsummoner score show score.yaml --profiles profiles/   # what each layer driv
 syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4
 syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
                     --cut-programs Derez,Lorenz,Scramble --fade 1.5 -o final.mp4
+syncsummoner check score.yaml --source timecoded.mkv --takes takes/ \
+                   --cut-programs Derez,Lorenz,Scramble [--splice cut.mp4]   # dead picture per take
+syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
 ```
 
 Every command logs each stage and its elapsed time to stderr (`-v` for detail,

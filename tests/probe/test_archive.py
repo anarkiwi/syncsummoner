@@ -12,11 +12,14 @@ import pytest
 from syncsummoner.probe import fit
 from syncsummoner.probe.archive import (
     ARCHIVE_SCHEMA_VERSION,
+    CODEFRAMES,
     CHANNELS,
     GAP,
     ArchiveError,
     FrameArchive,
     FrameRow,
+    is_footage,
+    stimulus_of,
 )
 from syncsummoner.probe.store import KeyKind, ProgramKey
 
@@ -109,7 +112,7 @@ def archive_at(tmp_path, **kwargs):
     return FrameArchive(tmp_path / "raw", clock=lambda: CLOCK, **kwargs)
 
 
-def write_archive(tmp_path, count=4, *, program="bitcrush", key=KEY, gaps=(), **kwargs):
+def write_archive(tmp_path, count=4, *, program="bitcrush", key=KEY, gaps=(), stimulus=None, **kwargs):
     """Commit a recording of ``count`` synthetic frames, as the recorder would leave it."""
     kwargs.setdefault("run", FakeDecoder(FPS, SIZE))
     archive = archive_at(tmp_path, **kwargs)
@@ -124,6 +127,7 @@ def write_archive(tmp_path, count=4, *, program="bitcrush", key=KEY, gaps=(), **
         width=SIZE[1],
         height=SIZE[0],
         fps=FPS,
+        stimulus=stimulus,
     )
     return archive, made, meta
 
@@ -154,7 +158,7 @@ def test_metadata_is_self_describing(tmp_path):
     """Metadata names the key, the geometry, the codec and the yield."""
     archive, made, _ = write_archive(tmp_path, 4, gaps=(3,))
     meta = json.loads(archive.paths("bitcrush")[2].read_text(encoding="utf-8"))
-    assert meta["schema_version"] == ARCHIVE_SCHEMA_VERSION == 3
+    assert meta["schema_version"] == ARCHIVE_SCHEMA_VERSION == 4
     assert meta["program"] == "bitcrush"
     assert (meta["key_kind"], meta["key_material"], meta["key_digest"]) == (
         "binary",
@@ -636,3 +640,72 @@ def test_a_scratch_recording_names_a_container_the_recorder_can_infer(tmp_path):
     assert scratch.suffix == archive.paths("bitcrush")[0].suffix
     assert scratch.name.startswith("."), "an uncommitted recording is not an archive"
     assert scratch != archive.paths("bitcrush")[0] and scratch.parent == archive.directory
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_passes_crop_the_strip_and_keep_it(tmp_path):
+    """A footage archive's analysis frames lose the strip, which is kept row for row at native width."""
+    made = [np.full((48, 64, CHANNELS), 16 * i, np.uint8) for i in range(6)]
+    for i, frame in enumerate(made):
+        frame[-8:] = 255 - 16 * i
+    source = tmp_path / "source.rgb"
+    source.write_bytes(b"".join(f.tobytes() for f in made))
+    archive = archive_at(tmp_path, threads=1)
+    scratch = archive.scratch("bitcrush")
+    encode_ffv1(source, scratch, height=48, width=64)
+    archive.commit("bitcrush", KEY, scratch, rows(len(made)), width=64, height=48, fps=FPS)
+    strips, held = [], {}
+    reader = archive.reader("bitcrush", KEY)
+    got = list(reader.passes(width=32, native=[2], into=held, strip_px=8, strips=strips))
+    assert len(got) == 6 and got[0].shape == reader.shape(32, 8) == (20, 32, 3)
+    assert all(abs(int(g.max()) - 16 * i) <= 2 for i, g in enumerate(got))
+    assert len(strips) == 6 and strips[0].shape == (8, 64, 3)
+    assert all(abs(int(s.min()) - (255 - 16 * i)) <= 2 for i, s in enumerate(strips))
+    assert set(held) == {2} and held[2].shape == (48, 64, 3)
+
+
+def test_a_version_3_archive_still_reads_as_a_codeframe_run(tmp_path):
+    """Archives from before the stimulus was recorded refit as what they were: the codeframe loop."""
+    archive, _, _ = write_archive(tmp_path)
+    meta_path = archive.paths("bitcrush")[2]
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta_path.write_text(json.dumps(meta | {"schema_version": 3}), encoding="utf-8")
+    meta = archive.meta("bitcrush")
+    assert meta is not None and stimulus_of(meta) == CODEFRAMES and not is_footage(meta)
+    assert is_footage({"stimulus": {"kind": "footage"}})
+
+
+FOOTAGE = {"kind": "footage", "clip": "stimulus.mkv", "sha256": "ab" * 32, "frames": 90}
+
+
+def test_commit_records_the_stimulus_it_was_given(tmp_path):
+    """The metadata names the stimulus played, and a footage run reads back as one."""
+    archive, _, meta = write_archive(tmp_path, stimulus=FOOTAGE)
+    assert meta["stimulus"] == FOOTAGE and archive.meta("bitcrush")["stimulus"] == FOOTAGE
+    assert is_footage(archive.meta("bitcrush"))
+
+
+def test_without_a_stimulus_the_commit_reads_as_codeframes(tmp_path):
+    """No stimulus given leaves the key out, which reads as the codeframe loop."""
+    archive, _, meta = write_archive(tmp_path)
+    assert "stimulus" not in meta and stimulus_of(archive.meta("bitcrush")) == CODEFRAMES
+
+
+@pytest.mark.parametrize(
+    "stored, asked, held",
+    [
+        (None, FOOTAGE, False),
+        (FOOTAGE, {**FOOTAGE, "sha256": "cd" * 32}, False),
+        (FOOTAGE, {**FOOTAGE, "frames": 30, "clip": "other.mkv"}, True),
+        (FOOTAGE, {"kind": "codeframes", "loop_seed": 7}, False),
+        (None, {"kind": "codeframes", "loop_seed": 7}, True),
+        ({"kind": "codeframes", "loop_seed": 7}, CODEFRAMES, True),
+        (FOOTAGE, None, True),
+    ],
+)
+def test_has_resumes_only_against_the_same_stimulus(tmp_path, stored, asked, held):
+    """Footage matches by kind and clip digest, codeframes by kind; no stimulus asks only the key."""
+    archive, _, _ = write_archive(tmp_path, stimulus=stored)
+    assert archive.has("bitcrush", KEY, stimulus=asked) is held
+    assert archive.has("bitcrush", KEY) is True
+    assert archive.has("bitcrush", ProgramKey("bitcrush", "cafe", KeyKind.BINARY), stimulus=asked) is False

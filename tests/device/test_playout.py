@@ -191,3 +191,39 @@ def test_a_clip_player_allows_a_whole_clip_to_go_up(monkeypatch):
     po.Playout("pi@rig")
     assert seen[0] == po.UPLOAD_TIMEOUT >= 300.0
     assert seen[1] < seen[0], "a still frame does not need a clip's budget"
+
+
+def test_a_looping_clip_player_repeats_the_clip_and_a_render_does_not():
+    """Only an archive loops its clip; the input option has to precede the input it repeats."""
+    once = po.ClipPlayer("pi@rig", runner=Recorder()).command()
+    looped = po.ClipPlayer("pi@rig", loop=True, runner=Recorder()).command()
+    assert "-stream_loop" not in once
+    assert looped.index("-stream_loop -1") < looped.index(f"-i {po.ClipPlayer.CLIP_PATH}")
+    assert looped.replace("-stream_loop -1 ", "") == once
+
+
+class PidRunner(Recorder):
+    """Answers the pidfile read with ``pid`` and signal 0 with whether ``alive``."""
+
+    def __init__(self, pid, alive):
+        super().__init__()
+        self.pid, self.alive = pid, alive
+
+    def __call__(self, command, data=None):
+        super().__call__(command, data)
+        if command.startswith("cat "):
+            return self.pid
+        return po.RUNNING if self.alive else po.STOPPED
+
+
+@pytest.mark.parametrize(
+    "pid, alive, running",
+    [("4242\n", True, True), ("4242", False, False), ("", True, False), ("garbage", True, False)],
+)
+def test_a_clip_player_is_running_only_when_its_recorded_pid_answers(pid, alive, running):
+    runner = PidRunner(pid, alive)
+    assert po.ClipPlayer("pi@rig", runner=runner).is_running() is running
+    probes = [c for c, _ in runner.calls if c.startswith("kill -0")]
+    assert probes == (
+        ["kill -0 4242 2>/dev/null && echo RUNNING || echo STOPPED"] if pid[:1].isdigit() else []
+    )

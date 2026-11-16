@@ -16,6 +16,8 @@ __all__ = [
     "read_state_index",
     "crop_strip",
     "state_index_capacity",
+    "burn_timecode",
+    "read_timecode",
 ]
 
 PATTERNS = (
@@ -292,3 +294,26 @@ def crop_strip(frame, *, strip_px=8):
     """Remove the state-index strip before analysis."""
     frame = np.asarray(frame)
     return frame[: frame.shape[0] - int(strip_px)]
+
+
+def burn_timecode(frame: np.ndarray, index: int, *, bits: int = 16, strip_px: int = 8) -> np.ndarray:
+    """Write a gray-coded frame index into a croppable bottom edge strip, behind a marker cell."""
+    out = np.array(frame, dtype=np.float32, copy=True)
+    code = int(index) ^ (int(index) >> 1)
+    cells = np.concatenate(([1.0], ((code >> np.arange(bits - 1, -1, -1)) & 1).astype(np.float32)))
+    edges = np.round(np.linspace(0, out.shape[1], cells.size + 1)).astype(int)
+    out[out.shape[0] - strip_px :] = np.repeat(cells, np.diff(edges))[None, :, None]
+    return out
+
+
+def read_timecode(
+    frame: np.ndarray, *, bits: int = 16, strip_px: int = 8, min_contrast: float = 0.25
+) -> int | None:
+    """Recover the frame index from the edge strip; ``None`` when the strip is absent or washed out."""
+    strip = np.asarray(frame[frame.shape[0] - strip_px :], dtype=np.float64).mean(axis=(0, 2))
+    edges = np.round(np.linspace(0, strip.size, bits + 2)).astype(int)
+    cells = np.add.reduceat(strip, edges[:-1]) / np.maximum(np.diff(edges), 1)
+    if np.ptp(cells) < min_contrast or cells[0] < cells.mean():
+        return None
+    binary = np.bitwise_xor.accumulate((cells[1:] > cells.mean()).astype(np.int64))
+    return int((binary * (1 << np.arange(bits - 1, -1, -1))).sum())

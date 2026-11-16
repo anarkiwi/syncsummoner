@@ -7,7 +7,9 @@ the capture stream. Program is fixed per pass; loading it blacks the output out.
 
 from __future__ import annotations
 
+import queue
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -28,9 +30,12 @@ from syncsummoner.device.recorder import (
     settle,
 )
 from syncsummoner.device.session import CC_BUDGET_HZ
+from syncsummoner.compose.cut import Cut
+from syncsummoner.compose.master import DEFAULT_CRF, X264
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
+from syncsummoner.probe.patterns import burn_timecode, read_timecode
 from syncsummoner.progress import LOG, human, meter, stage, track
 
 
@@ -130,29 +135,6 @@ class Rig:
     playout: Any
     link: Any = None
     transport: Any = None
-
-
-def burn_timecode(frame: np.ndarray, index: int, *, bits: int = 16, strip_px: int = 8) -> np.ndarray:
-    """Write a gray-coded frame index into a croppable bottom edge strip, behind a marker cell."""
-    out = np.array(frame, dtype=np.float32, copy=True)
-    code = int(index) ^ (int(index) >> 1)
-    cells = np.concatenate(([1.0], ((code >> np.arange(bits - 1, -1, -1)) & 1).astype(np.float32)))
-    edges = np.round(np.linspace(0, out.shape[1], cells.size + 1)).astype(int)
-    out[out.shape[0] - strip_px :] = np.repeat(cells, np.diff(edges))[None, :, None]
-    return out
-
-
-def read_timecode(
-    frame: np.ndarray, *, bits: int = 16, strip_px: int = 8, min_contrast: float = 0.25
-) -> int | None:
-    """Recover the frame index from the edge strip; ``None`` when the strip is absent or washed out."""
-    strip = np.asarray(frame[frame.shape[0] - strip_px :], dtype=np.float64).mean(axis=(0, 2))
-    edges = np.round(np.linspace(0, strip.size, bits + 2)).astype(int)
-    cells = np.add.reduceat(strip, edges[:-1]) / np.maximum(np.diff(edges), 1)
-    if np.ptp(cells) < min_contrast or cells[0] < cells.mean():
-        return None
-    binary = np.bitwise_xor.accumulate((cells[1:] > cells.mean()).astype(np.int64))
-    return int((binary * (1 << np.arange(bits - 1, -1, -1))).sum())
 
 
 def steady_lag(codes: Sequence[int | None], *, bits: int) -> int | None:
@@ -517,44 +499,6 @@ def render_played(
             rig.transport.close()
 
 
-@dataclass(frozen=True)
-class Cut:
-    """One span of the timeline and the program that renders it."""
-
-    start: float
-    end: float
-    program: str
-
-    @property
-    def duration(self) -> float:
-        """Span length in seconds."""
-        return max(0.0, self.end - self.start)
-
-
-def resolve_starts(measured: Mapping[str, float | None]) -> dict[str, float]:
-    """Fill in the picture start of any take whose strip did not survive.
-
-    The lag is the Pi player's and the capture's, which every pass in a run
-    shares, so the median of the takes that were read stands in for the rest.
-    With none read there is nothing to stand in, and cutting from the first
-    frame would splice lead-in into the output.
-    """
-    found = [value for value in measured.values() if value is not None]
-    if not found:
-        raise LostTimecodeError(
-            f"{', '.join(measured)}: the timecode strip did not survive, so the picture start "
-            "is unknown; check the program or the pass"
-        )
-    median = float(np.median(found))
-    for name in (name for name, value in measured.items() if value is None):
-        LOG.warning(
-            "%s: timecode strip did not survive; using the run's median picture start %.2fs",
-            name,
-            median,
-        )
-    return {name: median if value is None else value for name, value in measured.items()}
-
-
 def device_programs() -> Offered:
     """Program names the attached device offers, and its authors.
 
@@ -616,39 +560,177 @@ def cut_plan(score: Score, programs: Sequence[str]) -> list[Cut]:
     return [Cut(start, end, programs[i % len(programs)]) for i, (start, end) in enumerate(spans)]
 
 
-def assemble(
+#: 4:2:0 at full range, what the card's MJPEG decodes to, so a splice converts no level.
+SPLICE_PIX_FMT = "yuvj420p"
+
+
+class SpliceError(RuntimeError):
+    """A clip frame cannot be taken from the take its cut names."""
+
+
+def frame_owners(cuts: Sequence[Cut], fps: float) -> np.ndarray:
+    """Per clip frame, the index of the cut showing it; frame ``n`` sits at ``n / fps``."""
+    if not cuts:
+        raise ValueError("nothing to splice")
+    edges = np.rint(np.array([(cut.start, cut.end) for cut in cuts], dtype=np.float64) * fps).astype(np.int64)
+    owner = np.full(int(edges[:, 1].max()), -1, dtype=np.int64)
+    for index, (a, b) in enumerate(edges):
+        owner[max(a, 0) : b] = index
+    gap = np.flatnonzero(owner < 0)
+    if gap.size:
+        raise SpliceError(f"no cut covers {gap[0] / fps:.3f}s")
+    return owner
+
+
+def splice_indices(
+    cuts: Sequence[Cut], picked: Mapping[str, np.ndarray], fps: float
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Per clip frame, the program showing it, and per program the capture indices it is taken at.
+
+    ``picked`` is per program what :attr:`~syncsummoner.compose.takecheck.Trace.picked` holds:
+    the capture showing each clip frame, -1 where none does. A take is decoded once, forward,
+    so its captures must rise with the clip frames they show.
+    """
+    names = list(dict.fromkeys(cut.program for cut in cuts))
+    owner = np.array([names.index(cut.program) for cut in cuts], dtype=np.int64)[frame_owners(cuts, fps)]
+    wanted = {}
+    for index, name in enumerate(names):
+        frames = np.flatnonzero(owner == index)
+        known = np.full(owner.size, -1, dtype=np.int64)
+        given = np.asarray(picked.get(name, ()), dtype=np.int64)[: owner.size]
+        known[: given.size] = given
+        at = known[frames]
+        missing = frames[at < 0]
+        if missing.size:
+            run = missing[: int(np.argmax(np.r_[np.diff(missing) != 1, True])) + 1]
+            raise SpliceError(
+                f"{name}: no capture shows clip frames {run[0] / fps:.3f}-{(run[-1] + 1) / fps:.3f}s"
+            )
+        back = np.flatnonzero(np.diff(at) <= 0)
+        if back.size:
+            raise SpliceError(
+                f"{name}: the capture showing {frames[back[0] + 1] / fps:.3f}s comes before the last"
+            )
+        wanted[name] = at
+    return owner, {name: wanted[name] for name in names}
+
+
+def _frame_bytes(width: int, height: int) -> int:
+    """One :data:`SPLICE_PIX_FMT` frame: full-size luma and two half-size chroma planes."""
+    return width * height + 2 * ((width + 1) // 2) * ((height + 1) // 2)
+
+
+def _drain(stream, into: list[bytes]) -> None:
+    with stream:
+        into.extend(stream)
+
+
+class _Take:
+    """One take decoded forward on its own process, handing over only the captures asked for.
+
+    The hand-over queue holds one frame, so a take waits once it is a frame ahead of the cut.
+    """
+
+    def __init__(self, path: str | Path, wanted: np.ndarray, *, config: RenderConfig, ffmpeg: str):
+        self.path, self.wanted = str(path), wanted
+        self.size = _frame_bytes(config.width, config.height)
+        argv = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", self.path, "-map", "0:v:0"]
+        argv += ["-fps_mode", "passthrough", "-s", f"{config.width}x{config.height}"]
+        argv += ["-pix_fmt", SPLICE_PIX_FMT, "-f", "rawvideo", "pipe:1"]
+        self.proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.said: list[bytes] = []
+        self.frames: queue.Queue = queue.Queue(maxsize=1)
+        self.threads = [
+            threading.Thread(target=_drain, args=(self.proc.stderr, self.said), daemon=True),
+            threading.Thread(target=self._pull, daemon=True),
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def _pull(self) -> None:
+        buffer = bytearray(self.size)
+        at = 0
+        try:
+            for want in self.wanted:
+                while at <= want:
+                    if self.proc.stdout.readinto(buffer) != self.size:
+                        raise EOFError(f"capture {at}")
+                    at += 1
+                self.frames.put(bytes(buffer))
+        except (EOFError, OSError, ValueError) as err:
+            self.frames.put(err)
+        finally:
+            self.proc.kill()
+
+    def next(self) -> bytes:
+        """The next capture asked for, or why the take ran out before it."""
+        item = self.frames.get()
+        if isinstance(item, BaseException):
+            self.proc.wait()
+            said = b"".join(self.said).decode("utf-8", "replace").strip().splitlines()
+            raise SpliceError(f"{self.path} ended before {item}" + (f": {said[-1]}" if said else ""))
+        return item
+
+    def close(self) -> None:
+        """Stop decoding, free a hand-over left waiting, and reap the process."""
+        self.proc.kill()
+        try:
+            self.frames.get_nowait()
+        except queue.Empty:
+            pass
+        self.proc.wait()
+
+
+def splice(
     cuts: Sequence[Cut],
     takes: Mapping[str, str | Path],
+    picked: Mapping[str, np.ndarray],
     out: str | Path,
     *,
+    config: RenderConfig,
     ffmpeg: str = "ffmpeg",
-    starts: Mapping[str, float] | None = None,
-) -> None:
-    """Splice each cut's span out of its program's take, in order.
+) -> int:
+    """Write one frame per clip frame, each the capture its cut's take shows that frame in.
 
-    Every take covers the whole timeline, so a span is the same span in each; the
-    cut is a choice of which one to show, not a re-timing. ``starts`` carries
-    where each take's picture begins, since a pass opens on lead-in.
+    Every take is decoded once, forward, at full size, all at once; the cut takes each frame
+    from whichever take shows it, so no seek rounds a splice and no lead-in is guessed. The
+    picture is written at ``config.fps``, the clip's rate, with the master's encoder; the frame
+    count is returned.
     """
-    if not cuts:
-        raise ValueError("nothing to assemble")
-    offset = dict(starts or {})
-    argv = [ffmpeg, "-loglevel", "error", "-y"]
-    for cut in cuts:
-        head = offset.get(cut.program, 0.0)
-        argv += [
-            "-ss",
-            f"{head + cut.start:.3f}",
-            "-to",
-            f"{head + cut.end:.3f}",
-            "-i",
-            str(takes[cut.program]),
-        ]
-    joins = "".join(f"[{i}:v]" for i in range(len(cuts)))
-    argv += ["-filter_complex", f"{joins}concat=n={len(cuts)}:v=1:a=0[v]", "-map", "[v]", str(out)]
-    done = subprocess.run(argv, check=False, capture_output=True)
-    if done.returncode:
-        raise RuntimeError(f"assembling the cut failed: {done.stderr.decode('utf-8', 'replace')[:200]}")
+    owner, wanted = splice_indices(cuts, picked, config.fps)
+    names = list(wanted)
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo"]
+    argv += ["-pix_fmt", SPLICE_PIX_FMT, "-s", f"{config.width}x{config.height}", "-r", f"{config.fps:g}"]
+    argv += ["-i", "pipe:0", *X264, "-crf", str(DEFAULT_CRF), "-pix_fmt", SPLICE_PIX_FMT, str(out)]
+    readers = [_Take(takes[name], wanted[name], config=config, ffmpeg=ffmpeg) for name in names]
+    encoder = subprocess.Popen(  # pylint: disable=consider-using-with
+        argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    said: list[bytes] = []
+    drain = threading.Thread(target=_drain, args=(encoder.stderr, said), daemon=True)
+    drain.start()
+    written = 0
+    try:
+        with meter(owner.size / config.fps, desc="splicing") as progress:
+            for index in owner:
+                encoder.stdin.write(readers[index].next())
+                written += 1
+                progress.to(written / config.fps)
+    except BrokenPipeError:
+        pass
+    finally:
+        for reader in readers:
+            reader.close()
+        encoder.stdin.close()
+        encoder.wait()
+        drain.join()
+    if encoder.returncode or written < owner.size:
+        text = b"".join(said).decode("utf-8", "replace").strip().splitlines()
+        raise SpliceError(f"encoding {out} failed: {text[-1] if text else 'no output'}")
+    LOG.info("spliced %d frames from %d takes into %s", written, len(names), out)
+    return written
 
 
 def render_cuts(
@@ -667,7 +749,7 @@ def render_cuts(
     pass_render: Callable[..., Any] | None = None,
     reuse: bool = False,
 ) -> list[Cut]:
-    """Render one pass per program and cut between them on the score's sections.
+    """Render one pass per program and splice between them on the score's sections.
 
     A program the score already evolved a layer for is driven by that layer;
     anything else falls back to the first. The timecoded source is built once and
@@ -720,10 +802,9 @@ def render_cuts(
         human(score.duration),
         human(len(fresh) * score.duration),
     )
-    if fresh and not prepared:
+    if (fresh or not Path(scratch).is_file()) and not prepared:
         write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
         prepared = True
-    measured: dict[str, float | None] = {}
     for program in track(ordered, desc="passes", total=len(ordered), unit="program"):
         take = paths[program]
         if program in fresh:
@@ -746,13 +827,51 @@ def render_cuts(
                 raise BlankTakeError(f"{program}: {report}")
         else:
             LOG.info("%s: reusing take %s", program, take)
-        measured[program] = picture_start(take, config=config)
-        if measured[program] is not None:
-            LOG.info("%s: picture starts %.2fs into the take", program, measured[program])
-    starts = resolve_starts(measured)
-    with stage("assemble", cuts=len(plan), out=str(out)):
-        assemble(plan, paths, out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"), starts=starts)
+    plan, picked = checked_plan(score, plan, paths, scratch, config=config)
+    with stage("splice", cuts=len(plan), out=str(out)):
+        splice(
+            plan,
+            paths,
+            picked,
+            out,
+            config=replace(config, fps=float(score.fps)),
+            ffmpeg=getattr(config, "ffmpeg", "ffmpeg"),
+        )
     return plan
+
+
+def checked_plan(
+    score: Score,
+    plan: Sequence[Cut],
+    takes: Mapping[str, str | Path],
+    clip: str | Path,
+    *,
+    config: RenderConfig,
+) -> tuple[list[Cut], dict[str, np.ndarray]]:
+    """Judge every take against the clip it was fed, covering dead spans or failing the render.
+
+    Returns the covered plan and, per take, the capture showing each clip frame, which is
+    what :func:`splice` cuts by.
+    """
+    from syncsummoner.compose.takecheck import DeadTakeError, check_takes
+
+    with stage("check", takes=len(takes)):
+        report = check_takes(
+            score,
+            plan,
+            takes,
+            clip,
+            strip_px=config.strip_px,
+            bits=config.bits,
+            ffmpeg=getattr(config, "ffmpeg", "ffmpeg"),
+        )
+    for line in report.lines():
+        LOG.info("%s", line)
+    if report.failed:
+        raise DeadTakeError(
+            "dead picture no take can cover: " + "; ".join(str(span) for span in report.failed)
+        )
+    return report.cuts, {name: t.picked for name, t in report.traces.items()}
 
 
 def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True) -> Rig:

@@ -119,7 +119,7 @@ you. Minimum set:
 | `noise_1f` | behaviour on natural-statistics input |
 | `flat_grey`, `black` | noise floor; self-oscillation in feedback programs |
 | `motion_ball` | trajectory with a hard impact point — temporal response |
-| `natural_clip` | 4-second real footage loop; programs behave differently on camera sources |
+| `natural_clip` | a timecoded excerpt of real footage, looped by the player for a whole archive run; programs behave differently on camera sources, and only real footage shows what a program keeps of its input (§9) |
 
 ### 3.2 Frame identification
 
@@ -131,6 +131,11 @@ frame (8-bit gray code, high contrast, cropped before analysis). Each captured
 frame then self-identifies which parameter vector produced it. This removes all
 timing guesswork from the sweep and permits fast stepping without conservative
 dwell times.
+
+Footage cannot carry the state index in its picture, and needs a clip frame
+index instead: its strip carries the clip frame, the setpoint comes from the
+capture time, and which clip frame each capture shows comes from a fitted player
+clock (§9.1).
 
 ### 3.3 Plans, in order of cost
 
@@ -283,9 +288,14 @@ Objective terms:
 - penalize illegal levels and clipping, unless the section is marked `destroy`
 - reward motif return at section boundaries — visual rhyme, states revisited with
   variation
-- penalize low variance across any bar (anti-boredom floor)
+- penalize low variance across any bar (anti-boredom floor); with measured
+  survival, penalize the least share of the source's motion kept in any bar
+- ranked constraint: bars predicted dead beyond the destruction budget (§9.4),
+  compared before the weighted total
 - hard constraint: reachability, given measured settle times and a CC budget of
   roughly 200 msg/s aggregate
+
+Sections are split at the phrase grid before gestures are drawn (§9.5).
 
 ---
 
@@ -296,7 +306,9 @@ Offline, multi-pass, all real-time captures.
 1. Burn timecode into a croppable edge strip of the source; play out over HDMI.
 2. Run the score's CC automation against the transport; capture the return.
 3. Align by timecode, crop the strip, write the pass.
-4. Optionally re-feed pass output through a second program with its own score
+4. Check every take against the clip it was fed, bar by bar, and cover or fail
+   before mastering (§9.6).
+5. Optionally re-feed pass output through a second program with its own score
    layer, then composite offline. Layering is where depth beyond a single program
    comes from.
 
@@ -322,6 +334,8 @@ syncsummoner compose --profiles profiles/ --features features.json \
 
 syncsummoner audition score.yaml --seconds 30
 syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
+syncsummoner check score.yaml --source timecoded.mkv --takes takes/ --cut-programs A,B --splice cut.mp4
+syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4
 ```
 
 Standalone library entry point, which doubles as a seam test:
@@ -356,6 +370,136 @@ Axis assignment and the cliff atlas live in the **profile**, not the planner.
 Gestures are therefore written against canonical axes, which means a new firmware
 release with new programs gets absorbed by re-probing rather than by editing the
 composer.
+
+---
+
+## 9. Footage and survival
+
+Synthetic patterns say what a program does to a test signal; whether a take is
+usable depends on what it keeps of the footage it was fed. An archive run can
+therefore play real footage, and every measure below asks one question: does the
+output still show the source's picture and motion, frame against exact frame.
+
+### 9.1 Footage stimulus and frame identity
+
+`prepare_footage` writes the footage as a timecoded clip at the session raster:
+a 16-bit Gray-code clip frame index in the bottom strip, the picture above it.
+The clip and its record (`stimulus.mkv`, `stimulus.json`, with the clip's
+SHA-256, frame count, rate, bits and strip height) live in the archive
+directory, and every archive committed against it names it (schema 4). The Pi
+plays it with `ClipPlayer(loop=True)`: ffmpeg `-re -stream_loop -1` decoding
+from tmpfs into the framebuffer, uploaded once per run. An encoded clip is used
+because the player paces H.264 at the session rate and a few minutes of it fit
+tmpfs; looping keeps one uninterrupted picture under a whole sweep
+([hardware.md](hardware.md#clip-playout)).
+
+Setpoints attribute by capture time, as for the codeframe loop. The clip frame a
+capture shows comes from a `ClockModel` of the player: frame `n` is on show
+around `origin + n * interval`, wrapped over the loop.
+
+| Step | What | Why |
+| --- | --- | --- |
+| agreeing runs | keep captures whose strip agrees with the modal lag over more than `1 + log2(n) / bits` distinct frames | a misread lands on a given lag with odds `2^-bits`, so such runs are expected less than once by chance; a held strip spans one frame |
+| L1 fit | LP for start and period minimising total time outside each capture's frame interval | a torn or misread strip costs only its own slack; least squares would let it pull the line |
+| max-margin fit | LP over the captures the L1 line fits exactly, maximising the least margin | centres the line in what the captures allow, instead of tilting with the slow beat between card and player phase |
+| refit | repeat over every legible capture the line places in its own frame | uses all the evidence the strip gave |
+| motion fallback | where no strip reads: output TI summed on grids at the clip rate, rank cross-correlated with the source TI at every whole-frame lag (circular over a loop), grid phase stepped by half the capture spacing | ranks so no single cut decides; the phase step is as fine as the captures resolve |
+
+The card captures faster than the player shows, so `attribute` keeps, per clip
+frame, the capture nearest the centre of its display interval, furthest from
+either switch; the others are unattributed. A program that destroys the strip
+loses no frames, since attribution is by time.
+
+### 9.2 Survival measures and their tests
+
+`aesthetics.survival` reads ITU-T P.910 spatial information (SI, standard
+deviation of the Sobel magnitude of luma) and temporal information (TI, standard
+deviation of the luma difference between consecutive frames), both on 160x90
+area-scaled luma, for the source clip and for the attributed captures.
+
+| Measure | Definition | Threshold and its origin |
+| --- | --- | --- |
+| `si_ratio`, `ti_ratio` | output mean SI, TI over source mean, same frames | live floor: geometric mean of the source's value and quantisation noise alone (Weber–Fechner: perceived magnitude is logarithmic, so the midpoint between source and noise is their geometric mean) |
+| quantisation SI | `q * sqrt((4 - pi) / 2)`, `q = 1/255` | the Sobel magnitude of i.i.d. quantisation noise is Rayleigh with scale `q` |
+| quantisation TI | `q / sqrt(6)` | difference of two i.i.d. `q^2/12` fields |
+| `motion_follow` | Pearson correlation of output TI with source TI, at lead 0 or 1 | Fisher z of `r` at the effective sample count must exceed the three-sigma one-sided level, Bonferroni-corrected over the two leads |
+| effective samples | `n (1 - ab) / (1 + ab)`, `a`, `b` the lag-one autocorrelations | TI series are autocorrelated; AR(1) correction (Bretherton et al. 1999) keeps the z honest |
+
+Lead 1 is tried because an unsynced framebuffer can scan out the strip one frame
+ahead of the picture above it.
+
+### 9.3 Profiles carry survival
+
+A refit of a footage archive scores each setpoint group on the clip frames its
+captures show, adding `si_ratio`, `ti_ratio` and `motion_follow` to its record,
+and the fit keeps them among each parameter's measured curves. The loop
+behaviour fits read the codeframe loop and are not run on footage archives.
+Codeframe archives (schema 3) are still read and refit as before.
+
+Each measured curve is a first-order marginal, `E[metric | parameter value]`,
+estimated by Nadaraya–Watson regression with a Gaussian kernel. The archive
+moves every parameter at once, so the records at one value of one parameter are
+few and carry every other parameter's effect as noise; the kernel pools nearby
+values. The bandwidth minimises leave-one-out squared error over a dyadic grid
+from the least value gap to the span, with zero (the per-value mean) as a
+candidate, so a cliff is smoothed only when the data cannot resolve it. The
+planner predicts a vector as the sum of each parameter's departure from its own
+median (first-order HDMR), which is what first-order marginals are for.
+
+### 9.4 Survival constraint and destruction budget
+
+`predict_survival` judges each bar of a predicted trajectory against the same
+bar of the source footage, whose SI and TI come from `VideoFeatures`. A bar is
+dead when the predicted SI or TI falls below its live floor, or when the
+predicted follow would not reach the critical z over the bar's frames.
+
+Destruction is budgeted one bar at a time: inside a `destroy` section the first
+bar of a dead run is allowed and every further one counts; outside, every dead
+bar counts. `Objective.violation` is that count and `Objective.rank` sorts by
+`(violation, -total)`, so selection is constraint domination: no weighting of
+the other terms trades a dead picture for anything. With survival measured,
+boredom is the largest shortfall of predicted `ti_ratio` below 1 in any bar; a
+profile with no survival falls back to the variance floor, ranks unconstrained,
+and is logged as unverified.
+
+### 9.5 Phrase-length sections
+
+`phrase_bars` is the longest whole-bar grid, counted from the first downbeat, on
+which more than half the inner section boundaries (each snapped to its nearest
+downbeat) lie; one bar always qualifies. Sections are split on that grid,
+keeping label and destroy mark, so gestures and cuts change at phrase length
+rather than only at the segmentation's boundaries. The score records `bar` and
+`phrase_bars` in its metadata.
+
+### 9.6 Take check before mastering
+
+`render_cuts` runs `checked_plan` on every take before splicing, and `check`
+runs it standalone. Each recording is decoded once (body at 160x90 luma, strip at
+full width, times from the decoder's own `showinfo`), traced by the strip clock
+and the motion clock, and the clock under which output motion follows the source
+best is kept. Each bar is then judged:
+
+| Fault | Condition |
+| --- | --- |
+| `flat` | at most half the frames span more than one 8-bit code, or SI under the live floor |
+| `frozen` | TI under the live floor, or `recorder.held` cannot tell the bar from one picture under capture noise and its motion does not follow the source (a held picture's TI is capture noise, independent of the source's) |
+| `unfollowed` | more than three frames moved, the source TI varies beyond quantisation, and the follow test fails |
+
+A dead run inside a cut is replaced by the take of another program alive across
+the whole run that follows best (highest mean z); a lone dead bar inside a
+`destroy` section stays. A run nothing covers raises `DeadTakeError` naming the
+program and time range. Where a strip reads, its clock stands unless the motion clock makes the
+output's moving frames follow the source better by more than the critical z
+(chance among the lags searched), which a strip a program scrambled loses.
+
+A trace's `picked` is the attribution: per clip frame, the capture nearest the
+centre of its display interval, or -1. It is the one interface between alignment
+and everything after it: `check_takes(attributions=...)` takes one outright
+instead of fitting a clock, and `splice` cuts by it. The splice writes clip frame
+`n` from `takes[program(n)]` at capture `picked[n]`, decoding every take once,
+forward, in parallel, each handing over one frame at a time, so memory is bounded
+and no seek rounds a cut. A spliced master is therefore checked on the identity
+clock (`ClockModel.identity`).
 
 ---
 

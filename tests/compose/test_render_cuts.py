@@ -1,18 +1,38 @@
-"""Cutting a run of takes: picture starts, reused takes, take names."""
+"""Cutting a run of takes: attribution, reused takes, take names."""
 
 # pylint: disable=missing-function-docstring
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from syncsummoner.compose import render as R
+from syncsummoner.compose import takecheck as T
 from syncsummoner.compose.score import Layer, Score, Section
 
 
-def _cut_run(monkeypatch, tmp_path, starts, *, reuse=False, **kwargs):
-    """Cut a run whose takes measure ``starts``, returning what was rendered and assembled."""
-    seen = {"rendered": [], "starts": None}
+def _checked(monkeypatch, *, spans=(), cuts=None):
+    """Stand in for the take check: the plan as given, or ``cuts``, with ``spans`` found dead.
+
+    Each take's attribution is its own name's length plus the clip frame, so a splice
+    handed one take's picks for another's is caught.
+    """
+    seen = {}
+
+    def check(score, plan, takes, clip, **kw):
+        del score
+        seen.update(clip=clip, takes=dict(takes), **kw)
+        traces = {name: T.Trace(np.arange(10) + len(name), None, None, None, None, "strip") for name in takes}
+        return T.CheckReport(cuts=list(cuts or plan), spans=list(spans), traces=traces)
+
+    monkeypatch.setattr(T, "check_takes", check)
+    return seen
+
+
+def _cut_run(monkeypatch, tmp_path, names, *, reuse=False, **kwargs):
+    """Cut a run of programs ``names``, returning what was rendered and spliced."""
+    seen = {"rendered": []}
 
     def fake_render(score, source, out, **kw):
         del source, kw
@@ -20,19 +40,22 @@ def _cut_run(monkeypatch, tmp_path, starts, *, reuse=False, **kwargs):
         Path(out).write_bytes(b"take")
         return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
 
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: starts[Path(path).name])
-    monkeypatch.setattr(R, "assemble", lambda plan, paths, out, **kw: seen.update(kw, paths=paths))
-    names = [name.removeprefix("take-").removesuffix(".mkv") for name in starts]
+    def fake_splice(plan, paths, picked, out, **kw):
+        seen.update(kw, plan=plan, paths=paths, picked=picked, out=out)
+
+    monkeypatch.setattr(R, "splice", fake_splice)
+    seen["check"] = _checked(monkeypatch, **kwargs.pop("check", {}))
     R.render_cuts(
         Score(
             duration=30.0,
-            sections=[Section(10.0 * i, 10.0 * (i + 1), "A") for i in range(len(starts))],
+            fps=30.0,
+            sections=[Section(10.0 * i, 10.0 * (i + 1), "A") for i in range(len(names))],
             layers=[Layer(names[0], 0, [])],
         ),
         "clip.mkv",
         tmp_path / "out.mkv",
         profiles={},
-        programs=names,
+        programs=list(names),
         takes=tmp_path,
         prepared=True,
         reuse=reuse,
@@ -42,37 +65,24 @@ def _cut_run(monkeypatch, tmp_path, starts, *, reuse=False, **kwargs):
     return seen
 
 
-def test_a_take_whose_strip_is_lost_is_cut_at_the_runs_median_start(monkeypatch, tmp_path, caplog):
-    starts = {
-        "take-Derez.mkv": 1.9,
-        "take-Pinwheel.mkv": None,
-        "take-Lorenz.mkv": 1.4,
-        "take-Sfumato.mkv": 2.0,
-    }
-    with caplog.at_level("WARNING", logger="syncsummoner"):
-        seen = _cut_run(monkeypatch, tmp_path, starts)
-    assert seen["starts"] == {"Derez": 1.9, "Pinwheel": pytest.approx(1.9), "Lorenz": 1.4, "Sfumato": 2.0}
-    warning = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert warning == ["Pinwheel: timecode strip did not survive; using the run's median picture start 1.90s"]
-
-
-def test_a_run_with_no_legible_strip_is_refused_rather_than_cut_from_lead_in(monkeypatch, tmp_path):
-    with pytest.raises(R.LostTimecodeError, match="Pinwheel: the timecode strip did not survive"):
-        _cut_run(monkeypatch, tmp_path, {"take-Pinwheel.mkv": None})
+def test_each_take_is_spliced_by_its_own_attribution_at_the_clip_rate(monkeypatch, tmp_path):
+    seen = _cut_run(monkeypatch, tmp_path, ["Derez", "Pinwheel"], config=R.RenderConfig(fps=60.0))
+    assert set(seen["picked"]) == {"Derez", "Pinwheel"}
+    assert all(np.array_equal(p, np.arange(10) + len(n)) for n, p in seen["picked"].items())
+    assert seen["config"].fps == 30.0 and seen["out"] == tmp_path / "out.mkv"
 
 
 def test_reused_takes_skip_their_pass_and_are_cut_like_fresh_ones(monkeypatch, tmp_path, caplog):
     (tmp_path / "take-Derez.mkv").write_bytes(b"old")
     with caplog.at_level("INFO", logger="syncsummoner"):
-        seen = _cut_run(monkeypatch, tmp_path, {"take-Derez.mkv": 1.0, "take-Lorenz.mkv": 2.0}, reuse=True)
-    assert seen["rendered"] == ["Lorenz"]
-    assert seen["starts"] == {"Derez": 1.0, "Lorenz": 2.0}
+        seen = _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"], reuse=True)
+    assert seen["rendered"] == ["Lorenz"] and set(seen["picked"]) == {"Derez", "Lorenz"}
     assert f"Derez: reusing take {tmp_path / 'take-Derez.mkv'}" in caplog.messages
 
 
 def test_without_reuse_an_existing_take_is_rendered_again(monkeypatch, tmp_path):
     (tmp_path / "take-Derez.mkv").write_bytes(b"old")
-    assert _cut_run(monkeypatch, tmp_path, {"take-Derez.mkv": 1.0})["rendered"] == ["Derez"]
+    assert _cut_run(monkeypatch, tmp_path, ["Derez"])["rendered"] == ["Derez"]
 
 
 def test_a_fully_reused_render_never_touches_the_rig(monkeypatch, tmp_path):
@@ -83,20 +93,22 @@ def test_a_fully_reused_render_never_touches_the_rig(monkeypatch, tmp_path):
 
     for name in ("open_rig", "device_programs", "write_timecoded", "render_played"):
         monkeypatch.setattr(R, name, touched)
-    starts = {"take-Derez.mkv": 1.0, "take-Lorenz.mkv": 1.2}
-    for name in starts:
-        (tmp_path / name).write_bytes(b"old")
+    for name in ("Derez", "Lorenz"):
+        (tmp_path / f"take-{name}.mkv").write_bytes(b"old")
     seen = _cut_run(
-        monkeypatch, tmp_path, starts, reuse=True, pass_render=touched, available=R.device_programs
+        monkeypatch,
+        tmp_path,
+        ["Derez", "Lorenz"],
+        reuse=True,
+        pass_render=touched,
+        available=R.device_programs,
     )
-    assert seen["starts"] == {"Derez": 1.0, "Lorenz": 1.2}
+    assert seen["plan"] == [R.Cut(0.0, 10.0, "Derez"), R.Cut(10.0, 20.0, "Lorenz")]
 
 
 def test_the_device_is_asked_for_its_programs_only_when_a_pass_is_due(monkeypatch, tmp_path):
     asked = []
-    seen = _cut_run(
-        monkeypatch, tmp_path, {"take-Derez.mkv": 1.0}, available=lambda: asked.append(1) or ["Derez"]
-    )
+    seen = _cut_run(monkeypatch, tmp_path, ["Derez"], available=lambda: asked.append(1) or ["Derez"])
     assert asked == [1] and seen["rendered"] == ["Derez"]
 
 
@@ -104,8 +116,8 @@ def test_an_author_qualified_program_gets_a_take_file_not_a_subdirectory(monkeyp
     """``author/Name`` once named a directory that did not exist, and the pass died opening it."""
     program = "czartroniks/Roll the Bones"
     seen = {}
-    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 1.0)
-    monkeypatch.setattr(R, "assemble", lambda plan, paths, out, **kw: seen.update(paths))
+    monkeypatch.setattr(R, "splice", lambda plan, paths, picked, out, **kw: seen.update(paths))
+    _checked(monkeypatch)
 
     def fake_render(score, source, out, **kw):
         del score, source, kw
@@ -125,3 +137,20 @@ def test_an_author_qualified_program_gets_a_take_file_not_a_subdirectory(monkeyp
         )
         take = Path(seen[program])
         assert take.parent == tmp_path and take.name.startswith("take-czartroniks_Roll_the_Bones-")
+
+
+def test_every_take_is_checked_against_the_played_clip_before_the_cut(monkeypatch, tmp_path):
+    seen = _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"])
+    assert seen["check"]["clip"] == "timecoded.mkv" and set(seen["check"]["takes"]) == {"Derez", "Lorenz"}
+
+
+def test_a_covered_span_is_cut_from_the_take_alive_there(monkeypatch, tmp_path):
+    covered = [R.Cut(0.0, 5.0, "Derez"), R.Cut(5.0, 20.0, "Lorenz")]
+    seen = _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"], check={"cuts": covered})
+    assert seen["plan"] == covered
+
+
+def test_a_dead_span_nothing_covers_fails_the_render_and_names_it(monkeypatch, tmp_path):
+    dead = T.DeadSpan("Derez", 67.1, 112.1, T.Fault.FLAT, None)
+    with pytest.raises(T.DeadTakeError, match="Derez:   67.10- 112.10s flat"):
+        _cut_run(monkeypatch, tmp_path, ["Derez"], check={"spans": [dead]})

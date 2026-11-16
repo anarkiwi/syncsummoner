@@ -43,7 +43,15 @@ __all__ = [
 PROFILE_SCHEMA_VERSION = 2
 
 #: Metrics the compose proxy reads back per setpoint; measured, not inferred.
-PROXY_METRICS = ("spectral_slope", "concentration", "clip_frac", "illegal_frac")
+PROXY_METRICS = (
+    "spectral_slope",
+    "concentration",
+    "clip_frac",
+    "illegal_frac",
+    "si_ratio",
+    "ti_ratio",
+    "motion_follow",
+)
 
 AXIS_SIGNATURES = {
     Axis.TEXTURE_SCALE: {"peak_scale": 1.0, "concentration": 0.6, "spectral_slope": 0.5, "ch_*": 0.3},
@@ -110,11 +118,47 @@ def _mode(column):
     return values[int(np.argmax(counts))]
 
 
+def _bandwidths(unique):
+    """Candidate kernel widths: the per-value-mean limit, then dyadic from the least gap to the span."""
+    gap, span = float(np.diff(unique).min()), float(unique[-1] - unique[0])
+    return np.r_[0.0, np.minimum(gap * 2.0 ** np.arange(int(np.ceil(np.log2(span / gap))) + 1), span)]
+
+
+def _weights(excess, width):
+    """Gaussian kernel weights over squared distances in excess of each row's nearest, at ``width``."""
+    if width == 0:
+        return (excess == 0).astype(np.float64)
+    return np.exp(-0.5 * excess / width**2)
+
+
 def _curve(values, metrics):
-    unique, inverse = np.unique(values, return_inverse=True)
+    """E[metrics | values] at each distinct value, by Nadaraya-Watson with a Gaussian kernel.
+
+    The width minimises the leave-one-out squared error summed over the columns, the narrowest
+    on a tie; each row's weights are shifted by its nearest other record, so none underflows and
+    replicates leave their own mean in reach as the width shrinks.
+    """
+    unique, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+    inverse = inverse.ravel()
     sums = np.zeros((unique.size, metrics.shape[1]))
     np.add.at(sums, inverse, metrics)
-    return unique, sums / np.bincount(inverse, minlength=unique.size)[:, None]
+    if unique.size < 2:
+        return unique, sums / counts[:, None]
+    d2 = np.square(np.subtract.outer(unique, unique).astype(np.float64))
+    others = d2 + np.diag(np.where(counts > 1, 0.0, np.inf))
+    excess = others - others.min(axis=1, keepdims=True)
+
+    def loo(width):
+        kernel = _weights(excess, width)
+        own = np.diag(kernel)[inverse]
+        num, den = kernel @ sums, kernel @ counts
+        fit = (num[inverse] - own[:, None] * metrics) / (den[inverse] - own)[:, None]
+        return float(np.square(metrics - fit).sum())
+
+    widths = _bandwidths(unique)
+    best = widths[int(np.argmin([loo(w) for w in widths]))]
+    kernel = _weights(d2, best)
+    return unique, (kernel @ sums) / (kernel @ counts)[:, None]
 
 
 def _longest_run(mask):
@@ -219,7 +263,7 @@ def _fit_param(
     replaces the marginal effect where the design never isolated the parameter.
     """
     unique, curve = _curve(values, metrics)
-    # Averaging is linear, so the standardized curve inverts exactly to measured units.
+    # A kernel average is linear, so the standardized curve inverts exactly to measured units.
     spec.measured = {
         n: (curve[:, i] * unscale[1, i] + unscale[0, i]).tolist()
         for i, n in enumerate(names)

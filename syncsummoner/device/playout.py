@@ -197,8 +197,11 @@ class ClipPlayer(Playout):
     CLIP_PATH = "/dev/shm/syncsummoner-clip.mkv"
     PID_PATH = "/dev/shm/syncsummoner-clip.pid"
 
-    def __init__(self, host: str = DEFAULT_HOST, *, ssh_timeout_s: float = UPLOAD_TIMEOUT, **kwargs):
+    def __init__(
+        self, host: str = DEFAULT_HOST, *, ssh_timeout_s: float = UPLOAD_TIMEOUT, loop: bool = False, **kwargs
+    ):
         super().__init__(host, ssh_timeout_s=ssh_timeout_s, **kwargs)
+        self.loop = bool(loop)
 
     def upload(self, path: str) -> int:
         """Send the clip into tmpfs; returns the bytes put on the wire."""
@@ -207,9 +210,13 @@ class ClipPlayer(Playout):
         return len(data)
 
     def command(self) -> str:
-        """Pi-side pipeline: decode the clip at framebuffer geometry, blit each frame."""
+        """Pi-side pipeline: decode the clip at framebuffer geometry, blit each frame.
+
+        With ``loop`` the clip repeats without a gap until the player is stopped.
+        """
+        repeat = "-stream_loop -1 " if self.loop else ""
         return (
-            f"ffmpeg -hide_banner -loglevel error -re -i {self.CLIP_PATH} "
+            f"ffmpeg -hide_banner -loglevel error -re {repeat}-i {self.CLIP_PATH} "
             f"-vf scale={self.width}:{self.height} -r {{fps}} -pix_fmt bgr565le -f rawvideo - "
             f"| python3 {self.PUMP_PATH} {self.framebuffer} {self.frame_bytes}"
         )
@@ -219,6 +226,14 @@ class ClipPlayer(Playout):
         self._runner(f"cat > {self.PUMP_PATH}", self.PUMP_SOURCE.encode())
         run = self.command().format(fps=fps)
         self._runner(f"setsid nohup sh -c '{run}' >/dev/null 2>&1 & echo $! > {self.PID_PATH}")
+
+    def is_running(self) -> bool:
+        """Whether the process named by the pidfile is alive, by signal 0 rather than by pattern."""
+        pid = str(self._runner(f"cat {self.PID_PATH} 2>/dev/null || true") or "").strip()
+        return (
+            pid.isdigit()
+            and self._runner(f"kill -0 {pid} 2>/dev/null && echo {RUNNING} || echo {STOPPED}") == RUNNING
+        )
 
     def stop(self) -> None:
         """Stop whatever this player started, by the pid it recorded."""

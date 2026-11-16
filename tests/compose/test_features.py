@@ -350,3 +350,35 @@ def test_media_durations_bound_the_render():
     assert F.Features(audio=audio, video=video).duration == pytest.approx(2.0)
     assert F.Features(audio=audio, video=None).duration == pytest.approx(audio.duration)
     assert F.Features(audio=None, video=None).duration == 0.0
+
+
+def test_phrase_bars_is_the_longest_grid_most_boundaries_share():
+    downbeats = np.arange(0.0, 64.0)
+    on_four = [
+        F.Section(float(a), float(b), "A") for a, b in zip([0, 4, 8, 16, 24, 33], [4, 8, 16, 24, 33, 64])
+    ]
+    assert F.phrase_bars(on_four, downbeats) == 8
+    assert F.phrase_bars(on_four[:1], downbeats) == 1
+    assert F.phrase_bars([F.Section(0.0, 3.0, "A"), F.Section(3.0, 7.0, "B")], downbeats) == 3
+
+
+def test_phrases_split_long_sections_and_keep_their_marks():
+    downbeats = np.arange(0.0, 20.0)
+    split = F.phrases([F.Section(0.0, 3.0, "A"), F.Section(3.0, 19.0, "B", destroy=True)], downbeats, 4)
+    assert [(s.start, s.end) for s in split] == [
+        (0.0, 3.0),
+        (3.0, 4.0),
+        (4.0, 8.0),
+        (8.0, 12.0),
+        (12.0, 16.0),
+        (16.0, 19.0),
+    ]
+    assert all(s.destroy and s.label == "B" for s in split[1:])
+
+
+def test_video_features_carry_p910_information():
+    rng = np.random.default_rng(0)
+    frames = rng.random((5, 36, 64, 3)).astype(np.float32)
+    frames[3] = frames[2]
+    vf = F.analyze_frames(frames, fps=30.0)
+    assert vf.si.shape == vf.ti.shape == (5,) and np.isnan(vf.ti[0]) and vf.ti[3] == 0.0 and vf.si.min() > 0

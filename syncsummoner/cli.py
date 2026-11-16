@@ -289,11 +289,11 @@ def _names_cmd(args: argparse.Namespace) -> int:
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
     from syncsummoner.compose.render import SESSION_FORMATS
-    from syncsummoner.device.playout import LoopPlayer
+    from syncsummoner.device.playout import ClipPlayer, LoopPlayer
     from syncsummoner.device.recorder import FFV1, Recorder, require_ffmpeg
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
-    from syncsummoner.probe.harvest import HarvestConfig, harvest
+    from syncsummoner.probe.harvest import HarvestConfig, harvest, prepare_footage
 
     if args.format not in SESSION_FORMATS:
         raise ValueError(f"unknown format {args.format!r}; known: {', '.join(SESSION_FORMATS)}")
@@ -310,6 +310,27 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         route=args.route,
     )
     host = {} if args.source_host is None else {"host": args.source_host}
+    player: Any = LoopPlayer(width=config.width, height=config.height, **host)
+    if args.footage:
+        from syncsummoner.compose.render import RenderConfig, write_timecoded
+
+        stimulus = prepare_footage(
+            args.footage,
+            args.out,
+            render=RenderConfig.for_format(args.format),
+            write=write_timecoded,
+            start=args.footage_start,
+            seconds=args.footage_seconds,
+        )
+        config = dataclasses.replace(config, footage=str(Path(args.out) / stimulus["clip"]), loop_fps=fps)
+        player = ClipPlayer(width=config.width, height=config.height, loop=True, **host)
+        LOG.info(
+            "stimulus: %d frames (%.1fs) of %s, sha256 %s",
+            stimulus["frames"],
+            stimulus["frames"] / stimulus["fps"],
+            stimulus["source"],
+            stimulus["sha256"][:12],
+        )
     archive = FrameArchive(args.out)
     dark = sorted(archive.darkened())
     if dark:
@@ -325,7 +346,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
             mode=FFV1,
             copyts=True,
         ),
-        player=LoopPlayer(width=config.width, height=config.height, **host),
+        player=player,
         link=_link(args),
         programs=None if args.program == "all" else args.program.split(","),
         config=config,
@@ -524,7 +545,12 @@ def _render_cmd(args: argparse.Namespace) -> int:
         if not report.usable:
             return 1
     if not args.cut_programs:
-        lead = render_mod.resolve_starts({take: render_mod.picture_start(take, config=config)})[take]
+        lead = render_mod.picture_start(take, config=config)
+        if lead is None:
+            raise render_mod.LostTimecodeError(
+                f"{take}: the timecode strip did not survive, so the picture start is unknown; "
+                "check the program or the pass"
+            )
         LOG.info("picture starts %.2fs into the take", lead)
     if args.no_master:
         return 0
@@ -542,6 +568,48 @@ def _render_cmd(args: argparse.Namespace) -> int:
     LOG.info("%s: %.1fs mastered from %s", args.output, seconds, take)
     print(args.output)
     return 0
+
+
+def _check_cmd(args: argparse.Namespace) -> int:
+    """Judge takes, or a master, against the clip they were fed; cover the cut plan and splice it."""
+    from syncsummoner.compose import render as render_mod
+    from syncsummoner.compose import takecheck
+    from syncsummoner.compose.score import Score
+    from syncsummoner.probe.footage import ClockModel
+    from syncsummoner.probe.store import slug
+
+    score = Score.load(Path(args.score))
+    programs = [p.strip() for p in (args.cut_programs or "").split(",") if p.strip()]
+    planned = render_mod.cut_plan(score, programs) if programs else []
+    takes = {
+        p: str(Path(args.takes) / f"take-{slug(p)}.mkv") for p in dict.fromkeys(c.program for c in planned)
+    }
+    models = {}
+    if args.master:
+        if args.splice:
+            raise ValueError("--splice cuts takes, not a master")
+        models["master"] = ClockModel.identity(score.fps)
+        takes = {"master": args.master}
+        planned = [render_mod.Cut(0.0, score.duration, "master")]
+    report = takecheck.check_takes(
+        score, planned, takes, args.source, strip_px=args.strip_px, models=models, ffmpeg=args.ffmpeg
+    )
+    for line in report.lines():
+        LOG.info("%s", line)
+    for cut in report.cuts:
+        LOG.info("  %7.2f-%7.2fs  %s", cut.start, cut.end, cut.program)
+    if args.splice:
+        config = render_mod.RenderConfig.for_format(args.format, strip_px=args.strip_px)
+        render_mod.splice(
+            planned if args.as_planned else report.cuts,
+            takes,
+            {name: t.picked for name, t in report.traces.items()},
+            args.splice,
+            config=dataclasses.replace(config, fps=float(score.fps)),
+            ffmpeg=args.ffmpeg,
+        )
+        print(args.splice)
+    return 1 if report.failed else 0
 
 
 def _route(text: str) -> int | None:
@@ -675,6 +743,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument(
         "--retry-dark", action="store_true", help="re-run programs marked dark, re-judging them"
     )
+    collect.add_argument(
+        "--footage", metavar="PATH", help="natural footage to archive against; any clip ffmpeg reads"
+    )
+    collect.add_argument("--footage-start", type=float, default=0.0, metavar="SECONDS")
+    collect.add_argument(
+        "--footage-seconds", type=float, default=None, metavar="SECONDS", help="default: the whole clip"
+    )
     _add_link_args(collect)
     _add_route_arg(collect)
     collect.set_defaults(func=_harvest_cmd)
@@ -763,6 +838,21 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         if name == "audition":
             node.add_argument("--seconds", type=float, default=30.0, help="excerpt length")
             node.add_argument("--start", type=float, default=0.0, help="where the excerpt begins")
+
+    check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")
+    check.add_argument("score")
+    check.add_argument("--source", required=True, help="the timecoded clip the takes were played from")
+    check.add_argument("--takes", default=".", help="where the per-program takes are")
+    check.add_argument("--cut-programs", help="the programs the cut rotates through, as rendered")
+    check.add_argument("--master", help="judge one spliced clip, frame for frame the source's, instead")
+    check.add_argument("--splice", metavar="OUT", help="splice the covered cut plan into OUT")
+    check.add_argument(
+        "--as-planned", action="store_true", help="splice the plan as rendered, dead spans and all"
+    )
+    check.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
+    check.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
+    check.add_argument("--ffmpeg", default="ffmpeg")
+    check.set_defaults(func=_check_cmd)
 
     return parser
 
