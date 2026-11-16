@@ -190,8 +190,8 @@ runner.run_plan(session, capture, plan, *, program, analyzer) -> list[Measuremen
 fit.fit_profile(records, *, specs=None) -> ProgramProfile
 fit.PROXY_METRICS: tuple[str, ...]        # kept per setpoint on ParamSpec.measured
 
-behaviour.program_behaviour(archive, program, *, loop, seed, log) -> Behaviour
-behaviour.behaviours(archive, programs, *, loop, jobs, log) -> dict[str, Behaviour]
+behaviour.dwells(rows) -> list[Dwell]           # the native stream positions each fit reads
+behaviour.behaviour(dwells, frames, *, loop, seed) -> Behaviour   # frames: position -> native
 # Behaviour is (registered, pointwise): what a refit can only read off the frames.
 # style is not per-program - it is a band over the whole library, from
 # style.measured_styles(pointwise_by_program, labelled).
@@ -199,8 +199,10 @@ behaviour.behaviours(archive, programs, *, loop, jobs, log) -> dict[str, Behavio
 archive.FrameArchive(directory).scratch(program) -> Path        # record here, commit is a rename
 FrameArchive.commit(program, key, video, rows, *, width, height, fps) -> dict
 FrameReader.stream(*, start=0, count=None, width=None) -> Iterator[rgb24]  # ffmpeg scales
+FrameReader.passes(*, width=None, native=()) -> Iterator[(scaled, full | None)]  # one decode
 
-replay.replay(archive, *, analyzer, programs=None) -> dict[str, list[MeasurementRecord]]
+replay.replay(archive, *, analyzer, programs=None, jobs=None) -> dict[str, Replayed]   # a worker per program
+replay.replay_program(archive, program, *, analyzer, loop) -> Replayed   # records, profile, behaviour, notes
 replay.setpoints(reader, *, width) -> Iterator[(setpoint, params, frames)]   # GAP rows dropped
 
 harvest.sweep(session, base, vectors, *, config) -> list[Window]   # when each setpoint was held

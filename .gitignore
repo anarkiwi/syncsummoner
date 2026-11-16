@@ -9,11 +9,16 @@ dist/
 coverage.xml
 .pytest_cache/
 htmlcov/
-profiles/
-profiles-*/
+# Rig data and agent work: never source, never build context.
+archive*/
+profiles*/
 captures/
-archive/
-archive-*/
+render_work/
+robotsofdeath/
+.claude/
 *.mkv
 *.mov
+*.mp4
 *.yuv
+*.wav
+*.flac

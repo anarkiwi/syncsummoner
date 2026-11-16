@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -53,6 +55,8 @@ STORED_PIX_FMT = "yuv422p"
 READ_PIX_FMT = "rgb24"
 CHANNELS = 3
 _PARAM_COLUMNS = tuple(f"p{i + 1}" for i in range(PARAM_COUNT))
+#: Raw RGB on a pipe, one output frame per decoded frame whatever the timestamps say.
+_RAW_OUT = ("-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", READ_PIX_FMT)
 
 
 class ArchiveError(RuntimeError):
@@ -104,6 +108,21 @@ def _params(vector: Sequence[int]) -> tuple[int, ...]:
     return values
 
 
+def _drain(pipe: Any, shape: tuple, count: int, out: queue.SimpleQueue) -> None:
+    """Move up to ``count`` frames of ``shape`` off ``pipe`` into ``out``, then None.
+
+    A decoder writing two pipes stalls on whichever is not read, so the second
+    one is emptied by this thread while the first is read in order.
+    """
+    size = int(np.prod(shape))
+    for _ in range(count):
+        buf = pipe.read(size)
+        if len(buf) < size:
+            break
+        out.put(np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape))
+    out.put(None)
+
+
 class FrameReader:
     """Random access into one archived program: its rows, and any frame by index."""
 
@@ -116,6 +135,7 @@ class FrameReader:
         ffmpeg,
         run,
         popen: Callable[..., Any] = subprocess.Popen,
+        threads: int | None = None,
     ):
         self.video = Path(video)
         self.meta = dict(meta)
@@ -126,6 +146,15 @@ class FrameReader:
         self._ffmpeg = ffmpeg
         self._run = run
         self._popen = popen
+        self._threads = (
+            []
+            if threads is None
+            else [
+                flag
+                for name in ("-threads", "-filter_threads", "-filter_complex_threads")
+                for flag in (name, str(int(threads)))
+            ]
+        )
 
     @property
     def count(self) -> int:
@@ -148,6 +177,7 @@ class FrameReader:
             self._ffmpeg,
             "-loglevel",
             "error",
+            *self._threads,
             "-ss",
             f"{max(0.0, start - 0.5) / self.fps:.6f}",
             "-i",
@@ -157,7 +187,71 @@ class FrameReader:
         ]
         if width and width < self.width:
             argv += ["-vf", f"scale={int(width)}:-2"]
-        return argv + ["-f", "rawvideo", "-pix_fmt", READ_PIX_FMT, "pipe:1"]
+        return argv + [*_RAW_OUT, "pipe:1"]
+
+    def _scale(self, width: int | None) -> str:
+        """Filter taking a native frame to ``width``, the one :meth:`command` asks for."""
+        return f"scale={int(width)}:-2" if width and width < self.width else "null"
+
+    def passes(self, *, width: int | None = None, native: Iterable[int] = ()) -> Iterator[tuple]:
+        """Yield ``(scaled, full)`` for every frame in stream order, from one decode.
+
+        ``scaled`` is the frame as :meth:`stream` gives it at ``width``; ``full`` is
+        the frame at native size where its stream position is in ``native`` and
+        None elsewhere. One decoder feeds both through a split filter graph, so a
+        reader that needs both regimes decodes the archive once, in order.
+        """
+        keep = sorted({int(i) for i in native if 0 <= int(i) < self.count})
+        argv = [self._ffmpeg, "-loglevel", "error", *self._threads, "-i", str(self.video)]
+        if not keep:
+            argv += ["-filter_complex", f"[0:v]{self._scale(width)}[s]", "-map", "[s]", *_RAW_OUT, "pipe:1"]
+            yield from ((frame, None) for frame in self._frames(argv, self.shape(width), self.count, ()))
+            return
+        picked = "+".join(f"eq(n\\,{i})" for i in keep)
+        graph = f"[0:v]split[a][b];[a]{self._scale(width)}[s];[b]select='{picked}'[n]"
+        read_fd, write_fd = os.pipe()
+        argv += ["-filter_complex", graph, "-map", "[s]", *_RAW_OUT, "pipe:1"]
+        argv += ["-map", "[n]", *_RAW_OUT, f"pipe:{write_fd}"]
+        fulls: queue.SimpleQueue = queue.SimpleQueue()
+        with os.fdopen(read_fd, "rb") as side:
+            drain = threading.Thread(target=_drain, args=(side, self.shape(), len(keep), fulls), daemon=True)
+            scaled = self._frames(argv, self.shape(width), self.count, (write_fd,), started=drain.start)
+            wanted = set(keep)
+            try:
+                for position, frame in enumerate(scaled):
+                    full = fulls.get() if position in wanted else None
+                    if position in wanted and full is None:
+                        return
+                    yield frame, full
+            finally:
+                scaled.close()
+                if drain.is_alive():
+                    drain.join()
+
+    def _frames(
+        self,
+        argv: list[str],
+        shape: tuple,
+        want: int,
+        fds: tuple,
+        *,
+        started: Callable[[], None] = lambda: None,
+    ) -> Iterator[np.ndarray]:
+        """Frames of ``shape`` from a decoder's stdout, ending early if it does."""
+        size = int(np.prod(shape))
+        proc = self._popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=fds)
+        for fd in fds:
+            os.close(fd)
+        started()
+        try:
+            for _ in range(want):
+                buf = proc.stdout.read(size)
+                if buf is None or len(buf) < size:
+                    return
+                yield np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape)
+        finally:
+            proc.stdout.close()
+            proc.wait()
 
     def frame(self, index: int, *, width: int | None = None) -> np.ndarray:
         """Decode one frame as RGB, scaled to ``width`` by the decoder if asked."""
@@ -180,19 +274,9 @@ class FrameReader:
         want = self.count - start if count is None else min(int(count), self.count - start)
         if want <= 0:
             return
-        shape = self.shape(width)
-        size = int(np.prod(shape))
-        argv = self.command(start=start, count=want, width=width)
-        proc = self._popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            for _ in range(want):
-                buf = proc.stdout.read(size)
-                if buf is None or len(buf) < size:
-                    return
-                yield np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape)
-        finally:
-            proc.stdout.close()
-            proc.wait()
+        yield from self._frames(
+            self.command(start=start, count=want, width=width), self.shape(width), want, ()
+        )
 
     def select(self, *, params: Sequence[int] | None = None, setpoint: int | None = None) -> list[FrameRow]:
         """Rows matching every criterion given, in stream order."""
@@ -219,12 +303,14 @@ class FrameArchive:
         popen: Callable[..., Any] = subprocess.Popen,
         run: Callable[..., Any] = subprocess.run,
         ffmpeg: str = "ffmpeg",
+        threads: int | None = None,
     ):
         self.directory = Path(directory)
         self.clock = clock
         self.popen = popen
         self.run = run
         self.ffmpeg = ffmpeg
+        self.threads = threads
 
     def paths(self, program: str) -> tuple[Path, Path, Path]:
         """Video, sidecar and metadata paths for one program."""
@@ -409,4 +495,5 @@ class FrameArchive:
             ffmpeg=self.ffmpeg,
             run=self.run,
             popen=self.popen,
+            threads=self.threads,
         )

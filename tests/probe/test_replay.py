@@ -2,11 +2,15 @@
 
 # pylint: disable=missing-function-docstring
 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
 import numpy as np
+import pytest
 
 from syncsummoner.device.profile import Source
+from syncsummoner.probe import codeframes as cf
 from syncsummoner.probe import replay as R
-from syncsummoner.probe.archive import GAP, CHANNELS, FrameRow
+from syncsummoner.probe.archive import GAP, CHANNELS, ArchiveError, FrameRow
 from syncsummoner.probe.runner import ANALYSIS_WIDTH
 from tests.probe.test_runner import FakeAnalyzer
 
@@ -35,6 +39,21 @@ class Reader:
         self.widths.append(width)
         end = len(self.frames) if count is None else start + count
         return iter(self.frames[start:end])
+
+    def passes(self, *, width=None, native=()):
+        """Every frame once, with the native ones asked for alongside."""
+        self.widths.append(width)
+        keep = set(native)
+        return iter([(frame, frame if i in keep else None) for i, frame in enumerate(self.frames)])
+
+
+class Broken(Reader):
+    """A reader whose decoder fails part way through the archive."""
+
+    def passes(self, *, width=None, native=()):
+        del width, native
+        yield self.frames[0], None
+        raise ArchiveError("decoding gave 0 bytes")
 
 
 class Archive:
@@ -107,32 +126,67 @@ def test_records_of_a_program_the_archive_does_not_hold():
     assert not R.program_records(Archive({}), "absent", analyzer=FakeAnalyzer())
 
 
-def test_replay_measures_every_committed_program():
-    archive = Archive(
-        {
-            "a": Reader([rgb(90), rgb(95), rgb(90)], setpoints=[GAP, 1, 1]),
-            "b": Reader([rgb(120), rgb(125), rgb(120)], setpoints=[GAP, 1, 1]),
-        }
-    )
+@pytest.fixture(name="loop", scope="module")
+def loop_fixture():
+    """A loop at the stub's own geometry, so behaviour has something to register against."""
+    return cf.build_loop(width=SIZE[1], height=SIZE[0], rng=np.random.default_rng(3), count=4, strip_px=2)
+
+
+def sweep(levels=(90, 95, 100, 105), *, dwell=4):
+    """A reader over a setpoint per level, a gap before each, every vector distinct."""
+    frames, setpoints = [], []
+    for setpoint, level in enumerate(levels):
+        frames += [rgb(0)] + [rgb(level + k) for k in range(dwell)]
+        setpoints += [GAP] + [setpoint] * dwell
+    reader = Reader(frames, setpoints=setpoints)
+    reader.rows = [
+        FrameRow(
+            frame=r.frame, program="p", params=(max(r.setpoint, 0) * 10,) + (0,) * 11, setpoint=r.setpoint
+        )
+        for r in reader.rows
+    ]
+    return reader
+
+
+def test_one_program_is_measured_fitted_and_read_from_one_decode(loop):
+    reader = sweep()
+    result = R.replay_program(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), loop=loop)
+    assert reader.widths == [ANALYSIS_WIDTH], "one decoder, at the analysis width"
+    assert [r.state_index for r in result.records] == [0, 1, 2, 3]
+    assert result.profile is not None and result.profile.program == "p"
+    assert 0.0 <= result.behaviour.pointwise <= 1.0
+    assert any("no program info archived" in note for note in result.notes)
+
+
+def test_a_program_the_archive_does_not_hold_is_a_note(loop):
+    result = R.replay_program(Archive({}), "absent", analyzer=FakeAnalyzer(), loop=loop)
+    assert not result.records and result.profile is None and result.notes == ["absent: no committed archive"]
+
+
+def test_a_program_that_will_not_decode_does_not_end_the_refit(loop):
+    reader = Broken([rgb(90)] * 4, setpoints=[0] * 4)
+    result = R.replay_program(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), loop=loop)
+    assert not result.records and result.profile is None and result.behaviour == R.B.Behaviour()
+    assert "ArchiveError" in result.notes[0]
+
+
+def test_replay_keys_what_measured_and_notes_what_did_not(loop):
+    archive = Archive({"a": sweep(), "b": sweep((120, 125))})
     notes = []
-    out = R.replay(archive, analyzer=FakeAnalyzer(), log=notes.append)
-    assert sorted(out) == ["a", "b"] and all(len(v) == 1 for v in out.values())
-    assert sorted(notes) == ["a: 1 setpoints measured", "b: 1 setpoints measured"]
+    out = R.replay(archive, analyzer=FakeAnalyzer(), loop=loop, log=notes.append, executor=ThreadPoolExecutor)
+    assert sorted(out) == ["a", "b"] and [len(out[n].records) for n in "ab"] == [4, 2]
+    out = R.replay(archive, analyzer=FakeAnalyzer(), programs=["a", "gone"], loop=loop, log=notes.append)
+    assert sorted(out) == ["a"] and "gone: no committed archive" in notes
 
 
-def test_replay_measures_only_the_programs_it_was_given():
-    archive = Archive({name: Reader([rgb(90), rgb(95)], setpoints=[0, 0]) for name in ("a", "b")})
-    assert sorted(R.replay(archive, analyzer=FakeAnalyzer(), programs=["a"])) == ["a"]
+def test_worker_processes_return_what_threads_do(loop):
+    """The pool sends the archive and the analyzer, a module by its name, to each worker."""
+    from syncsummoner import aesthetics  # pylint: disable=import-outside-toplevel
 
-
-def test_replay_notes_a_program_it_could_not_measure_but_reports_nothing_for_it():
-    notes = []
-    assert not R.replay(Archive({}), analyzer=FakeAnalyzer(), programs=["absent"], log=notes.append)
-    assert notes == ["absent: 0 setpoints measured"]
-
-
-def test_replay_reads_several_programs_at_once():
-    """Decoding dominates and releases the lock, so the work overlaps."""
-    archive = Archive({name: Reader([rgb(90), rgb(95)], setpoints=[0, 0]) for name in ("a", "b", "c", "d")})
-    out = R.replay(archive, analyzer=FakeAnalyzer(), jobs=4)
-    assert sorted(out) == ["a", "b", "c", "d"] and all(len(v) == 1 for v in out.values())
+    archive = Archive({name: sweep() for name in ("a", "b", "c")})
+    threaded = R.replay(archive, analyzer=aesthetics, loop=loop, jobs=2, executor=ThreadPoolExecutor)
+    pooled = R.replay(archive, analyzer=aesthetics, loop=loop, jobs=2, executor=ProcessPoolExecutor)
+    assert sorted(pooled) == ["a", "b", "c"]
+    for name, result in pooled.items():
+        assert [r.metrics for r in result.records] == [r.metrics for r in threaded[name].records]
+        assert result.behaviour == threaded[name].behaviour

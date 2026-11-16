@@ -4,8 +4,6 @@
 # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 # pylint: disable=protected-access  ; the dwell picker is the unit worth testing directly
 
-from concurrent.futures import ProcessPoolExecutor
-
 import cv2
 import numpy as np
 import pytest
@@ -14,11 +12,10 @@ from syncsummoner.device.profile import ProgramStyle
 from syncsummoner.probe import behaviour as B
 from syncsummoner.probe import codeframes as cf
 from syncsummoner.probe import style as S
-from syncsummoner.probe.archive import ArchiveError, FrameRow, GAP
+from syncsummoner.probe.archive import FrameRow, GAP
 
 WIDTH, HEIGHT, COUNT = 160, 128, 16
 DWELL = 32
-FPS = 12.0
 
 
 @pytest.fixture(name="loop", scope="module")
@@ -32,34 +29,20 @@ def bytes_of(frame):
     return np.clip(np.rint(np.asarray(frame) * 255.0), 0, 255).astype(np.uint8)
 
 
-class Reader:
-    """Frame reader stub over a rendered dwell, streaming native frames in order."""
+class Capture:
+    """A program's native frames and the rows the archive holds for them."""
 
-    def __init__(self, frames, setpoints, *, fps=FPS):
+    def __init__(self, frames, setpoints):
         self.frames = [bytes_of(f) for f in frames]
-        self.fps = fps
-        self.meta = {"width": WIDTH, "height": HEIGHT, "frames": len(self.frames)}
         self.rows = [
             FrameRow(frame=i, program="p", params=tuple([max(s, 0)] * 12), setpoint=s)
             for i, s in enumerate(setpoints)
         ]
-        self.spans = []
 
-    def stream(self, *, start=0, count=None, width=None):
-        self.spans.append((start, count, width))
-        end = len(self.frames) if count is None else start + count
-        return iter(self.frames[start:end])
-
-
-class Archive:
-    """Frame archive stub holding one reader per program."""
-
-    def __init__(self, readers):
-        self.readers = dict(readers)
-
-    def reader(self, program, key=None):
-        del key
-        return self.readers.get(program)
+    def behaviour(self, loop):
+        """Behaviour read off just the positions the dwells ask for."""
+        spread = B.dwells(self.rows)
+        return B.behaviour(spread, {i: self.frames[i] for i in B.positions(spread)}, loop=loop)
 
 
 def played(loop, dwells=2):
@@ -74,12 +57,12 @@ def capture(loop, transform, dwells=2):
     for setpoint, dwell in enumerate(played(loop, dwells)):
         frames += [np.zeros_like(dwell[0])] + [np.clip(transform(f), 0.0, 1.0) for f in dwell]
         setpoints += [GAP] + [setpoint] * len(dwell)
-    return Reader(frames, setpoints)
+    return Capture(frames, setpoints)
 
 
 def measured(loop, transform):
     """Behaviour of one program whose archive holds the transformed loop."""
-    return B.program_behaviour(Archive({"p": capture(loop, transform)}), "p", loop=loop)
+    return capture(loop, transform).behaviour(loop)
 
 
 def tile(frame):
@@ -118,11 +101,14 @@ def test_a_passthrough_classifies_analog_which_the_enum_cannot_say_otherwise(loo
     assert styles["p"] is ProgramStyle.ANALOG
 
 
-def test_the_pass_reads_native_frames_not_scaled_ones(loop):
-    reader = capture(loop, lambda f: f)
-    B.program_behaviour(Archive({"p": reader}), "p", loop=loop)
-    assert reader.spans and all(width is None for _, _, width in reader.spans)
-    assert [count for _, count, _ in reader.spans] == [B.FRAME_SAMPLES] * 2
+def test_each_dwell_reads_only_the_captures_its_fits_score(loop):
+    rows = capture(loop, lambda f: f).rows
+    spread = B.dwells(rows)
+    assert [int(d.pointwise[0]) for d in spread] == [1, DWELL + 2], "a dwell starts after its gap"
+    for dwell in spread:
+        assert dwell.pointwise.size == B.POINTWISE_SAMPLES and dwell.registered.size == cf.REGISTER_SAMPLES
+        assert set(dwell.registered) <= set(range(dwell.pointwise[0], dwell.pointwise[0] + B.FRAME_SAMPLES))
+    assert len(B.positions(spread)) < 2 * B.FRAME_SAMPLES
 
 
 def test_dwells_are_spread_across_the_sweep_and_bounded():
@@ -144,31 +130,16 @@ def test_dwells_of_an_archive_of_nothing_but_gaps():
     assert not B._dwells(rows)
 
 
-def test_a_program_the_archive_does_not_hold_keeps_the_defaults():
-    notes = []
-    assert B.program_behaviour(Archive({}), "absent", log=notes.append) == B.Behaviour()
-    assert notes and "absent" in notes[0]
+def test_an_archive_of_nothing_but_gaps_has_no_dwell_to_read(loop):
+    rows = Capture([np.zeros((HEIGHT, WIDTH, 3), np.float32)] * 4, [GAP] * 4).rows
+    with pytest.raises(LookupError, match="no measured dwell"):
+        B.behaviour(B.dwells(rows), {}, loop=loop)
 
 
-def test_an_archive_of_nothing_but_gaps_keeps_the_defaults(loop):
-    reader = Reader([np.zeros((HEIGHT, WIDTH, 3), np.float32)] * 4, [GAP] * 4)
-    notes = []
-    found = B.program_behaviour(Archive({"p": reader}), "p", loop=loop, log=notes.append)
-    assert found == B.Behaviour() and "no measured dwell" in notes[0]
-
-
-def test_a_program_that_will_not_decode_does_not_end_the_refit(loop):
-    class Broken(Reader):
-        """A reader whose decoder fails part way through the archive."""
-
-        def stream(self, *, start=0, count=None, width=None):
-            del start, count, width
-            raise ArchiveError("decoding gave 0 bytes")
-
-    reader = Broken([np.zeros((HEIGHT, WIDTH, 3), np.float32)] * DWELL, [0] * DWELL)
-    notes = []
-    found = B.program_behaviour(Archive({"p": reader}), "p", loop=loop, log=notes.append)
-    assert found == B.Behaviour() and "ArchiveError" in notes[0]
+def test_dwells_whose_frames_were_never_decoded_read_nothing(loop):
+    reader = capture(loop, lambda f: f)
+    with pytest.raises(LookupError, match="no frames decoded"):
+        B.behaviour(B.dwells(reader.rows), {}, loop=loop)
 
 
 def test_behaviour_unpacks_into_the_profile_fields(loop):
@@ -176,40 +147,10 @@ def test_behaviour_unpacks_into_the_profile_fields(loop):
     assert registered > 0.9 and pointwise > 0.9
 
 
-def test_every_program_asked_for_is_keyed_even_where_it_could_not_be_read(loop):
-    archive = Archive({"a": capture(loop, lambda f: f)})
-    found = B.behaviours(archive, ["a", "b"], loop=loop, jobs=2)
-    assert sorted(found) == ["a", "b"] and found["b"] == B.Behaviour()
-    assert found["a"].pointwise > 0.9
-
-
-def test_worker_processes_return_what_threads_do_and_notes_reach_the_log(loop):
-    archive = Archive({"a": capture(loop, lambda f: f), "c": Reader([], [0] * DWELL)})
-    notes = []
-    found = B.behaviours(
-        archive,
-        ["a", "c"],
-        loop=loop,
-        jobs=2,
-        log=notes.append,
-        executor=ProcessPoolExecutor,
-    )
-    assert found == B.behaviours(archive, ["a", "c"], loop=loop)
-    assert found["a"].pointwise > 0.9 and found["c"] == B.Behaviour()
-    assert len(notes) == 1 and notes[0].startswith("c: loop behaviour not measured")
-
-
 def test_a_capture_at_another_resolution_is_matched_by_resampling_the_loop(loop):
     """The stimulus is resampled onto the capture; the capture is never scaled down."""
     found = measured(loop, lambda f: cv2.resize(f, (2 * WIDTH, 2 * HEIGHT)))
     assert found.registered > 0.9 and found.pointwise > 0.9
-
-
-def test_a_dwell_the_decoder_gives_no_frames_for_keeps_the_defaults(loop):
-    reader = Reader([], [0] * DWELL)
-    notes = []
-    found = B.program_behaviour(Archive({"p": reader}), "p", loop=loop, log=notes.append)
-    assert found == B.Behaviour() and "no frames decoded" in notes[0]
 
 
 def test_registration_runs_at_the_width_the_carrier_survives_at():

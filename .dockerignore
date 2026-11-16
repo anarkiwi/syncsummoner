@@ -9,15 +9,16 @@ htmlcov/
 .pytest_cache/
 .import_linter_cache/
 .coverage*
-archive/
+# Rig data and agent work: never source, never build context.
+archive*/
+profiles*/
 captures/
 render_work/
-profiles/
-profiles_diverse/
+robotsofdeath/
+.claude/
 *.mkv
 *.mov
 *.mp4
 *.yuv
 *.wav
 *.flac
-robotsofdeath/
