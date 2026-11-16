@@ -98,6 +98,7 @@ the fix:
 | `capture.mode` | the card offers MJPEG at the session size (`ffmpeg -f v4l2 -list_formats all`) |
 | `firmware.version` ... `video.output_connected` | pyvmancer's own device checks |
 | `device.format` | the device's output timing is `--format` |
+| `midi.cc_map` | every slot listens on the CC the MIDI controller in use sends it, and no CC drives two slots; the fix is `vmancer cc-map --restore --yes` |
 | `midi.latency` | pyvmancer's single CC write to serial readback median is within two output frames plus the readback round trip |
 | `midi.backlog` | paced ramps at each `--latency-rates` leave a sentinel no more than a frame behind a single write; the fix names the fastest clean rate |
 | `loop.signal`, `loop.index`, `loop.bars` | not the No Signal splash; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |

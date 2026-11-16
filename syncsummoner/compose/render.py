@@ -388,6 +388,7 @@ def render_played(
             with recorder.recording(out, seconds=score.duration + config.lead_s):
                 with rig.playout.playing(fps=config.fps):
                     written["writes"] = drive(rig, auto, duration=score.duration)
+            rig.transport.verify_cc_map()
     finally:
         if owned and rig.capture is not None:
             rig.capture.close()

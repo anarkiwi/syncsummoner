@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from pyvmancer import CcMapError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import BlankTakeError, TakeReport
@@ -71,6 +72,13 @@ class Port:
         self.loads = []
         self.closed = False
         self.hashes = 0
+        self.corrupt = False
+        self.verified = 0
+
+    def verify_cc_map(self):
+        self.verified += 1
+        if self.corrupt:
+            raise CcMapError("device CC map differs from the CCs sent (P12 CC0)")
 
     def programs(self):
         return list(self.programs_list)
@@ -499,6 +507,24 @@ def test_harvest_stops_once_the_device_will_not_hold_a_program(tmp_path):
     assert report.wedged and [r.program for r in report.results] == ["Alpha", "Beta"]
     assert report.failures[0].error.startswith("RuntimeError")
     assert port.closed
+
+
+def test_a_cc_map_changed_by_the_end_of_a_sweep_fails_the_program_unarchived(tmp_path):
+    """A take driven through a changed map measures the wrong slots, so it is never committed."""
+
+    class Corrupting(Sess):
+        """Session whose load of Alpha leaves the device CC map changed."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            self.transport.corrupt = name == "Alpha"
+
+    port, archive = Port(), Archive(tmp_path)
+    report = run(archive, port=port, session_factory=Corrupting)
+    assert [r.program for r in report.failures] == ["Alpha"]
+    assert report.failures[0].error.startswith("CcMapError")
+    assert archive.commits == ["Beta"] and port.verified == 2
+    assert not report.wedged and not report.blacked
 
 
 def test_a_failure_with_a_live_canary_carries_on(tmp_path):

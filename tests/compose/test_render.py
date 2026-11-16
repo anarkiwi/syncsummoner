@@ -13,6 +13,7 @@ import types
 
 import numpy as np
 import pytest
+from pyvmancer import CcMapError
 
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
@@ -484,7 +485,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
             session=Session(),
             capture=None,
             playout=Player(),
-            transport=types.SimpleNamespace(program_info=lambda: None),
+            transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=lambda: None),
         ),
         config=config,
         scratch=tmp_path / "tc.mkv",
@@ -557,7 +558,7 @@ def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=types.SimpleNamespace(program_info=lambda: None),
+        transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=lambda: None),
     )
     monkeypatch.setattr(R, "settle", lambda *a, **k: None)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
@@ -670,9 +671,18 @@ def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
     assert [round(float(f.mean()), 3) for f in stream] == [round(float(f.mean()), 3) for f in clip[10:15]]
 
 
-def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path):
-    """A load costs 12 to 19s, so a clip started before it has already run out by the take."""
+@pytest.mark.parametrize("corrupted", [False, True])
+def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corrupted):
+    """A load costs 12 to 19s, so a clip started before it has already run out by the take.
+
+    The CC map is read back once the pass is driven, and a changed map fails the pass.
+    """
     order = []
+
+    def verify():
+        order.append("verify")
+        if corrupted:
+            raise CcMapError("device CC map differs from the CCs sent (P12 CC0)")
 
     class Player:
         """ClipPlayer stand-in recording when playback starts and stops."""
@@ -716,7 +726,10 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path):
 
     monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle"))
     monkeypatch.setattr(
-        R, "inspect_take", lambda *a, **k: R.TakeReport(frames=300, picture=300, frozen=False, luma=0.4)
+        R,
+        "inspect_take",
+        lambda *a, **k: order.append("inspect")
+        or R.TakeReport(frames=300, picture=300, frozen=False, luma=0.4),
     )
     monkeypatch.setattr(R, "drive", lambda *a, **k: order.append("drive") or 0)
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
@@ -724,19 +737,20 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path):
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=types.SimpleNamespace(program_info=lambda: None),
+        transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=verify),
     )
     score = Score(duration=10.0, sections=[Section(0.0, 10.0, "A")], layers=[Layer("Passthru", 0, [])])
-    R.render_played(
-        score,
-        "clip.mkv",
-        tmp_path / "take.mkv",
-        profiles={},
-        rig=rig,
-        config=CONFIG,
-        prepared=True,
-        recorder=Rec(),
-    )
+    with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
+        R.render_played(
+            score,
+            "clip.mkv",
+            tmp_path / "take.mkv",
+            profiles={},
+            rig=rig,
+            config=CONFIG,
+            prepared=True,
+            recorder=Rec(),
+        )
     assert order == [
         "upload:timecoded.mkv",
         "play",
@@ -746,6 +760,8 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path):
         "play",
         "drive",
         "stop",
+        "verify",
+        *(() if corrupted else ("inspect",)),
     ]
 
 

@@ -12,6 +12,8 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from syncsummoner.progress import LOG
+
 from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, Role
 
 #: Parking every manual value at zero makes the additive sum equal the MIDI offset.
@@ -103,6 +105,8 @@ class Session:
         self._next_send = clock()
         self.journal = journal
         self._writes = 0
+        self._last_load: tuple[str | None, bool] = (None, False)
+        self.assign_events: list[dict[str, Any]] = []
 
     @property
     def park_values(self) -> np.ndarray:
@@ -151,6 +155,7 @@ class Session:
         Readback settles first, because serial and MIDI are asynchronous and the
         last parameter written is otherwise sampled before the device applies it.
         """
+        self.transport.consume_midi_assign()
         for index in range(1, PARAM_COUNT + 1):
             self._throttle()
             self.transport.set_param(index, 0)
@@ -161,12 +166,29 @@ class Session:
             state = np.asarray(self.transport.program_state(), dtype=int)
             drift = np.abs(state - self._park)
             if not np.any(drift > self.tolerance):
+                self._reassert_cc_map()
                 return
             if remaining is None:
                 bad = np.flatnonzero(drift > self.tolerance) + 1
                 raise ParkError(
                     f"parameters {bad.tolist()} read back {state.tolist()}, want {self._park.tolist()}"
                 )
+
+    def _reassert_cc_map(self) -> None:
+        """Reassign a MIDI Assign capture of the sink CC, recording it against the last load."""
+        assignment = self.transport.reassert_cc_map()
+        if assignment is None:
+            return
+        program, link = self._last_load
+        event = {
+            "time": time.time(),
+            "program": program,
+            "params": list(assignment.before.armed),
+            "link": link,
+        }
+        self.assign_events.append(event)
+        LOG.warning("%s", assignment.summary())
+        self._note("midi_assign", summary=assignment.summary(), **event)
 
     def verify_addressing(self, index: int = 1, *, target: float | bool = 0.75) -> int:
         """Check empirically that a write lands where asked, and raise when it does not.
@@ -296,11 +318,16 @@ class Session:
         The drop clears the source framebuffer: re-push any stimulus afterwards.
         """
         self._note("load_program", program=name, link=link is not None)
+        self._last_load = (name, link is not None)
         with ExitStack() as stack:
             if link is not None:
                 stack.enter_context(link.quiet())
             self.transport.load_program(name)
             self._sleep(self.load_blackout_s)
+        assignment = self.transport.cc_assignment
+        if assignment is not None:
+            LOG.info("%s: %s", name, assignment.summary())
+            self._note("cc_map", program=name, summary=assignment.summary())
         self._sent.clear()
         if link is not None:
             self.wait_state_settled()

@@ -313,7 +313,8 @@ class Doctor:
     def device(self, transport: Any) -> list[Finding]:
         """The device's own checks, and that its output timing is the session format."""
         timing = transport.video_status().output_timing
-        return diagnose(transport.device.shell) + [
+        device = transport.device
+        return diagnose(device.shell, device.midi if device.has_midi else None) + [
             _check(
                 "device.format",
                 str(timing).lower() == self.fmt.name.lower(),

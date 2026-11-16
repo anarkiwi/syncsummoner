@@ -166,6 +166,23 @@ class Transport:
         self._device.load_program(name, settle=0)
         self._loaded = name
 
+    @property
+    def cc_assignment(self) -> Any:
+        """The device's last CC-map assignment, as pyvmancer's ``CcMapAssignment``, or None."""
+        return self._device.cc_assignment
+
+    def consume_midi_assign(self) -> None:
+        """Send the sink CC, so an armed MIDI Assign captures it rather than a slot's CC."""
+        self._device.consume_midi_assign()
+
+    def reassert_cc_map(self) -> Any:
+        """Reassign a sink-CC capture and return the assignment, or None; any other change raises."""
+        return self._device.reassert_cc_map()
+
+    def verify_cc_map(self) -> Any:
+        """Read the CC map back, raising ``pyvmancer.CcMapError`` on any difference."""
+        return self._device.verify_cc_map()
+
     def program_info(self, name: str | None = None) -> ProgramInfo:
         """Parameter specs of a program, loading it first when it is not current.
 
