@@ -369,7 +369,7 @@ def test_ensure_live_resyncs_once_then_raises():
 
 
 def test_ensure_live_without_motion_accepts_a_still_stimulus():
-    """A probe drives a still pattern; no motion is correct, only the splash is failure."""
+    """A probe drives a still pattern; no motion is correct, only no picture is failure."""
     port = FakeTransport()
     session, _, _ = make_session(port)
     capture = types.SimpleNamespace(wait_for_content=lambda **_kw: False, wait_for_lock=lambda **_kw: True)
@@ -415,7 +415,6 @@ def test_health_marks_the_device_good_and_journals_it():
     rng = np.random.default_rng(1)
     capture = types.SimpleNamespace(
         frames=lambda n, **_kw: [rng.random((8, 8, 3)).astype(np.float32) for _ in range(n)],
-        chroma_fraction=lambda _f: 0.7,
     )
     assert session.health(capture)["ok"] is True
     assert log.since_last_good() == []

@@ -101,7 +101,7 @@ the fix:
 | `midi.cc_map` | every slot listens on the CC the MIDI controller in use sends it, and no CC drives two slots; the fix is `vmancer cc-map --restore --yes` |
 | `midi.latency` | pyvmancer's single CC write to serial readback median is within two output frames plus the readback round trip |
 | `midi.backlog` | paced ramps at each `--latency-rates` leave a sentinel no more than a frame behind a single write; the fix names the fastest clean rate |
-| `loop.signal`, `loop.index`, `loop.bars` | not the No Signal splash; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
+| `loop.signal`, `loop.index`, `loop.bars` | the HDMI transmitter drives `--format` and the capture is not a uniform field; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
 
 `--latency` writes CC offsets to the measured parameters, then restores them
 (`midi.restored` fails if they did not read back). By default it measures the
@@ -126,8 +126,10 @@ else may open it during a pass; a `Capture` handle left open makes the recorder
 exit immediately. Reopening also costs about 0.5 s of lock, so a pass records
 once rather than per sample.
 
-The capture card synthesizes a "No Signal" splash rather than going black. It
-has high variance and will pass any naive liveness test as content.
+The capture card reports no signal state and synthesizes a "No Signal" slide
+rather than going black, so whether there is signal comes from the Videomancer's
+HDMI transmitter in `video status`, never from the picture; see
+[hardware.md](hardware.md#signal-comes-from-the-videomancers-transmitter-the-card-exposes-none).
 
 Park the panel before measuring. MIDI CC is an offset onto the physical knob
 position, not an absolute set.

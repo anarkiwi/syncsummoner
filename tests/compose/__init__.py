@@ -1,8 +1,11 @@
 """Synthetic fixtures shared by the compose tests: no hardware, no media files, seeded RNG."""
 
+import types
+
 import numpy as np
 
 from syncsummoner.compose.features import Features, analyze_audio
+from syncsummoner.compose.render import RenderConfig, TakeReport
 from syncsummoner.device.profile import (
     Axis,
     Cliff,
@@ -14,8 +17,20 @@ from syncsummoner.device.profile import (
     Tongue,
     classify_role,
 )
+from tests import transmitter as tx
 
 SR = 22050
+#: What a settled load's probe holds when the program is drawing.
+PROBED = TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
+
+
+def rig_transport(*video, **kw):
+    """Transport stand-in whose transmitter replays ``video``, driving the session timing by default."""
+    fields = {"program_info": lambda: None, "verify_cc_map": lambda: None}
+    status = tx.Transmitter(*(video or [tx.at(RenderConfig.timing)])).video_status
+    return types.SimpleNamespace(**{**fields, "video_status": status, **kw})
+
+
 SEGMENT_KW = {"kernel_s": 0.5, "min_section_s": 0.4, "prominence_sigma": 0.5}
 
 

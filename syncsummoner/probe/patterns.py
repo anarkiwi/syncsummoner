@@ -170,8 +170,7 @@ def _band_noise(width, height, _frame_index, rng, sigma_frac=BAND_NOISE_SIGMA):
     """Low-pass colour noise: survives misalignment, breaks under displacement.
 
     A zone plate collapses from 0.999 to 0.013 pointwise fit under one pixel of
-    shift and a ramp survives 24 pixels at 0.912; this sits between. Chromatic
-    because a grey stimulus reads as the capture card's achromatic splash.
+    shift and a ramp survives 24 pixels at 0.912; this sits between.
     """
     import cv2  # pylint: disable=import-outside-toplevel,no-member
 

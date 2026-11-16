@@ -208,6 +208,15 @@ def test_probe_archive_records_the_card_losslessly_with_the_hosts_own_clock(harv
     assert kwargs["mode"] is recorder_mod.FFV1 and kwargs["copyts"] is True
     assert kwargs["device"] == "/dev/video9"
     assert (kwargs["width"], kwargs["height"], kwargs["fps"]) == (1920, 1080, 30)
+    assert harvested["config"].timing == "1080p30"
+
+
+def test_probe_archive_takes_raster_and_timing_from_one_format(harvested, tmp_path):
+    """The transmitter is judged against the same format the card is recorded at."""
+    assert cli.main(["probe", "archive", "--out", str(tmp_path), "--format", "ntsc"]) == 0
+    config = harvested["config"]
+    assert (config.width, config.height, config.capture_fps, config.timing) == (720, 480, 30, "ntsc")
+    assert cli.main(["probe", "archive", "--out", str(tmp_path), "--format", "4k"]) == 1
 
 
 def test_probe_archive_reports_a_wedged_device_as_a_failure(monkeypatch, tmp_path):
@@ -284,7 +293,7 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe names", ["--archive", "--program"]),
         ("score show", ["--profiles"]),
-        ("probe archive", ["--capture", "--setpoints", "--dwell", "--width", "--no-link"]),
+        ("probe archive", ["--capture", "--setpoints", "--dwell", "--format", "--no-link"]),
     ],
 )
 def test_every_documented_flag_is_actually_registered(command, flags, capsys):

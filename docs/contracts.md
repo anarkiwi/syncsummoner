@@ -137,18 +137,19 @@ class Capture:                       # long-lived; never reopened per sample
     def __init__(self, device="/dev/video0", *, width=720, height=576, fps=50): ...
     def __enter__ / __exit__
     def read(self) -> np.ndarray | None      # RGB float32 (H, W, 3)
-    def wait_for_lock(self, timeout_s=10.0) -> bool   # past the splash AND structured()
-    def is_no_signal(self, frame) -> bool    # capture card synthesizes a splash; see docs/hardware.md
-    def wait_for_content(self, timeout_s=15.0) -> bool   # past the splash AND moving
+    def wait_for_lock(self, timeout_s=10.0) -> bool   # a structured() frame arrives
+    def wait_for_content(self, timeout_s=15.0) -> bool   # frames arrive AND move
 
 class Recorder:                      # ffmpeg owns the card; the host touches no frame
     def __init__(self, device="/dev/video0", *, width, height, fps, mode=MJPEG, copyts=False): ...
     def command(self, path, *, seconds=None) -> list[str]     # -t is unusable under copyts
     def recording(self, path, *, seconds=None) -> ContextManager   # records for the block
     def timestamps(self, path) -> np.ndarray   # per-frame CLOCK_MONOTONIC capture times
-inspect_take(path) -> TakeReport   # picture/splash/uniform counts, luma range, motion; .mostly_picture (load), .usable (render), .ever_structured (archive), .frozen
+inspect_take(path) -> TakeReport   # picture/uniform counts, luma range, motion; .mostly_picture (load), .usable (render), .ever_structured (archive), .frozen
 held(frames) -> (motion, frozen)   # consecutive-difference correlation; -1/2 for one picture plus noise
-settle(recorder, *, program, timeout_s, probe_path)   # waits for .mostly_picture; raises BlankTakeError
+settle(recorder, transport, *, program, timing, timeout_s, probe_path) -> TakeReport  # transmitting() first, then the first probe with frames; SignalLostError / BlankTakeError
+require_signal(transport, *, program, timing, when) -> VideoStatus   # brackets every pass; raises SignalLostError
+transmitting(status, timing) -> bool | None   # hdmi_tx driving at the session timing; None when unreported
 
 class Link:                          # the HDMI link out of the stimulus source host
     def down(self) / up(self) -> str: ...

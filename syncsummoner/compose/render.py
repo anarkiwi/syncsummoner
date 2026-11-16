@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
-from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
+from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, require_signal, settle
 from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
@@ -56,6 +56,8 @@ class RenderConfig:
     width: int = 1280
     height: int = 720
     fps: float = 60.0
+    #: The output timing the device must drive, as it names it; the raster above is its size.
+    timing: str = "720p60"
     strip_px: int = 8
     bits: int = 16
     #: CC write to applied latency; None is one frame period, which docs/hardware.md records.
@@ -78,7 +80,7 @@ class RenderConfig:
     def for_format(cls, name: str, **kw: Any) -> "RenderConfig":
         """Config for a named session format; format is a session constant, never a parameter."""
         width, height, fps = SESSION_FORMATS[name]
-        return cls(width=width, height=height, fps=fps, **kw)
+        return cls(width=width, height=height, fps=fps, timing=name, **kw)
 
 
 @dataclass
@@ -372,23 +374,30 @@ def render_played(
                 latency = write_latency(config, rig.transport)
                 loaded["latency_ms"] = round(latency * 1e3, 1)
                 rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
-                settle(
+                probe = settle(
                     recorder,
+                    rig.transport,
                     program=layers[0].program,
+                    timing=config.timing,
                     timeout_s=config.settle_s,
                     probe_path=config.probe_path,
                 )
+                if not probe.mostly_picture:
+                    raise BlankTakeError(f"{layers[0].program}: the program outputs no picture ({probe})")
         auto = schedule(
             autos.get(layers[0].index, Automation.empty()),
             latency_s=latency,
             early_bias_s=config.early_bias_s,
             cc_budget_hz=config.cc_budget_hz,
         )
+        signal = {"program": layers[0].program, "timing": config.timing}
         with stage("pass", program=layers[0].program, seconds=f"{score.duration:.1f}") as written:
+            require_signal(rig.transport, when="as the pass began", **signal)
             with recorder.recording(out, seconds=score.duration + config.lead_s):
                 with rig.playout.playing(fps=config.fps):
                     written["writes"] = drive(rig, auto, duration=score.duration)
             rig.transport.verify_cc_map()
+            require_signal(rig.transport, when="as the pass ended", **signal)
     finally:
         if owned and rig.capture is not None:
             rig.capture.close()

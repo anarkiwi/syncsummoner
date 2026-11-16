@@ -7,6 +7,7 @@ ffmpeg reading the card in MJPEG can (docs/hardware.md).
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import shutil
 import signal
@@ -20,7 +21,8 @@ from typing import Any, Callable, Iterator
 
 import numpy as np
 
-from .capture import QUANTUM, Capture
+from .capture import QUANTUM
+from .transport import transmitting
 
 __all__ = [
     "FFV1",
@@ -30,11 +32,13 @@ __all__ = [
     "Recorder",
     "RecorderError",
     "SIGMA",
+    "SignalLostError",
     "TakeReport",
     "die_with_parent",
     "held",
     "inspect_take",
     "require_ffmpeg",
+    "require_signal",
     "settle",
 ]
 
@@ -65,8 +69,8 @@ FFV1 = (
 #: Linux prctl option tying a child's lifetime to its parent's.
 PR_SET_PDEATHSIG = 1
 #: Size every take is judged at, point-sampled so each sample is a pixel the card
-#: delivered: blending would invent mid-tones in the bilevel splash and average
-#: away the noise the motion test is calibrated against.
+#: delivered: blending would invent mid-tones at edges and average away the
+#: noise the motion test is calibrated against.
 INSPECT_SIZE = (160, 90)
 #: Standard errors within which a statistic counts as equal to its null value:
 #: the conventional three-sigma bound, a 0.27% chance of rejecting a true null.
@@ -112,12 +116,36 @@ class BlankTakeError(RuntimeError):
     """The device never returned a picture, or the take held none that moved."""
 
 
+class SignalLostError(BlankTakeError):
+    """The Videomancer's transmitter was not driving the session timing when it had to be."""
+
+
+def _lost(program: str, timing: str, status: Any, when: str) -> SignalLostError:
+    """The error for a transmitter not driving ``timing``, carrying the status that said so."""
+    known = transmitting(status, timing) is not None
+    why = f"the transmitter is not driving {timing}" if known else "the firmware reports no transmitter state"
+    return SignalLostError(f"{program}: {why} {when}; last video status {json.dumps(status.raw)}")
+
+
+def require_signal(transport: Any, *, program: str, timing: str, when: str) -> Any:
+    """The video status, when it shows the transmitter driving ``timing``; :class:`SignalLostError` if not.
+
+    A pass brackets its recording with this, so a transmitter that dropped
+    while it ran fails the pass rather than archiving the card's own frames.
+    """
+    status = transport.video_status()
+    if not transmitting(status, timing):
+        raise _lost(program, timing, status, when)
+    return status
+
+
 @dataclass(frozen=True)
 class TakeReport:
     """What a finished take actually holds, so a dead one is caught here and not on playback.
 
-    ``picture`` counts frames with spatial structure that are not the card's
-    splash, ``splash`` the splash, and the rest are uniform fields. ``spread`` is
+    ``picture`` counts frames with spatial structure, and the rest are uniform
+    fields: a take is recorded only while the transmitter drives the session
+    timing, so every frame is the program's own output. ``spread`` is
     the median frame's luma range in 8-bit steps, and ``motion`` the mean
     correlation of consecutive frame differences, -0.5 for a held picture, and
     None when too few distinct frames define one.
@@ -125,7 +153,6 @@ class TakeReport:
 
     frames: int = 0
     picture: int = 0
-    splash: int = 0
     spread: int = 0
     motion: float | None = None
     frozen: bool = True
@@ -133,10 +160,7 @@ class TakeReport:
 
     @property
     def mostly_picture(self) -> bool:
-        """Whether most frames carry a picture, moving or not; what a load waits for.
-
-        The splash is excluded, because a load relocking the card shows it.
-        """
+        """Whether most frames carry a picture, moving or not: a render's and a passthrough's load test."""
         return 2 * self.picture > self.frames
 
     @property
@@ -146,21 +170,20 @@ class TakeReport:
 
     @property
     def ever_structured(self) -> bool:
-        """Whether any frame holds spatial structure, splash-classified or not: an archive's standard.
+        """Whether any frame holds spatial structure: an archive's standard.
 
         A sweep visits setpoints whose output is a flat field and a generator may
-        hold one picture, so neither motion nor a majority is required. The
-        splash classifier is a pixel heuristic that achromatic content satisfies,
-        so it cannot condemn a program: only a take of uniform fields alone is dark.
+        hold one picture, so neither motion nor a majority is required: only a
+        take of uniform fields alone is dark.
         """
-        return self.picture + self.splash > 0
+        return self.picture > 0
 
     def __str__(self) -> str:
         verdict = "" if self.usable else "  UNUSABLE: " + ("frozen" if self.mostly_picture else "no picture")
         motion = "n/a" if self.motion is None else f"{self.motion:+.2f}"
         return (
-            f"{self.frames} frames: {self.picture} picture, {self.splash} splash, "
-            f"{self.frames - self.picture - self.splash} uniform; luma range {self.spread}, "
+            f"{self.frames} frames: {self.picture} picture, {self.frames - self.picture} uniform; "
+            f"luma range {self.spread}, "
             f"motion {motion}, mean luma {self.luma:.3f}{verdict}"
         )
 
@@ -342,8 +365,8 @@ def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240
 
     A frame is picture when its luma ranges over more than one
     :data:`~syncsummoner.device.capture.QUANTUM`, the uniform-field bound
-    :func:`~syncsummoner.device.capture.structured` applies, and it is not the
-    card's splash; whether the take moves is :func:`held`.
+    :func:`~syncsummoner.device.capture.structured` applies; whether the take
+    moves is :func:`held`.
     """
     from syncsummoner.aesthetics.levels import LUMA_709  # keeps scipy off the device import path
 
@@ -371,14 +394,10 @@ def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240
     weights = (LUMA_709 / 255.0).astype(np.float32)
     luma = np.einsum("...c,c->...", rgb, weights, dtype=np.float32, casting="unsafe")
     steps = np.rint(np.ptp(luma.reshape(count, -1), axis=1) / QUANTUM)
-    card = Capture()
-    splash = np.array([card.is_no_signal(rgb[i] / np.float32(255.0)) for i in np.flatnonzero(steps > 1)])
-    picture = int(np.count_nonzero(steps > 1)) - int(np.count_nonzero(splash))
     motion, frozen = held(luma)
     return TakeReport(
         frames=count,
-        picture=picture,
-        splash=int(np.count_nonzero(splash)),
+        picture=int(np.count_nonzero(steps > 1)),
         spread=int(np.median(steps)),
         motion=motion,
         frozen=frozen,
@@ -388,25 +407,34 @@ def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240
 
 def settle(
     recorder: Recorder,
+    transport: Any,
     *,
     program: str,
+    timing: str,
     timeout_s: float,
     probe_path: str | Path,
     probe_s: float = 2.0,
+    poll_s: float = 0.5,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> TakeReport:
-    """Wait for the picture to come back after a load, by recording a short probe.
+    """Wait out a load: the transmitter driving ``timing`` first, then a probe the card delivers.
 
-    Liveness is judged the way a take is, by :attr:`TakeReport.mostly_picture`: a picture,
-    moving or not, because a paused source is still a working rig. A load drops the source link and the
-    card has no mode to open until it relocks, so a recorder that will not start
-    yet is part of what this waits through rather than a failure.
+    The card reports no signal state of its own, so the Videomancer's
+    :func:`~syncsummoner.device.transport.transmitting` is polled over serial
+    before anything is recorded. Once it drives the session timing every frame
+    is the program's, so the first probe that holds frames is returned for the
+    caller to judge; a recorder that will not start yet is still waited through.
     """
     deadline = clock() + timeout_s
+    status = transport.video_status()
+    while not transmitting(status, timing):
+        if clock() >= deadline:
+            raise _lost(program, timing, status, f"within {timeout_s}s of the load")
+        sleep(poll_s)
+        status = transport.video_status()
     probe = Path(str(probe_path))
-    report = TakeReport()
-    said = ""
+    said = "no recording finished"
     try:
         while clock() < deadline:
             try:
@@ -416,9 +444,11 @@ def settle(
                 said = str(exc)
                 continue
             report = inspect_take(probe, ffmpeg=recorder.ffmpeg)
-            if report.mostly_picture:
+            if report.frames:
                 return report
+            said = str(report)
     finally:
         probe.unlink(missing_ok=True)
-    trailer = f"; last recorder error: {said}" if said else ""
-    raise BlankTakeError(f"{program}: no picture within {timeout_s}s of the load ({report}{trailer})")
+    raise BlankTakeError(
+        f"{program}: transmitting {timing} but nothing captured within {timeout_s}s ({said})"
+    )

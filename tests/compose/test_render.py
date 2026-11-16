@@ -18,6 +18,7 @@ from pyvmancer import CcMapError
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
 from syncsummoner.compose.vocabulary import Automation
+from tests.compose import PROBED, rig_transport
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
 
@@ -324,7 +325,7 @@ def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
 
 
 def test_reading_a_timecode_only_touches_the_strip():
-    """Converting the whole frame to float64 to read eight rows cost 12ms a frame."""
+    """Only the strip rows are converted, never the whole frame."""
     frame = np.random.random((1080, 1920, 3)).astype(np.float32)
     stamped = R.burn_timecode(frame, 4242, bits=16, strip_px=8)
     assert R.read_timecode(stamped, bits=16, strip_px=8) == 4242
@@ -461,10 +462,10 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
             order.append(("record",))
             return contextlib.nullcontext()
 
-    def fake_settle(recorder, **kwargs):
-        del recorder
+    def fake_settle(recorder, transport, **kwargs):
+        del recorder, transport
         order.append(("settle", kwargs))
-        return R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
+        return PROBED
 
     monkeypatch.setattr(R, "settle", fake_settle)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
@@ -485,7 +486,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
             session=Session(),
             capture=None,
             playout=Player(),
-            transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=lambda: None),
+            transport=rig_transport(),
         ),
         config=config,
         scratch=tmp_path / "tc.mkv",
@@ -495,6 +496,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
     assert [step[0] for step in order] == ["load", "settle", "record"]
     assert order[1][1] == {
         "program": "Teletext",
+        "timing": CONFIG.timing,
         "timeout_s": 7.5,
         "probe_path": config.probe_path,
     }
@@ -558,9 +560,9 @@ def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=lambda: None),
+        transport=rig_transport(),
     )
-    monkeypatch.setattr(R, "settle", lambda *a, **k: None)
+    monkeypatch.setattr(R, "settle", lambda *a, **k: PROBED)
     monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
     monkeypatch.setattr(
         R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
@@ -661,7 +663,7 @@ def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_
 
 
 def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
-    """A windowed score played from frame zero would show the wrong 30 seconds."""
+    """A windowed score plays the footage at its own start, not from frame zero."""
     clip = [np.full((CONFIG.height, CONFIG.width, 3), i / 20, np.float32) for i in range(20)]
     monkeypatch.setattr(
         "syncsummoner.compose.features.read_frames",
@@ -724,7 +726,7 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
             del path, seconds
             return contextlib.nullcontext()
 
-    monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle"))
+    monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle") or PROBED)
     monkeypatch.setattr(
         R,
         "inspect_take",
@@ -737,7 +739,10 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
         session=Session(),
         capture=None,
         playout=Player(),
-        transport=types.SimpleNamespace(program_info=lambda: None, verify_cc_map=verify),
+        transport=rig_transport(
+            verify_cc_map=verify,
+            video_status=lambda: order.append("signal") or rig_transport().video_status(),
+        ),
     )
     score = Score(duration=10.0, sections=[Section(0.0, 10.0, "A")], layers=[Layer("Passthru", 0, [])])
     with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
@@ -757,11 +762,12 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
         "load:Passthru",
         "settle",
         "stop",
+        "signal",
         "play",
         "drive",
         "stop",
         "verify",
-        *(() if corrupted else ("inspect",)),
+        *(() if corrupted else ("signal", "inspect")),
     ]
 
 

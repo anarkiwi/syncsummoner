@@ -114,7 +114,6 @@ def probe_health(transport: Any, capture: Any = None, *, frames: int = 6) -> dic
 
             stack = np.stack(got)
             out["mean"] = round(float(stack.mean()), 4)
-            out["chroma"] = round(float(capture.chroma_fraction(got[-1])), 4)
             out["motion"] = round(float(np.abs(np.diff(stack, axis=0)).mean()), 5) if len(got) > 1 else 0.0
         out["ok"] = bool(got) and float(out.get("mean", 0.0)) > 0.002
     except Exception as err:

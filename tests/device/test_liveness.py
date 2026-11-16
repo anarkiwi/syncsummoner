@@ -51,13 +51,17 @@ def dark_footage(rng, still=False):
     return frames
 
 
-def no_signal_card():
-    """High-contrast achromatic slide with text and a QR-like block, as the card synthesizes."""
-    card = np.full(SIZE + (3,), 255, np.uint8)
-    cv2.putText(card, "No Signal", (150, 120), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 0, 0), 8)
+def achromatic(moving):
+    """Bilevel white-on-black text and blocks, the look of a black-and-white program's output."""
+    frames = []
     modules = np.random.default_rng(5).random((21, 21)) < 0.5
-    card[180:327, 250:397] = np.where(np.kron(modules, np.ones((7, 7), bool)), 0, 255)[..., None]
-    return card
+    for t in range(FRAMES):
+        frame = np.zeros(SIZE + (3,), np.uint8)
+        shift = 8 * t if moving else 0
+        cv2.putText(frame, "Lumarian", (40 + shift, 120), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255,) * 3, 8)
+        frame[180:327, 250:397] = np.where(np.kron(modules, np.ones((7, 7), bool)), 255, 0)[..., None]
+        frames.append(frame)
+    return frames
 
 
 @needs_ffmpeg
@@ -94,10 +98,12 @@ def test_an_exactly_repeated_picture_is_live_but_frozen(tmp_path):
 
 
 @needs_ffmpeg
-def test_the_no_signal_splash_is_no_picture_despite_its_structure(tmp_path):
-    report = judged(tmp_path, [no_signal_card()] * FRAMES)
-    assert report.spread > 200, "it has more structure than any dark program"
-    assert report.splash == FRAMES and report.picture == 0 and not report.mostly_picture
+@pytest.mark.parametrize("moving", [True, False], ids=["moving", "still"])
+def test_achromatic_high_contrast_content_is_picture(tmp_path, moving):
+    """Black-and-white bilevel output is the program's picture: only uniformity condemns a frame."""
+    report = judged(tmp_path, achromatic(moving))
+    assert report.spread > 200 and report.picture == FRAMES and report.mostly_picture
+    assert report.ever_structured and report.usable is moving and "0 uniform" in str(report)
 
 
 @needs_ffmpeg

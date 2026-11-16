@@ -73,13 +73,11 @@ def test_health_is_decided_by_frames_not_by_the_flags():
     rng = np.random.default_rng(0)
     live = types.SimpleNamespace(
         frames=lambda n, **_kw: [rng.random((8, 8, 3)).astype(np.float32) for _ in range(n)],
-        chroma_fraction=lambda _f: 0.8,
     )
     assert jn.probe_health(transport, live)["ok"] is True
 
     dark = types.SimpleNamespace(
         frames=lambda n, **_kw: [np.zeros((8, 8, 3), np.float32) for _ in range(n)],
-        chroma_fraction=lambda _f: 0.0,
     )
     result = jn.probe_health(transport, dark)
     assert result["ok"] is False, "black frames are a fault however healthy the flags look"

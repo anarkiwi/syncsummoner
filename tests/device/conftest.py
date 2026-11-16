@@ -3,7 +3,6 @@
 # pylint: disable=missing-function-docstring
 
 import json
-from types import SimpleNamespace
 
 import mido
 import numpy as np
@@ -13,8 +12,10 @@ from pyvmancer.ccmap import encode_setting
 from pyvmancer.const import CC_MAP_SETTING_KEY, CC_MAP_UNASSIGNED, CC_MSB_MASK, DEFAULT_CC_MSB
 from pyvmancer.midi import MidiController, lsb_partner
 from pyvmancer.transports.base import MidiTransport
+from pyvmancer.video import VideoStatus
 
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
+from tests.transmitter import LIVE
 
 COLORBARS_INFO = {
     "name": "Colorbars",
@@ -132,8 +133,6 @@ class FakeShell:
         return {"input": {"source": "analog", "locked": True}, "timing": "720p60"}
 
     def video_state(self):
-        from pyvmancer.video import VideoStatus
-
         return VideoStatus.from_json(self.video_status())
 
     def resync(self, **kwargs):
@@ -245,7 +244,7 @@ class FakeTransport:
 
     def video_status(self):
         self.calls.append(("video_status",))
-        return SimpleNamespace(source_locked=self.source_locked)
+        return VideoStatus.from_json(dict(LIVE, source="hdmi", hdmi={"locked": self.source_locked}))
 
     def set_param(self, index, value):
         self.calls.append(("cc", index, int(value)))

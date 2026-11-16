@@ -295,7 +295,7 @@ class Session:
 
         ``require_motion`` distinguishes the two callers: playing a clip, a frozen
         frame means the output died; probing a still stimulus, no motion is
-        correct and only the splash indicates failure. A journalled failure
+        correct and only a missing or uniform picture indicates failure. A journalled failure
         reports what was asked of the device since it was last healthy.
         """
         wait = capture.wait_for_content if require_motion else capture.wait_for_lock

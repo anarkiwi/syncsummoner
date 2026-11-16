@@ -16,7 +16,7 @@ import numpy as np
 from pyvmancer.errors import ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
-from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
+from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, require_signal, settle
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import codeframes, plans
@@ -63,6 +63,8 @@ class HarvestConfig:
     width: int = 1920
     height: int = 1080
     capture_fps: int = 30
+    #: The output timing the device must drive, as it names it; the raster above is its size.
+    timing: str = "1080p30"
     loop_fps: float = 12.0
     loop_frames: int = codeframes.DEFAULT_COUNT
     setpoints: int = 32
@@ -273,22 +275,27 @@ def prove_passthrough(
 ) -> TakeReport:
     """Load a passthrough and wait for its picture, raising :class:`BlankTakeError` without one.
 
-    The passthrough carries the known chromatic stimulus, so it is held to the
-    load's :attr:`TakeReport.mostly_picture`, where a splash is evidence of a dead link.
+    The passthrough carries the known stimulus, so with the transmitter driving
+    the session timing its capture must be :attr:`TakeReport.mostly_picture`.
     """
     session.load_program(program, park=True, link=link)
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     session.set_params(session.working_point(transport.program_info()))
-    return settle(
+    report = settle(
         recorder,
+        transport,
         program=program,
+        timing=config.timing,
         timeout_s=config.live_timeout_s,
         probe_path=config.probe_path,
         probe_s=config.probe_s,
         clock=clock,
         sleep=sleep,
     )
+    if not report.mostly_picture:
+        raise BlankTakeError(f"{program}: the passthrough shows no picture ({report})")
+    return report
 
 
 def carries_stimulus(session: Any, recorder: Any, transport: Any, **live: Any) -> bool:
@@ -405,8 +412,9 @@ def harvest_program(
 ) -> ProgramResult:
     """Sweep one program into a single recording, then commit it as its archive.
 
-    The load drops the source link and blacks the output, so the picture is
-    waited for before the recording starts rather than measured through it.
+    The load drops the source link and blacks the output, so the transmitter is
+    waited for before the recording starts rather than measured through it, and
+    confirmed again at both ends of the recording.
     """
     start = clock()
     session.load_program(program, park=True, link=link)
@@ -418,7 +426,9 @@ def harvest_program(
     session.set_params(base)
     settle(
         recorder,
+        transport,
         program=program,
+        timing=config.timing,
         timeout_s=config.live_timeout_s,
         probe_path=config.probe_path,
         probe_s=config.probe_s,
@@ -427,6 +437,7 @@ def harvest_program(
     )
     video = archive.scratch(program)
     try:
+        require_signal(transport, program=program, timing=config.timing, when="as the sweep began")
         with recorder.recording(video):
             windows = sweep(
                 session,
@@ -437,6 +448,7 @@ def harvest_program(
                 clock=clock,
             )
         transport.verify_cc_map()
+        require_signal(transport, program=program, timing=config.timing, when="as the sweep ended")
         rows = attribute(recorder.timestamps(video), windows, program, base=raw_params(base))
         report = inspect_take(video, ffmpeg=recorder.ffmpeg)
         archive.commit(

@@ -119,41 +119,64 @@ The card returns frames at its own rate, not the session's: a 10 s pass at
 `1080p30` comes back as ~600 frames, about 60 fps. Nothing downstream counts
 frames — alignment is by the timecode strip and cuts are by time.
 
-## The capture card synthesizes a "No Signal" splash
+## Signal comes from the Videomancer's transmitter; the card exposes none
 
-With no valid input the card emits a high-contrast slide reading *No Signal* with
-a QR code, at whatever resolution was requested. It is not black and it has high
-variance, so any liveness test based on `std > 0` scores it as content.
-`Capture.is_no_signal` detects it structurally: the splash is achromatic (pixels
-with HSV saturation > 60 at ~0.000, versus ~0.69 for real Colorbars) and bilevel
-while being far from uniformly black. Takes are judged at a point-sampled
-160x90, so the samples are the card's own bilevel pixels rather than blends that
-would read as mid-tones.
+The capture card (AVerMedia Live Gamer Ultra 2.1, `uvcvideo`) has no readable
+signal state. V4L2 `ENUMINPUT` always reports ok, there is no DV-timings ioctl,
+the format list does not change with the source, and its vendor UVC extension
+unit is an undocumented request/response mailbox that stays the same across
+signal loss. With no input it synthesizes a high-contrast achromatic *No Signal*
+slide, which no pixel test can tell from black-and-white program output
+(`Lumarian`, `Colorbars` and `Pinwheel`'s effect frames all read as it).
 
-## Status flags are advisory; only a capture proves frames
+The card's only input is the Videomancer's HDMI output, which keeps driving even
+while the Pi's link is down; the card loses signal only when the transmitter
+stops, as it does for a few seconds of every program load. The transmitter
+state is in `video status`:
+
+```text
+"output":{"timing":"1080p30","hdmi_connected":true,...},"hdmi_tx":{"vic":34,"de":"2FE90F",...}   driving
+"hdmi_tx":{"vic":0,"de":"000000",...}                                                         stopped
+```
+
+`transmitting(status, timing)` in `device/transport.py` is the rig's one signal
+predicate: pyvmancer's `video.output_active` (a sink attached, a nonzero VIC and
+data enable) and an output timing equal to the session format. A sink reported
+absent is false; a firmware that omits the transmitter fields gives `None`,
+unknown, which every caller treats as no signal.
+
+- `settle()` polls it over serial after a load, and records nothing until it is
+  true; a transmitter that never returns fails with the last `video status`.
+- Render and archive passes check it again at the start and end of every
+  recording, alongside the CC-map read-back, and fail the pass if it dropped.
+- While it holds, every captured frame is the program's own output, so takes are
+  judged by structure and motion alone.
+
+## Input status flags are advisory
 
 The firmware has reported `hdmi.connected: false` while passing video perfectly,
 and a locked input while passing nothing. The top-level `locked` flag tracks
 genlock, so it reads false whenever timing is overridden even though the input is
 fine; the selected input's own sub-status is authoritative, which is what
-`VideoStatus.source_locked` reads. Anything that records checks the frames
-themselves: `settle()` judges liveness from a recording, exactly as a take is
-judged, and `inspect_take` judges the take.
+`VideoStatus.source_locked` reads. None of these says the output is being driven;
+only the transmitter state does.
 
-Picture is judged by structure, never brightness. A dead output is a spatially
-uniform field: `Roll Shutter` outputs video black at exactly 16 on every pixel of
-every frame, even under Bypass. A uniform field is one DC level per JPEG block,
-which MJPEG and resampling reproduce exactly, so a frame is a uniform field when
-its luma ranges over no more than one 8-bit step, and is picture otherwise,
-unless it is the splash. Dark footage carries full-range structure: dark 1960s
-black-and-white material through `Fray` measured `YMIN=0 YMAX=255 YAVG≈31`,
-which a mean-level threshold called blank.
+Picture is judged by structure, never brightness or colour. A dead program is a
+spatially uniform field: `Roll Shutter` outputs video black at exactly 16 on
+every pixel of every frame, even under Bypass. A uniform field is one DC level
+per JPEG block, which MJPEG and resampling reproduce exactly, so a frame is a
+uniform field when its luma ranges over no more than one 8-bit step, and is
+picture otherwise. Takes are judged at a point-sampled 160x90, so the samples
+are pixels the card delivered rather than blends. Dark footage carries
+full-range structure: dark 1960s black-and-white material through `Fray`
+measured `YMIN=0 YMAX=255 YAVG≈31`, which a mean-level threshold called blank.
 
 | Property | Means | Used by |
 | --- | --- | --- |
-| `live` | most frames are picture, moving or not | `settle()`: a paused source is a working rig |
+| `mostly_picture` | most frames are picture, moving or not | render's load probe; the archive's passthrough canary |
 | `frozen` | the take holds one picture plus noise | |
-| `usable` | `live` and not `frozen` | render, audition, harvest's `dark` verdict |
+| `usable` | `mostly_picture` and not `frozen` | render, audition |
+| `ever_structured` | any frame is picture | the archive's `dark` verdict |
 
 MJPEG noise makes every frame of a still picture differ, so counting distinct
 frames proves nothing. `frozen` uses the take as its own noise floor: for one

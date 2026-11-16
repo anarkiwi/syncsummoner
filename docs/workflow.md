@@ -118,7 +118,7 @@ ss device doctor --latency  # rig checks, plus MIDI CC latency and backlog at th
 
 That last line matters: a blinking console cursor inverts its cell on top of the
 framebuffer and lands in every take. The other pre-flight gotchas — parking the
-panel, one owner of `/dev/video0`, the capture card's "No Signal" splash — are in
+panel, one owner of `/dev/video0`, a capture card with no signal state of its own — are in
 [rig.md](rig.md#gotchas).
 
 ## Inputs
@@ -170,9 +170,9 @@ ss profile show --profiles profiles/
 
 A program is dark, and its frames are discarded, only when every inspected frame
 of its sweep is a uniform field: a sweep legitimately visits flat setpoints and a
-generator may hold one picture, and frames read as the card's "No Signal" splash
-count as picture, since that classifier is a pixel heuristic achromatic output
-satisfies. The verdict is left as `<program>.dark.json` in the archive directory
+generator may hold one picture. The sweep is recorded only while the device's
+HDMI transmitter drives the session format, so every frame is the program's own
+and black-and-white output is picture like any other. The verdict is left as `<program>.dark.json` in the archive directory
 and a resume skips it; each run lists the programs it skips. To re-judge them
 under the current criterion (an archive committed for one supersedes its verdict):
 
@@ -347,7 +347,7 @@ A real 30 second excerpt costs about a minute, most of it the load:
 09:57:17 load done in 12s
 09:57:18 pass (program=Passthru seconds=10.0)
 09:57:32 pass done in 14s: writes=9
-09:57:34 audition.take.mp4: 185 frames: 184 picture, 0 splash, 1 uniform; luma range 235, motion +0.71, mean luma 0.383
+09:57:34 audition.take.mp4: 185 frames: 184 picture, 1 uniform; luma range 235, motion +0.71, mean luma 0.383
 09:57:34 picture starts 1.20s into the take
 09:57:34 master (seconds=10.0 fades=1/1 out=audition.mp4)
 09:57:37 master done in 3s
@@ -384,8 +384,10 @@ What happens, in order:
 3. Then the HDMI link is dropped, the program loaded, and the pass waits
    for the picture to come back before recording — a load blacks the output for
    12 to 19 seconds on this rig, and the take must not start inside that. The wait
-   is a liveness probe judged exactly as a take is, with a 40 s budget; exceeding
-   it fails the pass rather than recording black.
+   polls the device's HDMI transmitter over serial until it drives the session
+   format, then records a short probe that must be mostly picture, all within a
+   40 s budget; exceeding it fails the pass rather than recording black. The
+   transmitter is checked again as the recording starts and once it ends.
 4. Recording starts, and a few seconds later the clip is played a second time,
    from its first frame, for the take itself. The first play is only what gives
    the liveness probe something moving to judge; it is over before the load
@@ -492,14 +494,17 @@ doing it twice, which is what the audition is for.
 
 | Symptom | Cause |
 | --- | --- |
-| `no picture within 40.0s of the load` | most probe frames were uniform fields (the program outputs a constant, e.g. video black at 16) or the card's "No Signal" splash; the report's `picture`/`splash`/`uniform` counts say which. Brightness plays no part, so dark footage is never "no picture" |
+| `the transmitter is not driving 1080p30 within 40.0s of the load` | the device's HDMI output never came back at the session format after the load; the error carries the last `video status`: `hdmi_tx` `vic` 0 or `de` `000000` is a stopped transmitter, a different `output.timing` is a format mismatch (`ss device doctor`, `device.format`) |
+| `the firmware reports no transmitter state` | `video status` has no `hdmi_tx` or `output.hdmi_connected`, so signal cannot be confirmed and nothing is recorded; update pyvmancer or the firmware |
+| `the transmitter is not driving ... as the pass began` / `as the pass ended` (or `sweep`) | the output dropped around a recording; the pass is failed rather than kept, and an archive goes on to its passthrough check |
+| `the program outputs no picture` | the transmitter is up but the load probe was mostly uniform fields: the program outputs a constant, e.g. video black at 16. Brightness and colour play no part, so dark or black-and-white footage is picture |
+| `transmitting 1080p30 but nothing captured` | the device sends video but the card delivered no frames: check the HDMI cable to the card and that nothing else holds `/dev/video0` |
 | take ends `UNUSABLE: frozen` | the take holds one picture: `motion` sits at -0.50, which is what codec noise alone gives; the output froze (a drop) or the program ignores its input |
 | take ends `UNUSABLE: no picture` | as for the load, over the whole take: check the program and `ss device ping` |
 | recorder exits immediately | something else holds `/dev/video0`; only one process may |
 | small flickering square in every take | `fbcon` cursor blink on the Pi; disable it, `chvt` does not fix it |
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
-| picture never returns after a load | relock; the settle budget is 40 s, and `video status` is advisory |
 | output starts mid-clip, or holds one frame | the picture's start was not found; check the `picture starts` line and that the strip survives the program; a `timecode strip did not survive` warning means that take was cut at the run's median start instead |
 | `timecode strip did not survive, so the picture start is unknown` | no take kept its strip; check the program, or that the pass recorded the clip at all |
 | pass dies uploading the clip | `/dev/shm` on the Pi is half its RAM; a long scratch at `crf 14` will not fit |
