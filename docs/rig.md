@@ -77,10 +77,12 @@ programs and setpoints, so that upload is paid once per run rather than per pass
 ```sh
 syncsummoner device doctor                # read-only: Pi, capture card, device
 syncsummoner device doctor --loop         # also push bars through Passthru and capture them
+syncsummoner device doctor --latency      # also time MIDI CC writes against serial readback
 syncsummoner device doctor --fix          # unblank the Pi framebuffer, stop the cursor blink, recheck
 ```
 
-Options: `--source-host pi@videopi`, `--format 1080p30`, `--capture /dev/video0`.
+Options: `--source-host pi@videopi`, `--format 1080p30`, `--capture /dev/video0`,
+and with `--latency`, `--latency-params 1,2` and `--latency-rates 5,10,20,40,80`.
 The JSON report goes to stdout, one line per finding to stderr, and the exit
 status is 1 when anything fails. Each finding names its check and, on failure,
 the fix:
@@ -96,12 +98,19 @@ the fix:
 | `capture.mode` | the card offers MJPEG at the session size (`ffmpeg -f v4l2 -list_formats all`) |
 | `firmware.version` ... `video.output_connected` | pyvmancer's own device checks |
 | `device.format` | the device's output timing is `--format` |
+| `midi.latency` | pyvmancer's single CC write to serial readback median is within two output frames plus the readback round trip |
+| `midi.backlog` | paced ramps at each `--latency-rates` leave a sentinel no more than a frame behind a single write; the fix names the fastest clean rate |
 | `loop.signal`, `loop.index`, `loop.bars` | not the No Signal splash; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
 
-`--loop` changes state: it loads `Passthru` and overwrites the Pi framebuffer.
+`--latency` writes CC offsets to the measured parameters, then restores them
+(`midi.restored` fails if they did not read back). By default it measures the
+loaded program's first continuous knob, else P1; pyvmancer refuses toggles,
+modulated parameters and ones with no CC headroom, and the refusal is reported
+as a failed `midi.latency`. `--loop` changes state: it loads `Passthru` and
+overwrites the Pi framebuffer.
 `Passthru` reports all twelve parameters as `Null`, so anything wrong in that
 capture is the chain, not the program. The device alone is `vmancer doctor`
-(pyvmancer 0.5). Over the serial shell, `doctor` reads what these do by hand:
+(pyvmancer 0.6). Over the serial shell, `doctor` reads what these do by hand:
 
 ```sh
 vmancer shell "version"             # firmware; must match the profile archive

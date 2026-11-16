@@ -34,8 +34,10 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
         host=args.source_host or DEFAULT_HOST,
         capture=args.capture,
         open_transport=lambda: Transport.open(serial=args.serial),
+        latency_params=args.latency_params,
+        latency_rates=args.latency_rates,
     )
-    findings = doctor.run(loop=args.loop, fix=args.fix)
+    findings = doctor.run(loop=args.loop, latency=args.latency, fix=args.fix)
     for finding in findings:
         (LOG.info if finding.ok else LOG.error)("%s", format_finding(finding))
     summary = report(findings)
@@ -408,6 +410,11 @@ def _wet(text: str | None) -> tuple[float, float] | None:
     return lo, hi
 
 
+def _numbers(kind: type) -> Any:
+    """An argparse type for a comma-separated list of ``kind``."""
+    return lambda text: tuple(kind(part) for part in text.split(","))
+
+
 def _take_path(args: argparse.Namespace) -> str:
     """Where the raw capture goes; ``--output`` names the finished clip, not the pass."""
     if args.take:
@@ -528,6 +535,17 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     doctor.add_argument("--capture", default="/dev/video0")
     doctor.add_argument(
         "--loop", action="store_true", help="also push bars through Passthru and capture them"
+    )
+    doctor.add_argument(
+        "--latency", action="store_true", help="also measure MIDI CC latency (writes, then restores)"
+    )
+    doctor.add_argument(
+        "--latency-params",
+        type=_numbers(int),
+        help="parameters to measure, e.g. 1,2,3 (default: the program's)",
+    )
+    doctor.add_argument(
+        "--latency-rates", type=_numbers(float), help="parameter sets per second (default: pyvmancer's)"
     )
     doctor.add_argument("--fix", action="store_true", help="apply safe source host fixes, then check again")
     doctor.set_defaults(func=_doctor_cmd)

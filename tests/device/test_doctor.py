@@ -8,16 +8,18 @@ from contextlib import contextmanager
 
 import numpy as np
 import pytest
+from pyvmancer import LatencyReport, RateResult, VmancerError
+from pyvmancer.latency import DEFAULT_RATES
 
 from syncsummoner import cli
 from syncsummoner.device import doctor as dr
 from syncsummoner.device.doctor import Doctor, Format
 from syncsummoner.device.host import HostCommandError
 from syncsummoner.device.recorder import MJPEG, RecorderError
-from syncsummoner.device.transport import Transport
+from syncsummoner.device.transport import ProgramInfo, Transport
 from syncsummoner.probe.patterns import generate
 
-from .conftest import FakeClock, FakeDevice, FakeShell
+from .conftest import COLORBARS_INFO, FakeClock, FakeDevice, FakeShell
 
 FMT = Format("1080p30", 1920, 1080, 30.0)
 KMSPRINT = """Connector 0 (35) HDMI-A-1 (connected)
@@ -379,8 +381,89 @@ def test_list_formats_reads_ffmpeg_stderr(monkeypatch):
     assert seen["argv"][-4:] == ["-list_formats", "all", "-i", "/dev/video0"]
 
 
+def measured(lags=((5, 0.04), (80, 0.05)), *, single=0.033, timing="1080p30", restored=True):
+    """A pyvmancer latency report: ``single`` s per write, and a sentinel lag per rate."""
+    rates = tuple(RateResult(float(r), 2 * r, 4 * r, 2.0, lag) for r, lag in lags)
+    period = 1 / 30 if timing == "1080p30" else None
+    return LatencyReport((3,), timing, period, 0.004, np.full(10, single), rates, (40,), restored)
+
+
+class Measure:
+    """Stands in for ``measure_latency``, keeping what it was asked to measure."""
+
+    def __init__(self, result=None):
+        self.result = measured() if result is None else result
+        self.calls = []
+
+    def __call__(self, device, **kwargs):
+        self.calls.append((device, kwargs))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def test_latency_is_opt_in_and_measures_the_programs_first_knob(rig):
+    measure = Measure()
+    doc = rig(measure=measure)
+    assert not {"midi.latency", "midi.backlog"} & set(by_check(doc.run()))
+    assert not measure.calls
+    found = by_check(doc.run(latency=True))
+    assert found["midi.latency"].ok and found["midi.backlog"].ok and found["device.format"].ok
+    assert "single write median 33.0 ms (0.99 frames)" in found["midi.latency"].detail
+    device, kwargs = measure.calls[0]
+    assert device is doc.dev and kwargs["params"] == (3,) and kwargs["rates"] == DEFAULT_RATES
+    assert doc.dev.closed
+
+
+def test_latency_backlog_names_the_fastest_clean_rate(rig):
+    measure = Measure(measured(((20, 0.04), (40, 0.06), (80, 0.3))))
+    found = by_check(
+        rig(measure=measure, latency_params=(1, 2), latency_rates=(20, 40, 80)).checks(latency=True)
+    )
+    assert found["midi.latency"].ok and not found["midi.backlog"].ok
+    assert found["midi.backlog"].fix.endswith("send at most 40 sets/s")
+    assert measure.calls[0][1]["params"] == (1, 2) and measure.calls[0][1]["rates"] == (20, 40, 80)
+
+
+def test_pyvmancer_refuses_a_toggle_before_writing(rig):
+    doc = rig(latency_params=(7,))
+    found = by_check(doc.checks(latency=True))
+    assert not found["midi.latency"].ok and "toggles cannot carry a ramp" in found["midi.latency"].detail
+    assert "--latency-params" in found["midi.latency"].fix and found["device.format"].ok
+    assert not any(call[0] == "set_param" for call in doc.dev.calls) and doc.dev.closed
+
+
+def test_a_modulated_parameter_is_reported_not_raised(rig):
+    refusal = VmancerError("P[3] have modulation sources [7]; disable them first")
+    doc = rig(measure=Measure(refusal))
+    found = doc.latency(Transport(doc.dev))
+    assert [(f.check, f.ok, f.detail) for f in found] == [("midi.latency", False, f"skipped: {refusal}")]
+
+
+def test_latency_without_midi_or_timing_or_restore(rig):
+    doc = rig(measure=Measure(measured(timing=None, restored=False)))
+    doc.dev.has_midi = False
+    assert by_check(doc.latency(Transport(doc.dev)))["midi.latency"].detail == "skipped: no MIDI link is open"
+    doc.dev.has_midi = True
+    found = by_check(doc.latency(Transport(doc.dev)))
+    assert not found["midi.latency"].ok and "midi.backlog" not in found
+    assert not found["midi.restored"].ok and found["midi.restored"].detail == "P[3] did not read back [40]"
+
+
+def test_latency_param_skips_unused_quantized_and_toggles():
+    nulls = {
+        "name": "Passthru",
+        "parameters": [{"name": f"Null {i}", "min": 0, "max": 100} for i in range(12)],
+    }
+    assert dr.latency_param(ProgramInfo.from_json(nulls)) == 1
+    assert dr.latency_param(ProgramInfo.from_json(COLORBARS_INFO)) == 3
+    toggles_only = dict(COLORBARS_INFO, parameters=COLORBARS_INFO["parameters"][:2] + [{"name": "-"}] * 4)
+    toggles_only["parameters"] += [{"name": "Level", "min": 0, "max": 100}] * 6
+    assert dr.latency_param(ProgramInfo.from_json(toggles_only)) == 1
+
+
 def test_cli_doctor_reports_json_and_exit_status(monkeypatch, rig, capsys):
-    doc = rig(pi=Pi(blank="4"))
+    doc = rig(pi=Pi(blank="4"), measure=Measure())
     built = {}
 
     def make(fmt, **kwargs):
@@ -394,5 +477,9 @@ def test_cli_doctor_reports_json_and_exit_status(monkeypatch, rig, capsys):
     assert built["fmt"] == FMT and built["host"] == "pi@videopi"
     assert cli.main(["device", "doctor", "--fix", "--source-host", "pi@other"]) == 0
     assert built["host"] == "pi@other"
+    assert built["latency_params"] is None and built["latency_rates"] is None
+    argv = ["device", "doctor", "--latency", "--latency-params", "1,2", "--latency-rates", "5,40"]
+    assert cli.main(argv) == 0
+    assert built["latency_params"] == (1, 2) and built["latency_rates"] == (5.0, 40.0)
     assert cli.main(["device", "doctor", "--format", "4k"]) == 1
     assert "unknown format" in capsys.readouterr().err
