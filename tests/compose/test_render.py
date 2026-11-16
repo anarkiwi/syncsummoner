@@ -106,6 +106,71 @@ def test_schedule_biases_visuals_early():
     assert R.schedule(auto).times[0] < auto.times[0]
 
 
+def test_write_latency_defaults_to_a_frame_and_takes_an_override():
+    assert R.write_latency(R.RenderConfig.for_format("1080p30"), None) == pytest.approx(1 / 30)
+    assert R.write_latency(R.RenderConfig.for_format("720p60"), None) == pytest.approx(1 / 60)
+    assert R.write_latency(dataclasses.replace(CONFIG, latency_s=0.02), None) == 0.02
+    late = R.schedule(Automation.of([1.0], 2, 500), latency_s=R.write_latency(CONFIG, None), early_bias_s=0.0)
+    assert late.times[0] == pytest.approx(1.0 - 1 / CONFIG.fps)
+
+
+@pytest.mark.parametrize("measured,want", [(0.031, 0.031), (None, 0.02)])
+def test_measured_latency_falls_back_to_the_configured_figure(monkeypatch, measured, want):
+    from syncsummoner.device import doctor
+
+    seen = []
+    monkeypatch.setattr(doctor, "write_latency", lambda transport: seen.append(transport) or measured)
+    config = dataclasses.replace(CONFIG, latency_s=0.02, measure_latency=True)
+    assert R.write_latency(config, "transport") == want and seen == ["transport"]
+
+
+def test_schedule_pulls_simultaneous_writes_forward_into_their_own_slots():
+    auto = Automation.concat([Automation.of([0.5, 1.0], i, [100, 200]) for i in (1, 2, 3)])
+    paced = R.schedule(auto, latency_s=0.0, early_bias_s=0.0, cc_budget_hz=100.0)
+    assert paced.times == pytest.approx([0.48, 0.49, 0.5, 0.98, 0.99, 1.0])
+    assert paced.indices.tolist() == [1, 2, 3, 1, 2, 3], "order within an instant is kept"
+    start = R.schedule(Automation.of([0.0, 0.0, 0.0], 1, [1, 2, 3]), early_bias_s=0.0, cc_budget_hz=100.0)
+    assert start.times == pytest.approx([0.0, 0.01, 0.02]), "nothing is due before the pass starts"
+
+
+class StampedTransport:
+    """Records when each CC write leaves, on a clock only sleeps advance."""
+
+    def __init__(self, clock, msgs_per_param):
+        self.clock, self.msgs_per_param, self.sent = clock, msgs_per_param, []
+
+    def set_param(self, index, value):
+        self.sent.append((self.clock(), index, value))
+
+
+@pytest.mark.parametrize("msgs_per_param", [1, 2])
+def test_a_schedule_at_the_planners_budget_is_delivered_on_time(msgs_per_param):
+    from syncsummoner.compose import planner
+    from syncsummoner.device.session import Session
+
+    from . import make_profile
+
+    budget, burst = 64.0, 4
+    cues = np.repeat(np.arange(1.0, 3.0, burst / budget), burst)
+    unsettled = np.array([4, 5, 6, 8], dtype=np.int32)
+    auto = Automation(cues, np.tile(unsettled, cues.size // burst), np.arange(cues.size, dtype=np.int32) + 1)
+    thinned = planner.thin(auto, make_profile(), fps=30.0, cc_budget_hz=budget)
+    assert len(thinned) == len(auto) and thinned.max_rate() == budget
+    paced = R.schedule(thinned, latency_s=0.033, early_bias_s=R.EARLY_BIAS_S, cc_budget_hz=budget)
+    clock = Clock()
+    transport = StampedTransport(clock, msgs_per_param)
+    session = Session(transport, cc_budget_hz=budget, clock=clock, sleep=clock.sleep)
+    rig = R.Rig(session=session, capture=None, playout=None)
+    assert R.drive(rig, paced, duration=3.0, clock=clock, sleep=clock.sleep) == len(auto)
+    sent = np.array([t for t, _, _ in transport.sent])
+    assert sent == pytest.approx(paced.times, abs=1e-9), "the session never holds a write back"
+    order = np.argsort(auto.times, kind="stable")
+    lead = auto.times[order] - sent
+    assert (
+        lead.min() >= 0.033 + R.EARLY_BIAS_S - 1e-9 and lead.max() <= 0.033 + R.EARLY_BIAS_S + burst / budget
+    )
+
+
 class Clock:
     """Monotonic clock advanced only by the sleeps handed to it."""
 

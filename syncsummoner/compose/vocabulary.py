@@ -92,7 +92,7 @@ class Automation:
         return Automation(self.times[m], self.indices[m], self.values[m])
 
     def max_rate(self, window_s: float = 1.0) -> float:
-        """Peak message rate over any sliding window, in messages per second."""
+        """Peak event rate over any sliding window, in parameter writes per second."""
         if len(self) == 0:
             return 0.0
         counts = np.searchsorted(self.times, self.times + window_s, side="left") - np.arange(len(self))

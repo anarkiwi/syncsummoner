@@ -460,3 +460,24 @@ def test_compose_wet_is_a_range_of_fractions():
     assert cli._wet(None) is None and cli._wet("0.2,1") == (0.2, 1.0)
     with pytest.raises(ValueError, match="--wet"):
         cli._wet("0.9,0.1")
+
+
+def test_render_timing_flags_reach_the_config(monkeypatch, tmp_path):
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    argv = [
+        "render",
+        _score_file(tmp_path),
+        "--source",
+        "clip.mkv",
+        "--no-master",
+        "-o",
+        str(tmp_path / "f.mp4"),
+    ]
+    assert cli.main(argv + ["--format", "1080p30"]) == 0
+    config = seen["render"][3]["config"]
+    assert (config.fps, config.latency_s, config.measure_latency) == (30.0, None, False)
+    assert config.cc_budget_hz == session_mod.CC_BUDGET_HZ
+    assert cli.main(argv + ["--latency-ms", "25", "--measure-latency", "--cc-budget", "150"]) == 0
+    config = seen["render"][3]["config"]
+    assert (config.latency_s, config.measure_latency, config.cc_budget_hz) == (0.025, True, 150.0)

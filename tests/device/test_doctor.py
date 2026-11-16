@@ -459,6 +459,27 @@ def test_latency_without_midi_or_timing_or_restore(rig):
     assert not found["midi.restored"].ok and found["midi.restored"].detail == "P[3] did not read back [40]"
 
 
+def test_write_latency_times_single_writes_on_the_programs_first_knob(rig):
+    measure = Measure(measured(single=0.031, restored=False))
+    transport = Transport(rig().dev)
+    assert dr.write_latency(transport, measure=measure) == pytest.approx(0.031)
+    assert measure.calls[0][1]["params"] == (3,) and measure.calls[0][1]["rates"] == ()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [VmancerError("P[3] have modulation sources [7]"), ValueError("toggles"), measured(single=np.nan)],
+)
+def test_write_latency_is_none_when_refused_or_unconverged(rig, result):
+    assert dr.write_latency(Transport(rig().dev), measure=Measure(result)) is None
+
+
+def test_write_latency_needs_midi(rig):
+    doc, measure = rig(), Measure()
+    doc.dev.has_midi = False
+    assert dr.write_latency(Transport(doc.dev), measure=measure) is None and not measure.calls
+
+
 def test_latency_param_skips_unused_quantized_and_toggles():
     nulls = {
         "name": "Passthru",

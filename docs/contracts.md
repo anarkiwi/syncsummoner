@@ -123,9 +123,9 @@ class Transport:                     # wraps pyvmancer; the only module that imp
     def transport_play(self) / transport_stop(self) / set_bpm(bpm) -> None: ...
     def close(self) -> None: ...
 
-class Session:                       # settle timing, CC rate limiting, state cache
-    def __init__(self, transport, *, cc_budget_hz=200.0): ...
-    def set_params(self, values: Mapping[int, float | bool]) -> None: ...  # rate limited, cached
+class Session:                       # settle timing, write rate limiting, state cache
+    def __init__(self, transport, *, cc_budget_hz=CC_BUDGET_HZ): ...  # parameter writes per second
+    def set_params(self, values: Mapping[int, float | bool]) -> None: ...  # one write per 1/cc_budget_hz, cached
     def park(self) -> None: ...      # drive every parameter to a known reference
     def load_program(self, name, *, park=True, link=None) -> None: ...  # absorbs the load blackout
     def working_point(self, info, *, exclude=()) -> dict[int, float | bool]: ...
@@ -222,4 +222,6 @@ render.unknown_programs(programs, available) -> list[str]   # named but not offe
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
+render.schedule(auto, *, latency_s, early_bias_s, cc_budget_hz) -> Automation  # forward by latency + bias, paced, never late
+render.write_latency(config, transport) -> float   # one frame, the override, or measured with that as fallback
 ```

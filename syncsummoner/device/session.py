@@ -1,4 +1,4 @@
-"""Measurement discipline: additive parameter addressing, CC budget, settle timing.
+"""Measurement discipline: additive parameter addressing, write budget, settle timing.
 
 ``Parameter = Manual + Modulation + MIDI``. A CC is an offset onto the stored
 manual value, so absolute addressing only exists relative to a parked reference.
@@ -18,6 +18,9 @@ from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, Role
 PARK_REFERENCE = 0
 #: Readback slack, in device units, for park and addressing verification.
 DEFAULT_TOLERANCE = 8
+#: Parameter writes per second the host sends; each is ``msgs_per_param`` CC
+#: messages on the wire. docs/hardware.md records the measured backlog limit.
+CC_BUDGET_HZ = 200.0
 #: The operator name that means no modulation.
 DISABLED_OPERATOR = "Disabled"
 
@@ -73,7 +76,7 @@ class Session:
         self,
         transport: Any,
         *,
-        cc_budget_hz: float = 200.0,
+        cc_budget_hz: float = CC_BUDGET_HZ,
         park_values: Sequence[int] | None = None,
         load_blackout_s: float = 4.0,
         tolerance: int = DEFAULT_TOLERANCE,
@@ -111,13 +114,13 @@ class Session:
         """Copy of the cached CC offsets, keyed by 1-based parameter index."""
         return dict(self._sent)
 
-    def _throttle(self, messages: int) -> None:
-        """Delay so the aggregate wire rate stays within the CC budget."""
+    def _throttle(self) -> None:
+        """Delay one parameter write so the aggregate write rate stays within the budget."""
         now = self._clock()
         if self._next_send > now:
             self._sleep(self._next_send - now)
             now = self._next_send
-        self._next_send = now + messages / self.cc_budget_hz
+        self._next_send = now + 1.0 / self.cc_budget_hz
 
     def offsets(self, values: Mapping[int, float | bool]) -> dict[int, int]:
         """CC offsets that land ``values`` absolutely, given the parked reference."""
@@ -135,7 +138,7 @@ class Session:
         if pending:
             self._writes += len(pending)
         for index, offset in pending:
-            self._throttle(self.transport.msgs_per_param)
+            self._throttle()
             self.transport.set_param(index, offset)
             self._sent[index] = offset
 
@@ -149,7 +152,7 @@ class Session:
         last parameter written is otherwise sampled before the device applies it.
         """
         for index in range(1, PARAM_COUNT + 1):
-            self._throttle(self.transport.msgs_per_param)
+            self._throttle()
             self.transport.set_param(index, 0)
             self.transport.set_manual(index, int(self._park[index - 1]))
             self._sent[index] = 0

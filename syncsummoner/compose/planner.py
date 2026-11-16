@@ -14,13 +14,13 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
+from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, track
 from syncsummoner.compose.features import Features, Section, information_content
 from syncsummoner.compose.score import DEFAULT_WET, GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext
 
 EPS = 1e-12
-CC_BUDGET_HZ = 200.0
 NATURAL_SLOPE_BAND = (-1.4, -1.0)
 SIM_DISCOUNT = 0.5
 #: Physical span of each metric the objective scores, so movement in one is
@@ -141,7 +141,7 @@ def _response(spec: ParamSpec, values: np.ndarray) -> np.ndarray:
 def reachable(
     auto: Automation, profile: ProgramProfile, *, fps: float, cc_budget_hz: float = CC_BUDGET_HZ
 ) -> bool:
-    """Hard constraint: aggregate CC budget and per-parameter measured settle time both respected."""
+    """Hard constraint: aggregate parameter writes per second and per-parameter settle time both respected."""
     if len(auto) == 0:
         return True
     if auto.max_rate() > cc_budget_hz:
@@ -192,7 +192,8 @@ def thin(
     """Defer and drop messages so the result satisfies the hard constraint.
 
     Writes a parameter cannot settle between are deferred to the latest value, so the
-    held state matches what the gestures asked for; the CC budget then drops the excess.
+    held state matches what the gestures asked for; the write budget, in parameter writes per
+    second, then drops the excess.
     """
     if len(auto) == 0:
         return auto

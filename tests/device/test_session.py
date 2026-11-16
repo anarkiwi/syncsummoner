@@ -114,7 +114,7 @@ def test_cc_budget_paces_aggregate_rate():
     for value in range(1, 21):
         session.set_params({1: value})
     assert len(port.calls) == 20
-    assert clock.now == pytest.approx(19 * 2 / 100.0, rel=1e-6)
+    assert clock.now == pytest.approx(19 / 100.0, rel=1e-6), "the budget counts writes, not messages"
 
 
 def test_cc_budget_does_not_sleep_when_idle():
