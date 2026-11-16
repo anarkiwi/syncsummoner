@@ -2,7 +2,8 @@
 
 Each program is one in-order decode, at the analysis width for the metrics and at
 native size for the dwell captures the behaviour fits read, run whole in a worker
-process; the parent only gathers what the workers return.
+process; the parent only gathers what the workers return. A footage archive's setpoints
+are also scored on what they kept of the clip frames their captures show.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import multiprocessing
 import os
 from contextlib import closing, contextmanager
 from concurrent.futures import Executor, ProcessPoolExecutor, as_completed
+from dataclasses import replace
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
@@ -19,18 +22,39 @@ import cv2  # pylint: disable=no-member  ; cv2 is a compiled extension pylint ca
 import numpy as np
 from threadpoolctl import threadpool_limits
 
+from syncsummoner import aesthetics
 from syncsummoner.device.profile import MeasurementRecord, ProgramProfile, Source
+from syncsummoner.device.recorder import INSPECT_SIZE
 from syncsummoner.probe import behaviour as B
-from syncsummoner.probe.archive import GAP
+from syncsummoner.probe.archive import GAP, is_footage, stimulus_of
 from syncsummoner.probe.fit import fit_profile
+from syncsummoner.probe.footage import (
+    ClockModel,
+    attribute,
+    clock_model,
+    motion_model,
+    source_series,
+    unit_frames,
+)
 from syncsummoner.probe.harvest import HarvestConfig, stimulus_loop
 from syncsummoner.probe.names import archived_specs
+from syncsummoner.probe.patterns import read_timecode
 from syncsummoner.probe.runner import ANALYSIS_WIDTH, measurement
 from syncsummoner.progress import LOG, track
 
-__all__ = ["STIMULUS", "Replayed", "group", "program_records", "replay", "replay_program", "setpoints"]
+__all__ = [
+    "STIMULUS",
+    "Replayed",
+    "clip_series",
+    "group",
+    "program_records",
+    "replay",
+    "replay_program",
+    "setpoints",
+    "survival_metrics",
+]
 
-#: What the archive run plays out; the loop is invariant across programs and setpoints.
+#: What an archive without a stimulus record played out; the loop is invariant across programs and setpoints.
 STIMULUS = "codeframes"
 #: Thread pools a worker's native libraries size from the environment as they load.
 SINGLE_THREADED = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
@@ -84,7 +108,7 @@ def _records(groups: Iterable, reader: Any, program: str, *, analyzer: Any, sour
             source=source,
             params=params,
             state_index=setpoint,
-            stimulus=STIMULUS,
+            stimulus=str(stimulus_of(reader.meta).get("kind", STIMULUS)),
             **metrics,
         )
         for setpoint, params, frames in groups
@@ -110,6 +134,91 @@ def program_records(
     )
 
 
+def clip_series(archive: Any, meta: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """SI and TI of every frame of the clip a footage archive played, stored beside it."""
+    stimulus = stimulus_of(meta)
+    return source_series(Path(archive.directory) / stimulus["clip"], strip_px=int(stimulus["strip_px"]))
+
+
+def _survival_frames(frames: Iterable[np.ndarray], into: list) -> Iterator[np.ndarray]:
+    """Pass frames through, keeping each in 8-bit luma area-scaled to the clip series' size."""
+    for frame in frames:
+        luma = cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_RGB2GRAY)  # pylint: disable=no-member
+        into.append(cv2.resize(luma, INSPECT_SIZE, interpolation=cv2.INTER_AREA))  # pylint: disable=no-member
+        yield frame
+
+
+def _clock(
+    times: np.ndarray, codes: np.ndarray, frames: list, stimulus: dict, source_ti: np.ndarray
+) -> tuple[ClockModel | None, str]:
+    """The player's clock from the strip where it reads, else from the motion, and which it was."""
+    fps, period = float(stimulus["fps"]), int(stimulus["frames"])
+    model = clock_model(times, codes, fps=fps, bits=int(stimulus["bits"]), period=period)
+    if model is not None:
+        return model, "strip"
+    if len(frames) > 1:
+        _, per_capture = aesthetics.information(unit_frames(frames))
+        model = motion_model(times, per_capture, source_ti, fps=fps, period=period)
+    return (model, "motion") if model is not None else (None, "none")
+
+
+def _kept(frames: list, captures: np.ndarray, index: np.ndarray, series: tuple, period: int) -> dict:
+    """Survival of the clip frames ``captures`` show at unwrapped ``index``, against those same source frames.
+
+    As in a take check, SI is read at each capture and TI against the capture of the clip frame
+    before; the follow is left out where too few frames moved to correlate.
+    """
+    if captures.size == 0:
+        return {}
+    order = np.argsort(index)
+    captures, span = captures[order], index[order] - index[order[0]]
+    unit = [frames[c].astype(np.float32) / np.float32(255.0) for c in captures]
+    out_si, out_ti = np.full(int(span[-1]) + 1, np.nan), np.full(int(span[-1]) + 1, np.nan)
+    out_si[span] = [aesthetics.spatial_information(frame) for frame in unit]
+    for k in np.flatnonzero(np.diff(span) == 1) + 1:
+        out_ti[span[k]] = aesthetics.temporal_information(unit[k - 1], unit[k])
+    clip = (index[order[0]] + np.arange(span[-1] + 1)) % period
+    kept = aesthetics.survival_stats(series[0][clip], series[1][clip], out_si, out_ti)
+    found = {"si_ratio": kept.si_ratio, "ti_ratio": kept.ti_ratio}
+    found.update({"motion_follow": kept.follow} if kept.frames > 2 else {})
+    return {name: float(value) for name, value in found.items() if np.isfinite(value)}
+
+
+def survival_metrics(
+    rows: list, frames: list, strips: list, stimulus: dict, series: tuple
+) -> tuple[list[dict[str, float]], str]:
+    """Per setpoint group, in :func:`group` order, what it kept of the clip, and how the clock was found.
+
+    Captures are attributed to clip frames by the fitted clock and ordered unwrapped, so a dwell
+    across the loop's wrap stays consecutive; with no clock every group comes back empty.
+    """
+    rows = rows[: len(frames)]
+    setpoint = np.array([row.setpoint for row in rows], dtype=np.int64)
+    live = np.flatnonzero(setpoint != GAP)
+    groups = np.split(live, np.flatnonzero(np.diff(setpoint[live]) != 0) + 1) if live.size else []
+    times = np.array([row.captured for row in rows], dtype=np.float64)
+    bits, strip_px = int(stimulus["bits"]), int(stimulus["strip_px"])
+    codes = np.array(
+        [
+            -1 if code is None else code
+            for strip in strips[: len(frames)]
+            for code in [read_timecode(strip.astype(np.float32) / 255.0, bits=bits, strip_px=strip_px)]
+        ],
+        dtype=np.int64,
+    )
+    model, how = _clock(times, codes, frames, stimulus, series[1])
+    if model is None:
+        return [{} for _ in groups], how
+    shown = attribute(times, model)
+    unwrapped = np.rint((times - model.origin) / model.interval).astype(np.int64)
+    period = int(stimulus["frames"])
+    return [
+        _kept(frames, picked, unwrapped[picked], series, period)
+        for members in groups
+        for picked in [members[shown[members] >= 0]]
+    ], how
+
+
 def replay_program(
     archive: Any,
     program: str,
@@ -118,13 +227,14 @@ def replay_program(
     loop: Any = None,
     source: Source = Source.HW,
     analysis_width: int = ANALYSIS_WIDTH,
+    series: tuple[np.ndarray, np.ndarray] | None = None,
     **metrics: Any,
 ) -> Replayed:
     """Measure, fit and read the loop behaviour of one program from a single decode.
 
-    A failure is a note rather than the end of a library refit, and the program
-    comes back with whatever was measured before it. An ``analyzer`` given as a
-    module path is imported here, since a module cannot be sent to a worker.
+    A failure is a note rather than the end of a library refit. An ``analyzer`` given as a module
+    path is imported here, since a module cannot be sent to a worker. A footage archive is scored
+    against ``series``, its clip's :func:`clip_series`, read here when not given.
     """
     if isinstance(analyzer, str):
         analyzer = importlib.import_module(analyzer)
@@ -133,12 +243,24 @@ def replay_program(
     reader = archive.reader(program)
     if reader is None:
         return Replayed(records, profile, found, [f"{program}: no committed archive"])
-    spread = B.dwells(reader.rows)
+    footage, stimulus = is_footage(reader.meta), stimulus_of(reader.meta)
+    spread = [] if footage else B.dwells(reader.rows)
     natives: dict[int, np.ndarray] = {}
+    strips: list[np.ndarray] = []
+    small: list[np.ndarray] = []
     try:
-        with closing(reader.passes(width=analysis_width, native=B.positions(spread), into=natives)) as passes:
+        with closing(
+            reader.passes(
+                width=analysis_width,
+                native=B.positions(spread),
+                into=natives,
+                strip_px=int(stimulus.get("strip_px", 0)) if footage else 0,
+                strips=strips if footage else None,
+            )
+        ) as passes:
+            frames = _survival_frames(passes, small) if footage else passes
             records = _records(
-                group((row, frame) for frame, row in zip(passes, reader.rows)),
+                group((row, frame) for frame, row in zip(frames, reader.rows)),
                 reader,
                 program,
                 analyzer=analyzer,
@@ -146,9 +268,25 @@ def replay_program(
                 analysis_width=analysis_width,
                 **metrics,
             )
-        found = B.behaviour(spread, natives, loop=loop)
+        if footage:
+            notes.append(f"{program}: loop behaviour reads the codeframe loop, which footage does not play")
+        else:
+            found = B.behaviour(spread, natives, loop=loop)
     except Exception as exc:
         notes.append(f"{program}: loop behaviour not measured ({type(exc).__name__}: {exc})")
+    if footage and records:
+        try:
+            kept, how = survival_metrics(
+                reader.rows,
+                small,
+                strips,
+                stimulus,
+                clip_series(archive, reader.meta) if series is None else series,
+            )
+            records = [replace(r, metrics={**r.metrics, **extra}) for r, extra in zip(records, kept)]
+            notes.append(f"{program}: footage clock from {how}")
+        except Exception as exc:
+            notes.append(f"{program}: survival not measured ({type(exc).__name__}: {exc})")
     if records:
         specs = archived_specs(reader.meta)
         if specs is None:
@@ -194,9 +332,19 @@ def replay(
     ``jobs`` workers each take a program whole, one per usable core by default.
     A program that measured nothing is noted and left out.
     """
-    names = sorted(archive.committed()) if programs is None else list(programs)
+    committed = archive.committed()
+    names = sorted(committed) if programs is None else list(programs)
     note = log if log is not None else lambda _message: None
     reference = stimulus_loop(HarvestConfig()) if loop is None else loop
+    clips = {
+        name: stimulus_of(committed[name])["clip"]
+        for name in names
+        if name in committed and is_footage(committed[name])
+    }
+    played: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name, clip in clips.items():
+        if clip not in played:
+            played[clip] = clip_series(archive, committed[name])
     workers = max(1, min(int(jobs or len(os.sched_getaffinity(0))), len(names) or 1))
     # A forked child inherits OpenCV's thread pool mid-state and can hang in it; a fresh one, started
     # under SINGLE_THREADED, also loads its BLAS without a pool per core.
@@ -209,7 +357,15 @@ def replay(
     out = {}
     with _environment(SINGLE_THREADED), executor(max_workers=workers, **options) as pool:
         futures = {
-            pool.submit(replay_program, archive, name, analyzer=shipped, loop=reference, **kwargs): name
+            pool.submit(
+                replay_program,
+                archive,
+                name,
+                analyzer=shipped,
+                loop=reference,
+                series=played.get(clips.get(name)),
+                **kwargs,
+            ): name
             for name in names
         }
         progress = track(as_completed(futures), desc="refit", total=len(names), unit="program")

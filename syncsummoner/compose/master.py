@@ -15,6 +15,9 @@ from syncsummoner.progress import stage
 
 #: Seconds of fade at each edge unless a caller says otherwise.
 DEFAULT_FADE_S = 1.0
+#: The encoder every finished picture is written with, and its default quality.
+X264 = ("-c:v", "libx264", "-preset", "slow")
+DEFAULT_CRF = 16
 
 
 def probe_duration(path: str | Path, *, ffprobe: str = "ffprobe") -> float:
@@ -66,7 +69,7 @@ def master_command(
     video_start: float = 0.0,
     strip_px: int = 0,
     ffmpeg: str = "ffmpeg",
-    crf: int = 16,
+    crf: int = DEFAULT_CRF,
 ) -> list[str]:
     """Argv that trims, fades and muxes one take into the finished clip.
 
@@ -92,7 +95,7 @@ def master_command(
     argv += ["-t", f"{duration:.3f}"]
     if video_chain:
         argv += ["-vf", video_chain]
-    argv += ["-c:v", "libx264", "-crf", str(crf), "-preset", "slow", "-pix_fmt", "yuv420p"]
+    argv += [*X264, "-crf", str(crf), "-pix_fmt", "yuv420p"]
     if audio is None:
         argv += ["-an"]
     else:

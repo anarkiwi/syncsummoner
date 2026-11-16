@@ -2,6 +2,8 @@
 
 # pylint: disable=missing-function-docstring,protected-access
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -441,3 +443,109 @@ def test_the_style_sets_the_wet_range_and_the_caller_can_override_it(features):
     fader = P.plan_automation(chosen, profiles)[0]
     values = fader.values[fader.indices == 12]
     assert values.size == 0 or (values.min() >= round(0.3 * 1023) and values.max() <= round(0.9 * 1023))
+
+
+def _footage(seconds, fps=FPS, seed=0):
+    """Source P.910 series for a moving clip: SI steady, TI varying frame to frame."""
+    rng = np.random.default_rng(seed)
+    n = int(seconds * fps)
+    return VideoFeatures(
+        fps=fps,
+        n_frames=n,
+        shot_boundaries=np.zeros(0, dtype=np.int64),
+        motion_energy=np.zeros(n),
+        luma=np.zeros(n),
+        chroma=np.zeros(n),
+        si=np.full(n, 0.3),
+        ti=np.r_[np.nan, rng.gamma(4.0, 0.01, n - 1)],
+    )
+
+
+def _kept(features, *, si=1.0, ti=1.0, follow=0.9, dead_from=None):
+    """A trajectory keeping the given shares of the source, collapsing to nothing after ``dead_from``."""
+    times = np.arange(0, features.audio.duration, 1 / FPS)
+
+    def ratio(v):
+        return np.where(times >= dead_from, 0.0, v) if dead_from is not None else np.full(times.size, v)
+
+    zeros = np.zeros(times.size)
+    return P.Trajectory(
+        times=times,
+        state=np.zeros((times.size, 12)),
+        activity=zeros,
+        ic=zeros,
+        concentration=zeros,
+        slope=np.full(times.size, -1.2),
+        clip_frac=zeros,
+        illegal_frac=zeros,
+        si_ratio=ratio(si),
+        ti_ratio=ratio(ti),
+        follow=ratio(follow),
+    )
+
+
+def test_a_kept_picture_has_no_dead_bars(features):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    kept = P.predict_survival(_kept(both), both)
+    assert kept is not None and not kept.dead.any()
+    assert np.allclose(kept.ti_ratio, 1.0)
+
+
+def test_a_flat_or_frozen_or_unfollowed_bar_is_dead(features):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    for shares in ({"si": 0.0}, {"ti": 0.0}, {"follow": 0.0}):
+        assert P.predict_survival(_kept(both, **shares), both).dead.all()
+
+
+def test_survival_is_unknown_without_curves_or_footage(features):
+    traj = _kept(Features(audio=features.audio, video=None))
+    assert P.predict_survival(traj, Features(audio=features.audio, video=None)) is None
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    assert P.predict_survival(replace(traj, si_ratio=None), both) is None
+
+
+def test_destruction_is_budgeted_one_bar_at_a_time_inside_destroy_sections():
+    kept = P.Kept(
+        starts=np.arange(6.0),
+        ends=np.arange(1.0, 7.0),
+        ti_ratio=np.zeros(6),
+        dead=np.array([1, 0, 1, 1, 0, 1], bool),
+    )
+    calm = Score(duration=6.0, sections=[Section(0.0, 6.0, "A")])
+    wild = Score(duration=6.0, sections=[Section(0.0, 6.0, "A", destroy=True)])
+    assert P.dead_bars_over_budget(kept, calm) == 4.0
+    assert P.dead_bars_over_budget(kept, wild) == 1.0
+
+
+def test_dead_bars_outrank_any_total_and_bore_the_objective(features):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    score = Score(
+        duration=features.audio.duration, fps=FPS, sections=[Section(0.0, features.audio.duration, "A")]
+    )
+    alive = P.evaluate(_kept(both), both, score)
+    dying = P.evaluate(_kept(both, dead_from=1.0), both, score)
+    assert alive.violation == 0.0 and dying.violation > 0.0 and alive.rank < dying.rank
+    assert alive.terms["boredom"] == pytest.approx(0.0) and dying.terms["boredom"] == pytest.approx(1.0)
+    assert (
+        P.Objective(total=-5.0, feasible=True).rank < P.Objective(total=5.0, feasible=True, violation=1).rank
+    )
+
+
+def test_survival_curves_are_read_back_from_the_profile():
+    profile = _measured_profile(
+        si_ratio=[1.0, 1.0, 0.5, 0.0, 0.0], ti_ratio=[1.0] * 5, motion_follow=[0.9] * 5
+    )
+    traj = P.proxy_render(
+        Automation.of([0.0, 0.5], 2, [0, 1023]), profile, fps=FPS, duration=1.0, rng=np.random.default_rng(0)
+    )
+    assert traj.si_ratio.max() == pytest.approx(1.0, abs=0.05) and traj.si_ratio.min() == pytest.approx(
+        0.0, abs=0.05
+    )
+    assert traj.follow is not None and np.all(traj.follow <= 1.0)
+
+
+def test_search_cuts_sections_at_the_phrase_grid(features):
+    score = P.search({"g": make_profile("g")}, features, rng=np.random.default_rng(1), budget=4, fps=FPS)
+    bars = features.audio.phrase_bars * features.audio.bar_duration
+    assert score.meta["phrase_bars"] == features.audio.phrase_bars and score.meta["bar"] > 0
+    assert all(s.duration <= bars + 1e-6 for s in score.sections)

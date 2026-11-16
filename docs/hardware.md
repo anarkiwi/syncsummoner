@@ -236,6 +236,29 @@ unmeasurable until that loop exists.
 A frame is displayed by writing raw 16-bit little-endian words to `/dev/fb0`,
 blue in the high bits; `ffmpeg -pix_fmt bgr565le` produces them directly.
 
+## Clip playout
+
+Measured offline from recorded takes.
+
+| Property | Value |
+| --- | --- |
+| Player | `ClipPlayer`: `ffmpeg -re` from `/dev/shm` into `/dev/fb0` |
+| Clip | 1080p30 H.264, timecoded |
+| Frame period | 33.3333 ms, a few ppm from nominal |
+| Captures per clip frame | two, the card returning about 60 fps |
+| Largest clip fitted | 822 MB, 351 s, in the Pi's tmpfs |
+| Upload of that clip | about 1.6 to 1.8 min |
+
+Playout starts with a burst lasting a fraction of a second before settling to
+rate. A picture start read from the first seconds of a take can therefore be off
+by up to about 0.67 s against the steady clock: on `Porthole` the lead-in read
+1.23 s and the fitted clock 1.90 s. Takes are therefore spliced by the capture
+the clock fitted over the whole take attributes to each clip frame, never by a start time.
+
+The framebuffer is written without vsync, so a capture can show the strip one
+frame ahead of the picture above it; on some takes motion correlates best at a
+one-frame lead. Survival tests leads of 0 and 1 frames for this reason.
+
 ## The analog input decodes luma and sync only
 
 Composite fed straight in yields zero chroma under both NTSC and PAL while luma
@@ -279,6 +302,11 @@ of the analog path's 0.958 gain and 18/255 pedestal.
 A destructive program mangles individual strips: inside a `Derez` take, frames
 decode correctly either side of ones that decode to nonsense. Alignment therefore
 takes the lag a take's frames agree on rather than trusting any single frame.
+
+Over the 8 programs of `takes6`, a 16-bit strip stayed legible on 4 and in
+patches on the others, which is why footage frames are identified by a clock
+fitted to whatever strip reads, with motion as the fallback, rather than by
+reading every frame.
 
 ## `settings export` and `settings get` hung the serial shell before 1.0.1
 

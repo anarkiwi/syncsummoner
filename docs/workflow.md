@@ -174,6 +174,30 @@ program runs whole in a worker process with single-threaded decode and OpenCV, o
 worker per core by default (`--jobs` caps it), so its cost is the FFV1 decode plus
 the per-pair optical flow, spread evenly over the cores.
 
+The codeframe loop says what each parameter does to a test signal. To also
+measure what each keeps of real footage, archive against a clip:
+
+```sh
+ss probe archive --footage source.mkv --out archive/ --source-host pi@videopi
+ss probe archive --footage source.mkv --footage-start 30 --footage-seconds 120 --out archive/ ...
+```
+
+The footage is conformed to the session raster, timecoded, and written to
+`archive/stimulus.mkv`, with `archive/stimulus.json` (source, excerpt, rate,
+strip, SHA-256) written last as its commit marker; the Pi plays it on a loop for
+the whole run. A resume reuses the clip when the record names the same excerpt
+and the clip still hashes the same, and skips a program only when its archive
+was recorded against that same clip; one recorded against the codeframe loop or
+another clip is recorded again. The clip has to fit the Pi's tmpfs.
+
+A refit of a footage archive adds three survival curves to each parameter:
+`si_ratio` and `ti_ratio`, the share of the source's spatial and temporal
+information kept, and `motion_follow`, how far the output's motion follows the
+source's. Each program logs `footage clock from strip`, `motion` or `none`; with
+`none` it has no survival. Codeframe archives still refit as before, without
+survival, and the loop behaviour fits run only on them. See
+[design.md](design.md#9-footage-and-survival).
+
 `--decode` picks where the archive is decoded: `cpu`, `vulkan` (FFV1 in compute
 shaders, ffmpeg 8 and later), or `auto`, the default. `auto` decodes the first
 program's opening frames both ways and takes Vulkan only when the frames are
@@ -296,6 +320,16 @@ anchored to the track's beats, downbeats and section edges, scores it against th
 measured response of that program, and keeps the best. `--passes 8` keeps the
 eight strongest programs, one capture pass each; `--style` biases which gestures
 are drawn on; `--seed` makes the whole search reproducible.
+
+With profiles refit from footage, the planner predicts, bar by bar, whether each
+program keeps the clip's picture and motion, using the clip's own SI and TI, so
+pass the clip being rendered. A bar predicted dead outside a `destroy` section,
+or past the first bar of a dead run inside one, ranks a candidate below any that
+has fewer, whatever its score. A program whose layer still breaks that budget
+logs `N bars predicted dead outside the destruction budget`; one without survival
+logs `no survival measured, so its picture is unverified; refit from footage`.
+Sections are split at the track's phrase length, which the score records as
+`phrase_bars`.
 
 `--budget` is the total number of candidates evaluated, spread over every program
 with a profile, so the generations each program gets is
@@ -442,35 +476,57 @@ What happens, in order:
    host writes only the parameters that are due. Each program is driven by its own
    evolved layer; the take covers the whole timeline.
 6. Each pass lands in `--takes` as `take-<program>.mkv` (an `author/Name` program
-   becomes `take-author_Name-<digest>.mkv`, the archive's name for it), and they are cut together
-   on the score's sections, in rotation, into `final.take.mp4`.
-7. The take opens on lead-in the picture has not reached yet, so its start is
-   read back out of the timecode strip rather than assumed — that is what the
-   strip is for — and reported as `picture starts N.NNs into the take`. The Pi's
-   player takes a few frames to reach rate; the lag held by a run of consecutive
-   frames counting up one per frame is what the take is cut against, and the
-   fade covers the ramp. The held lead-in frame and scattered misreads form no
-   such run, so they cannot set it. A program that
-   moves the picture geometrically can destroy the strip; that take is cut at the
-   median start of the run's other takes (the lag is the Pi's and the capture's,
-   which every pass shares) and the log says so:
-   `Pinwheel: timecode strip did not survive; using the run's median picture start 1.90s`.
-   If no take in the run kept its strip, the render stops rather than cut from
-   the take's first frame.
-8. Mastering: cut from where the picture starts, black out the timecode strip
+   becomes `take-author_Name-<digest>.mkv`, the archive's name for it), and they are spliced
+   together on the score's sections, in rotation, into `final.take.mp4`.
+7. The take opens on lead-in the picture has not reached yet, so no take is cut
+   by time. The take check (step 8) attributes every clip frame to the capture
+   nearest the centre of its display interval, by the player's clock fitted from
+   the timecode strip, or from the motion where a program destroys the strip
+   (`Pinwheel: aligned by motion, picture starts 1.918s`).
+8. Before the takes are spliced together, each is checked against the timecoded
+   clip it was fed: every capture is attributed to the clip frame it shows, and
+   every bar is judged `flat`, `frozen` or `unfollowed` on what it kept of the
+   same bar of the clip. A dead run inside a cut is covered from another
+   program's take alive across it (`Derez:   42.10-  46.20s frozen, covered by
+   Lorenz`); a lone dead bar inside a `destroy` section stays. A run no take
+   covers stops the render with `DeadTakeError: dead picture no take can cover:`
+   and the program and time range, before anything is mastered.
+9. The splice writes one frame per clip frame at the clip's rate: frame `n` is the
+   capture its cut's take shows clip frame `n` in. Every take is decoded once,
+   forward, at full size, all at once, and nothing is seeked, so no cut is a frame
+   early or late. A clip frame the chosen take has no capture of stops the splice
+   with `SpliceError: <program>: no capture shows clip frames <from>-<to>s`.
+10. Mastering: black out the timecode strip
    (cropped off the bottom edge and padded back, so the frame keeps its size and
    nothing is resampled), trim to the length both inputs cover, mux the track, fade the picture up from black and the audio up from
    silence over `--fade` seconds, and the same back down at the end.
 
 The capture card returns frames at its own rate — this one gives 60 for a
 `1080p30` session — so a take holds more frames than the session's rate implies.
-Nothing downstream counts frames: alignment is by the timecode strip, and the
-finished clip is cut by time.
+Attribution picks one capture per clip frame, so the splice is at the clip's rate.
 
 `--fade-in` and `--fade-out` override each edge separately; `--fade 0` renders
 hard cuts at both ends. On a clip shorter than two fades, each is clamped to half
 the clip so they meet rather than overlap. `--no-master` stops at the raw take,
 and `--take` puts it somewhere other than beside the output.
+
+The same check runs on its own, against takes already rendered or a spliced
+master, with no rig. It logs each take's alignment and every dead span, then the
+covered cut plan, and exits 1 when any span is uncovered. `--splice OUT` then
+splices the covered plan from the takes (`--as-planned` splices the plan as
+rendered, dead spans and all, which is what to check a master check against):
+
+```sh
+ss check score.yaml --source timecoded.mkv --takes takes/ \
+     --cut-programs Derez,Lorenz,Scramble,Sfumato,Kaledos,Folio,Isotherm,Howler
+ss check score.yaml --source timecoded.mkv --takes takes/ \
+     --cut-programs Derez,Lorenz,Scramble,Sfumato,Kaledos,Folio,Isotherm,Howler \
+     --splice final.take.mp4
+ss check score.yaml --source timecoded.mkv --master final.take.mp4
+```
+
+`--source` is the render's `--scratch`. A spliced master is frame for frame the
+clip's, so it is checked on the identity clock: master frame `n` is clip frame `n`.
 
 `--reuse-takes` cuts from any `take-<program>.mkv` already in `--takes` instead
 of rendering it again (`<program>: reusing take <path>`), so a render can be
@@ -533,6 +589,7 @@ doing it twice, which is what the audition is for.
 | --- | --- | --- |
 | `probe archive` | rig | hours, once per firmware |
 | `refit` | CPU | minutes, decode-bound |
+| `check` | CPU | one decode per take |
 | `analyze` / `compose` | CPU | seconds to a minute |
 | `audition` | rig | one load plus the excerpt |
 | `render` | rig | (load + relock + duration) per program |
@@ -558,7 +615,9 @@ doing it twice, which is what the audition is for.
 | small flickering square in every take | `fbcon` cursor blink on the Pi; disable it, `chvt` does not fix it |
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
-| output starts mid-clip, or holds one frame | the picture's start was not found; check the `picture starts` line and that the strip survives the program; a `timecode strip did not survive` warning means that take was cut at the run's median start instead |
+| `SpliceError: <program>: no capture shows clip frames ...` | the take was never aligned or ends early; check its `aligned by` line in the take check |
+| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or not following the clip, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
+| `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `--footage` and refit |
 | `timecode strip did not survive, so the picture start is unknown` | no take kept its strip; check the program, or that the pass recorded the clip at all |
 | pass dies uploading the clip | `/dev/shm` on the Pi is half its RAM; a long scratch at `crf 14` will not fit |
 | `Host key verification failed` | the mounted `known_hosts` has no entry for the Pi; `BatchMode` will not prompt for one |

@@ -8,7 +8,7 @@ sequence. librosa is optional; scipy fallbacks cover every function.
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -66,6 +66,11 @@ class AudioFeatures:
         """Median downbeat spacing, falling back to four beats at the estimated tempo."""
         return float(np.median(np.diff(self.downbeats))) if self.downbeats.size > 1 else 4 * 60.0 / self.tempo
 
+    @property
+    def phrase_bars(self) -> int:
+        """Bars per phrase: the longest grid of whole bars most section boundaries fall on."""
+        return phrase_bars(self.sections, self.downbeats)
+
 
 @dataclass(frozen=True, eq=False)
 class VideoFeatures:
@@ -77,6 +82,9 @@ class VideoFeatures:
     motion_energy: np.ndarray
     luma: np.ndarray
     chroma: np.ndarray
+    #: ITU-T P.910 spatial and temporal information per frame, at the size takes are judged at.
+    si: np.ndarray | None = None
+    ti: np.ndarray | None = None
 
     @property
     def duration(self) -> float:
@@ -365,8 +373,54 @@ def analyze_audio(
     )
 
 
+def phrase_bars(sections: Sequence[Section], downbeats: np.ndarray) -> int:
+    """Bars per phrase: the longest grid of whole bars that most section boundaries fall on.
+
+    Each inner boundary is placed at its nearest downbeat; a phrase of ``p`` bars is a grid on
+    which more than half of them lie, counted from the first downbeat. One bar always qualifies.
+    """
+    inner = np.array([s.start for s in sections[1:]], dtype=np.float64)
+    if inner.size == 0 or np.size(downbeats) < 2:
+        return 1
+    at = np.abs(np.asarray(downbeats)[None, :] - inner[:, None]).argmin(axis=1)
+    found = [p for p in range(1, int(np.size(downbeats))) if 2 * int(np.count_nonzero(at % p == 0)) > at.size]
+    return max(found, default=1)
+
+
+def phrases(sections: Sequence[Section], downbeats: np.ndarray, bars: int) -> tuple[Section, ...]:
+    """Every section split at the phrase grid, keeping its label and destroy mark."""
+    marks = np.asarray(downbeats, dtype=np.float64)[:: max(1, int(bars))]
+    out = []
+    for section in sections:
+        cuts = marks[(marks > section.start) & (marks < section.end)]
+        edges = np.r_[section.start, cuts, section.end]
+        out += [replace(section, start=float(a), end=float(b)) for a, b in zip(edges[:-1], edges[1:])]
+    return tuple(out)
+
+
+def _information(frame: np.ndarray, prev: np.ndarray | None) -> tuple[np.ndarray, float, float]:
+    """A frame at survival size, with its SI and its TI against the previous one."""
+    # pylint: disable=no-member
+    import cv2
+
+    from syncsummoner import aesthetics
+    from syncsummoner.device.recorder import INSPECT_SIZE
+
+    small = cv2.resize(np.asarray(frame, np.float32), INSPECT_SIZE, interpolation=cv2.INTER_AREA)
+    ti = aesthetics.temporal_information(prev, small) if prev is not None else np.nan
+    return small, aesthetics.spatial_information(small), float(ti)
+
+
 def _video_features(
-    diff: np.ndarray, *, fps: float, n_frames: int, luma: np.ndarray, chroma: np.ndarray, shot_sigma: float
+    diff: np.ndarray,
+    *,
+    fps: float,
+    n_frames: int,
+    luma: np.ndarray,
+    chroma: np.ndarray,
+    shot_sigma: float,
+    si: np.ndarray | None = None,
+    ti: np.ndarray | None = None,
 ) -> VideoFeatures:
     """Assemble features from per-frame series, so a stack and a stream agree exactly."""
     peaks, _ = signal.find_peaks(diff, prominence=shot_sigma * (diff.std() + EPS)) if diff.size else ([], {})
@@ -377,6 +431,8 @@ def _video_features(
         motion_energy=np.concatenate((diff[:1], diff)) if diff.size else np.zeros(n_frames),
         luma=luma,
         chroma=chroma,
+        si=si,
+        ti=ti,
     )
 
 
@@ -385,6 +441,11 @@ def analyze_frames(frames: np.ndarray, *, fps: float, shot_sigma: float = 3.0) -
     x = np.asarray(frames, dtype=np.float32)
     plane = x.mean(axis=3)
     diff = np.abs(np.diff(plane, axis=0)).mean(axis=(1, 2)) if x.shape[0] > 1 else np.zeros(0)
+    si, ti, prev = [], [], None
+    for frame in x:
+        prev, *measured = _information(frame, prev)
+        si.append(measured[0])
+        ti.append(measured[1])
     return _video_features(
         diff,
         fps=fps,
@@ -392,6 +453,8 @@ def analyze_frames(frames: np.ndarray, *, fps: float, shot_sigma: float = 3.0) -
         luma=plane.mean(axis=(1, 2)),
         chroma=x.std(axis=3).mean(axis=(1, 2)),
         shot_sigma=shot_sigma,
+        si=np.asarray(si, np.float64),
+        ti=np.asarray(ti, np.float64),
     )
 
 
@@ -431,8 +494,8 @@ def analyze_video(
     Every feature is a per-frame scalar or a difference against the frame before
     it, so a stack is never needed: 180s of 576p costs 21GB as one and 1.5MB here.
     """
-    fps, count, prev = 30.0, 0, None
-    luma, chroma, diff = [], [], []
+    fps, count, prev, small = 30.0, 0, None, None
+    luma, chroma, diff, si, ti = [], [], [], [], []
     for fps, frame in track(read_frames(path, max_frames=max_frames), desc="reading", unit="frame"):
         count += 1
         plane = frame.mean(axis=2)
@@ -441,6 +504,9 @@ def analyze_video(
         if prev is not None:
             diff.append(np.abs(plane - prev).mean())
         prev = plane
+        small, *measured = _information(frame, small)
+        si.append(measured[0])
+        ti.append(measured[1])
     return _video_features(
         np.asarray(diff, np.float32),
         fps=fps,
@@ -448,6 +514,8 @@ def analyze_video(
         luma=np.asarray(luma, np.float32),
         chroma=np.asarray(chroma, np.float32),
         shot_sigma=shot_sigma,
+        si=np.asarray(si, np.float64),
+        ti=np.asarray(ti, np.float64),
     )
 
 

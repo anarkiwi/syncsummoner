@@ -35,6 +35,20 @@ from syncsummoner.aesthetics.score import (
 )
 from syncsummoner.aesthetics.spectrum import SpectralStats, spectral_stats
 from syncsummoner.aesthetics.structure import PointwiseFit, pointwise_fit, pointwise_r2
+from syncsummoner.aesthetics.survival import (
+    Survival,
+    critical_z,
+    effective_samples,
+    follow_z,
+    QUANTUM,
+    information,
+    live_floor,
+    quantisation_si,
+    quantisation_ti,
+    spatial_information,
+    survival_stats,
+    temporal_information,
+)
 from syncsummoner.aesthetics.surprisal import (
     SurprisalModel,
     entropy_rate,
@@ -42,12 +56,13 @@ from syncsummoner.aesthetics.surprisal import (
 )
 from syncsummoner.aesthetics.sync import SyncResult, av_correlation
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "ChannelEnergy",
     "ClipDescriptor",
     "DynamicsResult",
+    "QUANTUM",
     "FlashRisk",
     "LevelStats",
     "MotionStats",
@@ -56,17 +71,23 @@ __all__ = [
     "SpectralStats",
     "StabilityClass",
     "SurprisalModel",
+    "Survival",
     "TemporalSplit",
     "SyncResult",
     "analyze_dynamics",
     "av_correlation",
+    "critical_z",
     "dead_output",
     "describe_clip",
+    "effective_samples",
     "entropy_rate",
     "flicker_ratio",
     "flash_risk",
+    "follow_z",
     "gabor_bank",
     "gabor_energy",
+    "information",
+    "live_floor",
     "information_content",
     "level_stats",
     "mitigate_flashes",
@@ -74,9 +95,14 @@ __all__ = [
     "passthrough_distance",
     "pointwise_fit",
     "pointwise_r2",
+    "quantisation_si",
+    "quantisation_ti",
     "relative_luminance",
     "score_clip",
+    "spatial_information",
     "spectral_stats",
+    "survival_stats",
+    "temporal_information",
     "temporal_split",
     "usable_rate_hz",
     "winding_number",

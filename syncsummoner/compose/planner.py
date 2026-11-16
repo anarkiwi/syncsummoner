@@ -16,7 +16,8 @@ import numpy as np
 from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
 from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, track
-from syncsummoner.compose.features import Features, Section, information_content
+from syncsummoner import aesthetics
+from syncsummoner.compose.features import Features, Section, information_content, phrases
 from syncsummoner.compose.score import DEFAULT_WET, GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext
 
@@ -28,8 +29,10 @@ SIM_DISCOUNT = 0.5
 #: The three fractions are bounded by construction; the slope's span is its
 #: measured range over every archived program.
 METRIC_SPAN = {"spectral_slope": 4.2, "concentration": 1.0, "clip_frac": 1.0, "illegal_frac": 1.0}
-#: A bar over which no measured metric moves by this fraction of its span is stasis.
+#: Stasis floor for profiles that measured no survival, as a fraction of each metric's span.
 BOREDOM_FLOOR = 0.02
+#: Survival responses a footage archive measures, as each parameter's share of what the source keeps.
+SURVIVAL = ("si_ratio", "ti_ratio", "motion_follow")
 
 SPAN_BARS: dict[Anchor, float] = {
     Anchor.BAR: 1.0,
@@ -83,15 +86,7 @@ class ObjectiveWeights:
 
 
 DEFAULT_WEIGHTS = ObjectiveWeights()
-#: Per-style objective weights. Naturalness is a cost only where the style wants a
-#: natural picture: ``glitchy`` exists to leave the natural slope band and to reach
-#: illegal levels, so scoring it against either penalizes the effect being asked for.
-#: ``levels`` is zero rather than merely small. Measured over 52 profiles, a residual
-#: 0.2 selected against every destructive program in the library and kept the mean
-#: pointwise fit at 0.90 — it excluded the programs the style exists to reach, since
-#: departing from legal levels is what they do. ``mud``, ``boredom`` and ``av_corr``
-#: are what keep the search from parking, and destroy-marked sections were already
-#: exempt, so the residual only ever applied to the calmer ones.
+#: Per-style weights; ``glitchy`` leaves the natural slope band and legal levels on purpose, so neither costs.
 STYLE_WEIGHTS: dict[str, ObjectiveWeights] = {
     "glitchy": ObjectiveWeights(slope=0.0, levels=0.0, boredom=1.0),
 }
@@ -109,15 +104,29 @@ class Trajectory:
     slope: np.ndarray
     clip_frac: np.ndarray
     illegal_frac: np.ndarray
+    #: Predicted share of the source's SI and TI kept, and how far output motion follows it; None unmeasured.
+    si_ratio: np.ndarray | None = None
+    ti_ratio: np.ndarray | None = None
+    follow: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
 class Objective:
-    """Weighted objective value plus its decomposition and the reachability verdict."""
+    """Weighted objective value, its decomposition, the reachability verdict and dead bars over budget.
+
+    ``violation`` counts bars predicted dead beyond what destroy-marked sections allow; the search
+    ranks by it before ``total``, so no weighting trades a dead picture for anything else.
+    """
 
     total: float
     feasible: bool
     terms: dict[str, float] = field(default_factory=dict)
+    violation: float = 0.0
+
+    @property
+    def rank(self) -> tuple[float, float]:
+        """Sort key: fewer dead bars first, then the higher total."""
+        return (self.violation, -self.total)
 
 
 def _corr(a: np.ndarray, b: np.ndarray) -> float:
@@ -237,10 +246,9 @@ def plan_automation(
 def _marginal(profile: ProgramProfile, raw: np.ndarray, name: str) -> np.ndarray | None:
     """Superpose each parameter's measured curve for one metric over the timeline.
 
-    ``ParamSpec.measured`` holds a one-at-a-time marginal, so the first-order
-    prediction at an arbitrary parameter vector is the sum of each parameter's
-    departure from its own median. ``None`` where nothing measured the metric,
-    which is every profile fitted before it was recorded.
+    ``ParamSpec.measured`` holds each parameter's first-order marginal, so the prediction at a
+    vector is the sum of their departures from their medians (first-order HDMR); ``None``
+    where nothing measured the metric.
     """
     deltas, bases = [], []
     for spec in profile.params:
@@ -326,6 +334,7 @@ def proxy_render(
         clip = inferred_clip if clip is None else clip
         illegal = inferred_illegal if illegal is None else illegal
 
+    kept = {name: _marginal(profile, raw, name) for name in SURVIVAL}
     return Trajectory(
         times=times,
         state=resp,
@@ -335,6 +344,9 @@ def proxy_render(
         slope=slope,
         clip_frac=np.clip(clip, 0.0, 1.0),
         illegal_frac=np.clip(illegal, 0.0, 1.0),
+        si_ratio=None if kept["si_ratio"] is None else np.maximum(kept["si_ratio"], 0.0),
+        ti_ratio=None if kept["ti_ratio"] is None else np.maximum(kept["ti_ratio"], 0.0),
+        follow=None if kept["motion_follow"] is None else np.clip(kept["motion_follow"], -1.0, 1.0),
     )
 
 
@@ -374,6 +386,68 @@ def _boredom(traj: Trajectory, bar_duration: float, *, floor: float) -> float:
     return float(np.max(np.maximum(floor - std, 0.0)) / floor)
 
 
+def bar_edges(features: Features, duration: float) -> np.ndarray:
+    """Bar boundaries in seconds over ``[0, duration]``: the downbeats, else the bar period."""
+    audio = features.audio
+    marks = audio.downbeats if audio.downbeats.size > 1 else np.arange(0.0, duration, audio.bar_duration)
+    return np.unique(np.r_[0.0, marks[(marks > 0.0) & (marks < duration)], duration])
+
+
+@dataclass(frozen=True)
+class Kept:
+    """Predicted survival per bar: how much picture and motion the output keeps, and which bars die."""
+
+    starts: np.ndarray
+    ends: np.ndarray
+    ti_ratio: np.ndarray
+    dead: np.ndarray
+
+
+def predict_survival(traj: Trajectory, features: Features) -> Kept | None:
+    """Judge each bar of a predicted trajectory against the same bar of the source footage.
+
+    A bar is dead where the output's predicted SI or TI falls below
+    :func:`~syncsummoner.aesthetics.live_floor` of the source's, or where its predicted
+    following would not reach :func:`~syncsummoner.aesthetics.critical_z` over the bar's frames.
+    """
+    video = features.video
+    if traj.si_ratio is None or traj.ti_ratio is None or video is None or video.si is None:
+        return None
+    edges = bar_edges(features, float(traj.times[-1]) + (traj.times[1] - traj.times[0]))
+    frame = np.clip(np.rint(traj.times * video.fps).astype(np.int64), 0, video.si.size - 1)
+    source_si, source_ti = video.si[frame], np.nan_to_num(video.ti[frame])
+    follow = traj.follow if traj.follow is not None else np.ones_like(traj.ti_ratio)
+    owner = np.clip(np.searchsorted(edges, traj.times, side="right") - 1, 0, edges.size - 2)
+    ratio, dead = np.zeros(edges.size - 1), np.zeros(edges.size - 1, dtype=bool)
+    for b in range(edges.size - 1):
+        m = owner == b
+        if not m.any():
+            continue
+        lo, hi = np.clip(np.rint(edges[b : b + 2] * video.fps).astype(np.int64), 0, video.ti.size)
+        series = np.nan_to_num(video.ti[lo:hi])
+        si, ti = float(source_si[m].mean()), float(source_ti[m].mean())
+        ratio[b] = float(traj.ti_ratio[m].mean())
+        flat = traj.si_ratio[m].mean() * si < aesthetics.live_floor(si, aesthetics.quantisation_si())
+        frozen = ratio[b] * ti < aesthetics.live_floor(ti, aesthetics.quantisation_ti())
+        z = aesthetics.follow_z(float(follow[m].mean()), aesthetics.effective_samples(series, series))
+        dead[b] = bool(flat or frozen or (series.size > 3 and z <= aesthetics.critical_z()))
+    return Kept(edges[:-1], edges[1:], ratio, dead)
+
+
+def dead_bars_over_budget(kept: Kept, score: Score) -> float:
+    """Dead bars the score cannot afford, destruction being budgeted one bar at a time.
+
+    Any dead bar outside a destroy-marked section counts, and inside one every bar of a dead
+    run beyond its first.
+    """
+    inside = score.destroy_mask(0.5 * (kept.starts + kept.ends))
+    edges = np.flatnonzero(np.diff(np.r_[0, kept.dead.astype(np.int8), 0]))
+    over = 0
+    for a, b in zip(edges[::2], edges[1::2]):
+        over += int(np.count_nonzero(~inside[a:b])) + max(0, int(np.count_nonzero(inside[a:b])) - 1)
+    return float(over)
+
+
 def evaluate(
     traj: Trajectory,
     features: Features,
@@ -401,7 +475,14 @@ def evaluate(
     terms["slope"] = float(dev[allowed].mean())
     terms["levels"] = float((traj.clip_frac + traj.illegal_frac)[legal].mean())
     terms["motif"] = _motif_return(traj, score.sections)
-    terms["boredom"] = _boredom(traj, audio.bar_duration, floor=boredom_floor)
+    kept = predict_survival(traj, features)
+    if kept is None:
+        terms["boredom"] = _boredom(traj, audio.bar_duration, floor=boredom_floor)
+        violation = 0.0
+    else:
+        terms["boredom"] = float(np.max(1.0 - np.minimum(kept.ti_ratio, 1.0)))
+        violation = dead_bars_over_budget(kept, score)
+        terms["dead_bars"] = float(kept.dead.sum())
     total = discount * (
         weights.av_corr * terms["av_corr"]
         + weights.motif * terms["motif"]
@@ -410,7 +491,7 @@ def evaluate(
         - weights.levels * terms["levels"]
         - weights.boredom * terms["boredom"]
     )
-    return Objective(total=float(total), feasible=True, terms=terms)
+    return Objective(total=float(total), feasible=True, terms=terms, violation=violation)
 
 
 def _bar_grid(audio, section: Section) -> np.ndarray:
@@ -548,14 +629,21 @@ def search(
         raise ValueError("planner.search requires audio features")
     style_weights = STYLES.get(style, STYLES["default"])
     duration = features.duration or audio.duration
-    sections = _clip_sections(_mark_destroy(audio.sections, audio, enabled=style in DESTROY_STYLES), duration)
+    marked = _mark_destroy(audio.sections, audio, enabled=style in DESTROY_STYLES)
+    sections = _clip_sections(list(phrases(marked, audio.downbeats, audio.phrase_bars)), duration)
     base = Score(
         seed=int(rng.integers(1 << 30)),
         bpm=audio.tempo,
         duration=duration,
         fps=fps,
         sections=list(sections),
-        meta={"style": style, "density": density, "wet": list(wet or STYLE_WET.get(style, DEFAULT_WET))},
+        meta={
+            "style": style,
+            "density": density,
+            "wet": list(wet or STYLE_WET.get(style, DEFAULT_WET)),
+            "bar": audio.bar_duration,
+            "phrase_bars": audio.phrase_bars,
+        },
     )
     weights = STYLE_WEIGHTS.get(style, DEFAULT_WEIGHTS) if weights is None else weights
     programs = sorted(profiles)
@@ -591,7 +679,7 @@ def search(
                 cc_budget_hz=cc_budget_hz,
             )
             if not reachable(auto, profile, fps=fps, cc_budget_hz=cc_budget_hz):
-                return Objective(total=-np.inf, feasible=False)
+                return Objective(total=-np.inf, feasible=False, violation=np.inf)
             traj = proxy_render(
                 auto,
                 profile,
@@ -605,7 +693,7 @@ def search(
             _sample_layer(program, profile, audio, sections, applicable, rng, density=density)
             for _ in range(population)
         ]
-        ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: -p[0].total)
+        ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: p[0].rank)
         for _ in range(generations - 1):
             elite = [m for _, m in ranked[: max(1, population // 2)]]
             children = [
@@ -613,16 +701,20 @@ def search(
                 for i in range(population - len(elite))
             ]
             pop = elite + children
-            ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: -p[0].total)
+            ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: p[0].rank)
         obj, layer = ranked[0]
         LOG.debug("%s: score %.3f over %d gestures", program, obj.total, len(layer.gestures))
-        best.append((obj.total, layer, obj.terms))
+        if "dead_bars" not in obj.terms:
+            LOG.warning("%s: no survival measured, so its picture is unverified; refit from footage", program)
+        elif obj.violation:
+            LOG.warning("%s: %d bars predicted dead outside the destruction budget", program, obj.violation)
+        best.append((obj, layer))
 
-    best.sort(key=lambda t: -t[0])
-    base.layers = [replace(layer, index=i) for i, (_, layer, _) in enumerate(best[:n_passes])]
-    base.meta["objective"] = [terms for _, _, terms in best[:n_passes]]
-    for layer, (total, _, _) in zip(base.layers, best):
-        LOG.info("kept %s: score %.3f, %d gestures", layer.program, total, len(layer.gestures))
+    best.sort(key=lambda t: t[0].rank)
+    base.layers = [replace(layer, index=i) for i, (_, layer) in enumerate(best[:n_passes])]
+    base.meta["objective"] = [obj.terms for obj, _ in best[:n_passes]]
+    for layer, (obj, _) in zip(base.layers, best):
+        LOG.info("kept %s: score %.3f, %d gestures", layer.program, obj.total, len(layer.gestures))
     return base
 
 

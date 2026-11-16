@@ -8,9 +8,12 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 import pytest
 
+from syncsummoner import aesthetics
 from syncsummoner.device.profile import Source
+from syncsummoner.device.recorder import INSPECT_SIZE
 from syncsummoner.probe import codeframes as cf
 from syncsummoner.probe import replay as R
+from syncsummoner.probe.patterns import burn_timecode
 from syncsummoner.probe.archive import GAP, CHANNELS, ArchiveError, FrameRow
 from syncsummoner.probe.runner import ANALYSIS_WIDTH
 from tests.probe.test_runner import FakeAnalyzer
@@ -41,21 +44,23 @@ class Reader:
         end = len(self.frames) if count is None else start + count
         return iter(self.frames[start:end])
 
-    def passes(self, *, width=None, native=(), into=None):
-        """Every frame once, the native ones asked for held in ``into`` as the decoder reaches them."""
+    def passes(self, *, width=None, native=(), into=None, strip_px=0, strips=None):
+        """Every frame once, the native ones asked for held in ``into`` and any strip kept in ``strips``."""
         self.widths.append(width)
         keep = set(native)
         for i, frame in enumerate(self.frames):
             if i in keep:
                 into[i] = frame
-            yield frame
+            if strip_px and strips is not None:
+                strips.append(frame[-strip_px:])
+            yield frame[: frame.shape[0] - strip_px]
 
 
 class Broken(Reader):
     """A reader whose decoder fails part way through the archive."""
 
-    def passes(self, *, width=None, native=(), into=None):
-        del width, native, into
+    def passes(self, *, width=None, native=(), into=None, strip_px=0, strips=None):
+        del width, native, into, strip_px, strips
         yield self.frames[0]
         raise ArchiveError("decoding gave 0 bytes")
 
@@ -63,11 +68,12 @@ class Broken(Reader):
 class Archive:
     """Frame archive stub holding one reader per program."""
 
-    def __init__(self, readers):
+    def __init__(self, readers, directory="."):
         self.readers = dict(readers)
+        self.directory = directory
 
     def committed(self):
-        return {name: {} for name in self.readers}
+        return {name: reader.meta for name, reader in self.readers.items()}
 
     def reader(self, program, key=None):
         del key
@@ -124,6 +130,7 @@ def test_records_carry_the_archive_provenance():
     assert record.program == "p" and record.firmware == "1.0.0-rc.40"
     assert record.source is Source.HW and record.stimulus == R.STIMULUS
     assert record.params == tuple([0] * 12) and record.metrics
+    assert not {"si_ratio", "ti_ratio", "motion_follow"} & set(record.metrics)
 
 
 def test_records_of_a_program_the_archive_does_not_hold():
@@ -185,7 +192,6 @@ def test_replay_keys_what_measured_and_notes_what_did_not(loop):
 
 def test_worker_processes_return_what_threads_do(loop):
     """The pool sends the archive and the analyzer, a module by its name, to each worker."""
-    from syncsummoner import aesthetics  # pylint: disable=import-outside-toplevel
 
     archive = Archive({name: sweep() for name in ("a", "b", "c")})
     threaded = R.replay(archive, analyzer=aesthetics, loop=loop, jobs=2, executor=ThreadPoolExecutor)
@@ -212,3 +218,107 @@ def test_workers_start_under_single_threaded_libraries_and_the_caller_keeps_its_
     R.replay(Archive({}), analyzer=FakeAnalyzer(), programs=[], executor=Recording)
     assert seen == R.SINGLE_THREADED
     assert os.environ["OPENBLAS_NUM_THREADS"] == "7" and "OMP_NUM_THREADS" not in os.environ
+
+
+STRIP, PERIOD, FPS, DWELL = 8, 48, 30.0, 30
+
+
+def clip_frames():
+    """A looping clip of a gray texture panning at a varying speed, each frame's index burnt in its strip."""
+    width, height = INSPECT_SIZE
+    rng = np.random.default_rng(1)
+    field = np.cumsum(np.cumsum(rng.standard_normal((height, 4 * width)), axis=0), axis=1)
+    field = (field - field.min()) / np.ptp(field)
+    shift = np.cumsum(rng.integers(0, 6, size=PERIOD))
+    frames = []
+    for n in range(PERIOD):
+        body = np.repeat(np.roll(field, -int(shift[n]), axis=1)[:, :width, None], CHANNELS, axis=2)
+        full = np.concatenate([body, np.zeros((STRIP, width, CHANNELS))])
+        frames.append(np.rint(255 * burn_timecode(full, n, bits=16, strip_px=STRIP)).astype(np.uint8))
+    return frames
+
+
+@pytest.fixture(name="clip", scope="module")
+def clip_fixture():
+    """The clip's frames and the SI and TI of its pictures, as the source series measures them."""
+    frames = clip_frames()
+    return frames, aesthetics.information(f[:-STRIP, :, 0].astype(np.float32) / 255.0 for f in frames)
+
+
+def footage_reader(clip, programs, *, wipe=False, captures=None, rate=1):
+    """A card capturing the played loop ``rate`` times a clip frame, through one program per setpoint.
+
+    ``programs`` maps each setpoint to ``"pass"`` or ``"freeze"``; a frozen dwell holds its first
+    frame, strip and all; ``wipe`` blanks every strip.
+    """
+    frames, setpoints = [], []
+    for setpoint, program in enumerate(programs):
+        start = len(frames) + 2
+        for i in range(len(frames), start + DWELL):
+            shown = clip[((start if program == "freeze" and i >= start else i) // rate) % PERIOD].copy()
+            if wipe:
+                shown[-STRIP:] = 0
+            frames.append(shown)
+            setpoints.append(GAP if i < start else setpoint)
+    frames, setpoints = frames[:captures], setpoints[:captures]
+    reader = Reader(frames, setpoints=setpoints)
+    height, width = frames[0].shape[:2]
+    stimulus = {"kind": "footage", "clip": "stimulus.mkv", "fps": FPS, "frames": PERIOD, "bits": 16}
+    reader.meta.update(width=width, height=height, stimulus={**stimulus, "strip_px": STRIP})
+    reader.rows = [replace_captured(row, (row.frame + 0.37) / (rate * FPS)) for row in reader.rows]
+    return reader
+
+
+def replace_captured(row, captured):
+    return FrameRow(
+        frame=row.frame, program=row.program, params=row.params, setpoint=row.setpoint, captured=captured
+    )
+
+
+def survival_of(clip, reader):
+    result = R.replay_program(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), series=clip[1])
+    return result, [r.metrics for r in result.records]
+
+
+def test_footage_setpoints_are_scored_on_what_they_kept_of_the_clip(clip):
+    """Passthrough keeps the clip's picture, motion and its timing; a frozen dwell keeps no motion."""
+    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass", "freeze", "pass", "freeze"]))
+    assert "p: footage clock from strip" in result.notes
+    assert [r.stimulus for r in result.records] == ["footage"] * 4
+    for kept in metrics[::2]:
+        assert kept["si_ratio"] == pytest.approx(1.0, abs=1e-6)
+        assert kept["ti_ratio"] == pytest.approx(1.0, abs=1e-6)
+        assert kept["motion_follow"] > 0.99
+    for kept in metrics[1::2]:
+        assert kept["ti_ratio"] == 0.0 and kept["motion_follow"] == 0.0
+    assert all("concentration" in kept for kept in metrics), "the analyzer's own metrics stay"
+
+
+def test_a_clip_whose_strip_never_reads_is_aligned_by_its_motion(clip):
+    """Captured faster than it plays, a clip's motion fixes where each of its frames went up."""
+    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass", "pass"], wipe=True, rate=2))
+    assert "p: footage clock from motion" in result.notes
+    for kept in metrics:
+        assert kept["ti_ratio"] == pytest.approx(1.0, abs=1e-6) and kept["motion_follow"] > 0.99
+
+
+def test_with_no_clock_survival_is_left_out_rather_than_zero(clip):
+    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass"], wipe=True, captures=4))
+    assert "p: footage clock from none" in result.notes
+    assert metrics and not {"si_ratio", "ti_ratio", "motion_follow"} & set(metrics[0])
+
+
+def test_the_refit_reads_each_played_clip_once_for_every_footage_program(clip, monkeypatch):
+    seen = []
+
+    def series(path, *, strip_px):
+        seen.append((str(path), strip_px))
+        return clip[1]
+
+    monkeypatch.setattr(R, "source_series", series)
+    archive = Archive({name: footage_reader(clip[0], ["pass"]) for name in "ab"}, directory="/archive")
+    out = R.replay(archive, analyzer=FakeAnalyzer(), executor=ThreadPoolExecutor)
+    assert seen == [("/archive/stimulus.mkv", STRIP)]
+    assert all(out[name].records[0].metrics["ti_ratio"] == pytest.approx(1.0, abs=1e-6) for name in "ab")
+    result = R.replay_program(archive, "a", analyzer=FakeAnalyzer())
+    assert len(seen) == 2 and "si_ratio" in result.records[0].metrics
