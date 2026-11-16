@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import multiprocessing
 import os
+from contextlib import closing
 from concurrent.futures import Executor, ProcessPoolExecutor, as_completed
 from types import ModuleType
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
@@ -132,24 +133,17 @@ def replay_program(
         return Replayed(records, profile, found, [f"{program}: no committed archive"])
     spread = B.dwells(reader.rows)
     natives: dict[int, np.ndarray] = {}
-
-    def scaled() -> Iterator[tuple[Any, np.ndarray]]:
-        passes = reader.passes(width=analysis_width, native=B.positions(spread))
-        for position, (row, (frame, full)) in enumerate(zip(reader.rows, passes)):
-            if full is not None:
-                natives[position] = full
-            yield row, frame
-
     try:
-        records = _records(
-            group(scaled()),
-            reader,
-            program,
-            analyzer=analyzer,
-            source=source,
-            analysis_width=analysis_width,
-            **metrics,
-        )
+        with closing(reader.passes(width=analysis_width, native=B.positions(spread), into=natives)) as passes:
+            records = _records(
+                group((row, frame) for frame, row in zip(passes, reader.rows)),
+                reader,
+                program,
+                analyzer=analyzer,
+                source=source,
+                analysis_width=analysis_width,
+                **metrics,
+            )
         found = B.behaviour(spread, natives, loop=loop)
     except Exception as exc:
         notes.append(f"{program}: loop behaviour not measured ({type(exc).__name__}: {exc})")

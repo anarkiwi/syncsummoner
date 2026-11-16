@@ -560,23 +560,25 @@ def test_a_stream_with_irregular_capture_times_is_one_frame_per_row(tmp_path):
 def test_one_pass_gives_the_scaled_stream_and_the_native_frames_asked_for(tmp_path, threads):
     """Positions past the end are ignored; the rest come back at native size, in place."""
     reader, made = irregular_recording(tmp_path, threads=threads)
-    got = list(reader.passes(width=32, native=[4, 1, 99]))
+    held = {}
+    got = list(reader.passes(width=32, native=[4, 1, 99], into=held))
     assert len(got) == len(made)
-    for (scaled, _), streamed in zip(got, reader.stream(width=32)):
+    for scaled, streamed in zip(got, reader.stream(width=32)):
         assert np.array_equal(scaled, streamed), "the split graph scales exactly as the plain one does"
-    assert [i for i, (_, full) in enumerate(got) if full is not None] == [1, 4]
-    for i in (1, 4):
-        assert got[i][1].shape == (32, 64, CHANNELS)
-        assert_blocks(got[i][1], i % len(BLOCKS))
+    assert sorted(held) == [1, 4]
+    for i, full in held.items():
+        assert full.shape == (32, 64, CHANNELS)
+        assert_blocks(full, i % len(BLOCKS))
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
 def test_one_pass_with_no_native_frames_is_the_scaled_stream(tmp_path):
     """With nothing asked for at native size there is no second pipe to drain."""
     reader, made = irregular_recording(tmp_path)
-    got = list(reader.passes())
-    assert len(got) == len(made) and all(full is None for _, full in got)
-    assert all(np.array_equal(a, b) for (a, _), b in zip(got, reader.stream()))
+    held = {}
+    got = list(reader.passes(into=held))
+    assert len(got) == len(made) and not held
+    assert all(np.array_equal(a, b) for a, b in zip(got, reader.stream()))
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
@@ -595,8 +597,8 @@ def test_one_pass_abandoned_part_way_reaps_its_decoder(tmp_path):
     assert len(started) == 1 and started[0].returncode is not None
 
 
-def test_one_pass_ends_when_the_native_side_runs_dry(tmp_path):
-    """A decoder that dies on the native output leaves no frame waiting for it."""
+def test_one_pass_holds_only_the_native_frames_the_decoder_delivered(tmp_path):
+    """A decoder that dies on the native output leaves those positions unheld, not misfiled."""
     archive, _, _ = write_archive(tmp_path)
     reader = archive.reader("bitcrush")
 
@@ -607,7 +609,24 @@ def test_one_pass_ends_when_the_native_side_runs_dry(tmp_path):
         )
 
     reader._popen = popen  # pylint: disable=protected-access
-    assert not list(reader.passes(native=[0]))
+    held = {}
+    assert len(list(reader.passes(native=[0, 2], into=held))) == reader.count and not held
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_one_pass_never_waits_on_the_native_pipe(tmp_path):
+    """Frames big enough to fill both pipes: the scaled reader must not block on the native one."""
+    made = [np.full((256, 512, CHANNELS), 16 * (i % 12), np.uint8) for i in range(40)]
+    source = tmp_path / "source.rgb"
+    source.write_bytes(b"".join(f.tobytes() for f in made))
+    archive = archive_at(tmp_path, threads=1)
+    scratch = archive.scratch("bitcrush")
+    encode_ffv1(source, scratch, height=256, width=512)
+    archive.commit("bitcrush", KEY, scratch, rows(len(made)), width=512, height=256, fps=FPS)
+    held = {}
+    got = list(archive.reader("bitcrush", KEY).passes(width=64, native=[3, 30, 31], into=held))
+    assert len(got) == len(made) and sorted(held) == [3, 30, 31]
+    assert all(int(held[i][0, 0, 0]) == pytest.approx(16 * (i % 12), abs=2) for i in held)
 
 
 def test_a_scratch_recording_names_a_container_the_recorder_can_infer(tmp_path):

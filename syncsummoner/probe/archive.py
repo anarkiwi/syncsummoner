@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import subprocess
 import threading
 import time
@@ -108,19 +107,14 @@ def _params(vector: Sequence[int]) -> tuple[int, ...]:
     return values
 
 
-def _drain(pipe: Any, shape: tuple, count: int, out: queue.SimpleQueue) -> None:
-    """Move up to ``count`` frames of ``shape`` off ``pipe`` into ``out``, then None.
-
-    A decoder writing two pipes stalls on whichever is not read, so the second
-    one is emptied by this thread while the first is read in order.
-    """
+def _drain(pipe: Any, shape: tuple, positions: Sequence[int], into: dict) -> None:
+    """Read the frame at each of ``positions`` off ``pipe`` into ``into``, stopping if it ends."""
     size = int(np.prod(shape))
-    for _ in range(count):
+    for position in positions:
         buf = pipe.read(size)
         if len(buf) < size:
-            break
-        out.put(np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape))
-    out.put(None)
+            return
+        into[position] = np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape)
 
 
 class FrameReader:
@@ -193,38 +187,33 @@ class FrameReader:
         """Filter taking a native frame to ``width``, the one :meth:`command` asks for."""
         return f"scale={int(width)}:-2" if width and width < self.width else "null"
 
-    def passes(self, *, width: int | None = None, native: Iterable[int] = ()) -> Iterator[tuple]:
-        """Yield ``(scaled, full)`` for every frame in stream order, from one decode.
+    def passes(
+        self, *, width: int | None = None, native: Iterable[int] = (), into: dict | None = None
+    ) -> Iterator[np.ndarray]:
+        """Yield every frame at ``width`` in stream order, keeping those at ``native`` full size.
 
-        ``scaled`` is the frame as :meth:`stream` gives it at ``width``; ``full`` is
-        the frame at native size where its stream position is in ``native`` and
-        None elsewhere. One decoder feeds both through a split filter graph, so a
-        reader that needs both regimes decodes the archive once, in order.
+        One decoder feeds both through a split filter graph, so the archive is read
+        once. The full-size frames land in ``into`` by stream position, complete once
+        the iterator ends; a thread drains them, since a decoder writing two pipes
+        stalls whichever one is not being read.
         """
         keep = sorted({int(i) for i in native if 0 <= int(i) < self.count})
         argv = [self._ffmpeg, "-loglevel", "error", *self._threads, "-i", str(self.video)]
         if not keep:
             argv += ["-filter_complex", f"[0:v]{self._scale(width)}[s]", "-map", "[s]", *_RAW_OUT, "pipe:1"]
-            yield from ((frame, None) for frame in self._frames(argv, self.shape(width), self.count, ()))
+            yield from self._frames(argv, self.shape(width), self.count, ())
             return
         picked = "+".join(f"eq(n\\,{i})" for i in keep)
         graph = f"[0:v]split[a][b];[a]{self._scale(width)}[s];[b]select='{picked}'[n]"
         read_fd, write_fd = os.pipe()
         argv += ["-filter_complex", graph, "-map", "[s]", *_RAW_OUT, "pipe:1"]
         argv += ["-map", "[n]", *_RAW_OUT, f"pipe:{write_fd}"]
-        fulls: queue.SimpleQueue = queue.SimpleQueue()
+        held = {} if into is None else into
         with os.fdopen(read_fd, "rb") as side:
-            drain = threading.Thread(target=_drain, args=(side, self.shape(), len(keep), fulls), daemon=True)
-            scaled = self._frames(argv, self.shape(width), self.count, (write_fd,), started=drain.start)
-            wanted = set(keep)
+            drain = threading.Thread(target=_drain, args=(side, self.shape(), keep, held), daemon=True)
             try:
-                for position, frame in enumerate(scaled):
-                    full = fulls.get() if position in wanted else None
-                    if position in wanted and full is None:
-                        return
-                    yield frame, full
+                yield from self._frames(argv, self.shape(width), self.count, (write_fd,), started=drain.start)
             finally:
-                scaled.close()
                 if drain.is_alive():
                     drain.join()
 

@@ -40,19 +40,22 @@ class Reader:
         end = len(self.frames) if count is None else start + count
         return iter(self.frames[start:end])
 
-    def passes(self, *, width=None, native=()):
-        """Every frame once, with the native ones asked for alongside."""
+    def passes(self, *, width=None, native=(), into=None):
+        """Every frame once, the native ones asked for held in ``into`` as the decoder reaches them."""
         self.widths.append(width)
         keep = set(native)
-        return iter([(frame, frame if i in keep else None) for i, frame in enumerate(self.frames)])
+        for i, frame in enumerate(self.frames):
+            if i in keep:
+                into[i] = frame
+            yield frame
 
 
 class Broken(Reader):
     """A reader whose decoder fails part way through the archive."""
 
-    def passes(self, *, width=None, native=()):
-        del width, native
-        yield self.frames[0], None
+    def passes(self, *, width=None, native=(), into=None):
+        del width, native, into
+        yield self.frames[0]
         raise ArchiveError("decoding gave 0 bytes")
 
 
