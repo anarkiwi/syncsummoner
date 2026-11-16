@@ -8,11 +8,12 @@ afterwards from the card's own capture times, so nothing paces or samples a loop
 from __future__ import annotations
 
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
+from pyvmancer.errors import ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, settle
@@ -34,6 +35,8 @@ __all__ = [
     "discard_dark",
     "harvest",
     "harvest_program",
+    "prove_passthrough",
+    "rig_fault",
     "stimulus_loop",
     "sweep",
     "sweep_vectors",
@@ -127,12 +130,13 @@ class ProgramResult:
 
 @dataclass(frozen=True)
 class HarvestReport:
-    """Every program's outcome, and whether the device wedged before the end."""
+    """Every program's outcome, and whether a rig fault, named by ``fault``, ended the run early."""
 
     results: list[ProgramResult] = field(default_factory=list)
     wedged: bool = False
     blacked: bool = False
     seconds: float = 0.0
+    fault: str = ""
 
     @property
     def stopped(self) -> bool:
@@ -148,6 +152,16 @@ class HarvestReport:
     def failures(self) -> list[ProgramResult]:
         """Programs that raised rather than archiving."""
         return [r for r in self.results if r.error]
+
+    def summary(self) -> list[str]:
+        """Closing lines: the totals, every program that failed with its error, and any fault."""
+        failed = [r for r in self.failures if r.report is None]
+        lines = [
+            f"{self.frames} frames from {len(self.results)} programs in {self.seconds / 60:.1f} min, "
+            f"{len(failed)} failed"
+        ]
+        lines += [f"  {r.program}: {r.error}" for r in failed]
+        return lines + ([f"stopped: {self.fault}"] if self.fault else [])
 
 
 def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) -> list[dict]:
@@ -231,10 +245,13 @@ def wedged(
 
     Measured: after roughly fifteen loads ``program info`` returns "no program
     loaded" and only a power cycle clears it; reload, resync and a timing change
-    all fail, so there is nothing to retry.
+    all fail, so there is nothing to retry. That read, after the settle, is the
+    verdict: a shell error from the load itself is not, since the load can be
+    acknowledged and read back before it completes.
     """
     try:
-        transport.load_program(program)
+        with suppress(ShellError):
+            transport.load_program(program)
         sleep(settle_s)
         transport.program_info()
         return False
@@ -242,7 +259,7 @@ def wedged(
         return True
 
 
-def carries_stimulus(
+def prove_passthrough(
     session: Any,
     recorder: Any,
     transport: Any,
@@ -253,11 +270,9 @@ def carries_stimulus(
     player: Any = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
-) -> bool:
-    """Does a passthrough still carry the source? Proof the rig, not the program, is dark.
+) -> TakeReport:
+    """Load a passthrough and wait for its picture, raising :class:`BlankTakeError` without one.
 
-    One program going dark is legitimate, so only a failing passthrough shows the
-    device has stopped emitting while still answering and reporting source lock.
     The passthrough carries the known chromatic stimulus, so it is held to the
     load's :attr:`TakeReport.mostly_picture`, where a splash is evidence of a dead link.
     """
@@ -265,19 +280,58 @@ def carries_stimulus(
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     session.set_params(session.working_point(transport.program_info()))
+    return settle(
+        recorder,
+        program=program,
+        timeout_s=config.live_timeout_s,
+        probe_path=config.probe_path,
+        probe_s=config.probe_s,
+        clock=clock,
+        sleep=sleep,
+    )
+
+
+def carries_stimulus(session: Any, recorder: Any, transport: Any, **live: Any) -> bool:
+    """Does a passthrough still carry the source? Proof the rig, not the program, is dark.
+
+    One program going dark is legitimate, so only a failing passthrough shows the
+    device has stopped emitting while still answering and reporting source lock.
+    """
     try:
-        settle(
-            recorder,
-            program=program,
-            timeout_s=config.live_timeout_s,
-            probe_path=config.probe_path,
-            probe_s=config.probe_s,
-            clock=clock,
-            sleep=sleep,
-        )
+        prove_passthrough(session, recorder, transport, **live)
         return True
     except BlankTakeError:
         return False
+
+
+def rig_fault(
+    session: Any,
+    recorder: Any,
+    transport: Any,
+    *,
+    config: HarvestConfig,
+    wedge_first: bool = True,
+    log: Callable[[str], None] = lambda _message: None,
+    **live: Any,
+) -> str:
+    """Why the rig, not a program, must stop the run; empty while it still carries the source.
+
+    A device that will hold no program, or one that has gone, is :data:`WEDGED_NOTE`;
+    a passthrough without a picture, the capture included, is :data:`BLACKED_NOTE`.
+    A passthrough that raises proves only that its load failed, so the device is
+    then asked whether it holds a program at all.
+    """
+    sleep = live.get("sleep", time.sleep)
+    if wedge_first and wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep):
+        return WEDGED_NOTE
+    try:
+        prove_passthrough(session, recorder, transport, config=config, **live)
+        return ""
+    except BlankTakeError as exc:
+        return f"{BLACKED_NOTE} ({exc})"
+    except Exception as exc:
+        log(f"{WEDGE_PROBE} check raised {type(exc).__name__}: {exc}")
+        return WEDGED_NOTE if wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep) else ""
 
 
 def wait_healthy(
@@ -422,7 +476,10 @@ def harvest(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> HarvestReport:
-    """Archive every program, resuming what is stored and stopping when the rig wedges.
+    """Archive every program, resuming what is stored and stopping only on a rig fault.
+
+    A program that raises is recorded as failed, with no dark verdict so a resume
+    retries it, and the run goes on unless :func:`rig_fault` blames the rig.
 
     Archives are keyed on name and firmware rather than on the program binary,
     because hashing a binary runs over the serial shell at wire speed and this
@@ -440,8 +497,8 @@ def harvest(
     session = session_factory(transport, load_blackout_s=config.load_blackout_s)
     firmware = str(transport.firmware())
     names: Sequence[str] = list(programs) if programs else sorted(transport.programs())
-    results, stopped, blacked, start = [], False, False, clock()
-    live = {"config": config, "link": link, "player": player, "sleep": sleep, "clock": clock}
+    results, fault, start = [], "", clock()
+    live = {"link": link, "player": player, "sleep": sleep, "clock": clock}
     try:
         with ExitStack() as stack:
             if player is not None:
@@ -456,43 +513,35 @@ def harvest(
                 try:
                     results.append(
                         harvest_program(
-                            session,
-                            recorder,
-                            archive,
-                            transport,
-                            name,
-                            key,
-                            config=config,
-                            rng=rng,
-                            link=link,
-                            player=player,
-                            sleep=sleep,
-                            clock=clock,
+                            session, recorder, archive, transport, name, key, config=config, rng=rng, **live
                         )
                     )
                 except Exception as exc:
+                    archive.clear_dark(name)
                     results.append(ProgramResult(name, error=f"{type(exc).__name__}: {exc}"))
                     note(str(results[-1]))
-                    if wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep):
-                        stopped = True
-                        note(WEDGED_NOTE)
-                        break
-                    if carries_stimulus(session, recorder, transport, **live):
+                    fault = rig_fault(session, recorder, transport, config=config, log=note, **live)
+                else:
+                    note(str(results[-1]))
+                    if not results[-1].dark:
                         continue
-                    blacked = True
-                    note(BLACKED_NOTE)
+                    luma = results[-1].report.luma if results[-1].report else 0.0
+                    results[-1] = discard_dark(archive, name, key, results[-1])
+                    fault = rig_fault(
+                        session, recorder, transport, config=config, wedge_first=False, log=note, **live
+                    )
+                    if not fault:
+                        archive.mark_dark(name, key, luma)
+                        note(f"{name} discarded: dark, but the rig still carries the source")
+                if fault:
+                    note(fault)
                     break
-                note(str(results[-1]))
-                if not results[-1].dark:
-                    continue
-                luma = results[-1].report.luma if results[-1].report else 0.0
-                results[-1] = discard_dark(archive, name, key, results[-1])
-                if not carries_stimulus(session, recorder, transport, **live):
-                    blacked = True
-                    note(BLACKED_NOTE)
-                    break
-                archive.mark_dark(name, key, luma)
-                note(f"{name} discarded: dark, but the rig still carries the source")
     finally:
         transport.close()
-    return HarvestReport(results=results, wedged=stopped, blacked=blacked, seconds=clock() - start)
+    return HarvestReport(
+        results=results,
+        wedged=fault.startswith(WEDGED_NOTE),
+        blacked=fault.startswith(BLACKED_NOTE),
+        seconds=clock() - start,
+        fault=fault,
+    )

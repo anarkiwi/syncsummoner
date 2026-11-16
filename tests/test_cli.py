@@ -162,7 +162,11 @@ def harvested_fixture(monkeypatch):
     def fake_harvest(archive, **kwargs):
         seen.update(kwargs, archive=archive)
         return harvest_mod.HarvestReport(
-            results=[harvest_mod.ProgramResult("Colorbars", frames=4)], seconds=60.0
+            results=[
+                harvest_mod.ProgramResult("Colorbars", frames=4),
+                harvest_mod.ProgramResult("Roll Shutter", error="BlankTakeError: no picture"),
+            ],
+            seconds=60.0,
         )
 
     monkeypatch.setattr(transport_mod, "Transport", Port)
@@ -179,7 +183,11 @@ def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tm
     assert isinstance(harvested["link"], Link) and harvested["player"] is not None
     assert harvested["config"].setpoints == 3 and harvested["config"].dwell_s == 2.5
     assert harvested["programs"] is None
-    assert "4 frames" in capsys.readouterr().err, "the run summary is a stage line, on stderr"
+    err = capsys.readouterr().err
+    assert (
+        "4 frames from 2 programs in 1.0 min, 1 failed" in err
+    ), "the run summary is a stage line, on stderr"
+    assert "Roll Shutter: BlankTakeError: no picture" in err, "every failed program is named with its error"
 
 
 def test_probe_archive_lists_dark_programs_and_retries_them_when_asked(harvested, tmp_path, capsys):
