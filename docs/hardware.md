@@ -257,8 +257,10 @@ A destructive program mangles individual strips: inside a `Derez` take, frames
 decode correctly either side of ones that decode to nonsense. Alignment therefore
 takes the lag a take's frames agree on rather than trusting any single frame.
 
-## `settings export` and `settings get` hang the serial shell
+## `settings export` and `settings get` hung the serial shell before 1.0.1
 
-Both verbs return no response and leave the command processor unresponsive to
-every subsequent command; MIDI and video output continue, `USBDEVFS_RESET` does
-not recover it, and a power cycle is required. The harness must not issue them.
+On earlier firmware both verbs returned no response and left the command
+processor unresponsive to every subsequent command; MIDI and video output
+continued, `USBDEVFS_RESET` did not recover it, and a power cycle was required.
+On 1.0.1 `settings get <key>` answers `{"key":k,"type":"uint32","value":v}`, and
+the CC-map assignment on every load relies on it for keys 200..211.
