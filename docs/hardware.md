@@ -327,3 +327,18 @@ nothing else amiss. `video status` shows it as `source: analog`. `device doctor`
 fails `device.input` when the selected input is not the session's `hdmi`, and
 archive and render passes check it after every load, failing that pass with
 `InputRouteError` rather than reading the black as a dark program or a dark rig.
+
+## Archive decoding on a GPU is slice-bound
+
+FFV1's range coder is serial within a slice, and ffmpeg's Vulkan decoder
+dispatches one workgroup per slice, so a frame decodes no faster than its largest
+slice does on one GPU thread. The archives are recorded with 4 slices. On
+defroster (RTX 5080, driver 620.70.06, ffmpeg 8.1.3, 24 cores), one Vulkan stream
+of an archive decoded 2.8 frames/s against 37 for one CPU core, and four
+concurrent Vulkan decoders, each its own process, totalled 2.3: the GPU runs one
+process's work at a time. Re-encoded with more slices, the first 120 frames of
+Bitcullis decoded on the GPU at 3.0, 11.3 and 36.8 frames/s for 4, 16 and 64
+slices, against about 53 on one core each time, and bit-identically to the CPU
+throughout. A library refit decodes one stream per core, so the GPU does not
+speed it up on this host at any slice count measured, and `refit --decode auto`
+stays on the CPU.

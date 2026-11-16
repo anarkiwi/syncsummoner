@@ -79,6 +79,7 @@ docker build --target runtime -t anarkiwi/syncsummoner .   # the working tree ov
 docker build --target lint .
 docker build --target test -t syncsummoner-test . && docker run --rm syncsummoner-test
 docker build --target test-aesthetics -t ss-aes . && docker run --rm ss-aes
+docker build -f Dockerfile.gpu -t syncsummoner:gpu .        # Vulkan archive decoding (docs/workflow.md)
 ```
 
 The `test-aesthetics` target installs only the aesthetics extra. It failing is

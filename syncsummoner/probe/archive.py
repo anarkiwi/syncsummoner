@@ -26,6 +26,7 @@ from syncsummoner.probe.store import ProgramKey, atomic_write, slug
 __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
     "DARK_SUFFIX",
+    "DECODERS",
     "GAP",
     "PROGRAM_INFO",
     "ArchiveError",
@@ -57,6 +58,24 @@ _PARAM_COLUMNS = tuple(f"p{i + 1}" for i in range(PARAM_COUNT))
 #: Raw RGB on a pipe, one output frame per decoded frame whatever the timestamps say. A raw
 #: encoder is a copy, so it runs on one thread rather than a pool per core per output.
 _RAW_OUT = ("-threads", "1", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", READ_PIX_FMT)
+#: Decoder input flags by backend. Vulkan decodes FFV1 in compute shaders and leaves each frame
+#: on the GPU, so the graph downloads it first; a decoder that fell back to the CPU then fails
+#: the download rather than passing for a GPU decode.
+DECODERS = {
+    "cpu": (),
+    "vulkan": (
+        "-init_hw_device",
+        "vulkan=vk",
+        "-hwaccel",
+        "vulkan",
+        "-hwaccel_device",
+        "vk",
+        "-hwaccel_output_format",
+        "vulkan",
+    ),
+}
+#: Frames the automatic choice decodes both ways before trusting the GPU with an archive.
+PROBE_FRAMES = 8
 
 
 class ArchiveError(RuntimeError):
@@ -118,6 +137,12 @@ def _drain(pipe: Any, shape: tuple, positions: Sequence[int], into: dict) -> Non
         into[position] = np.frombuffer(bytearray(buf), dtype=np.uint8).reshape(shape)
 
 
+def _last_line(stderr: bytes | str | None) -> str:
+    """The last thing a decoder said, which is where it says why it stopped."""
+    text = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr or ""
+    return (text.strip().splitlines() or ["no message"])[-1]
+
+
 class FrameReader:
     """Random access into one archived program: its rows, and any frame by index."""
 
@@ -131,6 +156,7 @@ class FrameReader:
         run,
         popen: Callable[..., Any] = subprocess.Popen,
         threads: int | None = None,
+        decode: str = "cpu",
     ):
         self.video = Path(video)
         self.meta = dict(meta)
@@ -149,6 +175,10 @@ class FrameReader:
                 for name in ("-threads", "-filter_threads", "-filter_complex_threads")
                 for flag in (name, str(int(threads)))
             ]
+        )
+        self._hwaccel = DECODERS[decode]
+        self._download = (
+            f"hwdownload,format={self.meta.get('stored_pix_fmt', STORED_PIX_FMT)}," if self._hwaccel else ""
         )
 
     @property
@@ -169,10 +199,7 @@ class FrameReader:
         than decoding from the beginning, and ffmpeg does any scaling asked for.
         """
         argv = [
-            self._ffmpeg,
-            "-loglevel",
-            "error",
-            *self._threads,
+            *self._head(),
             "-ss",
             f"{max(0.0, start - 0.5) / self.fps:.6f}",
             "-i",
@@ -180,9 +207,13 @@ class FrameReader:
             "-frames:v",
             str(int(count)),
         ]
-        if width and width < self.width:
-            argv += ["-vf", f"scale={int(width)}:-2"]
+        if self._download or (width and width < self.width):
+            argv += ["-vf", self._download + self._scale(width)]
         return argv + [*_RAW_OUT, "pipe:1"]
+
+    def _head(self) -> list[str]:
+        """Decoder argv up to the input's own options."""
+        return [self._ffmpeg, "-loglevel", "error", *self._threads, *self._hwaccel]
 
     def _scale(self, width: int | None) -> str:
         """Filter taking a native frame to ``width``, the one :meth:`command` asks for."""
@@ -199,13 +230,20 @@ class FrameReader:
         stalls whichever one is not being read.
         """
         keep = sorted({int(i) for i in native if 0 <= int(i) < self.count})
-        argv = [self._ffmpeg, "-loglevel", "error", *self._threads, "-i", str(self.video)]
+        argv = [*self._head(), "-i", str(self.video)]
         if not keep:
-            argv += ["-filter_complex", f"[0:v]{self._scale(width)}[s]", "-map", "[s]", *_RAW_OUT, "pipe:1"]
+            argv += [
+                "-filter_complex",
+                f"[0:v]{self._download}{self._scale(width)}[s]",
+                "-map",
+                "[s]",
+                *_RAW_OUT,
+                "pipe:1",
+            ]
             yield from self._frames(argv, self.shape(width), self.count, ())
             return
         picked = "+".join(f"eq(n\\,{i})" for i in keep)
-        graph = f"[0:v]split[a][b];[a]{self._scale(width)}[s];[b]select='{picked}'[n]"
+        graph = f"[0:v]{self._download}split[a][b];[a]{self._scale(width)}[s];[b]select='{picked}'[n]"
         read_fd, write_fd = os.pipe()
         argv += ["-filter_complex", graph, "-map", "[s]", *_RAW_OUT, "pipe:1"]
         argv += ["-map", "[n]", *_RAW_OUT, f"pipe:{write_fd}"]
@@ -294,6 +332,7 @@ class FrameArchive:
         run: Callable[..., Any] = subprocess.run,
         ffmpeg: str = "ffmpeg",
         threads: int | None = None,
+        decode: str = "cpu",
     ):
         self.directory = Path(directory)
         self.clock = clock
@@ -301,6 +340,7 @@ class FrameArchive:
         self.run = run
         self.ffmpeg = ffmpeg
         self.threads = threads
+        self.decode = decode
 
     def paths(self, program: str) -> tuple[Path, Path, Path]:
         """Video, sidecar and metadata paths for one program."""
@@ -473,7 +513,9 @@ class FrameArchive:
         payload = json.dumps(meta, indent=2)
         atomic_write(path, lambda tmp: tmp.write_text(payload, encoding="utf-8"))
 
-    def reader(self, program: str, key: ProgramKey | None = None) -> FrameReader | None:
+    def reader(
+        self, program: str, key: ProgramKey | None = None, *, decode: str | None = None
+    ) -> FrameReader | None:
         """Reader for a committed archive, or None when absent or keyed differently."""
         meta = self.meta(program)
         if meta is None or (key is not None and meta.get("key_digest") != key.digest):
@@ -486,4 +528,57 @@ class FrameArchive:
             run=self.run,
             popen=self.popen,
             threads=self.threads,
+            decode=self.decode if decode is None else decode,
         )
+
+    def choose_decode(
+        self,
+        choice: str = "auto",
+        programs: Iterable[str] | None = None,
+        *,
+        timer: Callable[[], float] = time.monotonic,
+    ) -> tuple[str, str]:
+        """The backend to decode with and why, without setting it.
+
+        ``auto`` takes Vulkan only if it decodes the first readable program's opening
+        frames byte for byte as the CPU does and at least as fast per stream: a GPU
+        slower per stream cannot win with one stream per worker. Asking for Vulkan
+        outright takes it whatever its pace, and raises where ``auto`` falls back.
+        """
+        if choice == "cpu":
+            return "cpu", "asked for"
+        names = sorted(self.committed()) if programs is None else list(programs)
+        name = next((name for name in names if self.meta(name) is not None), None)
+        if name is None:
+            why = "no committed archive to compare it on"
+        else:
+            (cpu, cpu_rate), (gpu, gpu_rate) = (self._probe(name, d, timer) for d in ("cpu", "vulkan"))
+            if cpu.returncode or not cpu.stdout:
+                raise ArchiveError(f"cannot decode {name} on the CPU: {_last_line(cpu.stderr)}")
+            if gpu.returncode:
+                why = f"Vulkan decode failed: {_last_line(gpu.stderr)}"
+            elif gpu.stdout != cpu.stdout:
+                why = f"Vulkan decode of {name} differs from the CPU's"
+            else:
+                pace = f"{gpu_rate:.1f} frames/s per stream against the CPU's {cpu_rate:.1f}"
+                if choice == "vulkan" or gpu_rate >= cpu_rate:
+                    return "vulkan", f"bit-identical to the CPU on {name}, {pace}"
+                return "cpu", f"Vulkan is bit-identical on {name} but slower, {pace}"
+        if choice == "vulkan":
+            raise ArchiveError(why)
+        return "cpu", why
+
+    def _probe(self, name: str, decode: str, timer: Callable[[], float]) -> tuple[Any, float]:
+        """A backend's decode of the opening frames, and its rate with start-up cancelled out.
+
+        One frame and then :data:`PROBE_FRAMES` are decoded, and the rate is taken
+        from the difference, since device and decoder set-up dwarf a few frames.
+        """
+        reader = self.reader(name, decode=decode)
+        results, spans = [], []
+        for count in (1, PROBE_FRAMES):
+            start = timer()
+            results.append(self.run(reader.command(count=count), capture_output=True, check=False))
+            spans.append(timer() - start)
+        failed = next((result for result in results if result.returncode), results[-1])
+        return failed, (PROBE_FRAMES - 1) / max(spans[1] - spans[0], 1e-9)

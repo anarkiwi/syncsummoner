@@ -218,6 +218,8 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     programs = None if args.program == "all" else args.program.split(",")
     # Each worker decodes on one thread: the pool is the parallelism.
     archive = FrameArchive(args.archive, ffmpeg=args.ffmpeg, threads=1)
+    archive.decode, why = archive.choose_decode(args.decode, programs)
+    LOG.info("decoding on %s: %s", archive.decode, why)
     measured = replay(archive, analyzer=aesthetics, programs=programs, jobs=args.jobs, log=LOG.warning)
     # A non-monotone value map kills the carrier as displacement does; only the fit tells them apart.
     styles, band = measured_styles({name: r.behaviour.pointwise for name, r in measured.items()}, {})
@@ -233,6 +235,29 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         written.append(str(path))
     LOG.info("%d profiles in %s", len(written), out)
     return 0 if written else 1
+
+
+def _decoders_cmd(args: argparse.Namespace) -> int:
+    """Digest each program's decode on every backend, and measure their rates under concurrency."""
+    from syncsummoner.probe.archive import FrameArchive
+    from syncsummoner.probe.decoders import digest, survey
+
+    archive = FrameArchive(args.archive, ffmpeg=args.ffmpeg, threads=args.threads)
+    names = sorted(archive.committed()) if args.program == "all" else args.program.split(",")
+    decoders = args.decode.split(",")
+    digests = {
+        name: {decode: digest(archive.reader(name, decode=decode)) for decode in decoders}
+        for name in names[: args.digests]
+    }
+    identical = all(len(set(found.values())) == 1 for found in digests.values())
+    streams = [int(n) for n in args.streams.split(",") if n]
+    report = {
+        "digests": digests,
+        "identical": identical,
+        "rates": survey(archive, names, decoders, streams, frames=args.frames),
+    }
+    print(json.dumps(report, indent=2))
+    return 0 if identical else 1
 
 
 def _names_cmd(args: argparse.Namespace) -> int:
@@ -591,7 +616,24 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     refit.add_argument("--out", default="profiles/")
     refit.add_argument("--ffmpeg", default="ffmpeg", help="decoder to read the archive with")
     refit.add_argument("--jobs", type=int, default=None, help="worker processes; one per core by default")
+    refit.add_argument(
+        "--decode",
+        choices=("auto", "cpu", "vulkan"),
+        default="auto",
+        help="where to decode the archive; auto uses a GPU only if it decodes bit-identically",
+    )
     refit.set_defaults(func=_refit_cmd)
+
+    decoders = probe_sub.add_parser("decoders", help="check archive decoders agree, and time them")
+    decoders.add_argument("--program", default="all")
+    decoders.add_argument("--archive", default="archive/")
+    decoders.add_argument("--ffmpeg", default="ffmpeg")
+    decoders.add_argument("--decode", default="cpu,vulkan", help="backends to compare, comma separated")
+    decoders.add_argument("--digests", type=int, default=3, help="programs to digest on every backend")
+    decoders.add_argument("--streams", default="", help="concurrent decoder counts to time, comma separated")
+    decoders.add_argument("--frames", type=int, default=None, help="frames per timed decode; all by default")
+    decoders.add_argument("--threads", type=int, default=1, help="threads per decoder, as refit runs them")
+    decoders.set_defaults(func=_decoders_cmd)
 
     names = probe_sub.add_parser("names", help="add the device's program info to archives that lack it")
     names.add_argument("--program", default="all")

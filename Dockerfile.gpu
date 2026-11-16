@@ -1,0 +1,50 @@
+# The runtime image on NVIDIA's base, decoding archives on the GPU through Vulkan compute
+# (`probe refit --decode`). The container runtime mounts the host driver's Vulkan ICD; on a
+# host without one the same image decodes on the CPU. Dependencies come from pyproject, as
+# the CPU image's do, so the two stay in step.
+# The CUDA base is only NVIDIA's container plumbing on Ubuntu: Vulkan needs no CUDA libraries.
+FROM nvidia/cuda:13.4.3-base-ubuntu26.04 AS nvidia
+
+# Pinned ffmpeg with the Vulkan FFV1 hwaccel: shaders compile to SPIR-V here, and the Vulkan
+# loader is opened at run time. Built on the runtime's own base so its libraries resolve.
+FROM nvidia AS ffmpeg
+ARG FFMPEG_VERSION=8.1.3
+ARG FFMPEG_SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils build-essential nasm pkg-config \
+        glslang-tools libvulkan-dev libx264-dev libasound2-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN curl -fsSLO https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz \
+    && echo "${FFMPEG_SHA256}  ffmpeg-${FFMPEG_VERSION}.tar.xz" | sha256sum -c - \
+    && tar xf ffmpeg-${FFMPEG_VERSION}.tar.xz \
+    && cd ffmpeg-${FFMPEG_VERSION} \
+    && ./configure --prefix=/opt/ffmpeg --disable-autodetect --disable-doc --disable-ffplay \
+        --disable-debug --enable-gpl --enable-libx264 --enable-alsa --enable-zlib --enable-vulkan \
+    && grep -q "^#define CONFIG_FFV1_VULKAN_HWACCEL 1" config_components.h \
+    && make -j"$(nproc)" install \
+    && strip /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe
+
+FROM nvidia AS deps
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 NUMBA_CACHE_DIR=/tmp/numba-cache
+# Graphics is what has the toolkit mount the Vulkan ICD; glvnd, EGL and Xext are what the
+# ICD library needs to create an instance.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-dev build-essential gfortran pkg-config \
+        libgl1 libglib2.0-0 libasound2t64 libasound2-dev openssh-client libusb-1.0-0 \
+        libvulkan1 libglvnd0 libegl1 libx11-6 libxext6 libx264-165 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+RUN python3 -c "import tomllib; p = tomllib.load(open('pyproject.toml', 'rb'))['project']; \
+print('\n'.join(p['dependencies'] + p['optional-dependencies']['audio']))" > /tmp/requirements.txt \
+    && python3 -m venv /venv \
+    && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt "pyvmancer[all]>=0.6.3"
+
+FROM deps AS runtime
+COPY . .
+RUN /venv/bin/pip install --no-deps -e .
+WORKDIR /work
+ENTRYPOINT ["/venv/bin/syncsummoner"]
