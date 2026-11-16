@@ -10,7 +10,6 @@ import argparse
 import dataclasses
 import json
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -208,9 +207,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     from syncsummoner import aesthetics
     from syncsummoner.device.recorder import require_ffmpeg
     from syncsummoner.probe.archive import FrameArchive
-    from syncsummoner.probe.behaviour import behaviours
-    from syncsummoner.probe.fit import fit_profile, save_measurements, save_profile
-    from syncsummoner.probe.names import archived_specs
+    from syncsummoner.probe.fit import save_measurements, save_profile
     from syncsummoner.probe.replay import replay
     from syncsummoner.probe.store import slug
     from syncsummoner.probe.style import measured_styles
@@ -219,31 +216,20 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     programs = None if args.program == "all" else args.program.split(",")
-    archive = FrameArchive(args.archive, ffmpeg=args.ffmpeg)
-    measured = replay(
-        archive,
-        analyzer=aesthetics,
-        programs=programs,
-        jobs=args.jobs,
-        log=LOG.info,
-    )
-    found = behaviours(
-        archive, sorted(measured), jobs=args.jobs, log=LOG.warning, executor=ProcessPoolExecutor
-    )
+    # Each worker decodes on one thread: the pool is the parallelism.
+    archive = FrameArchive(args.archive, ffmpeg=args.ffmpeg, threads=1)
+    measured = replay(archive, analyzer=aesthetics, programs=programs, jobs=args.jobs, log=LOG.warning)
     # A non-monotone value map kills the carrier as displacement does; only the fit tells them apart.
-    styles, band = measured_styles({name: b.pointwise for name, b in found.items()}, {})
+    styles, band = measured_styles({name: r.behaviour.pointwise for name, r in measured.items()}, {})
     LOG.info("analog above %.2f, digital below %.2f: no labels here, so the band is assumed", *band)
     written = []
-    for program, records in sorted(measured.items()):
+    for program, result in sorted(measured.items()):
         path = out / f"{slug(program)}.yaml"
-        specs = archived_specs(archive.meta(program))
-        if specs is None:
-            LOG.warning("%s: no program info archived, so parameters stay unnamed", program)
-        profile = fit_profile(records, specs=specs)
-        profile.registered, profile.pointwise = found[program]
+        profile = result.profile
+        profile.registered, profile.pointwise = result.behaviour
         profile.style = styles[program]
         save_profile(profile, path)
-        save_measurements(records, out / f"{slug(program)}.parquet")
+        save_measurements(result.records, out / f"{slug(program)}.parquet")
         written.append(str(path))
     LOG.info("%d profiles in %s", len(written), out)
     return 0 if written else 1
@@ -604,7 +590,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     refit.add_argument("--archive", default="archive/")
     refit.add_argument("--out", default="profiles/")
     refit.add_argument("--ffmpeg", default="ffmpeg", help="decoder to read the archive with")
-    refit.add_argument("--jobs", type=int, default=1, help="programs to read at once")
+    refit.add_argument("--jobs", type=int, default=None, help="worker processes; one per core by default")
     refit.set_defaults(func=_refit_cmd)
 
     names = probe_sub.add_parser("names", help="add the device's program info to archives that lack it")

@@ -168,6 +168,12 @@ ss probe refit --archive archive/ --out profiles/          # profiles from the a
 ss profile show --profiles profiles/
 ```
 
+A refit decodes each archive once, in order: one ffmpeg feeds the analysis-width
+frames to the metrics and the few native dwell captures to the behaviour fits. Each
+program runs whole in a worker process with single-threaded decode and OpenCV, one
+worker per core by default (`--jobs` caps it), so its cost is the FFV1 decode plus
+the per-pair optical flow, spread evenly over the cores.
+
 A program is dark, and its frames are discarded, only when every inspected frame
 of its sweep is a uniform field: a sweep legitimately visits flat setpoints and a
 generator may hold one picture. The sweep is recorded only while the device's
@@ -490,7 +496,8 @@ doing it twice, which is what the audition is for.
 
 | Step | Where | Cost |
 | --- | --- | --- |
-| `probe archive` + `refit` | rig, then CPU | hours, once per firmware |
+| `probe archive` | rig | hours, once per firmware |
+| `refit` | CPU | minutes, decode-bound |
 | `analyze` / `compose` | CPU | seconds to a minute |
 | `audition` | rig | one load plus the excerpt |
 | `render` | rig | (load + relock + duration) per program |

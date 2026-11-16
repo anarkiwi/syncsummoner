@@ -88,9 +88,9 @@ class FakeStreamer:
         self.truncate = truncate
         self.calls = []
 
-    def __call__(self, argv, stdout=None, stderr=None):
+    def __call__(self, argv, stdout=None, stderr=None, pass_fds=()):
         """Serve the slice asked for, downscaling as the decoder would when told to."""
-        del stdout, stderr
+        del stdout, stderr, pass_fds
         start = round(float(argv[argv.index("-ss") + 1]) * FPS + 0.5)
         want = int(argv[argv.index("-frames:v") + 1])
         scale = argv[argv.index("-vf") + 1] if "-vf" in argv else None
@@ -519,6 +519,114 @@ def test_a_real_recording_reads_back_frame_for_frame_in_colour(tmp_path):
             assert decoded[16, i * 16 + 8].astype(int) == pytest.approx(colour, abs=4)
     assert [f.shape for f in reader.stream()] == [(32, 64, CHANNELS)] * 4
     assert [f.shape for f in reader.stream(width=32)] == [reader.shape(32)] * 4
+
+
+def irregular_recording(tmp_path, count=6, **kwargs):
+    """A committed FFV1 recording whose capture times jump, as a real card's do."""
+    made = [block_frame(shift) for shift in range(count)]
+    source = tmp_path / "source.rgb"
+    source.write_bytes(b"".join(f.tobytes() for f in made))
+    archive = archive_at(tmp_path, **kwargs)
+    scratch = archive.scratch("bitcrush")
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-video_size", "64x32"]
+        + ["-framerate", str(FPS), "-i", str(source), "-vf", f"setpts=N/TB/{FPS}+gt(N\\,0)*2.5/TB/{FPS}"]
+        + ["-fps_mode", "passthrough", "-c:v", "ffv1", "-g", "4", "-pix_fmt", "yuv422p", str(scratch)],
+        check=True,
+        capture_output=True,
+    )
+    archive.commit("bitcrush", KEY, scratch, rows(count), width=64, height=32, fps=FPS)
+    return archive.reader("bitcrush", KEY), made
+
+
+def assert_blocks(decoded, shift):
+    """The decoded frame is the colour bars rotated by ``shift``."""
+    for i, colour in enumerate(BLOCKS[shift:] + BLOCKS[:shift]):
+        assert decoded[16, i * 16 + 8].astype(int) == pytest.approx(colour, abs=4)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_a_stream_with_irregular_capture_times_is_one_frame_per_row(tmp_path):
+    """A constant-rate output would repeat a frame at the jump and every later row would be off by one."""
+    reader, made = irregular_recording(tmp_path)
+    got = list(reader.stream())
+    assert len(got) == len(made)
+    for shift, decoded in enumerate(got):
+        assert_blocks(decoded, shift % len(BLOCKS))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+@pytest.mark.parametrize("threads", [None, 1])
+def test_one_pass_gives_the_scaled_stream_and_the_native_frames_asked_for(tmp_path, threads):
+    """Positions past the end are ignored; the rest come back at native size, in place."""
+    reader, made = irregular_recording(tmp_path, threads=threads)
+    held = {}
+    got = list(reader.passes(width=32, native=[4, 1, 99], into=held))
+    assert len(got) == len(made)
+    for scaled, streamed in zip(got, reader.stream(width=32)):
+        assert np.array_equal(scaled, streamed), "the split graph scales exactly as the plain one does"
+    assert sorted(held) == [1, 4]
+    for i, full in held.items():
+        assert full.shape == (32, 64, CHANNELS)
+        assert_blocks(full, i % len(BLOCKS))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_one_pass_with_no_native_frames_is_the_scaled_stream(tmp_path):
+    """With nothing asked for at native size there is no second pipe to drain."""
+    reader, made = irregular_recording(tmp_path)
+    held = {}
+    got = list(reader.passes(into=held))
+    assert len(got) == len(made) and not held
+    assert all(np.array_equal(a, b) for a, b in zip(got, reader.stream()))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_one_pass_abandoned_part_way_reaps_its_decoder(tmp_path):
+    """A reader that stops early leaves no decoder running and no drain thread waiting."""
+    started = []
+
+    def popen(*args, **kwargs):
+        started.append(subprocess.Popen(*args, **kwargs))  # pylint: disable=consider-using-with
+        return started[-1]
+
+    reader, _ = irregular_recording(tmp_path, popen=popen)
+    passes = reader.passes(width=32, native=[0, 5])
+    next(passes)
+    passes.close()
+    assert len(started) == 1 and started[0].returncode is not None
+
+
+def test_one_pass_holds_only_the_native_frames_the_decoder_delivered(tmp_path):
+    """A decoder that dies on the native output leaves those positions unheld, not misfiled."""
+    archive, _, _ = write_archive(tmp_path)
+    reader = archive.reader("bitcrush")
+
+    def popen(argv, stdout=None, stderr=None, pass_fds=()):
+        del argv, stdout, stderr, pass_fds
+        return SimpleNamespace(
+            stdout=io.BytesIO(bytes(reader.count * int(np.prod(reader.shape())))), wait=lambda: 0
+        )
+
+    reader._popen = popen  # pylint: disable=protected-access
+    held = {}
+    assert len(list(reader.passes(native=[0, 2], into=held))) == reader.count and not held
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_one_pass_never_waits_on_the_native_pipe(tmp_path):
+    """Frames big enough to fill both pipes: the scaled reader must not block on the native one."""
+    made = [np.full((256, 512, CHANNELS), 16 * (i % 12), np.uint8) for i in range(40)]
+    source = tmp_path / "source.rgb"
+    source.write_bytes(b"".join(f.tobytes() for f in made))
+    archive = archive_at(tmp_path, threads=1)
+    scratch = archive.scratch("bitcrush")
+    encode_ffv1(source, scratch, height=256, width=512)
+    archive.commit("bitcrush", KEY, scratch, rows(len(made)), width=512, height=256, fps=FPS)
+    held = {}
+    got = list(archive.reader("bitcrush", KEY).passes(width=64, native=[3, 30, 31], into=held))
+    assert len(got) == len(made) and sorted(held) == [3, 30, 31]
+    assert all(int(full[0, 0, 0]) == pytest.approx(16 * (i % 12), abs=2) for i, full in held.items())
 
 
 def test_a_scratch_recording_names_a_container_the_recorder_can_infer(tmp_path):

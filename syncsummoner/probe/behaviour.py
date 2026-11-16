@@ -9,11 +9,10 @@ registration is area-averaged, the chain having lowpassed the carrier away at na
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from concurrent.futures import Executor, ThreadPoolExecutor
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-from itertools import groupby, repeat
-from typing import Any, Callable, Iterable, NamedTuple
+from itertools import groupby
+from typing import Any, NamedTuple
 
 import cv2  # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 import numpy as np
@@ -22,11 +21,10 @@ from syncsummoner.aesthetics.structure import pointwise_r2
 from syncsummoner.probe import codeframes
 from syncsummoner.probe.archive import GAP
 from syncsummoner.probe.harvest import HarvestConfig, stimulus_loop
-from syncsummoner.progress import LOG, track
 
-__all__ = ["BINS", "Behaviour", "behaviours", "program_behaviour"]
+__all__ = ["BINS", "Behaviour", "Dwell", "behaviour", "dwells", "positions"]
 
-#: Dwells read per program and captures per dwell: 120 native frames, spread over the sweep.
+#: Dwells read per program, spread over the sweep, and the run of captures each spans.
 DWELL_SAMPLES = 5
 FRAME_SAMPLES = 24
 #: Captures pointwise-fitted per dwell, and pixels sampled from each: subsampled, never scaled.
@@ -59,19 +57,41 @@ def _picks(count: int, samples: int) -> np.ndarray:
 
 
 def _dwells(rows: Sequence[Any], *, samples: int = DWELL_SAMPLES, frames: int = FRAME_SAMPLES) -> list:
-    """Spread dwells as ``(start, count)`` spans of the frame stream.
+    """Spread dwells as ``(start, count)`` spans of stream positions.
 
     A dwell is a run of consecutive frames held at one setpoint, so its captures are
-    contiguous in time, taken under one vector, and decodable in one pass. Runs cut
-    short by dropped frames are passed over while any full one remains.
+    contiguous in time and taken under one vector. Runs cut short by dropped frames
+    are passed over while any full one remains.
     """
     runs = [
-        (int(group[0].frame), len(group))
-        for setpoint, group in ((k, list(g)) for k, g in groupby(rows, key=lambda row: row.setpoint))
+        (group[0][0], len(group))
+        for setpoint, group in (
+            (k, list(g)) for k, g in groupby(enumerate(rows), key=lambda item: item[1].setpoint)
+        )
         if setpoint != GAP
     ]
     usable = [run for run in runs if run[1] >= frames // 2] or runs
     return [(usable[i][0], min(usable[i][1], frames)) for i in _picks(len(usable), samples)]
+
+
+class Dwell(NamedTuple):
+    """Stream positions of one spread dwell's captures that each fit reads."""
+
+    pointwise: np.ndarray
+    registered: np.ndarray
+
+
+def dwells(rows: Sequence[Any]) -> list[Dwell]:
+    """The spread dwells of a program, as the native stream positions each fit reads."""
+    return [
+        Dwell(start + _picks(count, POINTWISE_SAMPLES), start + _picks(count, codeframes.REGISTER_SAMPLES))
+        for start, count in _dwells(rows)
+    ]
+
+
+def positions(spread: Iterable[Dwell]) -> set[int]:
+    """Every native stream position the dwells read, so one decode can keep just those."""
+    return {int(p) for dwell in spread for part in dwell for p in part}
 
 
 def _target(shape: tuple) -> tuple[int, int]:
@@ -119,111 +139,66 @@ def _sources(loop: codeframes.CodeLoop, shape: tuple, index: np.ndarray) -> list
 
 
 def _pointwise(captures: Sequence[np.ndarray], sources: Sequence[np.ndarray], index: np.ndarray) -> float:
-    """Best pointwise fit any loop position offers, median over the sampled captures.
+    """Best pointwise fit any loop position offers, median over the captures given.
 
     Best over positions rather than the temporally aligned one: a program may delay or
     freeze, and this exists to say whether a value curve could explain the output at
     all, not to date it.
     """
     scores = []
-    for i in _picks(len(captures), POINTWISE_SAMPLES):
-        pixels = captures[i].reshape(-1, 3)[index].astype(np.float32) / np.float32(255.0)
+    for capture in captures:
+        pixels = capture.reshape(-1, 3)[index].astype(np.float32) / np.float32(255.0)
         scores.append(max(pointwise_r2(source, pixels, bins=BINS) for source in sources))
     return float(np.median(scores)) if scores else 0.0
 
 
 def _registered(captures: Sequence[np.ndarray], loop: codeframes.CodeLoop, size: tuple) -> float:
-    """Median strength the loop's carrier is recovered at, over a few of the dwell's frames.
+    """Median strength the loop's carrier is recovered at, over the captures given.
 
     The carrier is common to every loop position, so registration needs no index and a
     few frames settle it; the magnitude is signless because an inverting program still
     registers.
     """
-    picks = _picks(len(captures), codeframes.REGISTER_SAMPLES)
-    fits = [codeframes.register(_reduced(captures[i], size), loop) for i in picks]
+    fits = [codeframes.register(_reduced(capture, size), loop) for capture in captures]
     return float(np.median([abs(fit.correlation) for fit in fits]))
 
 
-def program_behaviour(
-    archive: Any,
-    program: str,
+def behaviour(
+    spread: Sequence[Dwell],
+    frames: Mapping[int, np.ndarray],
     *,
     loop: codeframes.CodeLoop | None = None,
     seed: int = SEED,
-    log: Callable[[str], None] | None = None,
 ) -> Behaviour:
-    """Read one archived program's own frames into the two fields only they carry.
+    """The two fields only the frames carry, from the native captures at ``positions``.
 
-    A program that cannot be decoded, or that holds no measured dwell, reports the
-    profile's own defaults and says why: a refit covers the library, and one
-    unreadable program must not end it.
+    ``frames`` maps stream position to the native capture there. Raises
+    ``LookupError`` when there is no measured dwell or none of its frames is held,
+    which a caller reports as the profile's own defaults.
     """
-    note = log if log is not None else lambda _message: None
+    if not spread:
+        raise LookupError("no measured dwell")
     reference = stimulus_loop(HarvestConfig()) if loop is None else loop
-    try:
-        reader = archive.reader(program)
-        if reader is None:
-            raise LookupError("no committed archive")
-        spans = _dwells(reader.rows)
-        if not spans:
-            raise LookupError("no measured dwell")
-        rng = np.random.default_rng(seed)
-        sources: list[np.ndarray] | None = None
-        index, size, reduced = np.empty(0, dtype=np.intp), (0, 0), reference
-        rows = []
-        for start, count in spans:
-            captures = [np.asarray(frame) for frame in reader.stream(start=start, count=count)]
-            if not captures:
-                continue
-            if sources is None:
-                shape = captures[0].shape
-                pixels = int(shape[0]) * int(shape[1])
-                index = rng.choice(pixels, size=min(PIXEL_SAMPLES, pixels), replace=False)
-                sources = _sources(reference, shape, index)
-                size = _target(shape)
-                reduced = _scaled(reference, size[0])
-            rows.append((_registered(captures, reduced, size), _pointwise(captures, sources, index)))
-        if not rows:
-            raise LookupError("no frames decoded")
-        return Behaviour(
-            registered=float(np.median([row[0] for row in rows])),
-            pointwise=float(np.median([row[1] for row in rows])),
-        )
-    except Exception as exc:
-        note(f"{program}: loop behaviour not measured ({type(exc).__name__}: {exc})")
-        return Behaviour()
-
-
-def _measure(archive: Any, name: str, loop: codeframes.CodeLoop) -> tuple[str, Behaviour, list[str]]:
-    """One program's behaviour and the notes it made, so a worker process can hand both back."""
-    notes: list[str] = []
-    return name, program_behaviour(archive, name, loop=loop, log=notes.append), notes
-
-
-def behaviours(
-    archive: Any,
-    programs: Iterable[str],
-    *,
-    loop: codeframes.CodeLoop | None = None,
-    jobs: int = 1,
-    log: Callable[[str], None] | None = None,
-    executor: Callable[..., Executor] = ThreadPoolExecutor,
-) -> dict[str, Behaviour]:
-    """Loop behaviour of every named program, keyed by name and defaulted where unread.
-
-    ``jobs`` reads that many programs at once. The array work holds the interpreter
-    lock for much of its time, so a caller that wants the cores passes a process pool
-    as ``executor``; the archive and loop must then pickle.
-    """
-    names = list(programs)
-    reference = stimulus_loop(HarvestConfig()) if loop is None else loop
-    out = {}
-    with executor(max_workers=max(1, int(jobs))) as pool:
-        results = pool.map(_measure, repeat(archive), names, repeat(reference))
-        for name, found, notes in track(results, desc="behaviour", total=len(names), unit="program"):
-            out[name] = found
-            for note in notes:
-                if log is not None:
-                    log(note)
-            LOG.info("%s: behaviour %d/%d", name, len(out), len(names))
-    return out
+    rng = np.random.default_rng(seed)
+    sources: list[np.ndarray] | None = None
+    index, size, reduced = np.empty(0, dtype=np.intp), (0, 0), reference
+    rows = []
+    for dwell in spread:
+        pointwise = [np.asarray(frames[int(p)]) for p in dwell.pointwise if int(p) in frames]
+        registered = [np.asarray(frames[int(p)]) for p in dwell.registered if int(p) in frames]
+        if not pointwise or not registered:
+            continue
+        if sources is None:
+            shape = pointwise[0].shape
+            pixels = int(shape[0]) * int(shape[1])
+            index = rng.choice(pixels, size=min(PIXEL_SAMPLES, pixels), replace=False)
+            sources = _sources(reference, shape, index)
+            size = _target(shape)
+            reduced = _scaled(reference, size[0])
+        rows.append((_registered(registered, reduced, size), _pointwise(pointwise, sources, index)))
+    if not rows:
+        raise LookupError("no frames decoded")
+    return Behaviour(
+        registered=float(np.median([row[0] for row in rows])),
+        pointwise=float(np.median([row[1] for row in rows])),
+    )
