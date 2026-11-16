@@ -146,9 +146,9 @@ class Recorder:                      # ffmpeg owns the card; the host touches no
     def command(self, path, *, seconds=None) -> list[str]     # -t is unusable under copyts
     def recording(self, path, *, seconds=None) -> ContextManager   # records for the block
     def timestamps(self, path) -> np.ndarray   # per-frame CLOCK_MONOTONIC capture times
-inspect_take(path) -> TakeReport   # picture/splash/uniform counts, luma range, motion; .live, .frozen, .usable
+inspect_take(path) -> TakeReport   # picture/splash/uniform counts, luma range, motion; .mostly_picture (load), .usable (render), .ever_structured (archive), .frozen
 held(frames) -> (motion, frozen)   # consecutive-difference correlation; -1/2 for one picture plus noise
-settle(recorder, *, program, timeout_s, probe_path)   # waits for .live; raises BlankTakeError
+settle(recorder, *, program, timeout_s, probe_path)   # waits for .mostly_picture; raises BlankTakeError
 
 class Link:                          # the HDMI link out of the stimulus source host
     def down(self) / up(self) -> str: ...
@@ -205,7 +205,8 @@ replay.setpoints(reader, *, width) -> Iterator[(setpoint, params, frames)]   # G
 harvest.sweep(session, base, vectors, *, config) -> list[Window]   # when each setpoint was held
 harvest.attribute(times, windows, program, *, base) -> list[FrameRow]   # frame -> setpoint
 harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
-                programs=None, config=HarvestConfig(), session_factory=Session) -> HarvestReport
+                programs=None, config=HarvestConfig(), session_factory=Session,
+                retry_dark=False) -> HarvestReport   # dark = no frame ever structured
 ```
 
 ## `syncsummoner.compose`

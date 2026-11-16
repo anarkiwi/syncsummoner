@@ -168,6 +168,19 @@ ss probe refit --archive archive/ --out profiles/          # profiles from the a
 ss profile show --profiles profiles/
 ```
 
+A program is dark, and its frames are discarded, only when every inspected frame
+of its sweep is a uniform field: a sweep legitimately visits flat setpoints and a
+generator may hold one picture, and frames read as the card's "No Signal" splash
+count as picture, since that classifier is a pixel heuristic achromatic output
+satisfies. The verdict is left as `<program>.dark.json` in the archive directory
+and a resume skips it; each run lists the programs it skips. To re-judge them
+under the current criterion (an archive committed for one supersedes its verdict):
+
+```sh
+ss probe archive --out archive/ --source-host pi@videopi --retry-dark
+ss probe archive --out archive/ --source-host pi@videopi --retry-dark --program Lumarian
+```
+
 An archive keeps the device's own `program info` reply beside its frames, and a
 refit carries it into every parameter's name, native range and role. An archive
 recorded before that is back-filled from the device without re-archiving: each

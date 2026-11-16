@@ -132,17 +132,31 @@ class TakeReport:
     luma: float = 0.0
 
     @property
-    def live(self) -> bool:
-        """Whether most frames carry a picture, moving or not; what a load waits for."""
+    def mostly_picture(self) -> bool:
+        """Whether most frames carry a picture, moving or not; what a load waits for.
+
+        The splash is excluded, because a load relocking the card shows it.
+        """
         return 2 * self.picture > self.frames
 
     @property
     def usable(self) -> bool:
-        """Whether the take carries a picture that is not held still."""
-        return self.live and not self.frozen
+        """Whether the take carries a picture that is not held still: a render's standard."""
+        return self.mostly_picture and not self.frozen
+
+    @property
+    def ever_structured(self) -> bool:
+        """Whether any frame holds spatial structure, splash-classified or not: an archive's standard.
+
+        A sweep visits setpoints whose output is a flat field and a generator may
+        hold one picture, so neither motion nor a majority is required. The
+        splash classifier is a pixel heuristic that achromatic content satisfies,
+        so it cannot condemn a program: only a take of uniform fields alone is dark.
+        """
+        return self.picture + self.splash > 0
 
     def __str__(self) -> str:
-        verdict = "" if self.usable else "  UNUSABLE: " + ("frozen" if self.live else "no picture")
+        verdict = "" if self.usable else "  UNUSABLE: " + ("frozen" if self.mostly_picture else "no picture")
         motion = "n/a" if self.motion is None else f"{self.motion:+.2f}"
         return (
             f"{self.frames} frames: {self.picture} picture, {self.splash} splash, "
@@ -384,7 +398,7 @@ def settle(
 ) -> TakeReport:
     """Wait for the picture to come back after a load, by recording a short probe.
 
-    Liveness is judged the way a take is, by :attr:`TakeReport.live`: a picture,
+    Liveness is judged the way a take is, by :attr:`TakeReport.mostly_picture`: a picture,
     moving or not, because a paused source is still a working rig. A load drops the source link and the
     card has no mode to open until it relocks, so a recorder that will not start
     yet is part of what this waits through rather than a failure.
@@ -402,7 +416,7 @@ def settle(
                 said = str(exc)
                 continue
             report = inspect_take(probe, ffmpeg=recorder.ffmpeg)
-            if report.live:
+            if report.mostly_picture:
                 return report
     finally:
         probe.unlink(missing_ok=True)

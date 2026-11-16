@@ -182,6 +182,17 @@ def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tm
     assert "4 frames" in capsys.readouterr().err, "the run summary is a stage line, on stderr"
 
 
+def test_probe_archive_lists_dark_programs_and_retries_them_when_asked(harvested, tmp_path, capsys):
+    from syncsummoner.probe.archive import FrameArchive
+    from syncsummoner.probe.store import KeyKind, ProgramKey
+
+    FrameArchive(tmp_path).mark_dark("Lumarian", ProgramKey("Lumarian", "1", KeyKind.NAME_FIRMWARE), 0.4)
+    assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 0
+    assert harvested["retry_dark"] is False and "skipping dark: Lumarian" in capsys.readouterr().err
+    assert cli.main(["probe", "archive", "--out", str(tmp_path), "--retry-dark"]) == 0
+    assert harvested["retry_dark"] is True and "retrying dark: Lumarian" in capsys.readouterr().err
+
+
 def test_probe_archive_records_the_card_losslessly_with_the_hosts_own_clock(harvested, tmp_path):
     """Under ``copyts`` the stored frame times are what ``time.monotonic`` reads."""
     assert cli.main(["probe", "archive", "--out", str(tmp_path), "--capture", "/dev/video9"]) == 0

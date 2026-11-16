@@ -207,8 +207,8 @@ def test_inspection_point_samples_rgb_so_the_card_s_own_pixels_are_judged(monkey
 def test_a_live_paused_picture_settles_but_is_not_a_usable_take():
     """A load waits for any picture; a take must also not be held still."""
     paused = TakeReport(frames=10, picture=10, spread=255, motion=-0.5, frozen=True, luma=0.1)
-    assert paused.live and not paused.usable and "UNUSABLE: frozen" in str(paused)
-    assert TakeReport(frames=10, picture=5).live is False, "half is not most"
+    assert paused.mostly_picture and not paused.usable and "UNUSABLE: frozen" in str(paused)
+    assert TakeReport(frames=10, picture=5).mostly_picture is False, "half is not most"
 
 
 def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path):
@@ -227,7 +227,7 @@ def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path
         clock=lambda: next(ticks),
         sleep=lambda s: None,
     )
-    assert got.live and len(recorder.probes) == 2, "a still picture is back; it need not move"
+    assert got.mostly_picture and len(recorder.probes) == 2, "a still picture is back; it need not move"
     assert recorder.probes[0] == (str(probe), 0.5)
     assert not probe.exists(), "the probe never outlives the wait it was recorded for"
 

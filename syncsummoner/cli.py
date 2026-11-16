@@ -292,8 +292,12 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         seed=args.seed,
     )
     host = {} if args.source_host is None else {"host": args.source_host}
+    archive = FrameArchive(args.out)
+    dark = sorted(archive.darkened())
+    if dark:
+        LOG.info("%s dark: %s", "retrying" if args.retry_dark else "skipping", ", ".join(dark))
     report = harvest(
-        FrameArchive(args.out),
+        archive,
         open_transport=lambda: Transport.open(serial=args.serial),
         recorder=Recorder(
             device=args.capture,
@@ -308,6 +312,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         programs=None if args.program == "all" else args.program.split(","),
         config=config,
         log=LOG.info,
+        retry_dark=args.retry_dark,
     )
     LOG.info(
         "%d frames from %d programs in %.1f min", report.frames, len(report.results), report.seconds / 60
@@ -605,6 +610,9 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--setpoints", type=int, default=32)
     collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
     collect.add_argument("--seed", type=int, default=11)
+    collect.add_argument(
+        "--retry-dark", action="store_true", help="re-run programs marked dark, re-judging them"
+    )
     _add_link_args(collect)
     collect.set_defaults(func=_harvest_cmd)
 
