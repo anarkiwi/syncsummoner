@@ -210,7 +210,9 @@ harvest.attribute(times, windows, program, *, base) -> list[FrameRow]   # frame 
 harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
                 programs=None, config=HarvestConfig(), session_factory=Session,
                 retry_dark=False) -> HarvestReport   # dark = no frame ever structured
-harvest.rig_fault(session, recorder, transport, *, config) -> str   # "" unless gone from USB or a black Passthru
+harvest.control(session, recorder, transport, *, config) -> str   # Passthru control: "" only on a picture
+harvest.rig_fault(session, recorder, transport, *, config) -> str   # "" unless gone, wrong route or a black Passthru
+recorder.require_route(transport, *, program, route) -> int | None   # RouteError unless Vid Route Mode reads route
 HarvestReport.summary() -> list[str]   # totals, each failed program with its error, the fault
 ```
 
@@ -221,10 +223,14 @@ features.analyze(video_path, audio_path, *, rng) -> Features
 vocabulary.GESTURES: dict[str, Gesture]
 planner.search(profiles, features, *, style, rng, budget) -> Score
 planner.STYLE_WEIGHTS: dict[str, ObjectiveWeights]   # naturalness is not a cost for every style
-render.device_programs() -> list[str]                # what the attached device offers
+render.device_programs() -> Offered                 # names the attached device offers, .authors enumerated
 render.unknown_programs(programs, available) -> list[str]   # named but not offered; None checks nothing
-# render_cuts raises UnknownProgramError before the first pass, so firmware that
-# moved under the archive costs no rig time.
+# render_cuts lists again once when a name is missing, then raises UnknownProgramError
+# before the first pass with both listings (count, authors, sample, near names), so
+# firmware that moved under the archive costs no rig time.
+# render_played: a load probe or take with no picture runs the Passthru control first;
+# a failed control raises RigFaultError, a passing one reloads and retries the pass
+# PASS_RETRIES times before BlankTakeError "the program outputs no picture".
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change

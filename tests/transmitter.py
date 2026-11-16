@@ -2,6 +2,7 @@
 
 import time
 
+from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.liveness import Watch
 from pyvmancer.video import VideoStatus
 
@@ -33,7 +34,10 @@ class Live:
 
     ``attached`` lists the presence each check reads in turn, holding the last;
     ``stall`` and ``clock`` configure every watch, as the shell's settings do.
+    ``routed`` is the Vid Route Mode settings value the device reads.
     """
+
+    routed = ROUTE_HDMI_IN
 
     attached = (True,)
     report = None
@@ -46,6 +50,10 @@ class Live:
         seen = list(self.attached)
         self.attached = tuple(seen[1:]) or (seen[-1],)
         return seen[0]
+
+    def route(self):
+        """Vid Route Mode, as the transport reads it."""
+        return self.routed
 
     def watch(self, what):
         """A real pyvmancer ``Watch`` on this fake's presence."""

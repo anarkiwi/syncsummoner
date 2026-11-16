@@ -284,6 +284,19 @@ def test_a_device_left_on_another_input_is_flagged(rig):
     assert found["device.input"].detail == "input analog, session hdmi"
 
 
+def test_vid_route_mode_is_checked_against_hdmi_in_by_default(rig):
+    """Under Dual In the hdmi input still reads locked; only Vid Route Mode shows the black output."""
+    shell = RigShell()
+    doc = rig(shell=shell)
+    assert by_check(doc.checks())["video.route"].detail == "Vid Route Mode 1 (HDMI In), expected 1 (HDMI In)"
+    shell.routed = 4
+    found = by_check(doc.checks())
+    assert [f.check for f in found.values() if not f.ok] == ["video.route"]
+    assert "Vid Route Mode to HDMI In" in found["video.route"].fix
+    doc.route = 4
+    assert by_check(doc.checks())["video.route"].ok, "the expected value is overridable"
+
+
 def test_device_unreachable(rig):
     doc = rig()
 

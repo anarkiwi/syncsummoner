@@ -10,7 +10,13 @@ import numpy as np
 import pytest
 from pyvmancer import Videomancer
 from pyvmancer.ccmap import encode_setting
-from pyvmancer.const import CC_MAP_SETTING_KEY, CC_MAP_UNASSIGNED, CC_MSB_MASK, DEFAULT_CC_MSB
+from pyvmancer.const import (
+    CC_MAP_SETTING_KEY,
+    CC_MAP_UNASSIGNED,
+    CC_MSB_MASK,
+    DEFAULT_CC_MSB,
+    ROUTE_SETTING_KEY,
+)
 from pyvmancer.errors import ShellError
 from pyvmancer.midi import MidiController, lsb_partner
 from pyvmancer.shell import Reply, ShellClient
@@ -81,7 +87,8 @@ class FakeShell(Live):
         }
 
     def get_setting(self, key):
-        return json.dumps({"key": key, "type": "uint32", "value": self.keys[key - CC_MAP_SETTING_KEY]})
+        value = self.routed if key == ROUTE_SETTING_KEY else self.keys[key - CC_MAP_SETTING_KEY]
+        return json.dumps({"key": key, "type": "uint32", "value": value})
 
     def set_setting(self, key, value):
         self.calls.append(("setting", key, value))

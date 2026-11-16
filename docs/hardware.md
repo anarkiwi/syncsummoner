@@ -319,6 +319,22 @@ unblank ends. Those waits therefore start only after the link is back, and
 `Transport.watch` raises `HeldLinkError` if one starts or polls while the link is
 held down. Progress lines written during the drop end in `link down`.
 
+## Vid Route Mode decides what the processor is fed
+
+SETTINGS > Vid Route Mode is settings key 1. It read 4 under Auto and 1 under
+HDMI In; the other modes' values are unobserved. With the route found on Dual
+In, `video status` still read source `hdmi`, the HDMI input locked and the
+transmitter active, Passthru loaded and ran, and every program output exact
+zero, so the input check below passed while nothing was fed to the processor.
+Programs looked dead until the route was set back to HDMI In.
+
+`device doctor` fails `video.route` unless key 1 reads the expected value (HDMI
+In, 1, unless `--route` says otherwise), and render, audition and archive check
+it before the run and after every load and pass, next to the CC map, stopping
+with `RouteError`. A program is judged dark only after a Passthru control on
+the same rig shows a picture; a dark control is a rig fault reported with the
+route, input lock and transmitter state.
+
 ## Vid Route Mode Auto can strand the input
 
 Under SETTINGS > Vid Route Mode Auto, dropping the source HDMI link made the

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import numpy as np
+from pyvmancer.route import describe_route, route_name
 
 from .capture import QUANTUM
 from .transport import transmitting
@@ -32,6 +33,7 @@ __all__ = [
     "InputRouteError",
     "Recorder",
     "RecorderError",
+    "RouteError",
     "SIGMA",
     "SignalLostError",
     "TakeReport",
@@ -41,6 +43,8 @@ __all__ = [
     "inspect_take",
     "require_ffmpeg",
     "require_input",
+    "require_route",
+    "rig_state",
     "require_signal",
     "settle",
 ]
@@ -147,6 +151,42 @@ def require_input(transport: Any, *, program: str, source: str | None) -> Any:
             "check front panel SETTINGS > Vid Route Mode"
         )
     return status
+
+
+class RouteError(InputRouteError):
+    """Front panel Vid Route Mode reads other than the value the session needs."""
+
+
+def require_route(transport: Any, *, program: str, route: int | None) -> int | None:
+    """Vid Route Mode's settings value, when it reads ``route``; :class:`RouteError` if not.
+
+    Under another route the device can report the session's input locked and transmit while
+    every program outputs black, so nothing in ``video status`` shows it. None skips the check.
+    """
+    if route is None:
+        return None
+    value = transport.route()
+    if value != route:
+        raise RouteError(
+            f"{program}: Vid Route Mode reads {describe_route(value)}, the session needs "
+            f"{describe_route(route)}; set SETTINGS > Vid Route Mode to {route_name(route)} "
+            "on the front panel"
+        )
+    return value
+
+
+def rig_state(transport: Any) -> str:
+    """Vid Route Mode, the selected input and its lock, and the transmitter, as one line; never raises."""
+    try:
+        status = transport.video_status()
+        sent = status.raw.get("hdmi_tx") or {}
+        lock = "locked" if status.source_locked else "unlocked"
+        return (
+            f"Vid Route Mode {describe_route(transport.route())}, input {status.input_source} {lock}, "
+            f"transmitter vic {sent.get('vic')} de {sent.get('de')}"
+        )
+    except Exception as exc:
+        return f"rig state unread: {type(exc).__name__}: {exc}"
 
 
 def await_transmitting(
