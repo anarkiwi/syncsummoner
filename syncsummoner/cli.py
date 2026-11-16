@@ -36,6 +36,7 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
         open_transport=lambda: Transport.open(serial=args.serial, stall=args.stall),
         latency_params=args.latency_params,
         latency_rates=args.latency_rates,
+        route=args.route,
     )
     findings = doctor.run(loop=args.loop, latency=args.latency, fix=args.fix)
     for finding in findings:
@@ -306,6 +307,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         setpoints=args.setpoints,
         dwell_s=args.dwell,
         seed=args.seed,
+        route=args.route,
     )
     host = {} if args.source_host is None else {"host": args.source_host}
     archive = FrameArchive(args.out)
@@ -478,6 +480,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         "measure_latency": args.measure_latency,
         "cc_budget_hz": args.cc_budget,
         "stall_s": args.stall,
+        "route": args.route,
     }
     config = (
         render_mod.RenderConfig.for_format(args.format, **timing)
@@ -541,6 +544,25 @@ def _render_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _route(text: str) -> int | None:
+    """A Vid Route Mode value or observed mode name, or ``any`` to skip the check."""
+    from pyvmancer.route import parse_route
+
+    return None if text.lower() == "any" else parse_route(text)
+
+
+def _add_route_arg(parser: argparse.ArgumentParser) -> None:
+    from pyvmancer.const import ROUTE_HDMI_IN
+
+    parser.add_argument(
+        "--route",
+        type=_route,
+        default=ROUTE_HDMI_IN,
+        help="Vid Route Mode the rig must read: a settings value, hdmi-in (1) or auto (4), "
+        "or any to skip (default: hdmi-in)",
+    )
+
+
 def _add_link_args(parser: argparse.ArgumentParser) -> None:
     """Source-host options for any subcommand that changes program."""
     parser.add_argument("--source-host", help="ssh target driving the stimulus and the HDMI link")
@@ -585,6 +607,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         "--latency-rates", type=_numbers(float), help="parameter sets per second (default: pyvmancer's)"
     )
     doctor.add_argument("--fix", action="store_true", help="apply safe source host fixes, then check again")
+    _add_route_arg(doctor)
     doctor.set_defaults(func=_doctor_cmd)
 
     manifest = sub.add_parser(
@@ -653,6 +676,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         "--retry-dark", action="store_true", help="re-run programs marked dark, re-judging them"
     )
     _add_link_args(collect)
+    _add_route_arg(collect)
     collect.set_defaults(func=_harvest_cmd)
 
     profile = sub.add_parser("profile", help="inspect fitted profiles")
@@ -734,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             default=CC_BUDGET_HZ,
             help="parameter writes per second, within `device doctor --latency`'s midi.backlog",
         )
+        _add_route_arg(node)
         node.set_defaults(func=_render_cmd, render_cmd=name)
         if name == "audition":
             node.add_argument("--seconds", type=float, default=30.0, help="excerpt length")

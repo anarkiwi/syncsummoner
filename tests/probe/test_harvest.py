@@ -2,12 +2,13 @@
 
 # pylint: disable=missing-function-docstring
 
+import dataclasses
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
 import pytest
-from pyvmancer import CcMapError, DeviceGoneError, ProgramLoadError, ShellError
+from pyvmancer import CcMapError, DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device import recorder as recorder_mod
@@ -83,6 +84,9 @@ class Port:
         self.corrupt = False
         self.verified = 0
         self.load_errors = {}
+
+    def route(self):
+        return self.transmitter.route()
 
     def verify_cc_map(self):
         self.verified += 1
@@ -406,6 +410,19 @@ def test_wait_healthy_tolerates_a_transport_that_will_not_even_open():
     assert isinstance(got, Port) and len(attempts) == 3
 
 
+def test_wait_healthy_stops_at_a_port_another_process_holds():
+    """A held tty is not a power cycle, so waiting out the health deadline would only hide it."""
+    attempts = []
+
+    def opener():
+        attempts.append(1)
+        raise PortBusyError("/dev/ttyACM0")
+
+    with pytest.raises(PortBusyError):
+        H.wait_healthy(opener, config=CONFIG, sleep=lambda _s: None, clock=FakeClock())
+    assert len(attempts) == 1
+
+
 def test_the_canary_loads_a_passthrough_and_watches_for_the_picture():
     clock = FakeClock()
     port = Port()
@@ -578,6 +595,35 @@ def test_a_device_left_on_another_input_fails_the_pass_not_the_run(tmp_path):
     assert [r.program for r in report.failures] == ["Alpha", "Beta"] and not report.stopped
     assert all(r.error.startswith("InputRouteError") for r in report.failures) and not archive.commits
     assert any("Passthru check raised InputRouteError" in line for line in said)
+
+
+def test_a_wrong_route_before_the_run_archives_nothing(tmp_path):
+    """Vid Route Mode is checked before the first program, and a mismatch is the run's fault."""
+    port, archive = Port(), Archive(tmp_path)
+    port.transmitter.routed = 4
+    report = run(archive, port=port)
+    assert report.stopped and report.fault.startswith(H.ROUTE_NOTE) and not report.results
+    assert "reads 4 (Auto), the session needs 1 (HDMI In)" in report.fault
+    assert port.loads == [H.WEDGE_PROBE] and not archive.commits and port.closed
+
+
+def test_a_route_that_changes_during_a_sweep_fails_the_pass_and_stops_the_run(tmp_path):
+    """A route wrong after the sweep fails that program unarchived, and the control blames the route."""
+    port, archive = Port(programs=("Alpha", "Beta")), Archive(tmp_path)
+    routes = iter([1, 1])
+    port.route = lambda: next(routes, 4)
+    report = run(archive, port=port)
+    assert [r.program for r in report.results] == ["Alpha"] and not archive.commits
+    assert report.results[0].error.startswith("RouteError: Alpha: Vid Route Mode reads 4 (Auto)")
+    assert report.stopped and report.fault.startswith(H.ROUTE_NOTE) and not archive.dark_luma
+
+
+def test_the_route_check_can_be_skipped(tmp_path):
+    """``route=None`` never reads the setting."""
+    port = Port(programs=("Alpha",))
+    port.route = lambda: pytest.fail("the route was read")
+    report = run(Archive(tmp_path), port=port, config=dataclasses.replace(CONFIG, route=None))
+    assert not report.stopped and report.results[0].frames == PER_PROGRAM
 
 
 def test_a_cc_map_changed_by_the_end_of_a_sweep_fails_the_program_unarchived(tmp_path):
@@ -759,10 +805,12 @@ def test_a_dark_program_is_discarded_when_the_canary_still_carries_the_source(tm
 
 
 def test_black_output_with_a_dark_canary_stops_the_run(tmp_path, monkeypatch):
-    """A passthrough that carries nothing means the rig, not the program, is dark."""
+    """A passthrough that carries nothing means the rig, not the program, is dark: no dark verdict."""
     blind(monkeypatch, canary=False)
-    report = run(Archive(tmp_path))
-    assert report.blacked is True and report.stopped is True
+    archive = Archive(tmp_path)
+    report = run(archive)
+    assert report.blacked is True and report.stopped is True and not archive.dark_luma
+    assert "Vid Route Mode 1 (HDMI In)" in report.fault and "transmitter vic 34 de 2FE90F" in report.fault
     assert report.gone is False, "a black output is not a device gone from USB, and needs its own diagnosis"
     assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than archiving more"
 

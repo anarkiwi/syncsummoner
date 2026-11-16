@@ -6,9 +6,9 @@ import contextlib
 
 import numpy as np
 import pytest
-from pyvmancer import CcMapError, ShellError, VmancerError
+from pyvmancer import CcMapError, ReplyShapeError, ShellError, VmancerError
 from pyvmancer.ccmap import encode_setting
-from pyvmancer.const import CC_MAP_UNASSIGNED
+from pyvmancer.const import CC_MAP_UNASSIGNED, ShellErrorCode
 from pyvmancer.shell import Reply
 
 from syncsummoner.device import transport as tr
@@ -454,7 +454,7 @@ def test_firmware_without_authors_loads_plain_names_without_enumerating():
 
     def authors():
         device.shell.calls.append(("authors",))
-        raise ShellError(2, "unknown command")
+        raise ShellError(ShellErrorCode.PARSE_ERROR, "usage: programs authors")
 
     device.shell.authors = authors
     port = tr.Transport(device)
@@ -462,3 +462,39 @@ def test_firmware_without_authors_loads_plain_names_without_enumerating():
     port.load_program("Colorbars")
     assert device.shell.loads == ["Passthru", "Colorbars"]
     assert [c for c in device.shell.calls if c[0] in ("authors", "enumerate")] == [("authors",)]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ShellError(ShellErrorCode.SERVICE_UNAVAILABLE, "busy"), ReplyShapeError("programs", "{}", ["authors"])],
+)
+def test_an_authors_failure_is_never_read_as_firmware_without_authors(error):
+    """Loading a plain name unenumerated would load the active author's program of that name."""
+    device = FakeDevice()
+
+    def authors():
+        raise error
+
+    device.shell.authors = authors
+    with pytest.raises(type(error)):
+        tr.Transport(device).load_program("Passthru")
+    assert not device.shell.loads
+
+
+def test_authors_and_route_are_read_from_the_device():
+    """The authors listing and Vid Route Mode, as the render's listing error and route check use them."""
+    device = FakeDevice()
+    port = tr.Transport(device)
+    assert port.authors() == ["lzx", "czartroniks"] and port.route() == 1
+    device.shell.routed = 4
+    assert port.route() == 4
+
+
+def test_firmware_without_authors_reports_none():
+    device = FakeDevice()
+
+    def authors():
+        raise ShellError(ShellErrorCode.UNKNOWN_COMMAND, "unknown command")
+
+    device.shell.authors = authors
+    assert tr.Transport(device).authors() is None

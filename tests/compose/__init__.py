@@ -3,6 +3,7 @@
 import types
 
 import numpy as np
+from pyvmancer.const import ROUTE_HDMI_IN
 
 from syncsummoner.compose.features import Features, analyze_audio
 from syncsummoner.compose.render import RenderConfig, TakeReport
@@ -26,7 +27,7 @@ PROBED = TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
 
 def rig_transport(*video, **kw):
     """Transport stand-in whose transmitter replays ``video``, driving the session timing by default."""
-    fields = {"program_info": lambda: None, "verify_cc_map": lambda: None}
+    fields = {"program_info": lambda: None, "verify_cc_map": lambda: None, "route": lambda: ROUTE_HDMI_IN}
     status = tx.Transmitter(*(video or [tx.at(RenderConfig.timing)])).video_status
     return types.SimpleNamespace(**{**fields, "video_status": status, **kw})
 

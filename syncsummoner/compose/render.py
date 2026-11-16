@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
+from pyvmancer.const import ROUTE_HDMI_IN
 
 from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
 from syncsummoner.device.recorder import (
@@ -21,7 +22,9 @@ from syncsummoner.device.recorder import (
     TakeReport,
     inspect_take,
     require_input,
+    require_route,
     require_signal,
+    rig_state,
     settle,
 )
 from syncsummoner.device.session import CC_BUDGET_HZ
@@ -43,6 +46,25 @@ class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
 
+class RigFaultError(RuntimeError):
+    """A program showed no picture and the Passthru control on the same rig showed none either."""
+
+
+class Offered(tuple):
+    """Program names a device listed, with the authors it enumerated; None on firmware without authors."""
+
+    authors: tuple[str, ...] | None
+
+    def __new__(cls, names: Sequence[str], authors: Sequence[str] | None = None) -> "Offered":
+        offered = super().__new__(cls, names)
+        offered.authors = None if authors is None else tuple(authors)
+        return offered
+
+
+#: Passes reloaded and retried after showing no picture while the Passthru control did.
+PASS_RETRIES = 1
+#: Program names shown from a listing that lacked a requested one.
+LISTING_SAMPLE = 5
 #: A pass sleeps in ticks no longer than this, so its progress moves while it waits.
 DRIVE_TICK_S = 1.0
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
@@ -75,6 +97,10 @@ class RenderConfig:
     probe_timeout_s: float = 40.0
     #: The input the session feeds the device, verified after every load; None skips the check.
     source: str | None = "hdmi"
+    #: Vid Route Mode's settings value, verified before the run and after every load; None skips it.
+    route: int | None = ROUTE_HDMI_IN
+    #: Length of each probe recorded while a load settles, the Passthru control's included.
+    probe_s: float = 2.0
     #: pyvmancer's opt-in stall guard for device waits; None waits for as long as the device is on USB.
     stall_s: float | None = None
     #: Recorded before the clip is started, so the picture's own first frame is inside the take.
@@ -362,6 +388,71 @@ def drive(
     return written
 
 
+def _attempt(
+    rig: Rig, recorder: Any, out: str | Path, *, score: Score, autos: Mapping, config: RenderConfig
+) -> tuple[str, TakeReport]:
+    """Load the score's program and record its pass; returns what was judged and its report.
+
+    What was judged is ``load probe`` when the probe shows no picture, which ends the attempt
+    before the pass is driven, and ``take`` otherwise.
+    """
+    layer = min(score.layers, key=lambda item: item.index)
+    program = layer.program
+    with rig.playout.playing(fps=config.fps):
+        with stage("load", program=program) as loaded:
+            rig.session.load_program(program, link=rig.link)
+            require_route(rig.transport, program=program, route=config.route)
+            latency = write_latency(config, rig.transport)
+            loaded["latency_ms"] = round(latency * 1e3, 1)
+            rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
+            probe = settle(
+                recorder,
+                rig.transport,
+                program=program,
+                timing=config.timing,
+                probe_timeout_s=config.probe_timeout_s,
+                probe_path=config.probe_path,
+            )
+            require_input(rig.transport, program=program, source=config.source)
+    if not probe.mostly_picture:
+        return "load probe", probe
+    auto = schedule(
+        autos.get(layer.index, Automation.empty()),
+        latency_s=latency,
+        early_bias_s=config.early_bias_s,
+        cc_budget_hz=config.cc_budget_hz,
+    )
+    signal = {"program": program, "timing": config.timing}
+    with stage("pass", program=program, seconds=f"{score.duration:.1f}") as written:
+        require_signal(rig.transport, when="as the pass began", **signal)
+        with recorder.recording(out, seconds=score.duration + config.lead_s):
+            with rig.playout.playing(fps=config.fps):
+                written["writes"] = drive(rig, auto, duration=score.duration)
+        rig.transport.verify_cc_map()
+        require_route(rig.transport, program=program, route=config.route)
+        require_signal(rig.transport, when="as the pass ended", **signal)
+    return "take", inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+
+
+def verify_dark(
+    rig: Rig, recorder: Any, *, program: str, judged: str, report: TakeReport, config: RenderConfig
+) -> None:
+    """Run the Passthru control before a dark program is judged; :class:`RigFaultError` when it fails too.
+
+    Passthru carries the playing clip, so it showing no picture, or a wrong Vid Route Mode,
+    blames the rig: the error names the route, the input and the transmitter.
+    """
+    from syncsummoner.probe.harvest import control
+
+    with rig.playout.playing(fps=config.fps):
+        said = control(rig.session, recorder, rig.transport, config=config, link=rig.link)
+    if said:
+        raise RigFaultError(
+            f"{program}: the {judged} shows no picture ({report}), and the Passthru control failed: {said}; "
+            f"{rig_state(rig.transport)}"
+        )
+
+
 def render_played(
     score: Score,
     source: Any,
@@ -377,17 +468,16 @@ def render_played(
 ) -> TakeReport:
     """Render one pass: the rig plays, ffmpeg records, the host only drives.
 
-    Nothing on the host touches a frame while the rig is running, which is what
-    a real-time capture needs and what a per-frame loop could never give it. The
-    clip is played twice: once as the moving picture the load's liveness probe
-    needs, then again, inside the recording, for the take itself. The take opens
-    on lead-in the picture has not reached yet; :func:`picture_start` says where
-    it does.
+    Nothing on the host touches a frame while the rig runs. The clip plays as the load's probe
+    stimulus, then again inside the recording, which opens on lead-in (:func:`picture_start`).
+    A load probe or take with no picture is a program verdict only after :func:`verify_dark`
+    passes; the program is then reloaded and its pass retried :data:`PASS_RETRIES` times.
     """
     layers = sorted(score.layers, key=lambda item: item.index)
     if not layers:
         raise ValueError("score has no layers to render")
     config = RenderConfig() if config is None else config
+    program = layers[0].program
     owned = rig is None
     rig = open_rig(config, player=True, capture=False) if owned else rig
     if not prepared:
@@ -398,43 +488,33 @@ def render_played(
         recorder = Recorder(width=config.width, height=config.height, fps=config.fps)
     autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
     try:
+        require_route(rig.transport, program=program, route=config.route)
         with stage("upload", clip=str(scratch)) as sent:
             sent["bytes"] = rig.playout.upload(str(scratch))
-        with rig.playout.playing(fps=config.fps):
-            with stage("load", program=layers[0].program) as loaded:
-                rig.session.load_program(layers[0].program, link=rig.link)
-                latency = write_latency(config, rig.transport)
-                loaded["latency_ms"] = round(latency * 1e3, 1)
-                rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
-                probe = settle(
-                    recorder,
-                    rig.transport,
-                    program=layers[0].program,
-                    timing=config.timing,
-                    probe_timeout_s=config.probe_timeout_s,
-                    probe_path=config.probe_path,
-                )
-                require_input(rig.transport, program=layers[0].program, source=config.source)
-                if not probe.mostly_picture:
-                    raise BlankTakeError(f"{layers[0].program}: the program outputs no picture ({probe})")
-        auto = schedule(
-            autos.get(layers[0].index, Automation.empty()),
-            latency_s=latency,
-            early_bias_s=config.early_bias_s,
-            cc_budget_hz=config.cc_budget_hz,
+        for attempt in range(PASS_RETRIES + 1):
+            judged, report = _attempt(rig, recorder, out, score=score, autos=autos, config=config)
+            if report.mostly_picture:
+                return report
+            verify_dark(rig, recorder, program=program, judged=judged, report=report, config=config)
+            LOG.warning(
+                "%s: the %s shows no picture (%s) while Passthru does; %s",
+                program,
+                judged,
+                report,
+                (
+                    f"reloading for retry {attempt + 1} of {PASS_RETRIES}"
+                    if attempt < PASS_RETRIES
+                    else "no retry left"
+                ),
+            )
+        raise BlankTakeError(
+            f"{program}: the program outputs no picture ({report}), while Passthru on the same rig does"
         )
-        signal = {"program": layers[0].program, "timing": config.timing}
-        with stage("pass", program=layers[0].program, seconds=f"{score.duration:.1f}") as written:
-            require_signal(rig.transport, when="as the pass began", **signal)
-            with recorder.recording(out, seconds=score.duration + config.lead_s):
-                with rig.playout.playing(fps=config.fps):
-                    written["writes"] = drive(rig, auto, duration=score.duration)
-            rig.transport.verify_cc_map()
-            require_signal(rig.transport, when="as the pass ended", **signal)
     finally:
-        if owned and rig.capture is not None:
-            rig.capture.close()
-    return inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+        if owned:
+            if rig.capture is not None:
+                rig.capture.close()
+            rig.transport.close()
 
 
 @dataclass(frozen=True)
@@ -475,15 +555,38 @@ def resolve_starts(measured: Mapping[str, float | None]) -> dict[str, float]:
     return {name: median if value is None else value for name, value in measured.items()}
 
 
-def device_programs() -> list[str]:
-    """Program names the attached device offers. Imported here so compose needs no hardware."""
+def device_programs() -> Offered:
+    """Program names the attached device offers, and its authors.
+
+    The device layer is imported here, so compose needs no hardware.
+    """
     from syncsummoner.device.transport import Transport
 
     transport = Transport.open()
     try:
-        return list(transport.programs())
+        return Offered(transport.programs(), transport.authors())
     finally:
         transport.close()
+
+
+def describe_offer(offered: Sequence[str], missing: Sequence[str] = ()) -> str:
+    """A listing as its count, the authors enumerated, a sample, and any name matching a missing one's.
+
+    A name matches when its plain part, after any ``author/``, is the missing name's.
+    """
+    names = list(offered)
+    authors = getattr(offered, "authors", None)
+    said = (
+        f"{len(names)} programs from authors {', '.join(authors) if authors is not None else 'unreported'}"
+        f", e.g. {', '.join(names[:LISTING_SAMPLE]) or 'none'}"
+    )
+    plain = {name: name.rpartition("/")[2] for name in names}
+    near = [
+        f"{want} as {', '.join(found)}"
+        for want in missing
+        if (found := [n for n, p in plain.items() if p == want.rpartition("/")[2] and n != want])
+    ]
+    return said + (f"; listed {'; '.join(near)}" if near else "")
 
 
 def unknown_programs(programs: Sequence[str], available: Sequence[str] | None) -> list[str]:
@@ -582,12 +685,22 @@ def render_cuts(
     ordered = list(dict.fromkeys(cut.program for cut in plan))
     paths = {p: str(Path(takes) / f"take-{slug(p)}.mkv") for p in ordered}
     fresh = [p for p in ordered if not (reuse and Path(paths[p]).is_file())]
-    if fresh and callable(available):
-        available = available()
     pending = [p for p in programs if p in fresh or p not in paths]
-    unknown = unknown_programs(pending, available if fresh else None)
+    lister = available if fresh and callable(available) else None
+    listings = [lister()] if lister is not None else [available]
+    unknown = unknown_programs(pending, listings[-1] if fresh else None)
+    if unknown and lister is not None:
+        LOG.warning(
+            "the device does not offer %s in %s; listing again",
+            ", ".join(unknown),
+            describe_offer(listings[-1]),
+        )
+        listings.append(lister())
+        unknown = unknown_programs(pending, listings[-1])
+        LOG.info("second listing: %s", describe_offer(listings[-1], unknown))
     if unknown:
-        raise UnknownProgramError(f"the device does not offer {', '.join(unknown)}")
+        said = " then ".join(describe_offer(listing, unknown) for listing in listings)
+        raise UnknownProgramError(f"the device does not offer {', '.join(unknown)}; it listed {said}")
     run = render_played if pass_render is None else pass_render
     evolved = {layer.program: layer for layer in score.layers}
     Path(takes).mkdir(parents=True, exist_ok=True)

@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import pytest
-from pyvmancer import LatencyReport, RateResult, VmancerError
+from pyvmancer import LatencyReport, PortBusyError, RateResult, VmancerError
 from pyvmancer.latency import DEFAULT_RATES
 from pyvmancer.midi import MidiController
 
@@ -284,6 +284,19 @@ def test_a_device_left_on_another_input_is_flagged(rig):
     assert found["device.input"].detail == "input analog, session hdmi"
 
 
+def test_vid_route_mode_is_checked_against_hdmi_in_by_default(rig):
+    """Under Dual In the hdmi input still reads locked; only Vid Route Mode shows the black output."""
+    shell = RigShell()
+    doc = rig(shell=shell)
+    assert by_check(doc.checks())["video.route"].detail == "Vid Route Mode 1 (HDMI In), expected 1 (HDMI In)"
+    shell.routed = 4
+    found = by_check(doc.checks())
+    assert [f.check for f in found.values() if not f.ok] == ["video.route"]
+    assert "Vid Route Mode to HDMI In" in found["video.route"].fix
+    doc.route = 4
+    assert by_check(doc.checks())["video.route"].ok, "the expected value is overridable"
+
+
 def test_device_unreachable(rig):
     doc = rig()
 
@@ -294,6 +307,19 @@ def test_device_unreachable(rig):
     found = by_check(doc.checks(loop=True))
     assert not found["device.reachable"].ok and "dialout" in found["device.reachable"].fix
     assert found["ssh.reachable"].ok
+
+
+def test_a_port_held_elsewhere_is_named_rather_than_read_as_unreachable(rig):
+    """The shell serves one client, so a held tty is another process to close, not a cable."""
+    doc = rig()
+
+    def busy():
+        raise PortBusyError("/dev/ttyACM0")
+
+    doc._open_transport = busy  # pylint: disable=protected-access
+    found = by_check(doc.checks())
+    assert "device.reachable" not in found
+    assert not found["device.port_free"].ok and "fuser /dev/ttyACM0" in found["device.port_free"].detail
 
 
 def swap_rb(frame):

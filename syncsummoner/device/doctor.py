@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
 import numpy as np
+from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.const import ParamKind as Control
 from pyvmancer.const import param_kind
 from pyvmancer.diagnose import Finding, diagnose, diagnose_latency
-from pyvmancer.errors import VmancerError
+from pyvmancer.errors import PortBusyError, VmancerError
 from pyvmancer.latency import DEFAULT_RATES, measure_latency
 
 from syncsummoner.probe.patterns import generate, read_state_index, state_index_capacity, with_state_index
@@ -200,6 +201,7 @@ class Doctor:
         probe_timeout_s: float = 40.0,
         probe_s: float = 1.0,
         session_input: str = "hdmi",
+        route: int | None = ROUTE_HDMI_IN,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -225,6 +227,7 @@ class Doctor:
         self.probe_timeout_s = float(probe_timeout_s)
         self.probe_s = float(probe_s)
         self.session_input = session_input
+        self.route = route
         self._sleep = sleep
         self._clock = clock
 
@@ -314,11 +317,11 @@ class Doctor:
         ]
 
     def device(self, transport: Any) -> list[Finding]:
-        """The device's own checks, and that it reads the session's input and drives its format."""
+        """The device's own checks, Vid Route Mode against ``route``, and the session's input and format."""
         status = transport.video_status()
         timing, selected = status.output_timing, status.input_source
         device = transport.device
-        return diagnose(device.shell, device.midi if device.has_midi else None) + [
+        return diagnose(device.shell, device.midi if device.has_midi else None, route=self.route) + [
             _check(
                 "device.format",
                 str(timing).lower() == self.fmt.name.lower(),
@@ -458,6 +461,15 @@ class Doctor:
         found = self.source() + self.card()
         try:
             transport = self._open_transport()
+        except PortBusyError as err:
+            return found + [
+                Finding(
+                    "device.port_free",
+                    False,
+                    str(err),
+                    "close the other client holding the serial port, then rerun",
+                )
+            ]
         except Exception as err:
             return found + [
                 Finding(

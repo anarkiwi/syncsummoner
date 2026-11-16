@@ -13,8 +13,9 @@ from typing import Any, Callable, ContextManager, Iterable, Iterator, Mapping, S
 import numpy as np
 import pyvmancer as vm
 
-from pyvmancer.const import ParamRole, classify_param
+from pyvmancer.const import ABSENT_COMMAND_CODES, ParamRole, classify_param
 from pyvmancer.diagnose import diagnose_video
+from pyvmancer.route import read_route
 from pyvmancer.shell import DEFAULT_AUTHOR
 from pyvmancer.video import VideoStatus
 
@@ -224,14 +225,28 @@ class Transport:
             self._held = None
 
     def _has_authors(self) -> bool:
-        """Whether the firmware enumerates program authors, asked once per transport."""
+        """Whether the firmware enumerates program authors, asked once per transport.
+
+        Only an unknown-command or usage error means it does not; any other failure raises,
+        a malformed reply (``ReplyShapeError``) included.
+        """
         if self._authored is None:
             try:
                 self._shell.authors()
                 self._authored = True
-            except vm.ShellError:
+            except vm.ShellError as err:
+                if err.code not in ABSENT_COMMAND_CODES:
+                    raise
                 self._authored = False
         return self._authored
+
+    def authors(self) -> list[str] | None:
+        """Program authors the firmware enumerates, or None when it has none."""
+        return list(self._shell.authors()) if self._has_authors() else None
+
+    def route(self) -> int | None:
+        """Front panel Vid Route Mode as its settings value; None when the firmware has no such key."""
+        return read_route(self._shell)
 
     def firmware(self) -> str:
         """Firmware version string, recorded into every measurement."""

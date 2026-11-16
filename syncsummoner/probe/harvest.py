@@ -13,15 +13,19 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
-from pyvmancer.errors import DeviceGoneError, ProgramLoadError, ShellError
+from pyvmancer.const import ROUTE_HDMI_IN
+from pyvmancer.errors import DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import (
     BlankTakeError,
+    RouteError,
     TakeReport,
     inspect_take,
     require_input,
+    require_route,
     require_signal,
+    rig_state,
     settle,
 )
 from syncsummoner.device.session import Session
@@ -40,11 +44,13 @@ __all__ = [
     "Window",
     "attribute",
     "carries_stimulus",
+    "control",
     "discard_dark",
     "harvest",
     "harvest_program",
     "prove_passthrough",
     "rig_fault",
+    "route_fault",
     "stimulus_loop",
     "sweep",
     "sweep_vectors",
@@ -58,6 +64,9 @@ WEDGE_PROBE = "Passthru"
 #: The two faults that stop a run, each on positive evidence only: same remedy, never conflated.
 GONE_NOTE = "the device left USB: power cycle it, then rerun to resume"
 BLACKED_NOTE = "black output from a live source: the device needs a power cycle, then rerun"
+ROUTE_NOTE = "Vid Route Mode is wrong: set it on the front panel, then rerun"
+#: Notes that are positive evidence the rig, not a program, is at fault.
+FAULT_NOTES = (GONE_NOTE, BLACKED_NOTE, ROUTE_NOTE)
 
 
 class HarvestError(RuntimeError):
@@ -88,6 +97,8 @@ class HarvestConfig:
     probe_path: str = "/tmp/syncsummoner-probe.mkv"
     #: The input the session feeds the device, verified after every load; None skips the check.
     source: str | None = "hdmi"
+    #: Vid Route Mode's settings value, verified before the run and after every load; None skips it.
+    route: int | None = ROUTE_HDMI_IN
     startup_s: float = 2.0
     health_timeout_s: float = 3600.0
     health_poll_s: float = 10.0
@@ -154,8 +165,8 @@ class HarvestReport:
 
     @property
     def stopped(self) -> bool:
-        """Whether a device fault ended the run before the last program."""
-        return self.gone or self.blacked
+        """Whether a rig fault ended the run before the last program."""
+        return self.gone or self.blacked or bool(self.fault)
 
     @property
     def frames(self) -> int:
@@ -276,12 +287,13 @@ def prove_passthrough(
 ) -> TakeReport:
     """Load a passthrough and wait for its picture, raising :class:`NoPictureError` without one.
 
-    The passthrough carries the known stimulus, so once it has loaded and drives
-    the session timing, its capture must be :attr:`TakeReport.mostly_picture`.
-    The input is verified first, so a device left on another input fails with
+    Once it drives the session timing its capture must be :attr:`TakeReport.mostly_picture`.
+    Vid Route Mode and the input are verified first, so a wrong route or input fails as
     :class:`~syncsummoner.device.recorder.InputRouteError` rather than as black.
+    ``config`` needs ``timing``, ``source``, ``route``, the ``probe_*`` budget, and ``loop_fps`` for a player.
     """
     session.load_program(program, park=True, link=link)
+    require_route(transport, program=program, route=config.route)
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     session.set_params(session.working_point(transport.program_info()))
@@ -298,7 +310,9 @@ def prove_passthrough(
     )
     require_input(transport, program=program, source=config.source)
     if not report.mostly_picture:
-        raise NoPictureError(f"{program}: the passthrough shows no picture ({report})")
+        raise NoPictureError(
+            f"{program}: the passthrough shows no picture ({report}; {rig_state(transport)})"
+        )
     return report
 
 
@@ -315,6 +329,25 @@ def carries_stimulus(session: Any, recorder: Any, transport: Any, **live: Any) -
         return False
 
 
+def control(session: Any, recorder: Any, transport: Any, *, config: Any, **live: Any) -> str:
+    """Run the passthrough control on the rig as it stands; empty only when it shows a picture.
+
+    Otherwise it says why: a :data:`FAULT_NOTES` note on positive evidence (the device left USB,
+    a wrong Vid Route Mode, a transmitting passthrough with no picture), else what the check raised.
+    """
+    try:
+        prove_passthrough(session, recorder, transport, config=config, **live)
+        return ""
+    except DeviceGoneError as exc:
+        return f"{GONE_NOTE} ({exc})"
+    except RouteError as exc:
+        return f"{ROUTE_NOTE} ({exc})"
+    except NoPictureError as exc:
+        return f"{BLACKED_NOTE} ({exc})"
+    except Exception as exc:
+        return f"{WEDGE_PROBE} check raised {type(exc).__name__}: {exc}"
+
+
 def rig_fault(
     session: Any,
     recorder: Any,
@@ -324,24 +357,26 @@ def rig_fault(
     log: Callable[[str], None] = lambda _message: None,
     **live: Any,
 ) -> str:
-    """Why the rig, not a program, must stop the run; empty unless there is positive evidence.
+    """Why the rig, not a program, must stop the run; empty unless :func:`control` has positive evidence.
 
-    The evidence is a fresh passthrough load: the device leaving USB is
-    :data:`GONE_NOTE`, and a passthrough that loads and transmits but shows no
-    picture is :data:`BLACKED_NOTE`. Anything else the check raises, a refused
-    load or a capture that never delivered included, is logged and the run goes
-    on, since none of it shows the device needs a power cycle.
+    Anything else the control raises, a refused load or a capture that never delivered
+    included, is logged and the run goes on, since none of it shows the rig is at fault.
     """
+    said = control(session, recorder, transport, config=config, **live)
+    if said.startswith(FAULT_NOTES):
+        return said
+    if said:
+        log(said)
+    return ""
+
+
+def route_fault(transport: Any, *, config: Any) -> str:
+    """:data:`ROUTE_NOTE` with the reading when Vid Route Mode is not ``config.route``; else empty."""
     try:
-        prove_passthrough(session, recorder, transport, config=config, **live)
+        require_route(transport, program="before the run", route=config.route)
         return ""
-    except DeviceGoneError as exc:
-        return f"{GONE_NOTE} ({exc})"
-    except NoPictureError as exc:
-        return f"{BLACKED_NOTE} ({exc})"
-    except Exception as exc:
-        log(f"{WEDGE_PROBE} check raised {type(exc).__name__}: {exc}")
-        return ""
+    except RouteError as exc:
+        return f"{ROUTE_NOTE} ({exc})"
 
 
 def wait_healthy(
@@ -354,7 +389,7 @@ def wait_healthy(
     """Block until an attached device will hold a program, reopening across a power cycle.
 
     The deadline is on the device appearing and taking a load at all; each
-    load itself waits on liveness.
+    load itself waits on liveness. A port another process holds raises at once.
     """
     deadline = clock() + config.health_timeout_s
     while clock() < deadline:
@@ -363,6 +398,8 @@ def wait_healthy(
             if holds_program(transport):
                 return transport
             transport.close()
+        except PortBusyError:
+            raise
         except Exception:
             pass
         sleep(config.health_poll_s)
@@ -425,6 +462,7 @@ def harvest_program(
     """
     start = clock()
     session.load_program(program, park=True, link=link)
+    require_route(transport, program=program, route=config.route)
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     payload = transport.program_payload()
@@ -456,6 +494,7 @@ def harvest_program(
                 clock=clock,
             )
         transport.verify_cc_map()
+        require_route(transport, program=program, route=config.route)
         require_signal(transport, program=program, timing=config.timing, when="as the sweep ended")
         rows = attribute(recorder.timestamps(video), windows, program, base=raw_params(base))
         report = inspect_take(video, ffmpeg=recorder.ffmpeg)
@@ -520,11 +559,14 @@ def harvest(
     results, fault, start = [], "", clock()
     live = {"link": link, "player": player, "sleep": sleep, "clock": clock}
     try:
+        fault = route_fault(transport, config=config)
+        if fault:
+            note(fault)
         with ExitStack() as stack:
             if player is not None:
                 stack.enter_context(player.playing(fps=config.loop_fps))
                 sleep(config.startup_s)
-            for name in names:
+            for name in () if fault else names:
                 key = ProgramKey(name, firmware, KeyKind.NAME_FIRMWARE)
                 if archive.has(name, key) or (not retry_dark and archive.dark(name, key)):
                     results.append(ProgramResult(name))

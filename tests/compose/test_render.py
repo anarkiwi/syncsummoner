@@ -911,3 +911,78 @@ def test_a_program_the_device_dropped_costs_no_rig_time():
             pass_render=never,
         )
     assert not started
+
+
+def offering(*listings):
+    """A lister answering ``listings`` in turn, recording each call."""
+    calls = []
+
+    def lister():
+        calls.append(len(calls))
+        return listings[min(len(calls) - 1, len(listings) - 1)]
+
+    return lister, calls
+
+
+def cut_render(monkeypatch, tmp_path, available):
+    """Render cuts for Quilt and Pinwheel against ``available``, with passes that succeed at once."""
+    monkeypatch.setattr(R, "assemble", lambda *a, **k: None)
+    monkeypatch.setattr(R, "picture_start", lambda path, **kw: 0.0)
+    score = Score(duration=4.0, fps=30.0, sections=[Section(0.0, 2.0, "A"), Section(2.0, 4.0, "B")])
+    return R.render_cuts(
+        score,
+        "source.mkv",
+        tmp_path / "out.mp4",
+        profiles={},
+        programs=["czartroniks/Quilt", "Pinwheel"],
+        available=available,
+        takes=tmp_path,
+        prepared=True,
+        pass_render=lambda *a, **k: R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4),
+    )
+
+
+def test_a_short_listing_is_listed_again_before_failing(monkeypatch, tmp_path, caplog):
+    """A listing missing a program is retried once, and both results are logged."""
+    full = R.Offered(["Pinwheel", "czartroniks/Quilt"], ["lzx", "czartroniks"])
+    lister, calls = offering(R.Offered(["Quilt", "Fray"]), full)
+    with caplog.at_level("INFO"):
+        plan = cut_render(monkeypatch, tmp_path, lister)
+    assert [c.program for c in plan] == ["czartroniks/Quilt", "Pinwheel"] and calls == [0, 1]
+    assert (
+        "listing again" in caplog.text
+        and "second listing: 2 programs from authors lzx, czartroniks" in caplog.text
+    )
+
+
+def test_the_does_not_offer_error_says_what_the_device_listed(monkeypatch, tmp_path):
+    """The error carries each listing's count, its authors, a sample, and where a missing name was found."""
+    lister, calls = offering(R.Offered(["Quilt", "Fray"]), R.Offered(["Quilt", "Fray", "Bitcullis"], None))
+    with pytest.raises(R.UnknownProgramError) as caught:
+        cut_render(monkeypatch, tmp_path, lister)
+    said = str(caught.value)
+    assert calls == [0, 1] and said.startswith(
+        "the device does not offer czartroniks/Quilt, Pinwheel; it listed "
+    )
+    assert "2 programs from authors unreported, e.g. Quilt, Fray; listed czartroniks/Quilt as Quilt" in said
+    assert " then 3 programs from authors unreported, e.g. Quilt, Fray, Bitcullis" in said
+
+
+def test_describe_offer_samples_a_long_listing():
+    names = [f"P{i}" for i in range(R.LISTING_SAMPLE + 3)]
+    said = R.describe_offer(R.Offered(names, ["lzx"]), ["Q"])
+    assert said == f"{len(names)} programs from authors lzx, e.g. {', '.join(names[: R.LISTING_SAMPLE])}"
+    assert R.describe_offer([]) == "0 programs from authors unreported, e.g. none"
+
+
+def test_device_programs_reports_the_authors_it_enumerated(monkeypatch):
+    from syncsummoner.device import transport as transport_mod
+
+    port = types.SimpleNamespace(
+        programs=lambda: ["Pinwheel", "czartroniks/Quilt"], authors=lambda: ["lzx", "czartroniks"]
+    )
+    port.close = lambda: setattr(port, "closed", True)
+    monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda: port))
+    offered = R.device_programs()
+    assert list(offered) == ["Pinwheel", "czartroniks/Quilt"] and offered.authors == ("lzx", "czartroniks")
+    assert port.closed

@@ -308,6 +308,15 @@ transmitter's return after it is waited for the same way. The capture probe that
 follows keeps a budget, `probe_timeout_s`, because that is the card and recorder,
 not the device.
 
+## One shell client, one command at a time
+
+The shell answers one connection and one command at a time, and a reply that a
+client stopped waiting for would be read as the next command's. pyvmancer awaits
+every reply on USB liveness with no deadline, opens the tty exclusively, and
+sends a sync barrier before a client's first command. syncsummoner opens one
+`Transport` at a time and closes it before the next opens: a second open, here
+or by any other process, raises `PortBusyError`.
+
 ## A link-dropped load holds the link down for the command only
 
 `Session.load_program(..., link=...)` drops the source link while the device
@@ -318,6 +327,23 @@ for the transmitter or a picture, inside the drop is a circular wait that only a
 unblank ends. Those waits therefore start only after the link is back, and
 `Transport.watch` raises `HeldLinkError` if one starts or polls while the link is
 held down. Progress lines written during the drop end in `link down`.
+
+## Vid Route Mode decides what the processor is fed
+
+SETTINGS > Vid Route Mode is settings key 1, valued as the Serial Port Guide's
+table that pyvmancer carries as `ROUTE_MODES`: 0 Analog In, 1 HDMI In, 2 Dual In,
+3 Standalone, 4 Auto. With the route found on Dual
+In, `video status` still read source `hdmi`, the HDMI input locked and the
+transmitter active, Passthru loaded and ran, and every program output exact
+zero, so the input check below passed while nothing was fed to the processor.
+Programs looked dead until the route was set back to HDMI In.
+
+`device doctor` fails `video.route` unless key 1 reads the expected value (HDMI
+In, 1, unless `--route` says otherwise), and render, audition and archive check
+it before the run and after every load and pass, next to the CC map, stopping
+with `RouteError`. A program is judged dark only after a Passthru control on
+the same rig shows a picture; a dark control is a rig fault reported with the
+route, input lock and transmitter state.
 
 ## Vid Route Mode Auto can strand the input
 

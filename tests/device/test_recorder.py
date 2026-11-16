@@ -18,6 +18,7 @@ from syncsummoner.device.recorder import (
     RAW_422,
     BlankTakeError,
     InputRouteError,
+    RouteError,
     Recorder,
     RecorderError,
     SignalLostError,
@@ -25,6 +26,8 @@ from syncsummoner.device.recorder import (
     inspect_take,
     require_ffmpeg,
     require_input,
+    require_route,
+    rig_state,
     require_signal,
     settle,
 )
@@ -392,3 +395,29 @@ def test_the_recorder_is_asked_to_die_with_the_harness(tmp_path):
 def test_asking_to_die_with_the_parent_is_survivable():
     """A kernel that will not take the request must not stop a recording."""
     rec.die_with_parent()
+
+
+def test_rig_state_names_route_input_and_transmitter_and_never_raises():
+    """A rig fault report must still be written when the device cannot be read."""
+    assert (
+        rig_state(Transmitter())
+        == "Vid Route Mode 1 (HDMI In), input hdmi unlocked, transmitter vic 34 de 2FE90F"
+    )
+
+    class Gone(Transmitter):
+        """A device that left USB."""
+
+        def video_status(self):
+            raise OSError("device left USB")
+
+    assert rig_state(Gone()) == "rig state unread: OSError: device left USB"
+
+
+def test_require_route_names_the_reading_and_the_panel_setting():
+    """Only a mismatch raises; None skips reading the setting at all."""
+    assert require_route(Transmitter(), program="P", route=1) == 1
+    assert require_route(types.SimpleNamespace(), program="P", route=None) is None
+    port = Transmitter()
+    port.routed = 2
+    with pytest.raises(RouteError, match=r"P: Vid Route Mode reads 2 \(Dual In\), the session needs 1 "):
+        require_route(port, program="P", route=1)
