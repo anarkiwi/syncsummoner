@@ -12,10 +12,14 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, NamedTuple
+from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
 import numpy as np
-from pyvmancer.diagnose import Finding, diagnose
+from pyvmancer.const import ParamKind as Control
+from pyvmancer.const import param_kind
+from pyvmancer.diagnose import Finding, diagnose, diagnose_latency
+from pyvmancer.errors import VmancerError
+from pyvmancer.latency import DEFAULT_RATES, measure_latency
 
 from syncsummoner.probe.patterns import generate, read_state_index, state_index_capacity, with_state_index
 from syncsummoner.progress import LOG, stage
@@ -24,6 +28,7 @@ from .capture import Capture
 from .host import DEFAULT_HOST, HostCommandError, Runner, ssh_runner
 from .link import DEFAULT_BLANK, UNBLANK, Link
 from .playout import Playout
+from .profile import ParamKind
 from .recorder import MJPEG, Recorder, RecorderError, require_ffmpeg
 
 CURSOR_BLINK = "/sys/class/graphics/fbcon/cursor_blink"
@@ -126,12 +131,25 @@ def last_frame(path: str | Path, width: int, height: int, *, ffmpeg: str = "ffmp
     return np.frombuffer(data[:size], np.uint8).reshape(height, width, 3).astype(np.float32) / 255.0
 
 
+def latency_param(info: Any) -> int:
+    """A program's first continuous parameter on a knob, short of the crossfader; else P1."""
+    return next(
+        (
+            p.index
+            for p in info.sweepable()
+            if p.kind is ParamKind.CONTINUOUS and param_kind(p.index) is not Control.TOGGLE
+        ),
+        1,
+    )
+
+
 class Doctor:
     """Runs the rig's checks; every endpoint is injected, and opened only when used.
 
     ``runner`` reaches the source host, ``sysfs`` roots the card's USB lookup,
     ``formats`` lists what the card offers and ``open_transport`` opens the device.
-    Only the loop check, through ``playout``, ``link`` and ``recorder``, changes state.
+    Only the loop check, through ``playout``, ``link`` and ``recorder``, and the
+    latency check, through ``measure``, change state.
     """
 
     def __init__(
@@ -147,6 +165,9 @@ class Doctor:
         playout: Any = None,
         link: Any = None,
         recorder: Any = None,
+        measure: Callable[..., Any] = measure_latency,
+        latency_params: Sequence[int] | None = None,
+        latency_rates: Sequence[float] | None = None,
         rng: np.random.Generator | None = None,
         settle_s: float = 40.0,
         probe_s: float = 1.0,
@@ -168,6 +189,9 @@ class Doctor:
         self._recorder = recorder or Recorder(
             capture, width=fmt.width, height=fmt.height, fps=fmt.fps, mode=MJPEG
         )
+        self._measure = measure
+        self.latency_params = None if latency_params is None else tuple(latency_params)
+        self.latency_rates = DEFAULT_RATES if latency_rates is None else tuple(latency_rates)
         self._rng = np.random.default_rng() if rng is None else rng
         self.settle_s = float(settle_s)
         self.probe_s = float(probe_s)
@@ -272,6 +296,49 @@ class Doctor:
             )
         ]
 
+    def latency(self, transport: Any) -> list[Finding]:
+        """pyvmancer's ``midi.latency`` and ``midi.backlog``; writes, then restores, parameters.
+
+        Without ``latency_params`` the loaded program's :func:`latency_param` is measured.
+        """
+        device = transport.device
+        if not device.has_midi:
+            return [
+                Finding(
+                    "midi.latency",
+                    False,
+                    "skipped: no MIDI link is open",
+                    "check the device's USB MIDI port enumerates (`vmancer list`)",
+                )
+            ]
+        try:
+            params = self.latency_params or (latency_param(transport.program_info()),)
+            with stage("latency", params=",".join(map(str, params))) as result:
+                measured = self._measure(device, params=params, rates=self.latency_rates, report=LOG.info)
+                result.update(median_s=measured.single_median, restored=measured.restored)
+        except (ValueError, VmancerError) as err:
+            return [
+                Finding(
+                    "midi.latency",
+                    False,
+                    f"skipped: {err}",
+                    "choose unmodulated knobs with headroom with --latency-params",
+                )
+            ]
+        found = diagnose_latency(measured) or [
+            Finding("midi.latency", False, f"skipped: output timing {measured.timing} has no frame period")
+        ]
+        if not measured.restored:
+            found.append(
+                Finding(
+                    "midi.restored",
+                    False,
+                    f"P{list(measured.params)} did not read back {list(measured.prior)}",
+                    "the probed parameters were left offset: reload the program",
+                )
+            )
+        return found
+
     def _grab(self, index: int) -> np.ndarray | None:
         """Record short probes until the pushed frame comes back, or the budget runs out."""
         deadline, frame = self._clock() + self.settle_s, None
@@ -345,8 +412,8 @@ class Doctor:
             done.append("cursor blink off")
         return done
 
-    def checks(self, *, loop: bool = False) -> list[Finding]:
-        """Every check, the device opened once for both its own checks and the loop."""
+    def checks(self, *, loop: bool = False, latency: bool = False) -> list[Finding]:
+        """Every check, the device opened once for its own checks, the latency and the loop."""
         found = self.source() + self.card()
         try:
             transport = self._open_transport()
@@ -361,6 +428,8 @@ class Doctor:
             ]
         try:
             found += self.device(transport)
+            if latency:
+                found += self.latency(transport)
             if loop:
                 reachable = any(f.check == "ssh.reachable" and f.ok for f in found)
                 found += (
@@ -372,10 +441,10 @@ class Doctor:
             transport.close()
         return found
 
-    def run(self, *, loop: bool = False, fix: bool = False) -> list[Finding]:
+    def run(self, *, loop: bool = False, latency: bool = False, fix: bool = False) -> list[Finding]:
         """Run the checks; with ``fix``, remediate what is safe and run them again."""
-        found = self.checks(loop=loop)
+        found = self.checks(loop=loop, latency=latency)
         applied = self.fix(found) if fix else []
         for action in applied:
             LOG.info("fixed: %s", action)
-        return self.checks(loop=loop) if applied else found
+        return self.checks(loop=loop, latency=latency) if applied else found

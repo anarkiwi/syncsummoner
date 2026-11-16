@@ -113,6 +113,7 @@ ss device list          # serial, rawmidi node, tty, usbfs
 ss device ping          # firmware, and the video status the device reports
 ss device programs      # what can actually be composed for
 ssh pi@videopi 'echo 0 | sudo tee /sys/class/graphics/fbcon/cursor_blink'
+ss device doctor --latency  # rig checks, plus MIDI CC latency and backlog at the session's frame rate
 ```
 
 That last line matters: a blinking console cursor inverts its cell on top of the
