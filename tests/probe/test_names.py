@@ -5,11 +5,13 @@
 import json
 
 import pytest
+from pyvmancer.errors import DeviceGoneError, ShellError
 
 from syncsummoner.device.profile import ParamKind, Role
 from syncsummoner.probe import names as N
 from syncsummoner.probe.archive import PROGRAM_INFO, ArchiveError, FrameArchive
-from tests.device.conftest import COLORBARS_INFO, FakeClock
+from syncsummoner.probe.harvest import GONE_NOTE
+from tests.device.conftest import COLORBARS_INFO
 from tests.probe.test_archive import KEY, rows
 
 
@@ -20,14 +22,16 @@ def info(name):
 class Port:
     """Transport stub: switches program a set number of replies after each load."""
 
-    def __init__(self, *, lag=0, fail=(), holds=True):
-        self.lag, self.fail, self.holds = lag, set(fail), holds
+    def __init__(self, *, lag=0, fail=(), gone=False):
+        self.lag, self.fail, self.gone = lag, set(fail), gone
         self.current, self.pending, self.loads = "Passthru", None, []
 
     def load_program(self, name):
         self.loads.append(name)
-        if name in self.fail or not self.holds:
-            raise RuntimeError(f"no response loading {name}")
+        if self.gone:
+            raise DeviceGoneError(f"loading {name}", "shell busy 4.0s, usb gone")
+        if name in self.fail:
+            raise ShellError(4, "program not found", f"program load {name}")
         self.pending = (name.rpartition("/")[2], self.lag)
 
     def program_payload(self, name=None):
@@ -57,23 +61,20 @@ def test_plain_name_drops_the_author():
     assert N.plain_name("Fray") == "Fray"
 
 
-def test_a_stale_reply_is_asked_again_until_it_names_the_program():
-    clock = FakeClock()
-    port = Port(lag=2)
-    payload = N.read_program_info(port, "author/Beta", sleep=clock.sleep, clock=clock)
-    assert payload["name"] == "Beta"
-    assert clock.now == pytest.approx(1.0), "two stale replies, half a second apart"
+def test_the_reply_after_a_completed_load_names_the_program():
+    assert N.read_program_info(Port(), "author/Beta")["name"] == "Beta"
 
 
-def test_a_reply_that_never_switches_is_an_error():
-    clock = FakeClock()
-    with pytest.raises(LookupError, match="still reports 'Passthru'"):
-        N.read_program_info(Port(lag=99), "Alpha", timeout_s=2.0, sleep=clock.sleep, clock=clock)
+def test_a_reply_naming_another_program_is_an_error_at_once():
+    """The load returns only once the device runs the program, so another name is a wrong answer."""
+    port = Port(lag=1)
+    with pytest.raises(LookupError, match="device reports 'Passthru' after loading 'Alpha'"):
+        N.read_program_info(port, "Alpha")
 
 
 def test_backfill_annotates_what_lacks_a_reply_and_skips_the_rest(archive):
     port = Port()
-    report = N.backfill(archive, port, sleep=lambda _s: None)
+    report = N.backfill(archive, port)
     assert sorted(report.annotated) == ["Alpha", "author/Beta"] and report.skipped == ["Gamma"]
     assert "Gamma" not in port.loads
     meta = json.loads(archive.paths("author/Beta")[2].read_text(encoding="utf-8"))
@@ -82,17 +83,20 @@ def test_backfill_annotates_what_lacks_a_reply_and_skips_the_rest(archive):
     assert not again.annotated and len(again.skipped) == 3, "a rerun resumes, it does not repeat"
 
 
-def test_one_failed_program_is_reported_and_the_run_goes_on(archive, monkeypatch):
-    monkeypatch.setattr(N, "wedged", lambda transport: False)
+def test_one_failed_program_is_reported_and_the_run_goes_on(archive):
     said = []
     report = N.backfill(archive, Port(fail={"Alpha"}), log=said.append)
     assert set(report.failed) == {"Alpha"} and report.annotated == ["author/Beta"]
-    assert not report.wedged and "Alpha" in said[0]
+    assert not report.gone and "Alpha" in said[0]
 
 
-def test_a_device_that_holds_nothing_ends_the_run(archive):
-    report = N.backfill(archive, Port(holds=False), programs=["Alpha", "author/Beta", "Missing"])
-    assert report.wedged and list(report.failed) == ["Alpha"] and not report.annotated
+def test_a_device_gone_from_usb_ends_the_run(archive):
+    said = []
+    report = N.backfill(
+        archive, Port(gone=True), programs=["Alpha", "author/Beta", "Missing"], log=said.append
+    )
+    assert report.gone and list(report.failed) == ["Alpha"] and not report.annotated
+    assert said[-1] == GONE_NOTE
 
 
 def test_archived_specs_carry_names_ranges_and_roles(archive):

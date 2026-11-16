@@ -157,13 +157,13 @@ def test_verify_addressing_detects_gain_error():
         session.verify_addressing(3, target=0.8)
 
 
-def test_load_program_absorbs_blackout_and_reparks():
+def test_load_program_reparks_with_no_fixed_blackout():
+    """The transport returns once the device runs the program, so nothing is slept out blind."""
     clock = FakeClock()
-    session, port, _ = make_session(clock=clock, load_blackout_s=4.0)
+    session, port, _ = make_session(clock=clock)
     session.set_params({1: 0.5})
     session.load_program("Isotherm")
     assert port.loaded == "Isotherm"
-    assert 4.0 in clock.slept
     assert session.sent == {i: 0 for i in range(1, PARAM_COUNT + 1)}
 
 
@@ -201,15 +201,14 @@ def logging_session(port, clock, **kwargs):
 
 def test_load_program_holds_the_link_down_across_the_whole_reconfiguration():
     port, clock = FakeTransport(), FakeClock()
-    session = logging_session(port, clock, load_blackout_s=4.0)
+    session = logging_session(port, clock)
     session.load_program("Isotherm", link=FakeLink(port.calls), park=False)
-    assert port.calls[:3] == [("link", "down"), ("load", "Isotherm"), ("sleep", 4.0)]
-    assert ("link", "up") in port.calls
+    assert port.calls[:3] == [("link", "down"), ("load", "Isotherm"), ("link", "up")]
 
 
 def test_load_program_waits_for_settled_state_before_parking():
     port, clock = FakeTransport(), FakeClock()
-    session = logging_session(port, clock, load_blackout_s=0.0)
+    session = logging_session(port, clock)
     session.load_program("Isotherm", link=FakeLink(port.calls), park=True)
     restored = port.calls.index(("link", "up"))
     writes = [i for i, call in enumerate(port.calls) if call[0] == "manual"]
@@ -218,7 +217,7 @@ def test_load_program_waits_for_settled_state_before_parking():
 
 def test_load_program_without_a_link_parks_immediately():
     port, clock = FakeTransport(), FakeClock()
-    session = logging_session(port, clock, load_blackout_s=0.0)
+    session = logging_session(port, clock)
     session.load_program("Isotherm", park=False)
     assert ("link", "up") not in port.calls
 
@@ -254,8 +253,8 @@ def test_load_program_restores_the_link_when_the_load_fails():
 
 def test_load_program_without_a_link_touches_nothing_extra():
     port, clock = FakeTransport(), FakeClock()
-    logging_session(port, clock, load_blackout_s=4.0).load_program("Isotherm", park=False)
-    assert port.calls == [("load", "Isotherm"), ("sleep", 4.0)]
+    logging_session(port, clock).load_program("Isotherm", park=False)
+    assert port.calls == [("load", "Isotherm")]
 
 
 def test_load_program_journals_whether_the_link_was_used():
@@ -462,7 +461,7 @@ def test_park_on_a_fake_transport_sinks_first_and_reasserts_after_readback():
 
 
 def test_an_armed_midi_assign_after_a_link_dropped_load_is_reassigned_and_recorded(caplog):
-    session, shell = rig_session(load_blackout_s=0.0)
+    session, shell = rig_session()
     session.load_program("Isotherm", park=False, link=FakeLink([]))
     shell.armed = 12
     with caplog.at_level("WARNING", logger="syncsummoner"):

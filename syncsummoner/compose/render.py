@@ -16,7 +16,14 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
-from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, require_signal, settle
+from syncsummoner.device.recorder import (
+    BlankTakeError,
+    TakeReport,
+    inspect_take,
+    require_input,
+    require_signal,
+    settle,
+)
 from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
@@ -36,9 +43,6 @@ class UnsafeOutputError(RuntimeError):
     """Output tripped a hard safety veto and mitigation was declined."""
 
 
-#: Relock after a load was measured at 12 to 19s, against a settle budget that is
-#: a timeout; half the budget is what a pass is expected to wait, for estimates.
-EXPECTED_RELOCK_FRAC = 0.5
 #: A pass sleeps in ticks no longer than this, so its progress moves while it waits.
 DRIVE_TICK_S = 1.0
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
@@ -67,8 +71,12 @@ class RenderConfig:
     early_bias_s: float = EARLY_BIAS_S
     #: Parameter writes per second, shared by the planner and the session's pacing.
     cc_budget_hz: float = CC_BUDGET_HZ
-    #: Budget for the picture to return after a load; relock was measured at 12 to 19 seconds.
-    settle_s: float = 40.0
+    #: The card's budget to deliver a probe once the transmitter drives the session timing.
+    probe_timeout_s: float = 40.0
+    #: The input the session feeds the device, verified after every load; None skips the check.
+    source: str | None = "hdmi"
+    #: pyvmancer's opt-in stall guard for device waits; None waits for as long as the device is on USB.
+    stall_s: float | None = None
     #: Recorded before the clip is started, so the picture's own first frame is inside the take.
     lead_s: float = 3.0
     #: Where the liveness probe is recorded before a take begins.
@@ -379,9 +387,10 @@ def render_played(
                     rig.transport,
                     program=layers[0].program,
                     timing=config.timing,
-                    timeout_s=config.settle_s,
+                    probe_timeout_s=config.probe_timeout_s,
                     probe_path=config.probe_path,
                 )
+                require_input(rig.transport, program=layers[0].program, source=config.source)
                 if not probe.mostly_picture:
                     raise BlankTakeError(f"{layers[0].program}: the program outputs no picture ({probe})")
         auto = schedule(
@@ -567,12 +576,12 @@ def render_cuts(
             ", ".join(unused),
         )
     LOG.info(
-        "%d cuts over %d programs: %d passes of %s plus a relock each, about %s of rig time",
+        "%d cuts over %d programs: %d passes of %s plus a load and relock each, %s of capture",
         len(plan),
         len(ordered),
         len(fresh),
         human(score.duration),
-        human(len(fresh) * (score.duration + config.settle_s * EXPECTED_RELOCK_FRAC)),
+        human(len(fresh) * score.duration),
     )
     if fresh and not prepared:
         write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
@@ -622,7 +631,7 @@ def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True
     from syncsummoner.device import session as session_mod
     from syncsummoner.device import transport as transport_mod
 
-    transport = transport_mod.Transport.open()
+    transport = transport_mod.Transport.open(stall=config.stall_s)
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         transport=transport,

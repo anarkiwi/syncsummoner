@@ -182,11 +182,19 @@ ss probe archive --out archive/ --source-host pi@videopi --retry-dark --program 
 ```
 
 A program that fails (no picture after its load, a CC map that changed, a shell
-error) is logged as `FAILED` with its error, leaves no archive and no dark verdict,
-and is retried on the next resume; the run goes on. Only a rig fault ends a run:
-a device that will hold no program or has gone, or a Passthru that shows no picture
-(which a lost capture card also produces). The closing summary lists every failed
-program with its error and names the fault, if any.
+error, the device reading an input other than `hdmi`) is logged as `FAILED` with
+its error, leaves no archive and no dark verdict, and is retried on the next
+resume; the run goes on. Only a rig fault ends a run, and only on positive
+evidence: the device gone from USB, or a fresh Passthru that loads, reads `hdmi`
+and drives the session timing but shows no picture (which a lost capture card also
+produces). A load that merely takes long is never a fault. The closing summary
+lists every failed program with its error and names the fault, if any.
+
+Loads, and the transmitter's return after them, wait for as long as the device
+stays on USB, logging `still loading ...` lines as they go; author switches take
+several seconds of shell silence. `--stall SECONDS` (before the subcommand) is an
+opt-in guard for unattended runs: it fails a wait once nothing the device reports
+has changed for that long. It is off by default.
 
 An archive keeps the device's own `program info` reply beside its frames, and a
 refit carries it into every parameter's name, native range and role. An archive
@@ -471,8 +479,8 @@ with offending windows is temporally low-passed, not discarded.
 ## Time it takes
 
 A cut render says what it is about to cost before it starts the first pass —
-`N cuts over M programs: M passes of <length> plus a relock each, about <total>
-of rig time` — and every stage after that reports its own elapsed time.
+`N cuts over M programs: M passes of <length> plus a load and relock each, <total>
+of capture` — and every stage after that reports its own elapsed time.
 
 For a three minute piece at `1080p30`, per program: the load and relock, measured
 at 12 to 19 s, then three minutes of real-time capture. Eight programs is
@@ -515,6 +523,7 @@ doing it twice, which is what the audition is for.
 | `Permission denied` writing the scratch | files left by an earlier run as root; `sudo chown -R "$USER" .` in the work directory |
 | `cannot cache function ... no locator available` | numba has nowhere to write librosa's jit cache; the image sets `NUMBA_CACHE_DIR`, so rebuild it, or pass `-e NUMBA_CACHE_DIR=/tmp/numba-cache` |
 | `more programs than sections, N never comes up` | cuts follow the score's sections; audition a longer span, or name fewer programs |
+| black output; `device.input` fails, or a pass fails with `InputRouteError` | the device fell back to another input (Vid Route Mode Auto after the source link dropped); select `hdmi` on the front panel, or set Vid Route Mode to HDMI |
 | `video status` holds `NTSC` (or another timing) with `overridden` while the source is fine | a front panel override: set SETTINGS > Vid Route Mode to Auto, SYSTEM > Pref. Timing to the session format, power-cycle |
 | recorder cannot open the session format; the card lists only SD YUYV/NV12 | the card enumerated on USB 2; plug it straight into a USB 3 port with a USB 3 cable |
 | device reports no input lock, Pi `fb0/blank` reads 4 | the Pi framebuffer was left powered down; `syncsummoner device doctor --fix` |

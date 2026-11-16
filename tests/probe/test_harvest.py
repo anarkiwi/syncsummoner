@@ -7,11 +7,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from pyvmancer import CcMapError, ShellError, TransportError
+from pyvmancer import CcMapError, DeviceGoneError, ProgramLoadError, ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device import recorder as recorder_mod
-from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take
+from syncsummoner.device.recorder import BlankTakeError, InputRouteError, TakeReport, inspect_take
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import harvest as H
@@ -33,7 +33,6 @@ CONFIG = H.HarvestConfig(
     dwell_s=1.0,
     startup_s=0.0,
     health_poll_s=0.0,
-    wedge_settle_s=0.0,
     loop_frames=2,
 )
 #: A take that carries a moving picture, and one that is black however long it ran.
@@ -52,10 +51,10 @@ def no_ffmpeg(monkeypatch):
     monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: LIVE)
 
 
-def blind(monkeypatch, *, canary=True, take=DARK, canary_probe=None):
+def blind(monkeypatch, *, canary=True, take=DARK, canary_probe=DARK):
     """Every take reads black; ``canary`` says whether the passthrough still carries one.
 
-    A dark canary fails its settle, unless ``canary_probe`` is what its settle returns.
+    A dark canary settles to ``canary_probe``, or fails its settle when that is None.
     """
     monkeypatch.setattr(H, "inspect_take", lambda path, **kwargs: take)
 
@@ -103,6 +102,11 @@ class Port:
         self.loads.append(name)
         if self.load_errors.get(name):
             raise self.load_errors[name].pop(0)
+        if not self.holds:
+            raise ShellError(4, "program not found", f"program load {name}")
+
+    def watch(self, what):
+        return self.transmitter.watch(what)
 
     def program_payload(self, name=None):
         del name
@@ -361,22 +365,16 @@ def test_attribution_of_a_recording_that_holds_no_frames():
     assert not H.attribute(np.array([]), [window(0, 1.0, 2.0)], "Alpha", base=BASE)
 
 
-def test_wedged_distinguishes_a_live_device_from_one_that_holds_nothing():
-    assert not H.wedged(Port(), sleep=lambda _s: None)
-    assert H.wedged(Port(holds=False), sleep=lambda _s: None)
-
-
-def test_a_load_misread_before_it_completes_is_not_a_wedge():
-    """The verdict is ``program info`` after the settle, not a shell error from the load itself."""
+def test_holds_program_is_the_load_completing():
+    """The load waits on liveness, so its outcome is the verdict: refused is no, gone propagates."""
+    assert H.holds_program(Port())
+    assert not H.holds_program(Port(holds=False))
     port = Port()
-    port.load_errors[H.WEDGE_PROBE] = [ShellError(3, "no program loaded", "program info")]
-    assert not H.wedged(port, sleep=lambda _s: None)
-    port = Port(holds=False)
-    port.load_errors[H.WEDGE_PROBE] = [ShellError(3, "no program loaded", "program info")]
-    assert H.wedged(port, sleep=lambda _s: None)
-    port = Port()
-    port.load_errors[H.WEDGE_PROBE] = [TransportError("device gone")]
-    assert H.wedged(port, sleep=lambda _s: None), "a device that has gone holds nothing"
+    port.load_errors[H.WEDGE_PROBE] = [ProgramLoadError("Passthru", {"state": "running"}, "did not load")]
+    assert not H.holds_program(port)
+    port.load_errors[H.WEDGE_PROBE] = [DeviceGoneError("loading Passthru", "shell busy 3.0s")]
+    with pytest.raises(DeviceGoneError):
+        H.holds_program(port)
 
 
 def test_wait_healthy_reopens_the_transport_across_a_power_cycle():
@@ -428,26 +426,38 @@ def test_the_canary_restarts_the_stimulus_before_blaming_the_rig():
     assert player.starts == 1 and player.running
 
 
-@pytest.mark.parametrize("probe", [None, DARK], ids=["no-signal", "uniform"])
-def test_the_canary_is_false_when_the_picture_never_comes_back(monkeypatch, probe):
-    """A passthrough with no transmitter, or one driving a flat field, means the rig is dark."""
-    blind(monkeypatch, canary=False, canary_probe=probe)
+def test_the_canary_is_false_only_for_a_transmitted_flat_field(monkeypatch):
+    """A passthrough driving a flat field means the rig is dark; a capture that never came is no verdict."""
+    blind(monkeypatch, canary=False)
     clock = FakeClock()
     port = Port()
     assert not H.carries_stimulus(Sess(port), Rec(clock), port, config=CONFIG, sleep=clock.sleep, clock=clock)
+    blind(monkeypatch, canary=False, canary_probe=None)
+    with pytest.raises(BlankTakeError):
+        H.carries_stimulus(Sess(port), Rec(clock), port, config=CONFIG, sleep=clock.sleep, clock=clock)
+
+
+def test_a_passthrough_on_the_wrong_input_is_a_route_error_not_a_dark_rig(monkeypatch):
+    """A device left on analog is black for a reason the route check names before the picture is judged."""
+    blind(monkeypatch, canary=False)
+    clock = FakeClock()
+    port = Port(video=[dict(tx.LIVE, source="analog")])
+    with pytest.raises(InputRouteError, match="reads input 'analog'"):
+        H.carries_stimulus(Sess(port), Rec(clock), port, config=CONFIG, sleep=clock.sleep, clock=clock)
 
 
 def test_the_canary_judges_the_stimulus_only_once_the_transmitter_drives_it(monkeypatch):
-    """The real settle: a passthrough whose transmitter never returns carries nothing."""
+    """The real settle: the transmitter is waited for on liveness, and a device that leaves USB ends it."""
     monkeypatch.setattr(H, "settle", recorder_mod.settle)
     monkeypatch.setattr(recorder_mod, "inspect_take", lambda path, **kwargs: LIVE)
     clock = FakeClock()
-    alive, dead = Port(video=tx.blackout(3)), Port(video=[tx.DEAD])
-    for port, carried in ((alive, True), (dead, False)):
-        recorder = Rec(clock)
-        got = H.carries_stimulus(Sess(port), recorder, port, config=CONFIG, sleep=clock.sleep, clock=clock)
-        assert got is carried and len(recorder.recordings) == int(carried)
-    assert alive.transmitter.polls == 4
+    alive, dead = Port(video=tx.blackout(300)), Port(video=[tx.DEAD])
+    recorder = Rec(clock)
+    assert H.carries_stimulus(Sess(alive), recorder, alive, config=CONFIG, sleep=clock.sleep, clock=clock)
+    assert alive.transmitter.polls == 302 and len(recorder.recordings) == 1
+    dead.transmitter.attached = (True, False)
+    with pytest.raises(DeviceGoneError):
+        H.carries_stimulus(Sess(dead), Rec(clock), dead, config=CONFIG, sleep=clock.sleep, clock=clock)
 
 
 def test_a_program_is_swept_into_exactly_one_recording(tmp_path):
@@ -538,23 +548,36 @@ def test_harvest_only_probes_the_programs_it_was_given(tmp_path):
     assert [r.program for r in report.results] == ["Beta"]
 
 
-def test_harvest_stops_once_the_device_will_not_hold_a_program(tmp_path):
-    """No software recovery exists, so the remaining programs must not be burnt through."""
-
-    class Failing(Sess):
-        """Session whose second load leaves the device holding nothing."""
-
-        def load_program(self, name, *, park=True, link=None):
-            super().load_program(name, park=park, link=link)
-            if name == "Beta":
-                self.transport.holds = False
-                raise RuntimeError("load failed")
-
+def test_harvest_stops_once_the_device_leaves_usb(tmp_path):
+    """A device gone from USB needs a power cycle, so the remaining programs must not be burnt through."""
     port = Port(programs=("Alpha", "Beta", "Gamma"))
-    report = run(Archive(tmp_path), port=port, session_factory=Failing)
-    assert report.wedged and [r.program for r in report.results] == ["Alpha", "Beta"]
-    assert report.failures[0].error.startswith("RuntimeError")
+    gone = DeviceGoneError("loading Beta", "shell busy 8.0s, usb gone")
+    port.load_errors = {"Beta": [gone]}
+    report = run(Archive(tmp_path), port=port, session_factory=passthrough_raises(gone))
+    assert report.gone and [r.program for r in report.results] == ["Alpha", "Beta"]
+    assert report.failures[0].error.startswith("DeviceGoneError") and report.fault.startswith(H.GONE_NOTE)
     assert port.closed
+
+
+def test_a_load_that_merely_runs_long_never_stops_the_run(tmp_path):
+    """A refused or wrong load on a device still on USB fails that program only."""
+    port = Port(programs=("Alpha", "Beta"))
+    port.load_errors = {"Alpha": [ProgramLoadError("Alpha", {"state": "idle"}, "did not load")]}
+    report = run(Archive(tmp_path), port=port)
+    assert not report.stopped and [r.program for r in report.failures] == ["Alpha"]
+    assert report.results[1].frames == PER_PROGRAM
+
+
+def test_a_device_left_on_another_input_fails_the_pass_not_the_run(tmp_path):
+    """The selected input is verified after every load; a mismatch is that pass's failure."""
+    port, archive = Port(programs=("Alpha", "Beta"), video=[dict(tx.LIVE, source="analog")]), Archive(
+        tmp_path
+    )
+    said = []
+    report = run(archive, port=port, log=said.append)
+    assert [r.program for r in report.failures] == ["Alpha", "Beta"] and not report.stopped
+    assert all(r.error.startswith("InputRouteError") for r in report.failures) and not archive.commits
+    assert any("Passthru check raised InputRouteError" in line for line in said)
 
 
 def test_a_cc_map_changed_by_the_end_of_a_sweep_fails_the_program_unarchived(tmp_path):
@@ -572,12 +595,12 @@ def test_a_cc_map_changed_by_the_end_of_a_sweep_fails_the_program_unarchived(tmp
     assert [r.program for r in report.failures] == ["Alpha"]
     assert report.failures[0].error.startswith("CcMapError")
     assert archive.commits == ["Beta"] and port.verified == 2
-    assert not report.wedged and not report.blacked
+    assert not report.gone and not report.blacked
 
 
 @pytest.mark.parametrize(
     ("video", "when"),
-    [([tx.DEAD], "as the sweep began"), ([tx.LIVE, tx.at("720p60"), tx.LIVE], "as the sweep ended")],
+    [([tx.DEAD], "as the sweep began"), ([tx.LIVE, tx.LIVE, tx.at("720p60"), tx.LIVE], "as the sweep ended")],
     ids=["dropped-before", "dropped-during"],
 )
 def test_a_transmitter_lost_at_a_sweep_boundary_fails_the_program_unarchived(tmp_path, video, when):
@@ -627,6 +650,21 @@ def test_a_failure_with_a_live_canary_carries_on(tmp_path):
     assert report.failures and report.results[1].frames == PER_PROGRAM
 
 
+def passthrough_raises(*errors):
+    """A session factory whose passthrough loads raise ``errors`` in turn; the device itself opens fine."""
+    queue = list(errors)
+
+    class Refusing(Sess):
+        """Session whose passthrough load raises the next queued error."""
+
+        def load_program(self, name, *, park=True, link=None):
+            super().load_program(name, park=park, link=link)
+            if name == H.WEDGE_PROBE and queue:
+                raise queue.pop(0)
+
+    return Refusing
+
+
 def blank_once(monkeypatch, program):
     """``program`` shows no picture after its load; everything else, the passthrough included, does."""
 
@@ -644,9 +682,9 @@ def test_a_passthrough_load_that_raises_on_a_healthy_device_does_not_end_the_run
     """A blank program, then a passthrough load misread before it completed: the next program still runs."""
     blank_once(monkeypatch, "Alpha")
     port = Port(programs=("Alpha", "Beta"))
-    port.load_errors[H.WEDGE_PROBE] = [ShellError(3, "no program loaded", "program info")] * 3
+    refusing = passthrough_raises(ShellError(3, "no program loaded", "program info"))
     said = []
-    report = run(Archive(tmp_path), port=port, log=said.append)
+    report = run(Archive(tmp_path), port=port, log=said.append, session_factory=refusing)
     assert not report.stopped and not report.fault
     assert [r.program for r in report.results] == ["Alpha", "Beta"] and report.results[
         1
@@ -655,21 +693,12 @@ def test_a_passthrough_load_that_raises_on_a_healthy_device_does_not_end_the_run
     assert any("Passthru check raised ShellError" in line for line in said)
 
 
-def test_a_passthrough_that_raises_on_a_device_holding_nothing_is_a_wedge(tmp_path, monkeypatch):
+def test_a_passthrough_check_that_finds_the_device_gone_stops_the_run(tmp_path, monkeypatch):
     """The device that went away mid-check is a rig fault, and the run stops there."""
     blank_once(monkeypatch, "Alpha")
-
-    class Vanishing(Sess):
-        """Session whose passthrough load finds the device gone."""
-
-        def load_program(self, name, *, park=True, link=None):
-            super().load_program(name, park=park, link=link)
-            if name == H.WEDGE_PROBE:
-                self.transport.holds = False
-                raise TransportError("device gone")
-
-    report = run(Archive(tmp_path), port=Port(programs=("Alpha", "Beta")), session_factory=Vanishing)
-    assert report.wedged and report.fault == H.WEDGED_NOTE
+    gone = passthrough_raises(DeviceGoneError("loading Passthru", "shell busy 2.0s, usb gone"))
+    report = run(Archive(tmp_path), port=Port(programs=("Alpha", "Beta")), session_factory=gone)
+    assert report.gone and report.fault.startswith(H.GONE_NOTE)
     assert [r.program for r in report.results] == ["Alpha"]
 
 
@@ -694,7 +723,9 @@ def test_the_summary_lists_each_failed_program_with_its_error_and_the_fault(tmp_
     ]
     blind(monkeypatch, canary=False)
     report = run(Archive(tmp_path / "b"), port=Port(programs=("Alpha", "Beta")))
-    assert report.summary()[-1].startswith(f"stopped: {H.BLACKED_NOTE} (Passthru: no picture")
+    assert report.summary()[-1].startswith(
+        f"stopped: {H.BLACKED_NOTE} (Passthru: the passthrough shows no picture"
+    )
     assert ", 0 failed" in report.summary()[0], "a dark discard is not a failure"
 
 
@@ -711,7 +742,7 @@ def test_a_failure_on_a_dark_rig_stops_the_run(tmp_path, monkeypatch):
                 raise RuntimeError("that one is broken")
 
     report = run(Archive(tmp_path), session_factory=Failing)
-    assert report.blacked and not report.wedged, "a dark rig is not a wedge"
+    assert report.blacked and not report.gone, "a dark rig is not a device gone from USB"
     assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than trying the rest"
 
 
@@ -732,7 +763,7 @@ def test_black_output_with_a_dark_canary_stops_the_run(tmp_path, monkeypatch):
     blind(monkeypatch, canary=False)
     report = run(Archive(tmp_path))
     assert report.blacked is True and report.stopped is True
-    assert report.wedged is False, "a black output is not a wedge, and needs its own diagnosis"
+    assert report.gone is False, "a black output is not a device gone from USB, and needs its own diagnosis"
     assert [r.program for r in report.results] == ["Alpha"], "it stopped rather than archiving more"
 
 

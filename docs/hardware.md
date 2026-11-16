@@ -287,3 +287,32 @@ processor unresponsive to every subsequent command; MIDI and video output
 continued, `USBDEVFS_RESET` did not recover it, and a power cycle was required.
 On 1.0.1 `settings get <key>` answers `{"key":k,"type":"uint32","value":v}`, and
 the CC-map assignment on every load relies on it for keys 200..211.
+
+## Loads block the shell
+
+On firmware 1.0.1, traced with `fpga status` polled every 100 ms, the shell answers
+nothing while it works on the card: `programs enumerate lzx` took about 6 s,
+`programs enumerate czartroniks` about 10.7 s, and `program load` about 1 s once its
+author was active (0.02 s between two lzx programs). One raw `program load Fray`
+with lzx active answered after 11.4 s. Queued polls went unanswered and no log
+line appeared, while the device stayed enumerated as 16d0:14db. The FPGA can then
+sit at `state idle, configured true, program ''`, or keep running the previous
+program, before running the new one about 1 s later, and one `fpga status` poll can
+itself go unanswered meanwhile. A 20 s reply deadline once failed a Passthru load
+after a route change that completed on its own.
+
+None of that is a fault, so syncsummoner waits on liveness through pyvmancer: a
+load ends on the program running and `program info` answering, an error reply,
+the device leaving USB, or the FPGA settling on a different program. The
+transmitter's return after it is waited for the same way. The capture probe that
+follows keeps a budget, `probe_timeout_s`, because that is the card and recorder,
+not the device.
+
+## Vid Route Mode Auto can strand the input
+
+Under SETTINGS > Vid Route Mode Auto, dropping the source HDMI link made the
+device fall back to the analog input and stay there, so its output was black with
+nothing else amiss. `video status` shows it as `source: analog`. `device doctor`
+fails `device.input` when the selected input is not the session's `hdmi`, and
+archive and render passes check it after every load, failing that pass with
+`InputRouteError` rather than reading the black as a dark program or a dark rig.

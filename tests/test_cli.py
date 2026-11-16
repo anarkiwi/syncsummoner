@@ -24,14 +24,14 @@ class Port:
 
     corrupt = False
 
-    def __init__(self, serial=None):
-        self.serial = serial
+    def __init__(self, serial=None, stall=None):
+        self.serial, self.stall = serial, stall
         self.closed = False
 
     @classmethod
-    def open(cls, *, serial=None):
+    def open(cls, *, serial=None, stall=None):
         """Open."""
-        return cls(serial)
+        return cls(serial, stall)
 
     def programs(self):
         """Programs."""
@@ -190,6 +190,14 @@ def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tm
     assert "Roll Shutter: BlankTakeError: no picture" in err, "every failed program is named with its error"
 
 
+def test_the_stall_guard_is_off_unless_asked_for(harvested, tmp_path):
+    """Device waits run on liveness; ``--stall`` is the opt-in guard an unattended run may set."""
+    assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 0
+    assert harvested["open_transport"]().stall is None
+    assert cli.main(["--stall", "600", "probe", "archive", "--out", str(tmp_path)]) == 0
+    assert harvested["open_transport"]().stall == 600.0
+
+
 def test_probe_archive_lists_dark_programs_and_retries_them_when_asked(harvested, tmp_path, capsys):
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.store import KeyKind, ProgramKey
@@ -219,13 +227,13 @@ def test_probe_archive_takes_raster_and_timing_from_one_format(harvested, tmp_pa
     assert cli.main(["probe", "archive", "--out", str(tmp_path), "--format", "4k"]) == 1
 
 
-def test_probe_archive_reports_a_wedged_device_as_a_failure(monkeypatch, tmp_path):
+def test_probe_archive_reports_a_device_gone_from_usb_as_a_failure(monkeypatch, tmp_path):
     """A wedge needs a power cycle, so the exit status has to say so."""
     monkeypatch.setattr(transport_mod, "Transport", Port)
     monkeypatch.setattr(link_mod, "Link", Link)
     monkeypatch.setattr(recorder_mod, "Recorder", Rec)
     monkeypatch.setattr(recorder_mod, "require_ffmpeg", lambda *a, **kw: "ffmpeg")
-    monkeypatch.setattr(harvest_mod, "harvest", lambda *a, **kw: harvest_mod.HarvestReport(wedged=True))
+    monkeypatch.setattr(harvest_mod, "harvest", lambda *a, **kw: harvest_mod.HarvestReport(gone=True))
     assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 1
 
 

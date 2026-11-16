@@ -221,7 +221,7 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
 
         return make
 
-    module("syncsummoner.device.transport", Transport=types.SimpleNamespace(open=lambda: "transport"))
+    module("syncsummoner.device.transport", Transport=types.SimpleNamespace(open=lambda stall: "transport"))
     module("syncsummoner.device.session", Session=record("session"))
 
     def capture(*args, **kwargs):
@@ -473,7 +473,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
         R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
     )
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
-    config = dataclasses.replace(CONFIG, settle_s=7.5, probe_path=str(tmp_path / "probe.mkv"))
+    config = dataclasses.replace(CONFIG, probe_timeout_s=7.5, probe_path=str(tmp_path / "probe.mkv"))
     score = Score(
         seed=1, duration=1.0, fps=CONFIG.fps, layers=[Layer(index=0, program="Teletext", gestures=[])]
     )
@@ -497,7 +497,7 @@ def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_pat
     assert order[1][1] == {
         "program": "Teletext",
         "timing": CONFIG.timing,
-        "timeout_s": 7.5,
+        "probe_timeout_s": 7.5,
         "probe_path": config.probe_path,
     }
 
@@ -761,6 +761,7 @@ def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corr
         "play",
         "load:Passthru",
         "settle",
+        "signal",
         "stop",
         "signal",
         "play",

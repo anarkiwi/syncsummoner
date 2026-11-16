@@ -1,9 +1,13 @@
 """``video status`` payloads for the Videomancer's HDMI transmitter, and a transport replaying them."""
 
+import time
+
+from pyvmancer.liveness import Watch
 from pyvmancer.video import VideoStatus
 
 #: A transmitter driving 1080p30 into an attached sink.
 LIVE = {
+    "source": "hdmi",
     "timing": "1080p30",
     "output": {"timing": "1080p30", "hdmi_connected": True},
     "hdmi_tx": {"vic": 34, "de": "2FE90F"},
@@ -24,7 +28,33 @@ def blackout(polls: int) -> list[dict]:
     return [DEAD] * polls + [LIVE]
 
 
-class Transmitter:
+class Live:
+    """USB presence and pyvmancer liveness watches, as the transport hands them out.
+
+    ``attached`` lists the presence each check reads in turn, holding the last;
+    ``stall`` and ``clock`` configure every watch, as the shell's settings do.
+    """
+
+    attached = (True,)
+    report = None
+    stall = None
+    clock = staticmethod(time.monotonic)
+    watched: list | None = None
+
+    def present(self):
+        """The next scripted presence."""
+        seen = list(self.attached)
+        self.attached = tuple(seen[1:]) or (seen[-1],)
+        return seen[0]
+
+    def watch(self, what):
+        """A real pyvmancer ``Watch`` on this fake's presence."""
+        if self.watched is not None:
+            self.watched.append(what)
+        return Watch(what, self.present, report=self.report, stall=self.stall, clock=self.clock)
+
+
+class Transmitter(Live):
     """A transport whose ``video_status`` replays ``payloads`` in order, then holds the last."""
 
     def __init__(self, *payloads: dict):

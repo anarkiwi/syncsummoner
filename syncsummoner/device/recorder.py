@@ -29,15 +29,18 @@ __all__ = [
     "MJPEG",
     "RAW_422",
     "BlankTakeError",
+    "InputRouteError",
     "Recorder",
     "RecorderError",
     "SIGMA",
     "SignalLostError",
     "TakeReport",
+    "await_transmitting",
     "die_with_parent",
     "held",
     "inspect_take",
     "require_ffmpeg",
+    "require_input",
     "require_signal",
     "settle",
 ]
@@ -125,6 +128,54 @@ def _lost(program: str, timing: str, status: Any, when: str) -> SignalLostError:
     known = transmitting(status, timing) is not None
     why = f"the transmitter is not driving {timing}" if known else "the firmware reports no transmitter state"
     return SignalLostError(f"{program}: {why} {when}; last video status {json.dumps(status.raw)}")
+
+
+class InputRouteError(RuntimeError):
+    """The device has selected an input other than the one the session feeds."""
+
+
+def require_input(transport: Any, *, program: str, source: str | None) -> Any:
+    """The video status, when the device reads from ``source``; :class:`InputRouteError` if not.
+
+    Under Vid Route Mode Auto a dropped source link can leave the device on
+    another input, black, with nothing else amiss. None skips the check.
+    """
+    status = transport.video_status()
+    if source is not None and str(status.input_source).lower() != source.lower():
+        raise InputRouteError(
+            f"{program}: the device reads input {status.input_source!r}, the session feeds {source!r}; "
+            "check front panel SETTINGS > Vid Route Mode"
+        )
+    return status
+
+
+def await_transmitting(
+    transport: Any,
+    *,
+    program: str,
+    timing: str,
+    poll_s: float = 0.5,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Wait, on liveness, for the transmitter to drive ``timing``; returns that video status.
+
+    The transmitter coming back after a load is the event waited for, so there
+    is no deadline: every answered ``video status`` shows the device alive, and
+    the transport's watch ends the wait if it leaves USB or, when its opt-in
+    stall guard is set, if nothing in the status changes for that long. A
+    firmware that reports no transmitter state cannot show the event, so that
+    raises :class:`SignalLostError` at once.
+    """
+    watch = transport.watch(f"waiting for {program} to transmit {timing}")
+    status = transport.video_status()
+    while not (sending := transmitting(status, timing)):
+        if sending is None:
+            raise _lost(program, timing, status, "after the load")
+        shown = json.dumps([status.raw.get(key) for key in ("output", "hdmi_tx")], sort_keys=True)
+        watch.observe("transmitter down", shown)
+        sleep(poll_s)
+        status = transport.video_status()
+    return status
 
 
 def require_signal(transport: Any, *, program: str, timing: str, when: str) -> Any:
@@ -411,7 +462,7 @@ def settle(
     *,
     program: str,
     timing: str,
-    timeout_s: float,
+    probe_timeout_s: float,
     probe_path: str | Path,
     probe_s: float = 2.0,
     poll_s: float = 0.5,
@@ -420,19 +471,15 @@ def settle(
 ) -> TakeReport:
     """Wait out a load: the transmitter driving ``timing`` first, then a probe the card delivers.
 
-    The card reports no signal state of its own, so the Videomancer's
-    :func:`~syncsummoner.device.transport.transmitting` is polled over serial
-    before anything is recorded. Once it drives the session timing every frame
-    is the program's, so the first probe that holds frames is returned for the
-    caller to judge; a recorder that will not start yet is still waited through.
+    The card reports no signal state of its own, so :func:`await_transmitting`
+    waits, on liveness, for the Videomancer to drive the session timing before
+    anything is recorded. Once it does every frame is the program's, so the
+    first probe that holds frames is returned for the caller to judge; a
+    recorder that will not start yet is retried until ``probe_timeout_s``, a
+    budget for the card and the recorder, not for the device.
     """
-    deadline = clock() + timeout_s
-    status = transport.video_status()
-    while not transmitting(status, timing):
-        if clock() >= deadline:
-            raise _lost(program, timing, status, f"within {timeout_s}s of the load")
-        sleep(poll_s)
-        status = transport.video_status()
+    await_transmitting(transport, program=program, timing=timing, poll_s=poll_s, sleep=sleep)
+    deadline = clock() + probe_timeout_s
     probe = Path(str(probe_path))
     said = "no recording finished"
     try:
@@ -450,5 +497,5 @@ def settle(
     finally:
         probe.unlink(missing_ok=True)
     raise BlankTakeError(
-        f"{program}: transmitting {timing} but nothing captured within {timeout_s}s ({said})"
+        f"{program}: transmitting {timing} but nothing captured within {probe_timeout_s}s ({said})"
     )

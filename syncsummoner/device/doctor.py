@@ -197,8 +197,9 @@ class Doctor:
         latency_params: Sequence[int] | None = None,
         latency_rates: Sequence[float] | None = None,
         rng: np.random.Generator | None = None,
-        settle_s: float = 40.0,
+        probe_timeout_s: float = 40.0,
         probe_s: float = 1.0,
+        session_input: str = "hdmi",
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -221,8 +222,9 @@ class Doctor:
         self.latency_params = None if latency_params is None else tuple(latency_params)
         self.latency_rates = DEFAULT_RATES if latency_rates is None else tuple(latency_rates)
         self._rng = np.random.default_rng() if rng is None else rng
-        self.settle_s = float(settle_s)
+        self.probe_timeout_s = float(probe_timeout_s)
         self.probe_s = float(probe_s)
+        self.session_input = session_input
         self._sleep = sleep
         self._clock = clock
 
@@ -312,8 +314,9 @@ class Doctor:
         ]
 
     def device(self, transport: Any) -> list[Finding]:
-        """The device's own checks, and that its output timing is the session format."""
-        timing = transport.video_status().output_timing
+        """The device's own checks, and that it reads the session's input and drives its format."""
+        status = transport.video_status()
+        timing, selected = status.output_timing, status.input_source
         device = transport.device
         return diagnose(device.shell, device.midi if device.has_midi else None) + [
             _check(
@@ -322,7 +325,14 @@ class Doctor:
                 f"output timing {timing}, session {self.fmt.name}",
                 f"feed the device {self.fmt.name} and clear any front panel timing override "
                 "(SETTINGS > Vid Route Mode, SYSTEM > Pref. Timing)",
-            )
+            ),
+            _check(
+                "device.input",
+                str(selected).lower() == self.session_input.lower(),
+                f"input {selected}, session {self.session_input}",
+                f"the device reads {selected}, so its output is black: select {self.session_input} "
+                "(SETTINGS > Vid Route Mode; Auto falls back to another input when the source link drops)",
+            ),
         ]
 
     def latency(self, transport: Any) -> list[Finding]:
@@ -369,8 +379,8 @@ class Doctor:
         return found
 
     def _grab(self, index: int) -> np.ndarray | None:
-        """Record short probes until the pushed frame comes back, or the budget runs out."""
-        deadline, frame = self._clock() + self.settle_s, None
+        """Record short probes until the pushed frame comes back, or the card's budget runs out."""
+        deadline, frame = self._clock() + self.probe_timeout_s, None
         with tempfile.TemporaryDirectory() as scratch:
             probe = Path(scratch) / "doctor.mkv"
             while self._clock() < deadline:

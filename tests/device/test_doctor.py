@@ -273,6 +273,17 @@ def test_output_held_at_ntsc_fails_the_format(rig):
     assert not found["video.genlock"].ok
 
 
+def test_a_device_left_on_another_input_is_flagged(rig):
+    """Under Vid Route Mode Auto a dropped source link can leave the device on analog, black."""
+    shell = RigShell()
+    doc = rig(shell=shell)
+    assert by_check(doc.checks())["device.input"].detail == "input hdmi, session hdmi"
+    shell.video = dict(VIDEO, source="analog")
+    found = by_check(doc.checks())
+    assert not found["device.input"].ok and "Vid Route Mode" in found["device.input"].fix
+    assert found["device.input"].detail == "input analog, session hdmi"
+
+
 def test_device_unreachable(rig):
     doc = rig()
 

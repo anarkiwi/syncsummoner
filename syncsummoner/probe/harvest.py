@@ -8,15 +8,22 @@ afterwards from the card's own capture times, so nothing paces or samples a loop
 from __future__ import annotations
 
 import time
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
-from pyvmancer.errors import ShellError
+from pyvmancer.errors import DeviceGoneError, ProgramLoadError, ShellError
 
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
-from syncsummoner.device.recorder import BlankTakeError, TakeReport, inspect_take, require_signal, settle
+from syncsummoner.device.recorder import (
+    BlankTakeError,
+    TakeReport,
+    inspect_take,
+    require_input,
+    require_signal,
+    settle,
+)
 from syncsummoner.device.session import Session
 from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import codeframes, plans
@@ -28,6 +35,7 @@ __all__ = [
     "HarvestConfig",
     "HarvestError",
     "HarvestReport",
+    "NoPictureError",
     "ProgramResult",
     "Window",
     "attribute",
@@ -41,19 +49,23 @@ __all__ = [
     "sweep",
     "sweep_vectors",
     "upload_stimulus",
+    "holds_program",
     "wait_healthy",
-    "wedged",
 ]
 
-#: Loaded to ask whether the device will still hold any program at all.
+#: Loaded to ask whether the device still carries the source.
 WEDGE_PROBE = "Passthru"
-#: The two faults that stop a run: same remedy, different diagnosis, never conflated.
-WEDGED_NOTE = "no program will load: the device needs a power cycle, then rerun to resume"
+#: The two faults that stop a run, each on positive evidence only: same remedy, never conflated.
+GONE_NOTE = "the device left USB: power cycle it, then rerun to resume"
 BLACKED_NOTE = "black output from a live source: the device needs a power cycle, then rerun"
 
 
 class HarvestError(RuntimeError):
     """The rig never reached a state an archive run could start from."""
+
+
+class NoPictureError(BlankTakeError):
+    """A passthrough that loaded and is transmitting the session timing shows no picture."""
 
 
 @dataclass(frozen=True)
@@ -70,15 +82,15 @@ class HarvestConfig:
     setpoints: int = 32
     dwell_s: float = 1.0
     settle_s: float = 0.35
-    #: Relock after a load was measured at up to 19.1s, so anything shorter gives up early.
-    live_timeout_s: float = 40.0
+    #: The card's budget to deliver a probe once the transmitter drives the session timing.
+    probe_timeout_s: float = 40.0
     probe_s: float = 2.0
     probe_path: str = "/tmp/syncsummoner-probe.mkv"
-    load_blackout_s: float = 4.5
+    #: The input the session feeds the device, verified after every load; None skips the check.
+    source: str | None = "hdmi"
     startup_s: float = 2.0
     health_timeout_s: float = 3600.0
     health_poll_s: float = 10.0
-    wedge_settle_s: float = 2.0
     seed: int = 11
     loop_seed: int = 7
 
@@ -135,7 +147,7 @@ class HarvestReport:
     """Every program's outcome, and whether a rig fault, named by ``fault``, ended the run early."""
 
     results: list[ProgramResult] = field(default_factory=list)
-    wedged: bool = False
+    gone: bool = False
     blacked: bool = False
     seconds: float = 0.0
     fault: str = ""
@@ -143,7 +155,7 @@ class HarvestReport:
     @property
     def stopped(self) -> bool:
         """Whether a device fault ended the run before the last program."""
-        return self.wedged or self.blacked
+        return self.gone or self.blacked
 
     @property
     def frames(self) -> int:
@@ -236,29 +248,18 @@ def attribute(
     return rows
 
 
-def wedged(
-    transport: Any,
-    *,
-    program: str = WEDGE_PROBE,
-    settle_s: float = 2.0,
-    sleep: Callable[[float], None] = time.sleep,
-) -> bool:
-    """True when the device answers but will no longer hold any program.
+def holds_program(transport: Any, *, program: str = WEDGE_PROBE) -> bool:
+    """Whether the device loads ``program`` and runs it.
 
-    Measured: after roughly fifteen loads ``program info`` returns "no program
-    loaded" and only a power cycle clears it; reload, resync and a timing change
-    all fail, so there is nothing to retry. That read, after the settle, is the
-    verdict: a shell error from the load itself is not, since the load can be
-    acknowledged and read back before it completes.
+    The load waits on liveness, so it returns only once the program runs, the
+    device refuses it with an error reply or a load that settles elsewhere,
+    or the device leaves USB; the last propagates as ``DeviceGoneError``.
     """
     try:
-        with suppress(ShellError):
-            transport.load_program(program)
-        sleep(settle_s)
-        transport.program_info()
-        return False
-    except Exception:
+        transport.load_program(program)
         return True
+    except (ShellError, ProgramLoadError):
+        return False
 
 
 def prove_passthrough(
@@ -273,10 +274,12 @@ def prove_passthrough(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> TakeReport:
-    """Load a passthrough and wait for its picture, raising :class:`BlankTakeError` without one.
+    """Load a passthrough and wait for its picture, raising :class:`NoPictureError` without one.
 
-    The passthrough carries the known stimulus, so with the transmitter driving
-    the session timing its capture must be :attr:`TakeReport.mostly_picture`.
+    The passthrough carries the known stimulus, so once it has loaded and drives
+    the session timing, its capture must be :attr:`TakeReport.mostly_picture`.
+    The input is verified first, so a device left on another input fails with
+    :class:`~syncsummoner.device.recorder.InputRouteError` rather than as black.
     """
     session.load_program(program, park=True, link=link)
     if player is not None and not player.is_running():
@@ -287,14 +290,15 @@ def prove_passthrough(
         transport,
         program=program,
         timing=config.timing,
-        timeout_s=config.live_timeout_s,
+        probe_timeout_s=config.probe_timeout_s,
         probe_path=config.probe_path,
         probe_s=config.probe_s,
         clock=clock,
         sleep=sleep,
     )
+    require_input(transport, program=program, source=config.source)
     if not report.mostly_picture:
-        raise BlankTakeError(f"{program}: the passthrough shows no picture ({report})")
+        raise NoPictureError(f"{program}: the passthrough shows no picture ({report})")
     return report
 
 
@@ -307,7 +311,7 @@ def carries_stimulus(session: Any, recorder: Any, transport: Any, **live: Any) -
     try:
         prove_passthrough(session, recorder, transport, **live)
         return True
-    except BlankTakeError:
+    except NoPictureError:
         return False
 
 
@@ -317,28 +321,27 @@ def rig_fault(
     transport: Any,
     *,
     config: HarvestConfig,
-    wedge_first: bool = True,
     log: Callable[[str], None] = lambda _message: None,
     **live: Any,
 ) -> str:
-    """Why the rig, not a program, must stop the run; empty while it still carries the source.
+    """Why the rig, not a program, must stop the run; empty unless there is positive evidence.
 
-    A device that will hold no program, or one that has gone, is :data:`WEDGED_NOTE`;
-    a passthrough without a picture, the capture included, is :data:`BLACKED_NOTE`.
-    A passthrough that raises proves only that its load failed, so the device is
-    then asked whether it holds a program at all.
+    The evidence is a fresh passthrough load: the device leaving USB is
+    :data:`GONE_NOTE`, and a passthrough that loads and transmits but shows no
+    picture is :data:`BLACKED_NOTE`. Anything else the check raises, a refused
+    load or a capture that never delivered included, is logged and the run goes
+    on, since none of it shows the device needs a power cycle.
     """
-    sleep = live.get("sleep", time.sleep)
-    if wedge_first and wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep):
-        return WEDGED_NOTE
     try:
         prove_passthrough(session, recorder, transport, config=config, **live)
         return ""
-    except BlankTakeError as exc:
+    except DeviceGoneError as exc:
+        return f"{GONE_NOTE} ({exc})"
+    except NoPictureError as exc:
         return f"{BLACKED_NOTE} ({exc})"
     except Exception as exc:
         log(f"{WEDGE_PROBE} check raised {type(exc).__name__}: {exc}")
-        return WEDGED_NOTE if wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep) else ""
+        return ""
 
 
 def wait_healthy(
@@ -348,12 +351,16 @@ def wait_healthy(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> Any:
-    """Block until a device will hold a program, reopening across a power cycle."""
+    """Block until an attached device will hold a program, reopening across a power cycle.
+
+    The deadline is on the device appearing and taking a load at all; each
+    load itself waits on liveness.
+    """
     deadline = clock() + config.health_timeout_s
     while clock() < deadline:
         try:
             transport = open_transport()
-            if not wedged(transport, settle_s=config.wedge_settle_s, sleep=sleep):
+            if holds_program(transport):
                 return transport
             transport.close()
         except Exception:
@@ -429,12 +436,13 @@ def harvest_program(
         transport,
         program=program,
         timing=config.timing,
-        timeout_s=config.live_timeout_s,
+        probe_timeout_s=config.probe_timeout_s,
         probe_path=config.probe_path,
         probe_s=config.probe_s,
         clock=clock,
         sleep=sleep,
     )
+    require_input(transport, program=program, source=config.source)
     video = archive.scratch(program)
     try:
         require_signal(transport, program=program, timing=config.timing, when="as the sweep began")
@@ -506,7 +514,7 @@ def harvest(
         upload_stimulus(player, config)
     note("waiting for a device that will hold a program")
     transport = wait_healthy(open_transport, config=config, sleep=sleep, clock=clock)
-    session = session_factory(transport, load_blackout_s=config.load_blackout_s)
+    session = session_factory(transport)
     firmware = str(transport.firmware())
     names: Sequence[str] = list(programs) if programs else sorted(transport.programs())
     results, fault, start = [], "", clock()
@@ -539,9 +547,7 @@ def harvest(
                         continue
                     luma = results[-1].report.luma if results[-1].report else 0.0
                     results[-1] = discard_dark(archive, name, key, results[-1])
-                    fault = rig_fault(
-                        session, recorder, transport, config=config, wedge_first=False, log=note, **live
-                    )
+                    fault = rig_fault(session, recorder, transport, config=config, log=note, **live)
                     if not fault:
                         archive.mark_dark(name, key, luma)
                         note(f"{name} discarded: dark, but the rig still carries the source")
@@ -552,7 +558,7 @@ def harvest(
         transport.close()
     return HarvestReport(
         results=results,
-        wedged=fault.startswith(WEDGED_NOTE),
+        gone=fault.startswith(GONE_NOTE),
         blacked=fault.startswith(BLACKED_NOTE),
         seconds=clock() - start,
         fault=fault,
