@@ -18,7 +18,6 @@ from pyvmancer import CcMapError
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
 from syncsummoner.compose.vocabulary import Automation
-from tests import transmitter as tx
 from tests.compose import PROBED, rig_transport
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
