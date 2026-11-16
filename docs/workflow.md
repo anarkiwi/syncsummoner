@@ -174,6 +174,38 @@ program runs whole in a worker process with single-threaded decode and OpenCV, o
 worker per core by default (`--jobs` caps it), so its cost is the FFV1 decode plus
 the per-pair optical flow, spread evenly over the cores.
 
+`--decode` picks where the archive is decoded: `cpu`, `vulkan` (FFV1 in compute
+shaders, ffmpeg 8 and later), or `auto`, the default. `auto` decodes the first
+program's opening frames both ways and takes Vulkan only when the frames are
+byte for byte the CPU's and the GPU's per-stream rate is at least the CPU's, since
+every worker decodes one stream; otherwise it stays on the CPU and logs why, so
+the same command runs on any host. `vulkan` forces the GPU, and fails rather than
+fall back. Vulkan decode is bound by the archive's slice count (see
+[hardware.md](hardware.md#archive-decoding-on-a-gpu-is-slice-bound)), so the
+archives recorded so far decode faster on the CPU and `auto` keeps them there.
+
+The GPU image is `Dockerfile.gpu`: NVIDIA's base, with a pinned ffmpeg built with
+the Vulkan FFV1 hwaccel. The host needs the NVIDIA driver and
+nvidia-container-toolkit, and the GPU is passed through by its CDI name:
+
+```sh
+docker build -f Dockerfile.gpu -t syncsummoner:gpu .
+docker run --rm --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:/work" syncsummoner:gpu probe refit --archive archive/ --out profiles/ --decode auto
+docker run --rm --device nvidia.com/gpu=all -v "$PWD:/work" syncsummoner:gpu \
+  probe decoders --archive archive/ --digests 3 --streams 1,4 --frames 120
+```
+
+The CDI spec (`nvidia-ctk cdi generate`, under `/etc/cdi` or `/var/run/cdi`)
+mounts the driver's Vulkan ICD manifest, its implicit layers and
+`/dev/nvidia-modeset`. `--gpus all` does not: through Docker's built-in GPU hook
+the container gets the driver libraries and no ICD, and Vulkan fails with
+`VK_ERROR_INCOMPATIBLE_DRIVER`. Under CDI the spec decides what is mounted; the
+image still sets `NVIDIA_DRIVER_CAPABILITIES` to include `graphics`, which the
+toolkit's own runtime reads in its other modes. `probe decoders` digests each program's
+whole decoded stream on every backend (exit status 1 on any difference) and times
+concurrent decoders.
+
 A program is dark, and its frames are discarded, only when every inspected frame
 of its sweep is a uniform field: a sweep legitimately visits flat setpoints and a
 generator may hold one picture. The sweep is recorded only while the device's

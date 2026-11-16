@@ -64,6 +64,26 @@ jobs:
           assert librosa.onset.onset_strength(y=y, sr=sr).size
           '
 
+  # The GPU image builds without a GPU; CI has none, so it checks the build and that the
+  # decoder it ships has the Vulkan hwaccel, and leaves GPU decoding to a host with one.
+  gpu-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.gpu
+          target: runtime
+          load: true
+          tags: syncsummoner:gpu-ci
+          cache-from: type=gha,scope=gpu
+          cache-to: type=gha,mode=max,scope=gpu
+      - run: |
+          docker run --rm --entrypoint ffmpeg syncsummoner:gpu-ci -hide_banner -hwaccels | grep -x vulkan
+          docker run --rm syncsummoner:gpu-ci probe refit --help | grep -- --decode
+
   # Early warning that the aesthetics extraction seam has leaked.
   aesthetics-seam:
     runs-on: ubuntu-latest
