@@ -1,22 +1,27 @@
-"""Stimulus playout: RGB frames to a remote framebuffer feeding the analog input.
+"""Stimulus playout: a vsync-locked DRM/KMS player on the Pi feeding the device's input.
 
-A Raspberry Pi drives ``/dev/fb0`` into the device's video input. A frame is
-displayed by writing its raw BGR565 bytes there; an invariant loop is instead
-uploaded once and cycled by the Pi, so the host pushes no frame per pass.
+The Pi runs :mod:`syncsummoner.device.kmsplay`, which flips one frame per vblank and fails
+loudly on any missed one. The host uploads the stimulus once, starts and stops the player
+by its pidfile, and reads back its status and its log of every flip.
 """
 
 from __future__ import annotations
 
+import base64
 import gzip
-import subprocess
+import json
 import time
-from pathlib import Path
 from contextlib import contextmanager
+from fractions import Fraction
+from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
 
+from syncsummoner.progress import LOG
+
 from .host import DEFAULT_HOST, DEFAULT_TIMEOUT, Runner, ssh_runner
+from .kmsplay import RECORD, SEGMENT
 
 DEFAULT_FB = "/dev/fb0"
 #: 565 quantisation levels per channel, for an RGB-ordered source frame.
@@ -24,53 +29,33 @@ LEVELS = np.array([31, 63, 31], dtype=np.float32)
 #: Measured word layout is BGR565: blue occupies the high bits, not red.
 SHIFTS = np.array([0, 5, 11], dtype=np.uint16)
 LIMITED_BLACK, LIMITED_WHITE = 16.0 / 255.0, 235.0 / 255.0
-#: tmpfs, so the Pi's own reads of the loop run at memory speed.
-DEFAULT_LOOP_DIR = "/dev/shm/syncsummoner"
-#: Capture runs at 30 fps and needs a clean frame per loop position; caller tunes.
-DEFAULT_LOOP_FPS = 12.0
-#: Sized for one compressed loop upload, which the per-command default cannot cover.
+#: tmpfs, so the Pi's own reads of the stimulus run at memory speed.
+DEFAULT_DIR = "/dev/shm/syncsummoner"
+#: A loop frame is held for a whole number of vblanks: three at the 30 Hz session.
+DEFAULT_LOOP_FPS = 10.0
+#: Sized for one compressed loop or clip upload, which the per-command default cannot cover.
 UPLOAD_TIMEOUT = 300.0
 #: Measured ~10x on 565 codeframes, so the upload is bounded by the link, not the CPU.
 GZIP_LEVEL = 1
 RUNNING, STOPPED = "RUNNING", "STOPPED"
+#: :data:`~syncsummoner.device.kmsplay.RECORD` as a numpy record.
+FLIP = np.dtype([("v", "<i8"), ("seq", "<i8"), ("frame", "<i8"), ("t_ns", "<i8"), ("flags", "<i8")])
+assert FLIP.itemsize == RECORD.size
+#: The pacing thread's ``SCHED_FIFO`` ceiling, raised for the player's own shell only.
+RTPRIO_LIMIT = 20
+#: Status states the player settles in once started.
+SETTLED = ("playing", "failed", "stopped")
 
-#: The Pi-side player: frames are read into memory once, then paced into the framebuffer.
-PLAYER_SOURCE = '''"""Cycle raw framebuffer frames from tmpfs, paced against a monotonic clock.
 
-A signal ends the loop only between frames and a short write is resumed, so the
-framebuffer is never left holding half of one frame and half of another.
-"""
-
-import glob
-import os
-import signal
-import sys
-import time
-
-directory, framebuffer, fps = sys.argv[1], sys.argv[2], float(sys.argv[3])
-frames = [open(path, "rb").read() for path in sorted(glob.glob(directory + "/frame.*"))]
-running = [True]
-signal.signal(signal.SIGTERM, lambda *_: running.clear())
-interval, shown, origin = 1.0 / fps, 0, time.monotonic()
-fd = os.open(framebuffer, os.O_WRONLY | os.O_CREAT, 0o644)
-while frames and running:
-    view = memoryview(frames[shown % len(frames)])
-    os.lseek(fd, 0, os.SEEK_SET)
-    while view:
-        view = view[os.write(fd, view) :]
-    shown += 1
-    delay = origin + shown * interval - time.monotonic()
-    if delay > 0:
-        time.sleep(delay)
-os.close(fd)
-'''
+class PlayoutError(RuntimeError):
+    """The Pi-side player faulted, or did not reach the state it was driven to."""
 
 
 def to_fb565(frame: np.ndarray, *, limited_range: bool = True) -> bytes:
-    """Pack an RGB float32 frame in ``[0, 1]`` into the framebuffer's BGR565 words.
+    """Pack an RGB float32 frame in ``[0, 1]`` into the display's BGR565 words.
 
-    ``limited_range`` maps to studio swing, measured at unity gain end to end;
-    full range clips above ~92% against the chain's limited-range expectation.
+    ``limited_range`` maps to studio swing, measured at unity gain end to end; full range
+    clips above ~92% against the chain's limited-range expectation.
     """
     if frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError(f"frame must be (H, W, 3), got {frame.shape}")
@@ -82,12 +67,37 @@ def to_fb565(frame: np.ndarray, *, limited_range: bool = True) -> bytes:
     return words.astype("<u2").tobytes()
 
 
-class Playout:
-    """Pushes stimulus frames to the Pi framebuffer.
+def rate(fps: float | str | Fraction) -> Fraction:
+    """A frame rate as an exact fraction, NTSC's 1000/1001 rates included.
 
-    ``runner`` is injected so the whole class is exercisable with no Pi and no
-    network.
+    A float within half an NTSC offset of ``n * 1000/1001`` is taken to be that rate.
     """
+    if isinstance(fps, (str, Fraction)):
+        return Fraction(fps)
+    whole = round(fps * 1.001)
+    ntsc = Fraction(whole * 1000, 1001)
+    return ntsc if 2 * abs(float(ntsc) - fps) < float(whole - ntsc) else Fraction(fps).limit_denominator()
+
+
+def player_source() -> bytes:
+    """The Pi-side player program."""
+    return Path(__file__).with_name("kmsplay.py").read_bytes()
+
+
+def flip_summary(flips: np.ndarray, hold: int) -> dict:
+    """Counts a flip log is judged by: flips, segments, and any vblank or frame out of cadence."""
+    if not flips.size:
+        return {"flips": 0, "segments": 0, "missed": 0, "out_of_cadence": 0}
+    start = (flips["flags"] & SEGMENT) != 0
+    inside = ~start[1:]
+    missed = int(np.count_nonzero(np.diff(flips["seq"])[inside] != np.diff(flips["v"])[inside]))
+    due = flips["v"] // hold
+    off = int(np.count_nonzero((flips["frame"] != due)[np.r_[False, inside]]))
+    return {"flips": int(flips.size), "segments": int(start.sum()), "missed": missed, "out_of_cadence": off}
+
+
+class Playout:
+    """Geometry and frame packing shared by the players; ``runner`` reaches the Pi."""
 
     def __init__(
         self,
@@ -95,233 +105,81 @@ class Playout:
         *,
         width: int = 1920,
         height: int = 1080,
-        framebuffer: str = DEFAULT_FB,
         ssh_timeout_s: float = DEFAULT_TIMEOUT,
         runner: Runner | None = None,
-        sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
     ):
         self.width = int(width)
         self.height = int(height)
-        self.framebuffer = framebuffer
         self._runner = ssh_runner(host, timeout=ssh_timeout_s) if runner is None else runner
-        self._sleep = sleep
-        self._clock = clock
-        self._host = host
-        self._popen: Any = subprocess.Popen
-        self._pump: Any = None
 
     @property
     def frame_bytes(self) -> int:
-        """Size of one framebuffer write."""
+        """Size of one displayed frame."""
         return self.width * self.height * 2
 
     def encode(self, frame: np.ndarray) -> bytes:
-        """Pack one frame, checking it matches the framebuffer geometry."""
+        """Pack one frame, checking it matches the display geometry."""
         if frame.shape[:2] != (self.height, self.width):
             raise ValueError(f"frame must be ({self.height}, {self.width}), got {frame.shape[:2]}")
         return to_fb565(frame)
 
-    #: Blits whole frames from stdin, so a pass costs one connection instead of one each.
-    PUMP_SOURCE = (
-        "import os, sys\n"
-        "fb = os.open(sys.argv[1], os.O_RDWR)\n"
-        "size = int(sys.argv[2])\n"
-        "read = sys.stdin.buffer.read\n"
-        "buf = read(size)\n"
-        "while len(buf) == size:\n"
-        "    os.lseek(fb, 0, 0)\n"
-        "    os.write(fb, buf)\n"
-        "    buf = read(size)\n"
-    )
-    PUMP_PATH = "/dev/shm/syncsummoner-pump.py"
 
-    def show(self, frame: np.ndarray) -> None:
-        """Display one still frame, down the open pump when there is one.
+class KmsPlayer(Playout):
+    """Starts, watches and stops the Pi's vsync-locked player, addressed by its pidfile.
 
-        A connection per frame costs its whole handshake: measured, that paced a
-        render at 0.8 frames a second against a session of thirty.
-        """
-        data = self.encode(frame)
-        if self._pump is not None:
-            self._pump.stdin.write(data)
-            return
-        self._runner(f"cat > {self.framebuffer}", data)
-
-    @contextmanager
-    def streaming(self) -> Iterator["Playout"]:
-        """Hold one connection open for a whole pass, frames going down its stdin."""
-        self._runner(f"cat > {self.PUMP_PATH}", self.PUMP_SOURCE.encode())
-        self._pump = self._popen(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                self._host,
-                f"python3 {self.PUMP_PATH} {self.framebuffer} {self.frame_bytes}",
-            ],
-            stdin=subprocess.PIPE,
-        )
-        try:
-            yield self
-        finally:
-            pump, self._pump = self._pump, None
-            try:
-                pump.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-            pump.wait(timeout=DEFAULT_TIMEOUT)
-
-    def play(self, frames: Iterable[np.ndarray], *, fps: float = 60.0) -> int:
-        """Display a sequence, paced against a monotonic clock; returns frames shown."""
-        if fps <= 0:
-            raise ValueError(f"fps must be positive, got {fps}")
-        interval = 1.0 / fps
-        origin = self._clock()
-        count = 0
-        for count, frame in enumerate(frames, start=1):
-            self.show(frame)
-            delay = origin + count * interval - self._clock()
-            if delay > 0:
-                self._sleep(delay)
-        return count
-
-
-class ClipPlayer(Playout):
-    """Plays a whole clip from the Pi, so the host pushes nothing per frame.
-
-    The framebuffer takes 4MB a frame and the Pi decrypts every byte of it, which
-    caps a pushed pass at a few frames a second; decoding locally does not.
-    """
-
-    CLIP_PATH = "/dev/shm/syncsummoner-clip.mkv"
-    PID_PATH = "/dev/shm/syncsummoner-clip.pid"
-
-    def __init__(
-        self, host: str = DEFAULT_HOST, *, ssh_timeout_s: float = UPLOAD_TIMEOUT, loop: bool = False, **kwargs
-    ):
-        super().__init__(host, ssh_timeout_s=ssh_timeout_s, **kwargs)
-        self.loop = bool(loop)
-
-    def upload(self, path: str) -> int:
-        """Send the clip into tmpfs; returns the bytes put on the wire."""
-        data = Path(path).read_bytes()
-        self._runner(f"cat > {self.CLIP_PATH}", data)
-        return len(data)
-
-    def command(self) -> str:
-        """Pi-side pipeline: decode the clip at framebuffer geometry, blit each frame.
-
-        With ``loop`` the clip repeats without a gap until the player is stopped.
-        """
-        repeat = "-stream_loop -1 " if self.loop else ""
-        return (
-            f"ffmpeg -hide_banner -loglevel error -re {repeat}-i {self.CLIP_PATH} "
-            f"-vf scale={self.width}:{self.height} -r {{fps}} -pix_fmt bgr565le -f rawvideo - "
-            f"| python3 {self.PUMP_PATH} {self.framebuffer} {self.frame_bytes}"
-        )
-
-    def start(self, *, fps: float) -> None:
-        """Begin playing, detached, with its pid recorded rather than pattern matched."""
-        self._runner(f"cat > {self.PUMP_PATH}", self.PUMP_SOURCE.encode())
-        run = self.command().format(fps=fps)
-        self._runner(f"setsid nohup sh -c '{run}' >/dev/null 2>&1 & echo $! > {self.PID_PATH}")
-
-    def is_running(self) -> bool:
-        """Whether the process named by the pidfile is alive, by signal 0 rather than by pattern."""
-        pid = str(self._runner(f"cat {self.PID_PATH} 2>/dev/null || true") or "").strip()
-        return (
-            pid.isdigit()
-            and self._runner(f"kill -0 {pid} 2>/dev/null && echo {RUNNING} || echo {STOPPED}") == RUNNING
-        )
-
-    def stop(self) -> None:
-        """Stop whatever this player started, by the pid it recorded."""
-        self._runner(
-            f"kill -TERM -$(cat {self.PID_PATH}) 2>/dev/null; kill -TERM $(cat {self.PID_PATH})"
-            f" 2>/dev/null; rm -f {self.PID_PATH}; true"
-        )
-
-    @contextmanager
-    def playing(self, *, fps: float) -> Iterator["ClipPlayer"]:
-        """Play for the duration of the block, and stop afterwards whatever happens."""
-        self.start(fps=fps)
-        try:
-            yield self
-        finally:
-            self.stop()
-
-
-class PlayoutError(RuntimeError):
-    """The Pi-side player did not reach the state it was driven to."""
-
-
-class LoopPlayer(Playout):
-    """Cycles an uploaded loop on the Pi itself, so the host pushes nothing per pass.
-
-    The loop is invariant across programs and setpoints, so it is uploaded once
-    into tmpfs and cycled by a detached process addressed by pidfile; pattern
-    matching on ``ps`` is never used to find it.
+    Subclasses say what it plays through :meth:`source_args`. A fault the player reports
+    is raised as :class:`PlayoutError` when it is stopped or checked, never swallowed.
     """
 
     def __init__(
         self,
         host: str = DEFAULT_HOST,
         *,
-        directory: str = DEFAULT_LOOP_DIR,
+        directory: str = DEFAULT_DIR,
+        loop: bool = False,
+        preroll_s: float = 2.0,
         ssh_timeout_s: float = UPLOAD_TIMEOUT,
-        timeout_s: float = 10.0,
+        timeout_s: float = 90.0,
         poll_s: float = 0.25,
-        **kwargs,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+        **kwargs: Any,
     ):
         super().__init__(host, ssh_timeout_s=ssh_timeout_s, **kwargs)
         if poll_s <= 0:
             raise ValueError(f"poll_s must be positive, got {poll_s}")
         self.directory = directory.rstrip("/")
+        self.loop = bool(loop)
+        self.preroll_s = float(preroll_s)
         self.timeout_s = float(timeout_s)
         self.poll_s = float(poll_s)
+        self._sleep = sleep
+        self._clock = clock
+
+    def path(self, name: str) -> str:
+        """A file the player keeps in its directory on the Pi."""
+        return f"{self.directory}/{name}"
 
     @property
     def pid_path(self) -> str:
-        """Pidfile the player records its own pid in."""
-        return f"{self.directory}/player.pid"
+        """Pidfile the player's shell records the player's pid in."""
+        return self.path("player.pid")
 
-    @property
-    def log_path(self) -> str:
-        """Where the detached player's output lands."""
-        return f"{self.directory}/player.log"
+    def source_args(self) -> str:
+        """The player's source arguments."""
+        raise NotImplementedError
 
-    @property
-    def script_path(self) -> str:
-        """The player program on the Pi."""
-        return f"{self.directory}/player.py"
-
-    def upload(self, frames: Iterable[np.ndarray]) -> int:
-        """Send the loop, compressed, into tmpfs as one raw frame per file.
-
-        Returns the bytes put on the wire; the loop is invariant, so this is paid
-        once for a whole run rather than once per pass.
-        """
-        blob = b"".join(self.encode(frame) for frame in frames)
-        count = len(blob) // self.frame_bytes
-        if count < 1:
-            raise ValueError("loop must contain at least one frame")
-        payload = gzip.compress(blob, GZIP_LEVEL)
-        digits = max(3, len(str(count - 1)))
-        self._runner(
-            f"mkdir -p {self.directory} && rm -f {self.directory}/frame.* && "
-            f"gzip -dc | split -b {self.frame_bytes} -d -a {digits} - {self.directory}/frame.",
-            payload,
+    def command(self, fps: Fraction) -> str:
+        """The player's command line on the Pi."""
+        return (
+            f"python3 {self.path('kmsplay.py')} {self.source_args()} --fps {fps} "
+            f"--width {self.width} --height {self.height} --preroll-s {self.preroll_s:g} "
+            f"--flips {self.path('flips.bin')} --status {self.path('status.json')}"
+            + (" --loop" if self.loop else "")
         )
-        return len(payload)
-
-    def frame_count(self) -> int:
-        """How many loop frames are currently uploaded."""
-        out = str(self._runner(f"ls {self.directory}/frame.* 2>/dev/null | wc -l") or "").strip()
-        return int(out) if out.isdigit() else 0
 
     def pid(self) -> int | None:
-        """Pid in the pidfile, or None when the player has none recorded."""
+        """Pid in the pidfile, or None when none is recorded."""
         out = str(self._runner(f"cat {self.pid_path} 2>/dev/null || true") or "").strip()
         return int(out) if out.isdigit() else None
 
@@ -334,69 +192,154 @@ class LoopPlayer(Playout):
         pid = self.pid()
         return pid is not None and self._alive(pid)
 
+    def status(self) -> dict:
+        """The player's own status file; empty when it has written none."""
+        out = str(self._runner(f"cat {self.path('status.json')} 2>/dev/null || true") or "").strip()
+        return json.loads(out) if out else {}
+
     def log(self) -> str:
-        """Tail of the player's output, which is where a failed start explains itself."""
-        return self._runner(f"tail -n 5 {self.log_path} 2>/dev/null || true")
+        """Tail of the player's output, where a fault explains itself."""
+        return str(self._runner(f"tail -n 5 {self.path('player.log')} 2>/dev/null || true") or "")
 
-    def _wait(self, running: bool, what: str) -> None:
-        """Poll until liveness matches ``running``, or raise once the timeout passes."""
-        deadline = self._clock() + self.timeout_s
-        while self.is_running() != running:
-            if self._clock() >= deadline:
-                raise PlayoutError(f"{what} after {self.timeout_s}s: {self.log()}")
-            self._sleep(self.poll_s)
+    def flips(self) -> np.ndarray:
+        """Every flip of the last play, as :data:`FLIP` records."""
+        out = str(self._runner(f"base64 -w0 {self.path('flips.bin')} 2>/dev/null || true") or "")
+        data = base64.b64decode(out.strip())
+        return np.frombuffer(data[: len(data) - len(data) % FLIP.itemsize], dtype=FLIP)
 
-    def contenders(self) -> list[int]:
-        """Pids other than this player's holding the framebuffer open.
+    def _fault(self, status: dict) -> PlayoutError:
+        """The error for a player that reported a fault."""
+        return PlayoutError(f"the Pi player faulted: {status.get('error') or self.log() or 'no diagnostic'}")
 
-        Two writers on one framebuffer interleave their frames, so the stimulus
-        becomes a mixture of both and every measurement taken against it is of
-        something that was never played.
+    def check(self) -> dict:
+        """The status, raising if the player faulted or died without being stopped."""
+        status = self.status()
+        if status.get("state") == "failed":
+            raise self._fault(status)
+        if status.get("state") == "playing" and not self.is_running():
+            raise PlayoutError(f"the Pi player died while playing: {self.log() or 'no diagnostic'}")
+        return status
+
+    def start(self, *, fps: float | str | Fraction = DEFAULT_LOOP_FPS) -> int:
+        """Restart the player at ``fps``, returning its pid once it is flipping.
+
+        The pid is recorded by the shell that execs the player, so the pidfile holds the
+        player's own pid and survives the ssh session ending.
         """
-        out = str(self._runner(f"fuser {self.framebuffer} 2>/dev/null || true") or "")
-        mine = self.pid()
-        return [int(v) for v in out.split() if v.isdigit() and int(v) != mine]
-
-    def start(self, *, fps: float = DEFAULT_LOOP_FPS) -> int:
-        """Restart the detached player at ``fps`` per loop frame; returns its pid.
-
-        The pid is recorded by the shell that execs the player, so the pidfile
-        holds the player's own pid and survives the ssh session ending.
-        """
-        if fps <= 0:
+        exact = rate(fps)
+        if exact <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
-        held = self.contenders()
-        if held:
-            raise PlayoutError(
-                f"{self.framebuffer} is already held by {held}: a second writer would "
-                "interleave its frames into the stimulus"
-            )
         self.stop()
-        self._runner(f"mkdir -p {self.directory} && cat > {self.script_path}", PLAYER_SOURCE.encode())
+        self._runner(f"mkdir -p {self.directory} && cat > {self.path('kmsplay.py')}", player_source())
         self._runner(
-            f"setsid sh -c 'echo $$ > {self.pid_path}; "
-            f"exec python3 {self.script_path} {self.directory} {self.framebuffer} {float(fps)}' "
-            f"< /dev/null > {self.log_path} 2>&1 &"
+            f"rm -f {self.path('status.json')}; setsid sh -c 'echo $$ > {self.pid_path}; "
+            f"sudo -n prlimit --rtprio={RTPRIO_LIMIT} --pid $$; "
+            f"exec {self.command(exact)}' < /dev/null > {self.path('player.log')} 2>&1 &"
         )
-        self._wait(True, f"player did not start at {fps} fps")
+        deadline = self._clock() + self.timeout_s
+        while (state := self.status().get("state")) not in SETTLED:
+            if self._clock() >= deadline:
+                raise PlayoutError(
+                    f"player did not start at {exact} fps after {self.timeout_s}s: {self.log()}"
+                )
+            self._sleep(self.poll_s)
+        if state != "playing":
+            self.stop()
+            raise PlayoutError(f"player exited as it started: {self.log() or 'no diagnostic'}")
+        if not self.status().get("realtime"):
+            LOG.warning(
+                "the Pi player runs without SCHED_FIFO: a stall can make it miss a vblank, which it reports"
+            )
         return self.pid()
 
-    def stop(self) -> bool:
-        """Stop the player, leaving its last frame standing; True if it was running."""
+    def stop(self) -> dict:
+        """Stop the player, its last frame left standing; raises if it had faulted."""
         pid = self.pid()
-        running = pid is not None and self._alive(pid)
-        if running:
+        if pid is not None and self._alive(pid):
             self._runner(f"kill {pid} 2>/dev/null || true")
-            self._wait(False, f"player pid {pid} did not exit")
+            deadline = self._clock() + self.timeout_s
+            while self._alive(pid):
+                if self._clock() >= deadline:
+                    raise PlayoutError(f"player pid {pid} did not exit after {self.timeout_s}s: {self.log()}")
+                self._sleep(self.poll_s)
         if pid is not None:
             self._runner(f"rm -f {self.pid_path}")
-        return running
+        status = self.status() if pid is not None else {}
+        if status.get("state") == "failed":
+            raise self._fault(status)
+        return status
 
     @contextmanager
-    def playing(self, *, fps: float = DEFAULT_LOOP_FPS) -> Iterator["LoopPlayer"]:
-        """Hold the loop running for the block, stopping it on the way out or on error."""
+    def playing(self, *, fps: float | str | Fraction = DEFAULT_LOOP_FPS) -> Iterator["KmsPlayer"]:
+        """Play for the block, stopping afterwards; a fault fails the block unless it already failed."""
         self.start(fps=fps)
         try:
             yield self
-        finally:
-            self.stop()
+        except BaseException:
+            try:
+                self.stop()
+            except PlayoutError:
+                pass
+            raise
+        self.stop()
+
+
+class ClipPlayer(KmsPlayer):
+    """Plays a clip decoded on the Pi, so the host pushes nothing per frame."""
+
+    @property
+    def clip_path(self) -> str:
+        """Where the clip sits in tmpfs."""
+        return self.path("clip.mkv")
+
+    def upload(self, path: str) -> int:
+        """Send the clip into tmpfs; returns the bytes put on the wire."""
+        data = Path(path).read_bytes()
+        self._runner(f"mkdir -p {self.directory} && cat > {self.clip_path}", data)
+        return len(data)
+
+    def source_args(self) -> str:
+        """Decode the uploaded clip."""
+        return f"--clip {self.clip_path}"
+
+
+class LoopPlayer(KmsPlayer):
+    """Cycles an uploaded loop of frames, uploaded once into tmpfs and cycled by the Pi."""
+
+    def __init__(self, host: str = DEFAULT_HOST, **kwargs: Any):
+        kwargs.setdefault("loop", True)
+        super().__init__(host, **kwargs)
+
+    @property
+    def frames_dir(self) -> str:
+        """Where the loop's raw frames sit in tmpfs."""
+        return self.path("frames")
+
+    def upload(self, frames: Iterable[np.ndarray]) -> int:
+        """Send the loop, compressed, into tmpfs as one raw frame per file; returns bytes sent."""
+        blob = b"".join(self.encode(frame) for frame in frames)
+        count = len(blob) // self.frame_bytes
+        if count < 1:
+            raise ValueError("loop must contain at least one frame")
+        payload = gzip.compress(blob, GZIP_LEVEL)
+        digits = max(3, len(str(count - 1)))
+        self._runner(
+            f"mkdir -p {self.frames_dir} && rm -f {self.frames_dir}/frame.* && "
+            f"gzip -dc | split -b {self.frame_bytes} -d -a {digits} - {self.frames_dir}/frame.",
+            payload,
+        )
+        return len(payload)
+
+    def frame_count(self) -> int:
+        """How many loop frames are currently uploaded."""
+        out = str(self._runner(f"ls {self.frames_dir}/frame.* 2>/dev/null | wc -l") or "").strip()
+        return int(out) if out.isdigit() else 0
+
+    def source_args(self) -> str:
+        """Cycle the uploaded frames."""
+        return f"--frames {self.frames_dir}"
+
+    def show(self, frame: np.ndarray, *, fps: float | str | Fraction = DEFAULT_LOOP_FPS) -> int:
+        """Hold one still frame up until the player is stopped or restarted; returns its pid."""
+        self.upload([frame])
+        return self.start(fps=fps)

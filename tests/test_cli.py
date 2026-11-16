@@ -237,11 +237,10 @@ def test_probe_archive_lists_dark_programs_and_retries_them_when_asked(harvested
     assert harvested["retry_dark"] is True and "retrying dark: Lumarian" in capsys.readouterr().err
 
 
-def test_probe_archive_records_the_card_losslessly_with_the_hosts_own_clock(harvested, tmp_path):
-    """Under ``copyts`` the stored frame times are what ``time.monotonic`` reads."""
+def test_probe_archive_records_the_card_losslessly(harvested, tmp_path):
     assert cli.main(["probe", "archive", "--out", str(tmp_path), "--capture", "/dev/video9"]) == 0
     kwargs = harvested["recorder"].kwargs
-    assert kwargs["mode"] is recorder_mod.FFV1 and kwargs["copyts"] is True
+    assert kwargs["mode"] is recorder_mod.FFV1
     assert kwargs["device"] == "/dev/video9"
     assert (kwargs["width"], kwargs["height"], kwargs["fps"]) == (1920, 1080, 30)
     assert harvested["config"].timing == "1080p30"
@@ -329,6 +328,7 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe names", ["--archive", "--program"]),
         ("score show", ["--profiles"]),
+        ("lockcheck", ["--take", "--scratch", "--prepared", "--judge", "--program", "--lead-in", "--route"]),
         (
             "probe archive",
             [
@@ -367,16 +367,17 @@ def _render_stubs(monkeypatch, seen):
         return kwargs.get("seconds") or 42.0
 
     monkeypatch.setattr("syncsummoner.compose.render.render_played", fake_render)
-    monkeypatch.setattr("syncsummoner.compose.render.picture_start", lambda path, **kw: 1.5)
+    monkeypatch.setattr("syncsummoner.compose.render.take_start", lambda path, **kw: 1.5)
     monkeypatch.setattr("syncsummoner.compose.master.master", fake_master)
 
 
-def _score_file(tmp_path):
+def _score_file(tmp_path, sections=1):
     from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
 
+    span = 120.0 / sections
     score = Score(
         duration=120.0,
-        sections=[Section(0.0, 120.0, "A")],
+        sections=[Section(span * i, span * (i + 1), "A") for i in range(sections)],
         layers=[Layer("g", 0, [GestureInstance("hold", 10.0, 1.0)])],
     )
     path = tmp_path / "score.yaml"
@@ -487,13 +488,15 @@ def test_an_existing_take_is_remastered_without_a_pass(monkeypatch, tmp_path):
     assert seen["master"][3]["video_start"] == 1.5
 
 
-def test_a_take_with_no_legible_strip_is_not_mastered_from_its_lead_in(monkeypatch, tmp_path, capsys):
+def test_a_take_with_no_lock_record_is_not_mastered(monkeypatch, tmp_path, capsys):
+    from syncsummoner.compose import lock
+
     seen = {}
     _render_stubs(monkeypatch, seen)
-    monkeypatch.setattr("syncsummoner.compose.render.picture_start", lambda path, **kw: None)
+    monkeypatch.setattr("syncsummoner.compose.render.take_start", lock.take_start)
     argv = ["render", _score_file(tmp_path), "--source", "clip.mkv", "-o", str(tmp_path / "final.mp4")]
     assert cli.main(argv) == 1
-    assert "master" not in seen and "timecode strip did not survive" in capsys.readouterr().err
+    assert "master" not in seen and "no lock record" in capsys.readouterr().err
 
 
 def test_a_cut_render_asks_the_device_for_programs_only_through_render_cuts(monkeypatch, tmp_path):
@@ -638,3 +641,82 @@ def test_check_splices_the_covered_plan_or_the_plan_as_rendered(monkeypatch, tmp
     assert seen["check"][1] == {"A": str(Path("t") / "take-A.mkv")}
     assert cli.main(argv + ["--splice", out, "--as-planned"]) == 0
     assert [c.program for c in seen["splice"][0]] == ["A"]
+
+
+def test_check_cuts_by_the_locked_attribution_beside_a_take_and_warns_without_one(
+    monkeypatch, tmp_path, capsys
+):
+    import numpy as np
+
+    seen = {}
+    _check_stubs(monkeypatch, seen)
+    np.save(tmp_path / "take-A.mkv.picked.npy", np.array([4, 6, 8]))
+    argv = [
+        "check",
+        _score_file(tmp_path, 2),
+        "--source",
+        "clip.mkv",
+        "--takes",
+        str(tmp_path),
+        "--cut-programs",
+    ]
+    assert cli.main(argv + ["A,B"]) == 0
+    attributions = seen["check"][3]["attributions"]
+    assert set(attributions) == {"A"} and attributions["A"].tolist() == [4, 6, 8]
+    err = capsys.readouterr().err
+    assert "B: no locked attribution beside" in err and "A: no locked" not in err
+
+
+def _lockcheck_stubs(monkeypatch, seen, ok=True):
+    """Stand in for the timecoding, the locked play and the verdict, recording what each was handed."""
+    from syncsummoner.compose import lockcheck as lockcheck_mod
+    from syncsummoner.compose import render as render_mod
+
+    report = SimpleNamespace(ok=ok, summary=lambda: "LOCKED" if ok else "NOT LOCKED")
+    monkeypatch.setattr(recorder_mod, "require_ffmpeg", lambda *a, **k: "ffmpeg")
+    monkeypatch.setattr(
+        render_mod,
+        "write_timecoded",
+        lambda source, out, **kw: seen.update(timecoded=(source, out, kw)) or 90,
+    )
+    monkeypatch.setattr(
+        lockcheck_mod, "lockcheck", lambda take, **kw: seen.update(played=(take, kw)) or report
+    )
+    monkeypatch.setattr(lockcheck_mod, "judge", lambda take, **kw: seen.update(judged=(take, kw)) or report)
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_lockcheck_timecodes_the_footage_plays_it_and_exits_on_the_verdict(monkeypatch, tmp_path, capsys, ok):
+    seen = {}
+    _lockcheck_stubs(monkeypatch, seen, ok)
+    take, clip = tmp_path / "t" / "take.mkv", str(tmp_path / "c.mkv")
+    argv = ["lockcheck", "film.mp4", "--take", str(take), "--scratch", clip, "--format", "1080p30"]
+    assert cli.main(argv + ["--seconds", "4", "--start", "2", "--lead-in", "2"]) == (0 if ok else 1)
+    source, out, kw = seen["timecoded"]
+    assert (source, out, kw["seconds"], kw["start"], kw["lead"]) == ("film.mp4", clip, 4.0, 2.0, 60)
+    played, kw = seen["played"]
+    assert (played, kw["clip"], kw["program"], kw["seconds"]) == (str(take), clip, None, 3.0)
+    assert kw["config"].lead_in_s == 2.0 and take.parent.is_dir() and "judged" not in seen
+    assert capsys.readouterr().out.strip() == ("LOCKED" if ok else "NOT LOCKED")
+
+
+@pytest.mark.parametrize(
+    "flags,clip",
+    [(["--judge"], "c.mkv"), (["--judge", "--program", "Teletext"], None)],
+    ids=["passthru", "program"],
+)
+def test_lockcheck_judges_a_recorded_take_alone(monkeypatch, tmp_path, flags, clip):
+    seen = {}
+    _lockcheck_stubs(monkeypatch, seen)
+    argv = ["lockcheck", "--take", str(tmp_path / "take.mkv"), "--scratch", "c.mkv"]
+    assert cli.main(argv + flags) == 0
+    assert seen["judged"][1]["clip"] == clip and "played" not in seen and "timecoded" not in seen
+
+
+def test_lockcheck_plays_a_prepared_clip_as_it_is(monkeypatch, tmp_path):
+    seen = {}
+    _lockcheck_stubs(monkeypatch, seen)
+    argv = ["lockcheck", "--prepared", "--take", str(tmp_path / "take.mkv"), "--scratch", "c.mkv"]
+    assert cli.main(argv + ["--program", "Teletext"]) == 0
+    assert "timecoded" not in seen and seen["played"][1]["seconds"] is None
+    assert seen["played"][1]["program"] == "Teletext"

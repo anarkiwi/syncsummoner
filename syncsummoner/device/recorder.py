@@ -12,6 +12,7 @@ import math
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from pyvmancer.route import describe_route, route_name
 
 from .capture import QUANTUM
 from .transport import transmitting
+from .v4l2rec import read_log
 
 __all__ = [
     "FFV1",
@@ -328,11 +330,9 @@ class Recorder:
         height: int = 1080,
         fps: float = 30.0,
         mode: tuple[str, ...] = MJPEG,
-        copyts: bool = False,
         ffmpeg: str = "ffmpeg",
-        ffprobe: str = "ffprobe",
+        python: str = sys.executable,
         popen: Callable[..., Any] = subprocess.Popen,
-        run: Callable[..., Any] = subprocess.run,
         sleep: Callable[[float], None] = time.sleep,
     ):
         self.device = device
@@ -340,40 +340,37 @@ class Recorder:
         self.height = int(height)
         self.fps = float(fps)
         self.mode = tuple(mode)
-        self.copyts = bool(copyts)
         self.ffmpeg = ffmpeg
-        self.ffprobe = ffprobe
+        self.python = python
         self._popen = popen
-        self._run = run
         self._sleep = sleep
 
     def command(self, path: str | Path, *, seconds: float | None = None) -> list[str]:
-        """Recorder argv: the card in, one file out, whatever ``mode`` stores it as.
+        """Recorder argv: :mod:`~syncsummoner.device.v4l2rec` reading the card, ffmpeg storing it.
 
-        ``-t`` is unavailable under ``copyts``, where it is read against the
-        card's own clock and would stop the recording before it started.
+        ``seconds`` becomes a frame count at the card's own rate, so a take holds exactly that
+        many frames; every frame's V4L2 sequence and timestamp go to the :func:`~.v4l2rec.sidecar`.
         """
         argv = [
-            self.ffmpeg,
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "v4l2",
-            "-input_format",
-            self.mode[0],
-            "-video_size",
-            f"{self.width}x{self.height}",
-            "-framerate",
-            str(int(self.fps)),
-            "-i",
+            self.python,
+            "-m",
+            "syncsummoner.device.v4l2rec",
+            "--device",
             self.device,
+            "--width",
+            str(self.width),
+            "--height",
+            str(self.height),
+            "--fps",
+            f"{self.fps:g}",
+            "--input-format",
+            self.mode[0],
+            "--ffmpeg",
+            self.ffmpeg,
         ]
-        if self.copyts:
-            argv.append("-copyts")
-        elif seconds is not None:
-            argv += ["-t", f"{seconds:.3f}"]
-        return argv + list(self.mode[1:]) + [str(path)]
+        if seconds is not None:
+            argv += ["--seconds", f"{seconds:.3f}"]
+        return argv + [str(path), "--", *self.mode[1:]]
 
     @contextmanager
     def recording(
@@ -424,40 +421,27 @@ class Recorder:
             return int(proc.wait() or 0)
 
     def timestamps(self, path: str | Path) -> np.ndarray:
-        """When the card delivered each recorded frame, in stream order.
+        """When the card delivered each recorded frame, in seconds of ``CLOCK_MONOTONIC``.
 
-        Under ``copyts`` the stored presentation times are the card's own
-        ``CLOCK_MONOTONIC`` capture times, which is what :func:`time.monotonic`
-        reads, so the host's schedule and the recording share one timeline.
+        These are the driver's own buffer times from the sidecar, the clock
+        :func:`time.monotonic` reads, so the host's schedule and the recording share one timeline.
         """
-        done = self._run(
-            [
-                self.ffprobe,
-                "-v",
-                "error",
-                "-select_streams",
-                "v",
-                "-show_entries",
-                "packet=pts_time",
-                "-of",
-                "csv=p=0",
-                str(path),
-            ],
-            capture_output=True,
-            check=False,
-        )
-        out = done.stdout
-        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
-        return np.array([float(v) for v in text.split() if v], dtype=np.float64)
+        return read_log(path)["t_ns"] / 1e9
+
+    def frame_log(self, path: str | Path) -> np.ndarray:
+        """Every stored frame's V4L2 sequence, timestamp, size and flags."""
+        return read_log(path)
 
 
-def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240) -> TakeReport:
+def inspect_take(
+    path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240, start_s: float = 0.0
+) -> TakeReport:
     """Judge a finished take by structure and motion, never by brightness.
 
     A frame is picture when its luma ranges over more than one
     :data:`~syncsummoner.device.capture.QUANTUM`, the uniform-field bound
     :func:`~syncsummoner.device.capture.structured` applies; whether the take
-    moves is :func:`held`.
+    moves is :func:`held`. ``start_s`` skips a lead-in.
     """
     from syncsummoner.aesthetics.levels import LUMA_709  # keeps scipy off the device import path
 
@@ -466,6 +450,8 @@ def inspect_take(path: str | Path, *, ffmpeg: str = "ffmpeg", samples: int = 240
         ffmpeg,
         "-loglevel",
         "error",
+        "-ss",
+        f"{start_s:.3f}",
         "-i",
         str(path),
         "-vf",

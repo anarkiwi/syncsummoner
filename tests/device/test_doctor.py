@@ -50,8 +50,10 @@ FPGA = {"state": "running", "configured": True, "program": "Passthru"}
 class Pi:
     """Source host answering the doctor's one read with the sysfs values it holds."""
 
-    def __init__(self, blank="0", blink="0", size="1920,1080", depth="16", kms=KMSPRINT, *, down=False):
-        self.values = [blank, blink, size, depth]
+    def __init__(
+        self, blank="0", blink="0", size="1920,1080", depth="16", kms=KMSPRINT, *, down=False, **drm
+    ):
+        self.values = [blank, blink, size, depth, drm.get("player", ""), drm.get("holders", "")]
         self.kms = kms
         self.down = down
         self.commands = []
@@ -108,13 +110,17 @@ class FakeLink:
 
 
 class FakePlayout:
-    """Keeps the last frame shown."""
+    """Keeps the last frame shown, the rate it was held at, and whether it is still up."""
 
     def __init__(self):
-        self.frame = None
+        self.frame = self.fps = None
+        self.playing = False
 
-    def show(self, frame):
-        self.frame = frame
+    def show(self, frame, *, fps):
+        self.frame, self.fps, self.playing = frame, fps, True
+
+    def stop(self):
+        self.playing = False
 
 
 class FakeRecorder:
@@ -216,6 +222,21 @@ def test_mode_and_geometry_must_match_the_format(rig):
     assert not found["source.mode"].ok and "1920x1080@30" in found["source.mode"].fix
     assert not found["source.fb_geometry"].ok
     assert found["source.fb_geometry"].detail == "framebuffer 1280x720 at 32 bpp"
+
+
+@pytest.mark.parametrize(
+    ("player", "holders", "ok", "detail"),
+    [
+        ("", "", True, "held by nothing besides the player"),
+        ("4242", "4242", True, "held by nothing besides the player"),
+        ("4242", "4242 977 31", False, "held by 31, 977 besides the player"),
+        ("", "977", False, "held by 977 besides the player"),
+    ],
+)
+def test_only_the_player_may_hold_the_drm_card(rig, player, holders, ok, detail):
+    found = by_check(rig(pi=Pi(player=player, holders=holders)).checks())["source.drm_free"]
+    assert found.ok is ok and found.detail == f"{dr.DRM_CARD} {detail}"
+    assert ("977" in found.fix) is not ok
 
 
 def test_no_kmsprint_skips_the_mode_check(rig):
@@ -347,6 +368,7 @@ def test_loop_passes_on_a_clean_chain(rig, captured):
     assert found["loop.signal"].ok and found["loop.index"].ok and found["loop.bars"].ok
     assert found["loop.bars"].detail == "bars read white yellow cyan green magenta red blue"
     assert doc.dev.shell.loads == ["Passthru"]
+    assert doc.player.fps == FMT.fps and not doc.player.playing
     assert doc._link.calls[:2] == ["down", "up"]  # pylint: disable=protected-access
 
 

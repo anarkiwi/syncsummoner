@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring
 
+import types
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,11 @@ def _checked(monkeypatch, *, spans=(), cuts=None):
     Each take's attribution is its own name's length plus the clip frame, so a splice
     handed one take's picks for another's is caught.
     """
-    seen = {}
+    seen = {"attributed": []}
+
+    def attribute(take, *, config):
+        seen["attributed"].append((Path(take).name, config.fps))
+        return types.SimpleNamespace(picked=np.arange(5) * len(Path(take).name))
 
     def check(score, plan, takes, clip, **kw):
         del score
@@ -26,6 +31,7 @@ def _checked(monkeypatch, *, spans=(), cuts=None):
         traces = {name: T.Trace(np.arange(10) + len(name), None, None, None, None, "strip") for name in takes}
         return T.CheckReport(cuts=list(cuts or plan), spans=list(spans), traces=traces)
 
+    monkeypatch.setattr(R, "attribute_take", attribute)
     monkeypatch.setattr(T, "check_takes", check)
     return seen
 
@@ -139,9 +145,15 @@ def test_an_author_qualified_program_gets_a_take_file_not_a_subdirectory(monkeyp
         assert take.parent == tmp_path and take.name.startswith("take-czartroniks_Roll_the_Bones-")
 
 
-def test_every_take_is_checked_against_the_played_clip_before_the_cut(monkeypatch, tmp_path):
-    seen = _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"])
-    assert seen["check"]["clip"] == "timecoded.mkv" and set(seen["check"]["takes"]) == {"Derez", "Lorenz"}
+def test_every_take_is_checked_against_the_played_clip_by_its_locked_attribution(monkeypatch, tmp_path):
+    seen = _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"])["check"]
+    assert seen["clip"] == "timecoded.mkv" and set(seen["takes"]) == {"Derez", "Lorenz"}
+    fps = R.RenderConfig().fps
+    assert seen["attributed"] == [("take-Derez.mkv", fps), ("take-Lorenz.mkv", fps)], "at the session rate"
+    assert {n: a.tolist() for n, a in seen["attributions"].items()} == {
+        "Derez": (np.arange(5) * 14).tolist(),
+        "Lorenz": (np.arange(5) * 15).tolist(),
+    }
 
 
 def test_a_covered_span_is_cut_from_the_take_alive_there(monkeypatch, tmp_path):

@@ -19,6 +19,7 @@ import numpy as np
 from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.errors import DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
+from syncsummoner.device.playout import DEFAULT_LOOP_FPS
 from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
 from syncsummoner.device.recorder import (
     BlankTakeError,
@@ -91,7 +92,8 @@ class HarvestConfig:
     capture_fps: int = 30
     #: The output timing the device must drive, as it names it; the raster above is its size.
     timing: str = "1080p30"
-    loop_fps: float = 12.0
+    #: A whole number of vblanks per loop frame, as the locked player requires.
+    loop_fps: float = DEFAULT_LOOP_FPS
     loop_frames: int = codeframes.DEFAULT_COUNT
     setpoints: int = 32
     dwell_s: float = 1.0

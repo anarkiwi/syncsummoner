@@ -1,0 +1,182 @@
+"""Acceptance check of the locked frame clock: a timecoded take judged capture by capture.
+
+Every flip must land on its vblank, every clip frame must have its captures in one gap-free
+run on the card's cadence, every legible strip must read the frame the cadence says, and,
+under Passthru, no capture may show a neighbouring frame in its upper bands.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from syncsummoner.compose import render
+from syncsummoner.compose.lock import Run, signed, strip_codes
+from syncsummoner.progress import LOG, stage
+
+#: Size frames are compared at for the tear check.
+TEAR_SIZE = (96, 54)
+#: Bands judged for tearing: the top and middle thirds, as row fractions.
+BANDS = ((0.0, 1 / 3), (1 / 3, 2 / 3))
+
+
+@dataclass(frozen=True)
+class LockReport:
+    """What a locked take shows: cadence, drops and tears over its clip frames."""
+
+    frames: int
+    attributed: int
+    flips: dict
+    drops: int
+    gaps: int
+    off_cadence: int
+    read: int
+    agreed: int
+    judged: int
+    torn: int
+    run: Run
+
+    @property
+    def ok(self) -> bool:
+        """Whether the take is exact: every frame attributed, nothing missed, dropped, off cadence or torn."""
+        return (
+            self.attributed == self.frames
+            and self.flips["missed"] == 0
+            and self.flips["out_of_cadence"] == 0
+            and self.drops == 0
+            and self.gaps == 0
+            and self.off_cadence == 0
+            and self.agreed == self.read
+            and self.torn == 0
+        )
+
+    def summary(self) -> str:
+        """The verdict and every count behind it."""
+        flips = self.flips
+        return (
+            f"{'LOCKED' if self.ok else 'NOT LOCKED'}: {self.attributed}/{self.frames} clip frames "
+            f"attributed; Pi {flips['flips']} flips, {flips['missed']} missed vblanks, "
+            f"{flips['out_of_cadence']} off cadence; card {self.drops} lost frames, {self.gaps} gaps and "
+            f"{self.off_cadence} frame changes off cadence in the clip; strips {self.agreed}/{self.read} "
+            f"agree; {self.torn}/{self.judged} torn"
+        )
+
+
+def luma(path: str | Path, *, ffmpeg: str = "ffmpeg") -> np.ndarray:
+    """Every frame of a recording as small luma, area-averaged."""
+    width, height = TEAR_SIZE
+    argv = [ffmpeg, "-loglevel", "error", "-i", str(path), "-fps_mode", "passthrough"]
+    argv += ["-vf", f"scale={width}:{height}:flags=area", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    data = subprocess.run(argv, check=True, capture_output=True).stdout
+    size = width * height
+    return np.frombuffer(data[: len(data) - len(data) % size], np.uint8).reshape(-1, height, width)
+
+
+def band_error(a: np.ndarray, b: np.ndarray, band: slice) -> np.ndarray:
+    """Mean absolute difference of two frame stacks over a band of rows, per frame."""
+    return np.abs(a[:, band] - b[:, band]).mean(axis=(1, 2))
+
+
+def tears(captured: np.ndarray, source: np.ndarray) -> tuple[int, int]:
+    """Bands judged and bands torn, over captures paired with the source frames they should show.
+
+    A band is judged where its neighbouring source frames differ from it by more than the
+    better match's residual, and torn where a neighbour matches the capture better.
+    """
+    cap = captured.astype(np.float64)
+    src = source.astype(np.float64)
+    gain, offset = np.polyfit(src[1:-1].ravel()[::7], cap[1:-1].ravel()[::7], 1)
+    src = gain * src + offset
+    judged = torn = 0
+    rows = cap.shape[1]
+    for top, bottom in BANDS:
+        band = slice(int(round(top * rows)), int(round(bottom * rows)))
+        own = band_error(cap[1:-1], src[1:-1], band)
+        near = np.minimum(band_error(cap[1:-1], src[:-2], band), band_error(cap[1:-1], src[2:], band))
+        apart = np.minimum(band_error(src[1:-1], src[:-2], band), band_error(src[1:-1], src[2:], band))
+        seen = apart > np.minimum(own, near)
+        judged += int(seen.sum())
+        torn += int((seen & (near < own)).sum())
+    return judged, torn
+
+
+def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> LockReport:
+    """Judge a recorded take; with ``clip`` (a Passthru take's played clip) also check for tears."""
+    from syncsummoner.device.playout import flip_summary
+    from syncsummoner.device.v4l2rec import read_log
+
+    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
+    codes = strip_codes(take, width=config.width, strip_px=config.strip_px, bits=config.bits, ffmpeg=ffmpeg)
+    found = render.attribute_take(take, config=config, codes=codes)
+    record = np.load(render.lock_path(take))
+    frames = read_log(take)
+    m, run = found.per_frame, found.run
+    first = int(found.picked[0]) - m // 2
+    last = int(found.picked[-1]) - m // 2 + m - 1
+    span = np.arange(first, last + 1)
+    new = np.r_[False, frames["digest"][1:] != frames["digest"][:-1]][span]
+    on_cadence = (run.slot + span - run.first) % m == 0
+    gaps = sum(1 for r in found.runs if first < r.first <= last)
+    clip_codes = signed(codes[span], config.bits)
+    readable = (codes[span] >= 0) & (clip_codes >= 0) & (clip_codes < found.picked.size)
+    judged = torn = 0
+    if clip is not None:
+        with stage("tears", take=str(take)) as said:
+            source = luma(clip, ffmpeg=ffmpeg)[found.lead : found.lead + found.picked.size]
+            judged, torn = tears(luma(take, ffmpeg=ffmpeg)[found.picked], source)
+            said.update(judged=judged, torn=torn)
+    return LockReport(
+        frames=int(found.picked.size),
+        attributed=int(np.count_nonzero(found.picked >= 0)),
+        flips=flip_summary(record["flips"], int(record["hold"])),
+        drops=int(np.clip(np.diff(frames["sequence"][first : last + 1]) - 1, 0, None).sum()),
+        gaps=gaps,
+        off_cadence=int(np.count_nonzero(new & ~on_cadence)),
+        read=int(readable.sum()),
+        agreed=int(np.count_nonzero(readable & (clip_codes == found.shown[span]))),
+        judged=judged,
+        torn=torn,
+        run=run,
+    )
+
+
+def clip_seconds(clip: str | Path, config: Any) -> float:
+    """A prepared clip's length after its lead-in, from its frame count."""
+    argv = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets"]
+    argv += ["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(clip)]
+    packets = int(subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip())
+    return (packets - render.lead_frames(config)) / config.fps
+
+
+def lockcheck(
+    take: str | Path,
+    *,
+    clip: str | Path,
+    config: Any,
+    program: str | None = None,
+    rig: Any = None,
+    recorder: Any = None,
+    seconds: float | None = None,
+) -> LockReport:
+    """Play ``clip`` through Passthru, or ``program`` loaded in the lead-in; record it and judge it."""
+    seconds = clip_seconds(clip, config) if seconds is None else seconds
+    owned = rig is None
+    rig = render.open_rig(config, capture=False) if owned else rig
+    if recorder is None:
+        from syncsummoner.device.recorder import MJPEG, Recorder
+
+        recorder = Recorder(width=config.width, height=config.height, fps=config.fps, mode=MJPEG)
+    try:
+        with stage("upload", clip=str(clip)) as sent:
+            sent["bytes"] = rig.playout.upload(str(clip))
+        render.play_take(rig, recorder, take, program=program, seconds=seconds, config=config)
+    finally:
+        if owned:
+            rig.transport.close()
+    report = judge(take, config=config, clip=clip if program is None else None)
+    LOG.info("%s: %s", take, report.summary())
+    return report

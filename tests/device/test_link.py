@@ -2,7 +2,10 @@
 
 # pylint: disable=missing-function-docstring
 
+import re
+import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -31,7 +34,7 @@ class FakeHost:
                 else:
                     self.state, self.pending = self.pending, None
             return f"  {self.state}\n"
-        self.pending = DOWN if int(command.split()[1]) == POWERDOWN else UP
+        self.pending = DOWN if int(re.search(r"echo (\d) \| sudo", command)[1]) == POWERDOWN else UP
         return ""
 
     @property
@@ -46,18 +49,68 @@ def make_link(host=None, **kwargs):
     return Link(runner=host, sleep=clock.sleep, clock=clock, **kwargs), host, clock
 
 
-def test_down_powers_the_framebuffer_off_through_sudo():
+def test_down_then_up_each_issue_one_drive_and_wait_for_dpms():
     link, host, _ = make_link()
-    assert link.down() == DOWN
-    assert host.writes == [f"echo {POWERDOWN} | sudo -n tee {lk.DEFAULT_BLANK} > /dev/null"]
-    assert link.state() == DOWN
+    assert link.down() == DOWN and link.state() == DOWN
+    assert link.up() == UP and link.state() == UP
+    assert "kill -USR1" in host.writes[0] and f"echo {POWERDOWN} | sudo" in host.writes[0]
+    assert "kill -USR2" in host.writes[1] and f"echo {UNBLANK} | sudo" in host.writes[1]
+    assert len(host.writes) == 2 and all(lk.DEFAULT_PLAYER_PID in w for w in host.writes)
 
 
-def test_up_unblanks_and_restores_the_link():
-    link, host, _ = make_link()
-    link.down()
-    assert link.up() == UP
-    assert host.writes[-1] == f"echo {UNBLANK} | sudo -n tee {lk.DEFAULT_BLANK} > /dev/null"
+def shell_runner(tmp_path):
+    """Runs each command in a real shell, with a ``sudo`` that just runs its command."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "sudo").write_text('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    (bin_dir / "sudo").chmod(0o755)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    return lambda command: subprocess.run(
+        ["sh", "-c", command], env=env, capture_output=True, text=True, check=True
+    ).stdout
+
+
+SIGNALLED = (
+    "import signal, sys, time\n"
+    "for s in (signal.SIGUSR1, signal.SIGUSR2):\n"
+    "    signal.signal(s, lambda n, _: print(signal.Signals(n).name, flush=True))\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(30)\n"
+)
+
+
+@pytest.mark.parametrize(("drive", "want"), [("down", DOWN), ("up", UP)])
+def test_a_live_player_is_signalled_and_fbdev_left_alone(tmp_path, drive, want):
+    pidfile, blank, dpms = tmp_path / "player.pid", tmp_path / "blank", tmp_path / "dpms"
+    dpms.write_text(want)
+    with subprocess.Popen([sys.executable, "-c", SIGNALLED], stdout=subprocess.PIPE, text=True) as proc:
+        assert proc.stdout.readline() == "ready\n"
+        pidfile.write_text(f"{proc.pid}\n")
+        link = Link(
+            runner=shell_runner(tmp_path), blank_path=str(blank), dpms_path=str(dpms), player_pid=str(pidfile)
+        )
+        assert getattr(link, drive)() == want
+        got = proc.stdout.readline().strip()
+        proc.send_signal(signal.SIGKILL)
+    assert got == f"SIGUSR{1 if want == DOWN else 2}" and not blank.exists()
+
+
+@pytest.mark.parametrize("pid", [None, "dead", ""])
+@pytest.mark.parametrize(("drive", "value"), [("down", POWERDOWN), ("up", UNBLANK)])
+def test_without_a_live_player_fbdev_blanking_drives_the_link(tmp_path, pid, drive, value):
+    pidfile, blank, dpms = tmp_path / "player.pid", tmp_path / "blank", tmp_path / "dpms"
+    dpms.write_text(DOWN if value == POWERDOWN else UP)
+    if pid == "dead":
+        with subprocess.Popen(["true"]) as gone:
+            gone.wait()
+        pid = str(gone.pid)
+    if pid is not None:
+        pidfile.write_text(pid)
+    link = Link(
+        runner=shell_runner(tmp_path), blank_path=str(blank), dpms_path=str(dpms), player_pid=str(pidfile)
+    )
+    getattr(link, drive)()
+    assert blank.read_text() == f"{value}\n"
 
 
 def test_state_reads_dpms_and_strips():
@@ -67,9 +120,11 @@ def test_state_reads_dpms_and_strips():
 
 
 def test_paths_and_host_are_parameters_not_rig_constants():
-    link, host, _ = make_link(blank_path="/sys/fbX/blank", dpms_path="/sys/cardX/dpms")
+    link, host, _ = make_link(
+        blank_path="/sys/fbX/blank", dpms_path="/sys/cardX/dpms", player_pid="/run/p.pid"
+    )
     link.down()
-    assert "/sys/fbX/blank" in host.writes[0]
+    assert "/sys/fbX/blank" in host.writes[0] and "cat /run/p.pid" in host.writes[0]
     assert host.commands[1] == "cat /sys/cardX/dpms"
 
 

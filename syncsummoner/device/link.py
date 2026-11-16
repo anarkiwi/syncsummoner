@@ -1,8 +1,8 @@
 """Rig-level control of the HDMI link from the stimulus source into the device.
 
-Under full KMS ``vcgencmd display_power`` is a no-op; the DRM fbdev emulation
-(``vc4drmfb``) is the working control. Blanking the source framebuffer drops the
-link, which the device reports as loss of source lock, and clears the display.
+While the KMS player holds the display it drops the link itself, on ``SIGUSR1`` until
+``SIGUSR2``, with its timeline still running; otherwise fbdev blanking (``vc4drmfb``) drops
+it. Either way the device reports loss of source lock, and ``dpms`` follows.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 from .host import DEFAULT_HOST, Runner, ssh_runner
+from .playout import DEFAULT_DIR
 
 DEFAULT_BLANK = "/sys/class/graphics/fb0/blank"
 DEFAULT_DPMS = "/sys/class/drm/card1-HDMI-A-1/dpms"
@@ -19,6 +20,10 @@ DEFAULT_DPMS = "/sys/class/drm/card1-HDMI-A-1/dpms"
 UNBLANK, POWERDOWN = 0, 4
 #: Values ``dpms`` reads back as.
 UP, DOWN = "On", "Off"
+#: The KMS player's pidfile: a live player owns the display, so it is the one asked.
+DEFAULT_PLAYER_PID = f"{DEFAULT_DIR}/player.pid"
+#: Signals the player takes the link down and back up on.
+PLAYER_SIGNAL = {POWERDOWN: "USR1", UNBLANK: "USR2"}
 
 
 class LinkError(RuntimeError):
@@ -39,6 +44,7 @@ class Link:
         *,
         blank_path: str = DEFAULT_BLANK,
         dpms_path: str = DEFAULT_DPMS,
+        player_pid: str = DEFAULT_PLAYER_PID,
         timeout_s: float = 10.0,
         poll_s: float = 0.25,
         runner: Runner | None = None,
@@ -49,6 +55,7 @@ class Link:
             raise ValueError(f"poll_s must be positive, got {poll_s}")
         self.blank_path = blank_path
         self.dpms_path = dpms_path
+        self.player_pid = player_pid
         self.timeout_s = float(timeout_s)
         self.poll_s = float(poll_s)
         self._runner = ssh_runner(host) if runner is None else runner
@@ -60,8 +67,12 @@ class Link:
         return self._runner(f"cat {self.dpms_path}").strip()
 
     def _blank(self, value: int, want: str) -> str:
-        """Drive the framebuffer blanking level and wait for ``dpms`` to follow."""
-        self._runner(f"echo {value} | sudo -n tee {self.blank_path} > /dev/null")
+        """Have the player, or fbdev when none runs, drive the link, and wait for ``dpms`` to follow."""
+        self._runner(
+            f"P=$(cat {self.player_pid} 2>/dev/null); "
+            f'if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then kill -{PLAYER_SIGNAL[value]} "$P"; '
+            f"else echo {value} | sudo -n tee {self.blank_path} > /dev/null; fi"
+        )
         deadline = self._clock() + self.timeout_s
         while True:
             state = self.state()

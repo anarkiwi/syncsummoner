@@ -107,3 +107,33 @@ def test_motion_wraps_over_a_loop():
 
 def test_motion_needs_a_few_frames():
     assert F.motion_model(np.arange(2) / FPS, np.zeros(2), np.zeros(2), fps=FPS) is None
+
+
+def _recorded(monkeypatch, codes, frames):
+    monkeypatch.setattr(
+        F,
+        "decode_recording",
+        lambda clip, **kw: F.Recording(
+            times=np.arange(len(codes)) / FPS, codes=np.array(codes), frames=frames
+        ),
+    )
+    return F.source_series("clip.mkv", strip_px=8)
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [[65532, 65533, 65534, 65535], [-1, 65534, -1, 65535], []],
+    ids=["lead-in", "misread-lead-in", "none"],
+)
+def test_the_source_series_starts_at_clip_frame_0_after_any_lead_in(monkeypatch, lead):
+    rng = np.random.default_rng(4)
+    clip = rng.integers(0, 256, (6, 36, 64), dtype=np.uint8)
+    held = np.repeat(clip[:1], len(lead), axis=0)
+    si, ti = _recorded(monkeypatch, lead + list(range(6)), np.concatenate([held, clip]))
+    want_si, want_ti = _recorded(monkeypatch, list(range(6)), clip)
+    assert len(si) == 6 and np.array_equal(si, want_si) and np.array_equal(ti, want_ti, equal_nan=True)
+
+
+def test_a_clip_with_no_lead_in_keeps_an_unread_first_frame(monkeypatch):
+    clip = np.random.default_rng(5).integers(0, 256, (5, 36, 64), dtype=np.uint8)
+    assert len(_recorded(monkeypatch, [-1, 1, 2, 3, 4], clip)[0]) == 5

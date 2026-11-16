@@ -322,9 +322,14 @@ def _drain(pipe, into: list[bytes]) -> None:
 def source_series(
     clip: str | Path, *, strip_px: int, size: tuple[int, int] = INSPECT_SIZE, ffmpeg: str = "ffmpeg"
 ) -> tuple[np.ndarray, np.ndarray]:
-    """SI and TI of every frame of the clip that was played, in clip order, at survival size."""
+    """SI and TI of every frame of the clip that was played, in clip order, at survival size.
+
+    A locked take's lead-in, numbered below zero and so wrapped to the strip's top half, is skipped.
+    """
     recording = decode_recording(clip, strip_px=strip_px, bits=16, size=size, ffmpeg=ffmpeg)
-    return aesthetics.information(unit_frames(recording.frames))
+    clip_codes = (recording.codes >= 0) & (recording.codes < 1 << 15)
+    lead = int(np.argmax(clip_codes)) if np.any(recording.codes >= 1 << 15) else 0
+    return aesthetics.information(unit_frames(recording.frames[lead:]))
 
 
 def unit_frames(frames: np.ndarray):

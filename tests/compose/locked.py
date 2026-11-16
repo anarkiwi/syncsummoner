@@ -1,0 +1,225 @@
+"""Synthetic locked takes: the Pi's flip log and the card's frame log for known captured slots."""
+
+import contextlib
+import dataclasses
+import types
+from pathlib import Path
+
+import numpy as np
+
+from syncsummoner.compose import lock as L
+from syncsummoner.compose import render as R
+from syncsummoner.compose.score import Layer, Score, Section
+from syncsummoner.device.playout import FLIP
+from syncsummoner.device.v4l2rec import FRAME, sidecar
+from tests.compose import PROBED, rig_transport
+
+VBLANK_NS = 16_666_667
+PI_T0 = 1_000_000_000
+#: Capture clock minus Pi clock.
+CARD_NS = 7_000_000_000
+WRAP = 0xFFFF
+
+
+@dataclasses.dataclass
+class Take:
+    """A take's logs, and the sub-frame slot ``per_frame * played + copy`` each capture truly shows."""
+
+    slots: np.ndarray
+    frames: np.ndarray
+    flips: np.ndarray
+    codes: np.ndarray
+    lead: int
+    count: int
+    per_frame: int
+    hold: int
+
+    @property
+    def kw(self) -> dict:
+        """What the lock record says was played."""
+        return {"hold": self.hold, "lead": self.lead, "count": self.count}
+
+    def picked(self) -> np.ndarray:
+        """The capture of each clip frame's middle copy, -1 where none was captured."""
+        want = self.per_frame * (np.arange(self.count) + self.lead) + self.per_frame // 2
+        at = {int(s): k for k, s in enumerate(self.slots)}
+        return np.array([at.get(int(w), -1) for w in want])
+
+    def shown(self) -> np.ndarray:
+        """The clip frame each capture shows, negative in the lead-in."""
+        return self.slots // self.per_frame - self.lead
+
+
+def flip_log(frames: int, hold: int) -> np.ndarray:
+    """A flip every vblank, each frame held ``hold`` vblanks, one segment."""
+    v = np.arange(frames * hold)
+    out = np.zeros(v.size, FLIP)
+    out["v"] = out["seq"] = v
+    out["frame"] = v // hold
+    out["t_ns"] = PI_T0 + v * VBLANK_NS
+    out["flags"][0] = 1
+    return out
+
+
+def take(
+    runs,
+    *,
+    lead=8,
+    count=6,
+    per_frame=2,
+    hold=2,
+    strips=(0,),
+    misread=None,
+    shift=0,
+):
+    """Captures of slots ``first..last`` per run ``(first, last, late, lost)``, ``late`` in captures.
+
+    ``lost`` is the driver sequence numbers skipped before the run; runs in ``strips`` carry
+    legible strips, ``misread`` is ``(capture, code)``, and ``shift`` moves the card's repeats.
+    """
+    slots, late, sequence, legible = [], [], [], []
+    seq = 0
+    for index, (first, last, delay, *lost) in enumerate(runs):
+        span = np.arange(first, last + 1)
+        seq += lost[0] if lost else 0
+        slots.append(span)
+        late.append(np.broadcast_to(np.asarray(delay, float), span.shape))
+        sequence.append(seq + np.arange(span.size))
+        seq += span.size
+        legible.append(np.full(span.size, index in strips))
+    slots, late = np.concatenate(slots), np.concatenate(late)
+    capture = hold * VBLANK_NS / per_frame
+    frames = np.zeros(slots.size, FRAME)
+    frames["sequence"] = np.concatenate(sequence)
+    frames["t_ns"] = np.round(PI_T0 + CARD_NS + (slots + late) * capture).astype(np.int64)
+    frames["bytes"] = 1
+    frames["digest"] = (slots + shift) // per_frame
+    codes = np.where(np.concatenate(legible), (slots // per_frame - lead) & WRAP, -1)
+    if misread is not None:
+        codes[misread[0]] = misread[1]
+    flips = flip_log(lead + count + 1, hold)
+    return Take(slots, frames, flips, codes, lead, count, per_frame, hold)
+
+
+#: Lead-in with strips, a load's outage, a run on another card phase, a lost frame, the rest of the clip.
+STANDARD = ((0, 7, 0.0), (13, 19, 0.3), (21, 27, 0.3, 1))
+#: The same take with nothing lost after the outage.
+CLEAN = ((0, 7, 0.0), (13, 27, 0.3))
+
+
+class Clock:
+    """Monotonic clock advanced only by the sleeps handed to it."""
+
+    def __init__(self, now=0.0):
+        self.now = now
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        """Sleep."""
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+class Played:
+    """A rig and recorder playing ``played`` on ``clock``, logging each step; the card's log written on stop.
+
+    ``skew_s`` is how long after the recording starts the first lead-in frame reaches the card,
+    and ``load_s`` how long each program's load takes.
+    """
+
+    def __init__(self, played, transport=None, *, clock=None, load_s=None, skew_s=0.0):
+        self.take, self.clock, self.skew_s = played, clock or Clock(), skew_s
+        self.load_s, self.log = dict(load_s or {}), []
+        session = types.SimpleNamespace(
+            load_program=self.load,
+            working_point=lambda info: {1: 0.5},
+            set_params=lambda values: self.log.append(("params", dict(values))),
+        )
+        self.rig = R.Rig(
+            session=session, capture=None, playout=self, transport=transport or rig_transport(), link="link"
+        )
+
+    @property
+    def steps(self) -> list:
+        """The step names, in order."""
+        return [step[0] for step in self.log]
+
+    def load(self, program, *, link=None, park=True):
+        """Load a program, taking its time on the clock."""
+        del park
+        self.log.append(("load", program, link))
+        self.clock.now += self.load_s.get(program, 0.0)
+
+    def upload(self, path):
+        """Upload."""
+        self.log.append(("upload", str(path)))
+        return 1
+
+    @contextlib.contextmanager
+    def playing(self, *, fps):
+        """Play for the block."""
+        self.log.append(("play", fps, self.clock.now))
+        yield self
+        self.log.append(("stop",))
+
+    def status(self):
+        """The player's status."""
+        return {"hold": self.take.hold}
+
+    def flips(self):
+        """The flip log of the last play."""
+        self.log.append(("flips",))
+        return self.take.flips
+
+    @contextlib.contextmanager
+    def recording(self, path, seconds=None):
+        """Record for the block; the frame log is on the clock the recording started on."""
+        del seconds
+        self.log.append(("record", str(path)))
+        base = int(round((self.clock.now + self.skew_s) * 1e9)) - PI_T0 - CARD_NS
+        yield
+        frames = self.take.frames.copy()
+        frames["t_ns"] += base
+        Path(sidecar(path)).write_bytes(frames.tobytes())
+        self.log.append(("recorded",))
+
+
+#: A session the standard take was played at: its lead-in and clip in frames, and a short tail.
+LOCKED = R.RenderConfig(width=160, height=24, fps=30.0, strip_px=8, bits=16, lead_in_s=8 / 30, tail_s=0.05)
+
+
+def locked_pass(monkeypatch, played=None, transport=None, **kwargs):
+    """A :class:`Played` rig on its own clock, the pass's automation and judging logged rather than run."""
+    rig = Played(take(STANDARD) if played is None else played, transport, **kwargs)
+    monkeypatch.setattr(R, "time", types.SimpleNamespace(monotonic=rig.clock, sleep=rig.clock.sleep))
+    monkeypatch.setattr(L, "strip_codes", lambda *a, **k: rig.take.codes)
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+
+    def drive(_rig, _auto, *, duration, start):
+        rig.log.append(("drive", start, duration))
+        return 0
+
+    monkeypatch.setattr(R, "drive", drive)
+    monkeypatch.setattr(
+        R, "inspect_take", lambda path, **kw: rig.log.append(("inspect", kw["start_s"])) or PROBED
+    )
+    return rig
+
+
+def render_locked(rig, out, config=LOCKED, program="Teletext"):
+    """Render a one-layer score the length of the standard take's clip on ``rig``."""
+    score = Score(duration=0.2, fps=30.0, sections=[Section(0.0, 0.2, "A")], layers=[Layer(program, 0, [])])
+    return R.render_played(
+        score,
+        "clip.mkv",
+        out,
+        profiles={},
+        rig=rig.rig,
+        config=config,
+        scratch="tc.mkv",
+        prepared=True,
+        recorder=rig,
+    )

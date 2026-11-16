@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from pyvmancer.errors import DeviceGoneError, StallError
 
-from syncsummoner.device import recorder as rec
+from syncsummoner.device import recorder as rec, v4l2rec
 from syncsummoner.device.recorder import (
     FFV1,
     MJPEG,
@@ -97,38 +97,54 @@ def test_require_ffmpeg_names_the_missing_binary(monkeypatch):
         require_ffmpeg("not-a-real-binary")
 
 
-def test_the_recorder_asks_the_card_for_what_it_can_actually_deliver():
-    """MJPEG measured 59.8fps against 25.8 raw and 7.7 through a per-frame loop."""
-    argv = Recorder(width=1920, height=1080, fps=30.0, mode=MJPEG).command("/tmp/take.mkv", seconds=12.5)
-    assert argv[argv.index("-input_format") + 1] == "mjpeg"
-    assert argv[argv.index("-video_size") + 1] == "1920x1080"
-    assert argv[argv.index("-c:v") + 1] == "copy", "the card compresses; the host does not re-encode"
-    assert argv[argv.index("-t") + 1] == "12.500" and argv[-1] == "/tmp/take.mkv"
+def option(argv, flag):
+    return argv[argv.index(flag) + 1]
 
 
-def test_an_archive_recording_keeps_the_cards_own_samples():
-    argv = Recorder(mode=RAW_422).command("/tmp/raw.mkv")
-    assert argv[argv.index("-input_format") + 1] == "yuyv422"
-    assert argv[argv.index("-c:v") + 1] == "rawvideo" and "-t" not in argv
+def test_the_recorder_runs_the_v4l2_recorder_asking_the_card_for_its_mode():
+    argv = Recorder("/dev/video2", fps=29.97, mode=MJPEG, python="py").command("/tmp/take.mkv", seconds=12.5)
+    assert argv[:3] == ["py", "-m", "syncsummoner.device.v4l2rec"]
+    assert [option(argv, f) for f in ("--device", "--width", "--height", "--fps", "--input-format")] == [
+        "/dev/video2",
+        "1920",
+        "1080",
+        "29.97",
+        "mjpeg",
+    ]
+    assert option(argv, "--seconds") == "12.500"
+    assert argv[-4:] == [
+        "/tmp/take.mkv",
+        "--",
+        "-c:v",
+        "copy",
+    ], "the card compresses; the host does not re-encode"
 
 
-def test_every_output_argument_of_a_mode_reaches_the_encoder_in_order():
-    """A lossless mode is a whole argument list, not a codec name."""
-    argv = Recorder(mode=FFV1).command("/tmp/archive.mkv")
-    assert argv[-len(FFV1) : -1] == list(FFV1[1:])
-    assert argv[argv.index("-slices") + 1] == "4" and argv[-1] == "/tmp/archive.mkv"
+@pytest.mark.parametrize("mode", [RAW_422, FFV1])
+def test_every_output_argument_of_a_mode_reaches_the_encoder_in_order(mode):
+    argv = Recorder(mode=mode).command("/tmp/archive.mkv")
+    assert option(argv, "--input-format") == "yuyv422" and "--seconds" not in argv
+    assert argv[argv.index("--") + 1 :] == list(mode[1:])
 
 
-def test_copyts_replaces_the_duration_rather_than_joining_it():
-    """Under copyts ffmpeg reads -t against the card's clock and stops before it starts."""
-    argv = Recorder(mode=FFV1, copyts=True).command("/tmp/archive.mkv", seconds=30.0)
-    assert "-copyts" in argv and "-t" not in argv
-    assert argv.index("-copyts") > argv.index("-i"), "an output flag, after the input it stamps"
-
-
-def test_without_copyts_a_duration_still_bounds_the_take():
-    argv = Recorder(mode=MJPEG).command("/tmp/take.mkv", seconds=4.0)
-    assert argv[argv.index("-t") + 1] == "4.000" and "-copyts" not in argv
+def test_the_recorder_command_parses_back_to_what_was_asked():
+    argv = Recorder("/dev/video1", width=1280, height=720, fps=60.0, mode=FFV1, ffmpeg="/opt/ffmpeg").command(
+        "/tmp/a.mkv", seconds=2.0
+    )
+    args = v4l2rec.parse_args(argv[3:])
+    assert (args.device, args.width, args.height, args.fps, args.seconds) == (
+        "/dev/video1",
+        1280,
+        720,
+        60.0,
+        2.0,
+    )
+    assert (args.input_format, args.ffmpeg, args.out, args.out_args) == (
+        "yuyv422",
+        "/opt/ffmpeg",
+        "/tmp/a.mkv",
+        list(FFV1[1:]),
+    )
 
 
 def test_recording_stops_the_encoder_and_checks_it_wrote(tmp_path):
@@ -181,26 +197,14 @@ def test_stopping_a_recorder_whose_pipe_is_already_gone_still_waits_for_it():
     assert Recorder().stop(proc) == 3
 
 
-def test_timestamps_are_the_per_packet_presentation_times():
-    """Under copyts these are CLOCK_MONOTONIC, which is what the host schedules on."""
-    calls = []
-    recorder = Recorder(run=fake_run(calls, stdout=b"1000.5\n1000.533\n1000.567\n"))
-    stamps = recorder.timestamps("/tmp/archive.mkv")
-    assert stamps.dtype == np.float64
-    assert stamps == pytest.approx([1000.5, 1000.533, 1000.567])
-    argv = calls[0]
-    assert argv[0] == "ffprobe" and argv[argv.index("-show_entries") + 1] == "packet=pts_time"
-    assert argv[argv.index("-select_streams") + 1] == "v" and argv[-1] == "/tmp/archive.mkv"
-
-
-def test_timestamps_accept_text_output_too():
-    recorder = Recorder(run=fake_run([], stdout="0.0 0.04 0.08"))
-    assert recorder.timestamps("/tmp/a.mkv") == pytest.approx([0.0, 0.04, 0.08])
-
-
-def test_timestamps_of_an_unreadable_file_are_empty():
-    """A failed probe is no timeline, not a crash: the caller has nothing to attribute."""
-    assert Recorder(run=fake_run([], stdout=b"", returncode=1)).timestamps("/tmp/gone.mkv").size == 0
+def test_timestamps_and_frame_log_come_from_the_sidecar(tmp_path):
+    take = tmp_path / "take.mkv"
+    log = np.zeros(3, dtype=v4l2rec.FRAME)
+    log["sequence"], log["t_ns"] = [7, 8, 10], [1_000_500_000_000, 1_000_533_000_000, 1_000_600_000_000]
+    v4l2rec.sidecar(take).write_bytes(log.tobytes())
+    stamps = Recorder().timestamps(take)
+    assert stamps.dtype == np.float64 and stamps == pytest.approx([1000.5, 1000.533, 1000.6])
+    assert Recorder().frame_log(take)["sequence"].tolist() == [7, 8, 10]
 
 
 def test_inspection_point_samples_rgb_so_the_card_s_own_pixels_are_judged(monkeypatch, tmp_path):
@@ -209,8 +213,10 @@ def test_inspection_point_samples_rgb_so_the_card_s_own_pixels_are_judged(monkey
     report = inspect_take(tmp_path / "take.mkv")
     assert report.frames == 4 and report.picture == 0, "uniform fields are dead at any brightness"
     assert report.luma == pytest.approx(np.mean([0, 90, 180, 255]) / 255.0, abs=1e-4)
-    assert argv[0][argv[0].index("-pix_fmt") + 1] == "rgb24"
-    assert "flags=neighbor" in argv[0][argv[0].index("-vf") + 1]
+    assert option(argv[0], "-pix_fmt") == "rgb24" and option(argv[0], "-ss") == "0.000"
+    assert "flags=neighbor" in option(argv[0], "-vf")
+    inspect_take(tmp_path / "take.mkv", start_s=2.5)
+    assert option(argv[1], "-ss") == "2.500" and argv[1].index("-ss") < argv[1].index("-i")
 
 
 def test_a_live_paused_picture_settles_but_is_not_a_usable_take():

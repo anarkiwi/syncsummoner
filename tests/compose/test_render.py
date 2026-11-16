@@ -13,10 +13,13 @@ import numpy as np
 import pytest
 from pyvmancer import CcMapError
 
+from syncsummoner.compose import lock as L
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
 from syncsummoner.compose.vocabulary import Automation
+from syncsummoner.probe.patterns import read_timecode
 from tests.compose import PROBED, rig_transport
+from tests.compose.locked import LOCKED, Clock, locked_pass, render_locked
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
 
@@ -37,77 +40,26 @@ class FakeSession:
         self.calls.append(dict(values))
 
 
-class FakeLink:
-    """Stands in for the source HDMI link; a real one blanks the Pi framebuffer."""
-
-
-class FakeRig(R.Rig):
-    """Loopback rig: the capture returns whatever was last played out, optionally dropping frames."""
-
-    def __init__(self, *, drop_every=0, no_signal=False, link=None):
-        session = FakeSession()
-        super().__init__(session=session, capture=self, playout=self, link=link)
-        self.last = None
-        self.n = 0
-        self.drop_every = drop_every
-        self.no_signal = no_signal
-
-    def show(self, frame):
-        self.last = frame
-
-    def read(self):
-        self.n += 1
-        if self.no_signal:
-            return None
-        if self.drop_every and self.n % self.drop_every == 0:
-            return None
-        return self.last
-
-
 @pytest.fixture(autouse=True)
 def _unjudged(monkeypatch):
-    """Takes here are stand-ins with no picture to judge; the check has tests of its own."""
-    from syncsummoner.compose import takecheck
-
-    monkeypatch.setattr(
-        takecheck,
-        "check_takes",
-        lambda score, plan, takes, clip, **kw: takecheck.CheckReport(cuts=list(plan)),
-    )
-
-
-def source_stack(n=12, h=24, w=32):
-    rng = np.random.default_rng(0)
-    return rng.uniform(0.1, 0.9, (n, h, w, 3)).astype(np.float32)
-
-
-def simple_score(programs=("glitch",)):
-    return Score(
-        seed=3,
-        duration=1.2,
-        fps=CONFIG.fps,
-        sections=[Section(0.0, 1.2, "A")],
-        layers=[
-            Layer(p, i, [GestureInstance("ramp", 1.0, 0.6, "motion_rate", 0.8, (), 1)])
-            for i, p in enumerate(programs)
-        ],
-    )
+    """Takes here are stand-ins with no lock record or picture; the check has tests of its own."""
+    monkeypatch.setattr(R, "checked_plan", lambda score, plan, takes, clip, *, config: (list(plan), {}))
 
 
 @pytest.mark.parametrize("index", [0, 1, 7, 1234, 65535])
 def test_timecode_round_trip(index):
     frame = np.zeros((24, 32, 3), np.float32)
     burned = R.burn_timecode(frame, index, bits=16, strip_px=4)
-    assert R.read_timecode(burned, bits=16, strip_px=4) == index
+    assert read_timecode(burned, bits=16, strip_px=4) == index
     assert R.crop_strip(burned, strip_px=4).shape == (20, 32, 3)
     assert frame.max() == 0.0
 
 
 def test_timecode_absent_or_washed_out_reads_none():
     flat = np.full((24, 32, 3), 0.5, np.float32)
-    assert R.read_timecode(flat, bits=16, strip_px=4) is None
+    assert read_timecode(flat, bits=16, strip_px=4) is None
     burned = R.burn_timecode(np.zeros((24, 32, 3), np.float32), 5, bits=16, strip_px=4)
-    assert R.read_timecode(burned * 0.1, bits=16, strip_px=4) is None
+    assert read_timecode(burned * 0.1, bits=16, strip_px=4) is None
 
 
 def test_schedule_biases_visuals_early():
@@ -183,22 +135,6 @@ def test_a_schedule_at_the_planners_budget_is_delivered_on_time(msgs_per_param):
     )
 
 
-class Clock:
-    """Monotonic clock advanced only by the sleeps handed to it."""
-
-    def __init__(self):
-        self.now = 0.0
-        self.slept = []
-
-    def __call__(self):
-        return self.now
-
-    def sleep(self, seconds):
-        """Sleep."""
-        self.slept.append(seconds)
-        self.now += seconds
-
-
 def test_drive_wakes_only_when_a_parameter_is_due():
     """The host does nothing per frame: simultaneous writes are one batch, not one call each."""
     auto = Automation.concat([Automation.of([0.0, 0.4], 2, [500, 900]), Automation.of([0.0], 5, 300)])
@@ -239,7 +175,7 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
         return types.SimpleNamespace(open=lambda: "open capture")
 
     module("syncsummoner.device.capture", Capture=capture)
-    module("syncsummoner.device.playout", Playout=record("playout"))
+    module("syncsummoner.device.playout", ClipPlayer=record("playout"))
     module("syncsummoner.device.link", Link=record("link"))
     rig = R.open_rig(CONFIG)
     assert rig.session == (("transport",), {"cc_budget_hz": CONFIG.cc_budget_hz})
@@ -289,7 +225,7 @@ def test_open_rig_hands_back_an_open_capture(monkeypatch):
 
     monkeypatch.setattr(capture_mod, "Capture", FakeCapture)
     monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
-    monkeypatch.setattr(playout_mod, "Playout", lambda *a, **k: None)
+    monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
     monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
     monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
     rig = R.open_rig(CONFIG)
@@ -302,8 +238,9 @@ def test_the_rig_session_is_a_named_format():
     assert (rig.width, rig.height, rig.fps) == (1920, 1080, 30.0)
 
 
-def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
-    clip = [np.full((4, 4, 3), 0.5, np.float32) for _ in range(6)]
+@pytest.mark.parametrize("lead", [0, 3])
+def test_write_timecoded_stamps_every_frame_after_a_wrapped_lead_in(monkeypatch, tmp_path, lead):
+    clip = [np.full((4, 4, 3), 0.1 * (i + 1), np.float32) for i in range(6)]
     monkeypatch.setattr(
         "syncsummoner.compose.features.read_frames",
         lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
@@ -327,21 +264,23 @@ def test_write_timecoded_stamps_every_frame(monkeypatch, tmp_path):
             stdin=Pipe(), stderr=io.BytesIO(b""), wait=lambda: 0, returncode=0
         ),
     )
-    total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG)
-    assert total == len(written) == 6
+    total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG, lead=lead)
+    assert total == 6 and len(written) == 6 + lead
     shaped = [f.reshape(CONFIG.height, CONFIG.width, 3).astype(np.float32) / 255.0 for f in written]
-    codes = [R.read_timecode(f, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in shaped]
-    assert codes == list(range(6)), "each frame carries its own index"
+    codes = [read_timecode(f, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in shaped]
+    assert codes == [65536 - lead + i for i in range(lead)] + list(range(6))
+    body = [f[: -CONFIG.strip_px].mean() for f in shaped]
+    assert body[: lead + 1] == [body[lead]] * (lead + 1) and body[lead] < body[lead + 1]
 
 
 def test_reading_a_timecode_only_touches_the_strip():
     """Only the strip rows are converted, never the whole frame."""
     frame = np.random.random((1080, 1920, 3)).astype(np.float32)
     stamped = R.burn_timecode(frame, 4242, bits=16, strip_px=8)
-    assert R.read_timecode(stamped, bits=16, strip_px=8) == 4242
+    assert read_timecode(stamped, bits=16, strip_px=8) == 4242
     start = time.perf_counter()
     for _ in range(20):
-        R.read_timecode(stamped, bits=16, strip_px=8)
+        read_timecode(stamped, bits=16, strip_px=8)
     assert (time.perf_counter() - start) / 20 < 0.005, "a strip read is not a whole-frame conversion"
 
 
@@ -413,87 +352,6 @@ def test_render_cuts_runs_one_pass_per_program_and_refuses_a_blank_one(monkeypat
         )
 
 
-def test_a_pass_waits_for_the_picture_on_the_configs_budget(monkeypatch, tmp_path):
-    """The load blacks the output out, so the take may not start until it is back."""
-    order = []
-
-    class Session:
-        """Session recording the load only."""
-
-        def load_program(self, program, link=None):
-            """Load program."""
-            del link
-            order.append(("load", program))
-
-        def working_point(self, info):
-            """Working point."""
-            del info
-            return {}
-
-        def set_params(self, values):
-            """Set params."""
-            del values
-
-    class Player:
-        """Playout stand-in."""
-
-        def upload(self, path):
-            """Upload."""
-
-        def playing(self, fps):
-            """Playing."""
-            del fps
-            return contextlib.nullcontext()
-
-    class Rec:
-        """Recorder stand-in recording when the take itself started."""
-
-        def recording(self, path, seconds=None):
-            """Recording."""
-            del path, seconds
-            order.append(("record",))
-            return contextlib.nullcontext()
-
-    def fake_settle(recorder, transport, **kwargs):
-        del recorder, transport
-        order.append(("settle", kwargs))
-        return PROBED
-
-    monkeypatch.setattr(R, "settle", fake_settle)
-    monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
-    monkeypatch.setattr(
-        R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
-    )
-    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
-    config = dataclasses.replace(CONFIG, probe_timeout_s=7.5, probe_path=str(tmp_path / "probe.mkv"))
-    score = Score(
-        seed=1, duration=1.0, fps=CONFIG.fps, layers=[Layer(index=0, program="Teletext", gestures=[])]
-    )
-    R.render_played(
-        score,
-        "clip.mkv",
-        tmp_path / "out.mkv",
-        profiles={},
-        rig=R.Rig(
-            session=Session(),
-            capture=None,
-            playout=Player(),
-            transport=rig_transport(),
-        ),
-        config=config,
-        scratch=tmp_path / "tc.mkv",
-        prepared=True,
-        recorder=Rec(),
-    )
-    assert [step[0] for step in order] == ["load", "settle", "record"]
-    assert order[1][1] == {
-        "program": "Teletext",
-        "timing": CONFIG.timing,
-        "probe_timeout_s": 7.5,
-        "probe_path": config.probe_path,
-    }
-
-
 def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
     """A capture held here stops ffmpeg opening the card, and the pass dies at once."""
     import syncsummoner.device.capture as capture_mod
@@ -507,7 +365,6 @@ def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
         capture_mod, "Capture", lambda **kw: types.SimpleNamespace(open=lambda: opened.append(True))
     )
     monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
-    monkeypatch.setattr(playout_mod, "Playout", lambda *a, **k: None)
     monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
     monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
     monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
@@ -516,79 +373,75 @@ def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
     assert opened == [True], "the old path still gets one when it asks"
 
 
-def test_a_pass_puts_the_program_at_its_working_point(monkeypatch, tmp_path):
-    """Parking drives every parameter to zero, and a program at zero renders black."""
-    calls = []
+@pytest.mark.parametrize("corrupted", [False, True])
+def test_a_locked_take_loads_its_program_in_the_lead_in_and_keeps_its_lock(monkeypatch, tmp_path, corrupted):
+    """Passthru first, then recording and player; the program loads inside, the lock saved once stopped."""
 
-    class Session:
-        """Session recording load and parameter writes in order."""
+    def verify():
+        rig.log.append(("verify",))
+        if corrupted:
+            raise CcMapError("device CC map differs from the CCs sent (P12 CC0)")
 
-        def load_program(self, program, link=None):
-            """Load program."""
-            del link
-            calls.append(("load", program))
+    rig = locked_pass(monkeypatch, transport=rig_transport(verify_cc_map=verify), load_s={"Teletext": 0.1})
+    out = tmp_path / "take.mkv"
+    with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
+        assert render_locked(rig, out) == PROBED
+    steps = [
+        "upload",
+        "load",
+        "record",
+        "play",
+        "load",
+        "params",
+        "drive",
+        "stop",
+        "recorded",
+        "flips",
+        "verify",
+    ]
+    assert rig.steps == steps + ([] if corrupted else ["inspect"])
+    assert [step[1:] for step in rig.log if step[0] == "load"] == [("Passthru", "link"), ("Teletext", "link")]
+    began = next(step[2] for step in rig.log if step[0] == "play")
+    assert rig.log[6] == ("drive", pytest.approx(began + 8 / 30), 0.2), "the pass is timed from clip frame 0"
+    assert rig.clock.now == pytest.approx(began + 8 / 30 + 0.2 + LOCKED.tail_s)
+    record = np.load(L.lock_path(out))
+    assert (int(record["hold"]), int(record["lead"]), int(record["count"])) == (2, 8, 6)
+    assert np.array_equal(record["flips"], rig.take.flips)
+    if not corrupted:
+        picked = rig.take.picked()
+        assert np.load(L.picked_path(out)).tolist() == picked.tolist()
+        assert rig.log[-1] == ("inspect", pytest.approx(picked[0] / 60))
 
-        def working_point(self, info):
-            """Working point."""
-            del info
-            return {1: 0.5, 12: 1.0}
 
-        def set_params(self, values):
-            """Set params."""
-            calls.append(("params", dict(values)))
+def test_a_passthru_take_loads_nothing_inside_its_lead_in(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch, clock=Clock(5.0))
+    out = tmp_path / "take.mkv"
+    loaded = R.play_take(rig.rig, rig, out, program=None, seconds=0.2, config=LOCKED)
+    assert rig.steps == ["load", "record", "play", "stop", "recorded", "flips"] and loaded == 5.0
+    assert L.lock_path(out).is_file()
 
-    class Player:
-        """Playout stand-in."""
 
-        def upload(self, path):
-            """Upload."""
+@pytest.mark.parametrize(
+    "load_s,skew_s,match,locked",
+    [
+        (0.3, 0.0, r"Teletext: loading took 0.3s, past the 0.3s lead-in; raise lead_in_s", False),
+        (0.2, -0.1, r"Teletext: clip frame 0 reached the card 0.03s before the load ended", True),
+    ],
+    ids=["load-overran", "clip-before-load"],
+)
+def test_a_load_not_done_before_clip_frame_0_is_a_lead_in_error(
+    monkeypatch, tmp_path, load_s, skew_s, match, locked
+):
+    rig = locked_pass(monkeypatch, load_s={"Teletext": load_s}, skew_s=skew_s)
+    out = tmp_path / "take.mkv"
+    with pytest.raises(R.LeadInError, match=match):
+        render_locked(rig, out)
+    assert ("drive" in rig.steps) is locked
+    assert L.lock_path(out).is_file() is locked and "inspect" not in rig.steps
 
-        def playing(self, fps):
-            """Playing."""
-            del fps
-            return contextlib.nullcontext()
 
-    rig = R.Rig(
-        session=Session(),
-        capture=None,
-        playout=Player(),
-        transport=rig_transport(),
-    )
-    monkeypatch.setattr(R, "settle", lambda *a, **k: PROBED)
-    monkeypatch.setattr(R, "drive", lambda *a, **k: 0)
-    monkeypatch.setattr(
-        R, "inspect_take", lambda *a, **k: R.TakeReport(frames=4, picture=4, frozen=False, luma=0.4)
-    )
-    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
-
-    class Rec:
-        """Recorder stand-in."""
-
-        def recording(self, path, seconds=None):
-            """Recording."""
-            del path, seconds
-            return contextlib.nullcontext()
-
-    score = Score(
-        seed=1,
-        bpm=120.0,
-        duration=1.0,
-        fps=CONFIG.fps,
-        layers=[Layer(index=0, program="Teletext", gestures=[])],
-    )
-    R.render_played(
-        score,
-        "clip.mkv",
-        tmp_path / "out.mkv",
-        profiles={},
-        rig=rig,
-        config=CONFIG,
-        scratch=tmp_path / "tc.mkv",
-        prepared=True,
-        recorder=Rec(),
-    )
-    assert calls[0] == ("load", "Teletext")
-    assert calls[1][0] == "params" and calls[1][1] == {1: 0.5, 12: 1.0}, "the load is followed by a picture"
+def test_lead_frames_rounds_the_lead_in_to_whole_frames():
+    assert [R.lead_frames(dataclasses.replace(LOCKED, lead_in_s=s)) for s in (0.99, 1.01, 0.0)] == [30, 30, 0]
 
 
 def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_path):
@@ -661,105 +514,6 @@ def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
     )
     _, stream = R.source_stream("clip.mkv", CONFIG, seconds=0.5, start=1.0)
     assert [round(float(f.mean()), 3) for f in stream] == [round(float(f.mean()), 3) for f in clip[10:15]]
-
-
-@pytest.mark.parametrize("corrupted", [False, True])
-def test_the_take_gets_the_clip_from_its_first_frame(monkeypatch, tmp_path, corrupted):
-    """A load costs 12 to 19s, so a clip started before it has already run out by the take.
-
-    The CC map is read back once the pass is driven, and a changed map fails the pass.
-    """
-    order = []
-
-    def verify():
-        order.append("verify")
-        if corrupted:
-            raise CcMapError("device CC map differs from the CCs sent (P12 CC0)")
-
-    class Player:
-        """ClipPlayer stand-in recording when playback starts and stops."""
-
-        def upload(self, path):
-            """Upload."""
-            order.append(f"upload:{path}")
-            return 1
-
-        @contextlib.contextmanager
-        def playing(self, *, fps):
-            """Play for the duration of the block."""
-            del fps
-            order.append("play")
-            yield self
-            order.append("stop")
-
-    class Session:
-        """Session recording the load only."""
-
-        def load_program(self, program, link=None):
-            """Load program."""
-            del link
-            order.append(f"load:{program}")
-
-        def set_params(self, values):
-            """Set params."""
-
-        def working_point(self, info):
-            """Working point."""
-            del info
-            return {}
-
-    class Rec:
-        """Recorder stand-in."""
-
-        def recording(self, path, seconds=None):
-            """Recording."""
-            del path, seconds
-            return contextlib.nullcontext()
-
-    monkeypatch.setattr(R, "settle", lambda *a, **k: order.append("settle") or PROBED)
-    monkeypatch.setattr(
-        R,
-        "inspect_take",
-        lambda *a, **k: order.append("inspect")
-        or R.TakeReport(frames=300, picture=300, frozen=False, luma=0.4),
-    )
-    monkeypatch.setattr(R, "drive", lambda *a, **k: order.append("drive") or 0)
-    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
-    rig = R.Rig(
-        session=Session(),
-        capture=None,
-        playout=Player(),
-        transport=rig_transport(
-            verify_cc_map=verify,
-            video_status=lambda: order.append("signal") or rig_transport().video_status(),
-        ),
-    )
-    score = Score(duration=10.0, sections=[Section(0.0, 10.0, "A")], layers=[Layer("Passthru", 0, [])])
-    with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
-        R.render_played(
-            score,
-            "clip.mkv",
-            tmp_path / "take.mkv",
-            profiles={},
-            rig=rig,
-            config=CONFIG,
-            prepared=True,
-            recorder=Rec(),
-        )
-    assert order == [
-        "upload:timecoded.mkv",
-        "play",
-        "load:Passthru",
-        "settle",
-        "signal",
-        "stop",
-        "signal",
-        "play",
-        "drive",
-        "stop",
-        "verify",
-        *(() if corrupted else ("signal", "inspect")),
-    ]
 
 
 def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):

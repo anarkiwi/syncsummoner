@@ -27,6 +27,7 @@ python -m syncsummoner.aesthetics score clip.mp4
 syncsummoner device list | ping | programs
 syncsummoner device doctor [--format 1080p30] [--loop] [--fix]   # rig diagnostics, JSON report
 syncsummoner manifest /media/card/programs [--write]   # rebuild manifest.json from the .vmprog files
+syncsummoner lockcheck source.mkv [--program NAME]   # check the locked frame clock end to end, exit 1 unless exact
 
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/
 syncsummoner probe sim --program blur --image zoneplate.png

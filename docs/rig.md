@@ -48,29 +48,29 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Playout
 
-The Pi runs no compositor, so DRM is free and the framebuffer can be written
-directly. Convert a frame and push it:
+Every stimulus is played on the Pi by `syncsummoner.device.kmsplay`, a vsync-locked
+DRM/KMS player on pykms: ffmpeg decodes the clip to raw frames, and the player
+commits one atomic page flip per vblank, holding each frame `refresh / fps`
+vblanks, logging every flip (`flips.bin`) and faulting on any missed vblank
+(`status.json`, raised on the host as `PlayoutError`). Its pacing thread runs
+`SCHED_FIFO`, the ceiling raised with `sudo -n prlimit` for the player's shell, so
+the Pi user needs passwordless sudo. The host starts and stops it by pidfile in
+`/dev/shm`. `ClipPlayer` plays an uploaded clip, once or looped; `LoopPlayer`
+cycles uploaded raw frames through the same player, at 10 fps by default (a
+whole number of vblanks at 30 Hz; a rate that does not divide the refresh is
+refused). Nothing else may hold the DRM device (`source.drm_free`). Measured
+properties are in [hardware.md](hardware.md#locked-playout).
 
-```sh
-ffmpeg -i frame.png -pix_fmt rgb565le -s 720x576 -f rawvideo -y /tmp/f.raw
-ssh pi@videopi 'cat > /dev/fb0' < /tmp/f.raw
-```
+While the player runs, `Link` drops the HDMI link by signalling it (`SIGUSR1`
+down, `SIGUSR2` up); with no player running it blanks fbdev. A stopped player
+leaves its last frame in `/dev/fb0`.
 
-`syncsummoner.device.playout` does the conversion with numpy and pushes over a
-runner callable, so it is testable without the Pi attached.
-
-A per-frame push costs about 1.1 s at 1920x1080 (4.1 MB of BGR565 at the 3.8
-MB/s the framebuffer write sustains), so a 24-frame loop played that way is 26 s
-per pass. `LoopPlayer` instead uploads the whole loop once into `/dev/shm` and
-starts a detached Pi-side process that cycles it, addressed by pidfile:
-
-```sh
-python3 -c 'from syncsummoner.device import LoopPlayer; p = LoopPlayer(); print(p.is_running())'
-```
-
-Measured on this rig, 24 frames is 99.5 MB raw, uploading in 10.3 s; gzipped it
-is 10.0 MB and 2.2 s, so the upload is compressed. The loop is invariant across
-programs and setpoints, so that upload is paid once per run rather than per pass.
+`syncsummoner lockcheck` checks the whole frame clock on the rig: it plays a
+timecoded clip through Passthru (or `--program NAME`, loaded in the lead-in),
+records it, and prints `LOCKED` or `NOT LOCKED` with the flips, missed vblanks,
+card drops, gaps, off-cadence frame changes, strip agreement and, under Passthru,
+torn captures; it exits 1 unless locked. `--prepared` plays `--scratch` as an
+already timecoded clip, and `--judge` re-judges `--take` without playing.
 
 ## Bring-up checks
 
@@ -93,6 +93,7 @@ the fix:
 | `source.fb_unblanked` | `/sys/class/graphics/fb0/blank` is 0; 4 means no HDMI source for the device |
 | `source.cursor_blink` | `/sys/class/graphics/fbcon/cursor_blink` is 0 |
 | `source.fb_geometry` | framebuffer `virtual_size` and 16 bpp match `--format` |
+| `source.drm_free` | nothing but the player holds `/dev/dri/card1`; another DRM master keeps the player off the display |
 | `source.mode` | `kmsprint` CRTC size and rate match `--format`; skipped without `kmsprint` |
 | `capture.usb_speed` | the card's video function is on a 5000 Mbit/s link |
 | `capture.mode` | the card offers MJPEG at the session size (`ffmpeg -f v4l2 -list_formats all`) |
@@ -101,14 +102,14 @@ the fix:
 | `midi.cc_map` | every slot listens on the CC the MIDI controller in use sends it, and no CC drives two slots; the fix is `vmancer cc-map --restore --yes` |
 | `midi.latency` | pyvmancer's single CC write to serial readback median is within two output frames plus the readback round trip |
 | `midi.backlog` | paced ramps at each `--latency-rates` leave a sentinel no more than a frame behind a single write; the fix names the fastest clean rate |
-| `loop.signal`, `loop.index`, `loop.bars` | the HDMI transmitter drives `--format` and the capture is not a uniform field; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
+| `loop.signal`, `loop.index`, `loop.bars` | a still shown by `LoopPlayer.show`: the HDMI transmitter drives `--format` and the capture is not a uniform field; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
 
 `--latency` writes CC offsets to the measured parameters, then restores them
 (`midi.restored` fails if they did not read back). By default it measures the
 loaded program's first continuous knob, else P1; pyvmancer refuses toggles,
 modulated parameters and ones with no CC headroom, and the refusal is reported
 as a failed `midi.latency`. `--loop` changes state: it loads `Passthru` and
-overwrites the Pi framebuffer.
+leaves its still on the Pi's display.
 `Passthru` reports all twelve parameters as `Null`, so anything wrong in that
 capture is the chain, not the program. The device alone is `vmancer doctor`
 (pyvmancer 0.6). Over the serial shell, `doctor` reads what these do by hand:
@@ -121,10 +122,11 @@ vmancer shell "video status"        # source, timing, lock, output
 
 ## Gotchas
 
-Only one process may hold `/dev/video0`. ffmpeg records the card, so nothing
-else may open it during a pass; a `Capture` handle left open makes the recorder
-exit immediately. Reopening also costs about 0.5 s of lock, so a pass records
-once rather than per sample.
+Only one process may hold `/dev/video0`. `syncsummoner.device.v4l2rec` records
+the card, so nothing else may open it during a pass; a `Capture` handle left open
+makes the recorder exit immediately. Reopening costs a relock
+([hardware.md](hardware.md#capture-lock-is-slow)), so a pass records once rather
+than per sample.
 
 The capture card reports no signal state and synthesizes a "No Signal" slide
 rather than going black, so whether there is signal comes from the Videomancer's
@@ -137,11 +139,11 @@ position, not an absolute set.
 Program change costs a multi-second blackout. Batch every evaluation for a
 program together.
 
-Any VT on the Pi bleeds into every recording. `LoopPlayer` writes `/dev/fb0`
-directly, but `fbcon`'s cursor blink inverts its cell on top of that
-regardless, as a small flickering square wherever the console's cursor
-sits. `chvt` to another VT does not fix this: systemd spawns a fresh getty
-on whatever VT becomes active, with its own cursor at a new position.
+Any VT on the Pi bleeds into every recording made while no player runs. fbdev
+shows `/dev/fb0` then, which holds the player's last frame, and `fbcon`'s cursor
+blink inverts its cell on top of it as a small flickering square wherever the
+console's cursor sits. `chvt` to another VT does not fix this: systemd spawns a
+fresh getty on whatever VT becomes active, with its own cursor at a new position.
 Disable the blink outright before a session instead:
 
 ```sh
