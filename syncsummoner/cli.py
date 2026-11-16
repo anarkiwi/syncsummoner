@@ -509,6 +509,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         fade_out=_fade(args, "fade_out"),
         audio_start=start,
         video_start=lead,
+        strip_px=config.strip_px,
     )
     LOG.info("%s: %.1fs mastered from %s", args.output, seconds, take)
     print(args.output)

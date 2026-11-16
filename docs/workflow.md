@@ -415,16 +415,19 @@ What happens, in order:
 7. The take opens on lead-in the picture has not reached yet, so its start is
    read back out of the timecode strip rather than assumed — that is what the
    strip is for — and reported as `picture starts N.NNs into the take`. The Pi's
-   player takes a few frames to reach rate; the lag every later frame agrees on
-   is what the take is cut against, and the fade covers the ramp. A program that
+   player takes a few frames to reach rate; the lag held by a run of consecutive
+   frames counting up one per frame is what the take is cut against, and the
+   fade covers the ramp. The held lead-in frame and scattered misreads form no
+   such run, so they cannot set it. A program that
    moves the picture geometrically can destroy the strip; that take is cut at the
    median start of the run's other takes (the lag is the Pi's and the capture's,
    which every pass shares) and the log says so:
    `Pinwheel: timecode strip did not survive; using the run's median picture start 1.90s`.
    If no take in the run kept its strip, the render stops rather than cut from
    the take's first frame.
-8. Mastering: cut from where the picture starts, trim to the length both inputs
-   cover, mux the track, fade the picture up from black and the audio up from
+8. Mastering: cut from where the picture starts, black out the timecode strip
+   (cropped off the bottom edge and padded back, so the frame keeps its size and
+   nothing is resampled), trim to the length both inputs cover, mux the track, fade the picture up from black and the audio up from
    silence over `--fade` seconds, and the same back down at the end.
 
 The capture card returns frames at its own rate — this one gives 60 for a

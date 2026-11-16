@@ -1,4 +1,4 @@
-"""Finishing a captured take: trim to the shorter input, mux the audio, fade the edges.
+"""Finishing a captured take: trim to the shorter input, blank the strip, mux the audio, fade the edges.
 
 A pass off the capture card is video only and runs edge to edge, because the rig
 has no notion of a beginning or an end. Mastering is one ffmpeg invocation, built
@@ -64,6 +64,7 @@ def master_command(
     fade_out: float = DEFAULT_FADE_S,
     audio_start: float = 0.0,
     video_start: float = 0.0,
+    strip_px: int = 0,
     ffmpeg: str = "ffmpeg",
     crf: int = 16,
 ) -> list[str]:
@@ -73,8 +74,15 @@ def master_command(
     piece keeps the sound it was composed against. ``video_start`` drops the take's
     lead-in as a filter rather than a seek: a capture's timestamps are the card's,
     and a seek against them lands near the frame asked for rather than on it.
+
+    ``strip_px`` is the timecode strip along the bottom edge, which is cropped
+    and padded back in black: the frame keeps its size and every other pixel
+    stays where the device put it, with nothing resampled.
     """
     video_chain, audio_chain = fade_filters(duration, fade_in=fade_in, fade_out=fade_out)
+    if strip_px > 0:
+        blank = f"crop=iw:ih-{strip_px}:0:0,pad=iw:ih+{strip_px}:0:0:black"
+        video_chain = f"{blank},{video_chain}" if video_chain else blank
     if video_start > 0:
         trim = f"trim=start={video_start:.3f},setpts=PTS-STARTPTS"
         video_chain = f"{trim},{video_chain}" if video_chain else trim
@@ -104,6 +112,7 @@ def master(
     fade_out: float = DEFAULT_FADE_S,
     audio_start: float = 0.0,
     video_start: float = 0.0,
+    strip_px: int = 0,
     ffmpeg: str = "ffmpeg",
     ffprobe: str = "ffprobe",
 ) -> float:
@@ -122,6 +131,7 @@ def master(
         fade_out=fade_out,
         audio_start=audio_start,
         video_start=video_start,
+        strip_px=strip_px,
         ffmpeg=ffmpeg,
     )
     with stage("master", seconds=f"{duration:.1f}", fades=f"{fade_in:g}/{fade_out:g}", out=str(out)):
