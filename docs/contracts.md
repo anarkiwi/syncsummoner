@@ -137,7 +137,7 @@ class Capture:                       # long-lived; never reopened per sample
     def __init__(self, device="/dev/video0", *, width=720, height=576, fps=50): ...
     def __enter__ / __exit__
     def read(self) -> np.ndarray | None      # RGB float32 (H, W, 3)
-    def wait_for_lock(self, timeout_s=10.0) -> bool
+    def wait_for_lock(self, timeout_s=10.0) -> bool   # past the splash AND structured()
     def is_no_signal(self, frame) -> bool    # capture card synthesizes a splash; see docs/hardware.md
     def wait_for_content(self, timeout_s=15.0) -> bool   # past the splash AND moving
 
@@ -146,8 +146,9 @@ class Recorder:                      # ffmpeg owns the card; the host touches no
     def command(self, path, *, seconds=None) -> list[str]     # -t is unusable under copyts
     def recording(self, path, *, seconds=None) -> ContextManager   # records for the block
     def timestamps(self, path) -> np.ndarray   # per-frame CLOCK_MONOTONIC capture times
-inspect_take(path) -> TakeReport                      # frames, distinct, blank, luma
-settle(recorder, *, program, timeout_s, probe_path)   # records a probe; raises BlankTakeError
+inspect_take(path) -> TakeReport   # picture/splash/uniform counts, luma range, motion; .live, .frozen, .usable
+held(frames) -> (motion, frozen)   # consecutive-difference correlation; -1/2 for one picture plus noise
+settle(recorder, *, program, timeout_s, probe_path)   # waits for .live; raises BlankTakeError
 
 class Link:                          # the HDMI link out of the stimulus source host
     def down(self) / up(self) -> str: ...

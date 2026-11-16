@@ -55,10 +55,10 @@ def fake_run(calls, stdout=b"", returncode=0):
     return run
 
 
-def gray_stream(levels):
-    """Raw gray frames at the inspection geometry, one constant level each."""
-    stride = rec.INSPECT_WIDTH * (rec.INSPECT_WIDTH * 9 // 16)
-    return b"".join(bytes([int(level)]) * stride for level in levels)
+def flat_stream(levels):
+    """Raw RGB frames at the inspection geometry, one uniform level each."""
+    width, height = rec.INSPECT_SIZE
+    return b"".join(bytes([int(level)]) * (width * height * 3) for level in levels)
 
 
 class FakeRecorder:
@@ -194,30 +194,26 @@ def test_timestamps_of_an_unreadable_file_are_empty():
     assert Recorder(run=fake_run([], stdout=b"", returncode=1)).timestamps("/tmp/gone.mkv").size == 0
 
 
-def test_inspecting_a_take_counts_blank_and_distinct_frames(monkeypatch, tmp_path):
+def test_inspection_point_samples_rgb_so_the_card_s_own_pixels_are_judged(monkeypatch, tmp_path):
     argv = []
-    monkeypatch.setattr(rec.subprocess, "run", fake_run(argv, stdout=gray_stream([0, 90, 180, 255])))
+    monkeypatch.setattr(rec.subprocess, "run", fake_run(argv, stdout=flat_stream([0, 90, 180, 255])))
     report = inspect_take(tmp_path / "take.mkv")
-    assert (report.frames, report.distinct, report.blank) == (4, 4, 1)
-    assert report.usable and report.luma == pytest.approx(np.mean([0, 90, 180, 255]) / 255.0, abs=1e-6)
-    assert argv[0][argv[0].index("-pix_fmt") + 1] == "gray"
+    assert report.frames == 4 and report.picture == 0, "uniform fields are dead at any brightness"
+    assert report.luma == pytest.approx(np.mean([0, 90, 180, 255]) / 255.0, abs=1e-4)
+    assert argv[0][argv[0].index("-pix_fmt") + 1] == "rgb24"
+    assert "flags=neighbor" in argv[0][argv[0].index("-vf") + 1]
 
 
-def test_an_all_black_take_is_reported_unusable(monkeypatch, tmp_path):
-    monkeypatch.setattr(rec.subprocess, "run", fake_run([], stdout=gray_stream([0, 0, 0, 0])))
-    report = inspect_take(tmp_path / "black.mkv")
-    assert report.blank == 4 and not report.usable and "UNUSABLE" in str(report)
-
-
-def test_a_take_with_no_frames_at_all_is_unusable(monkeypatch, tmp_path):
-    monkeypatch.setattr(rec.subprocess, "run", fake_run([], stdout=b""))
-    report = inspect_take(tmp_path / "empty.mkv")
-    assert report == TakeReport(frames=0, distinct=0, blank=0, luma=0.0) and not report.usable
+def test_a_live_paused_picture_settles_but_is_not_a_usable_take():
+    """A load waits for any picture; a take must also not be held still."""
+    paused = TakeReport(frames=10, picture=10, spread=255, motion=-0.5, frozen=True, luma=0.1)
+    assert paused.live and not paused.usable and "UNUSABLE: frozen" in str(paused)
+    assert TakeReport(frames=10, picture=5).live is False, "half is not most"
 
 
 def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path):
     """A guard built on the discarded per-frame loop failed on a perfectly good picture."""
-    reports = iter([TakeReport(10, 1, 10, 0.0), TakeReport(10, 9, 0, 0.4)])
+    reports = iter([TakeReport(frames=10), TakeReport(frames=10, picture=10, frozen=True)])
     monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": next(reports))
     ticks = iter([0.0, 0.0, 1.0, 2.0])
     recorder = FakeRecorder()
@@ -231,13 +227,13 @@ def test_settling_judges_liveness_the_way_a_take_is_judged(monkeypatch, tmp_path
         clock=lambda: next(ticks),
         sleep=lambda s: None,
     )
-    assert got.usable and len(recorder.probes) == 2, "it keeps probing until the picture is back"
+    assert got.live and len(recorder.probes) == 2, "a still picture is back; it need not move"
     assert recorder.probes[0] == (str(probe), 0.5)
     assert not probe.exists(), "the probe never outlives the wait it was recorded for"
 
 
 def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
-    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(6, 1, 6, 0.0))
+    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(frames=6, splash=6))
     ticks = iter([0.0, 0.0, 99.0])
     probe = tmp_path / "probe.mkv"
     with pytest.raises(BlankTakeError, match="no picture within 1.0s"):
@@ -255,7 +251,9 @@ def test_settling_gives_up_with_what_it_saw(monkeypatch, tmp_path):
 
 def test_settling_past_the_deadline_never_records(monkeypatch, tmp_path):
     """A budget already spent buys no probe, and the report says nothing was seen."""
-    monkeypatch.setattr(rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(9, 9, 0, 0.5))
+    monkeypatch.setattr(
+        rec, "inspect_take", lambda path, ffmpeg="ffmpeg": TakeReport(frames=9, picture=9, frozen=False)
+    )
     recorder = FakeRecorder()
     with pytest.raises(BlankTakeError, match="0 frames"):
         settle(
@@ -289,7 +287,7 @@ def test_settle_waits_through_a_recorder_that_cannot_open_the_card_yet(tmp_path,
             kill=lambda: None,
         )
 
-    live = TakeReport(frames=8, distinct=8, blank=0, luma=0.4)
+    live = TakeReport(frames=8, picture=8, frozen=False, luma=0.4)
     monkeypatch.setattr(rec, "inspect_take", lambda *a, **k: live)
     recorder = Recorder(popen=popen, sleep=clock.sleep)
     report = settle(

@@ -327,7 +327,7 @@ A real 30 second excerpt costs about a minute, most of it the load:
 09:57:17 load done in 12s
 09:57:18 pass (program=Passthru seconds=10.0)
 09:57:32 pass done in 14s: writes=9
-09:57:34 audition.take.mp4: 185 frames, 146 distinct, 1 blank, mean luma 0.383
+09:57:34 audition.take.mp4: 185 frames: 184 picture, 0 splash, 1 uniform; luma range 235, motion +0.71, mean luma 0.383
 09:57:34 picture starts 1.20s into the take
 09:57:34 master (seconds=10.0 fades=1/1 out=audition.mp4)
 09:57:37 master done in 3s
@@ -463,7 +463,9 @@ doing it twice, which is what the audition is for.
 
 | Symptom | Cause |
 | --- | --- |
-| take is uniform grey and "usable" | the card's "No Signal" splash, not the rig; check `ss device ping` |
+| `no picture within 40.0s of the load` | most probe frames were uniform fields (the program outputs a constant, e.g. video black at 16) or the card's "No Signal" splash; the report's `picture`/`splash`/`uniform` counts say which. Brightness plays no part, so dark footage is never "no picture" |
+| take ends `UNUSABLE: frozen` | the take holds one picture: `motion` sits at -0.50, which is what codec noise alone gives; the output froze (a drop) or the program ignores its input |
+| take ends `UNUSABLE: no picture` | as for the load, over the whole take: check the program and `ss device ping` |
 | recorder exits immediately | something else holds `/dev/video0`; only one process may |
 | small flickering square in every take | `fbcon` cursor blink on the Pi; disable it, `chvt` does not fix it |
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |

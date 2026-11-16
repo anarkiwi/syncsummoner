@@ -76,8 +76,10 @@ With no valid input the card emits a high-contrast slide reading *No Signal* wit
 a QR code, at whatever resolution was requested. It is not black and it has high
 variance, so any liveness test based on `std > 0` scores it as content.
 `Capture.is_no_signal` detects it structurally: the splash is achromatic (pixels
-with HSV saturation > 60 at ~0.000, versus ~0.69 for real Colorbars) while being
-far from uniformly black.
+with HSV saturation > 60 at ~0.000, versus ~0.69 for real Colorbars) and bilevel
+while being far from uniformly black. Takes are judged at a point-sampled
+160x90, so the samples are the card's own bilevel pixels rather than blends that
+would read as mid-tones.
 
 ## Status flags are advisory; only a capture proves frames
 
@@ -88,6 +90,32 @@ fine; the selected input's own sub-status is authoritative, which is what
 `VideoStatus.source_locked` reads. Anything that records checks the frames
 themselves: `settle()` judges liveness from a recording, exactly as a take is
 judged, and `inspect_take` judges the take.
+
+Picture is judged by structure, never brightness. A dead output is a spatially
+uniform field: `Roll Shutter` outputs video black at exactly 16 on every pixel of
+every frame, even under Bypass. A uniform field is one DC level per JPEG block,
+which MJPEG and resampling reproduce exactly, so a frame is a uniform field when
+its luma ranges over no more than one 8-bit step, and is picture otherwise,
+unless it is the splash. Dark footage carries full-range structure: dark 1960s
+black-and-white material through `Fray` measured `YMIN=0 YMAX=255 YAVG≈31`,
+which a mean-level threshold called blank.
+
+| Property | Means | Used by |
+| --- | --- | --- |
+| `live` | most frames are picture, moving or not | `settle()`: a paused source is a working rig |
+| `frozen` | the take holds one picture plus noise | |
+| `usable` | `live` and not `frozen` | render, audition, harvest's `dark` verdict |
+
+MJPEG noise makes every frame of a still picture differ, so counting distinct
+frames proves nothing. `frozen` uses the take as its own noise floor: for one
+picture plus noise independent between frames, consecutive differences share one
+noise term with opposite signs and correlate at exactly -1/2, whatever the
+noise's level or texture. Motion pulls that correlation up and flicker towards
+-1. The take is frozen when the mean correlation sits within three standard
+errors of -1/2 and a one-way analysis of variance over pixels shows the frames
+share a picture, which is what separates a held picture from snow, whose frames
+also correlate at -1/2. Exact repeats are dropped first, and fewer than four
+distinct frames cannot show motion.
 
 ## Capture lock is slow
 
