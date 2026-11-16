@@ -344,7 +344,6 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
             height=config.height,
             fps=config.capture_fps,
             mode=FFV1,
-            copyts=True,
         ),
         player=player,
         link=_link(args),
@@ -483,6 +482,39 @@ def _fade(args: argparse.Namespace, edge: str) -> float:
     return DEFAULT_FADE_S if value is None else float(value)
 
 
+def _lockcheck_cmd(args: argparse.Namespace) -> int:
+    """Play a timecoded clip through the rig and judge the frame clock capture by capture."""
+    from syncsummoner.compose import lockcheck as lockcheck_mod
+    from syncsummoner.compose import render as render_mod
+    from syncsummoner.device.recorder import require_ffmpeg
+
+    require_ffmpeg()
+    lead = {} if args.lead_in is None else {"lead_in_s": args.lead_in}
+    config = render_mod.RenderConfig.for_format(
+        args.format, source_host=args.source_host, route=args.route, stall_s=args.stall, **lead
+    )
+    _make_room(args.take, args.scratch)
+    if args.judge:
+        report = lockcheck_mod.judge(args.take, config=config, clip=None if args.program else args.scratch)
+    else:
+        seconds = args.seconds
+        if not args.prepared:
+            frames = render_mod.write_timecoded(
+                args.source,
+                args.scratch,
+                config=config,
+                seconds=args.seconds,
+                start=args.start,
+                lead=render_mod.lead_frames(config),
+            )
+            seconds = frames / config.fps
+        report = lockcheck_mod.lockcheck(
+            args.take, clip=args.scratch, config=config, program=args.program, seconds=seconds
+        )
+    print(report.summary())
+    return 0 if report.ok else 1
+
+
 def _render_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose import master as master_mod
     from syncsummoner.compose import render as render_mod
@@ -545,13 +577,8 @@ def _render_cmd(args: argparse.Namespace) -> int:
         if not report.usable:
             return 1
     if not args.cut_programs:
-        lead = render_mod.picture_start(take, config=config)
-        if lead is None:
-            raise render_mod.LostTimecodeError(
-                f"{take}: the timecode strip did not survive, so the picture start is unknown; "
-                "check the program or the pass"
-            )
-        LOG.info("picture starts %.2fs into the take", lead)
+        lead = render_mod.take_start(take, config=config)
+        LOG.info("clip frame 0 is %.3fs into the take", lead)
     if args.no_master:
         return 0
     seconds = master_mod.master(
@@ -591,8 +618,19 @@ def _check_cmd(args: argparse.Namespace) -> int:
         models["master"] = ClockModel.identity(score.fps)
         takes = {"master": args.master}
         planned = [render_mod.Cut(0.0, score.duration, "master")]
+    locked = {name: render_mod.picked_path(take) for name, take in takes.items()}
+    attributions = {name: np.load(path) for name, path in locked.items() if path.is_file()}
+    for name in sorted(set(takes) - set(attributions) - set(models)):
+        LOG.warning("%s: no locked attribution beside %s, so its clock is fitted", name, takes[name])
     report = takecheck.check_takes(
-        score, planned, takes, args.source, strip_px=args.strip_px, models=models, ffmpeg=args.ffmpeg
+        score,
+        planned,
+        takes,
+        args.source,
+        strip_px=args.strip_px,
+        models=models,
+        attributions=attributions,
+        ffmpeg=args.ffmpeg,
     )
     for line in report.lines():
         LOG.info("%s", line)
@@ -790,6 +828,22 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--wet", help="LO,HI wet range, fractions of the wet control (default: per style)")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
+
+    lock = sub.add_parser("lockcheck", help="play a timecoded clip and check the frame clock is exact")
+    lock.add_argument("source", nargs="?", help="footage to timecode (omit with --prepared or --judge)")
+    lock.add_argument("--take", default="lockcheck.mkv", help="where the capture is recorded")
+    lock.add_argument("--scratch", default="lockcheck-clip.mkv", help="where the timecoded clip is built")
+    lock.add_argument("--prepared", action="store_true", help="take --scratch as an already timecoded clip")
+    lock.add_argument("--judge", action="store_true", help="judge --take as recorded, playing nothing")
+    lock.add_argument("--program", help="load this program in the lead-in instead of staying on Passthru")
+    lock.add_argument("--format", default="1080p30", help="session format the rig runs at")
+    lock.add_argument("--seconds", type=float, help="length of the clip to play (default: all of it)")
+    lock.add_argument("--start", type=float, default=0.0, help="where in the footage the clip starts")
+    lock.add_argument("--lead-in", type=float, help="seconds of strip-coded lead-in (default: the render's)")
+    lock.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
+    lock.add_argument("--stall", type=float, help="pyvmancer's stall guard for device waits, seconds")
+    _add_route_arg(lock)
+    lock.set_defaults(func=_lockcheck_cmd)
 
     for name, help_text in (("render", "render the full pass"), ("audition", "render a short excerpt")):
         node = sub.add_parser(name, help=help_text)

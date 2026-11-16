@@ -27,8 +27,8 @@ from syncsummoner.progress import LOG, stage
 
 from .capture import structured
 from .host import DEFAULT_HOST, HostCommandError, Runner, ssh_runner
-from .link import DEFAULT_BLANK, UNBLANK, Link
-from .playout import Playout
+from .link import DEFAULT_BLANK, DEFAULT_PLAYER_PID, UNBLANK, Link
+from .playout import LoopPlayer
 from .profile import ParamKind
 from .recorder import MJPEG, Recorder, RecorderError, require_ffmpeg
 from .transport import transmitting
@@ -36,6 +36,8 @@ from .transport import transmitting
 CURSOR_BLINK = "/sys/class/graphics/fbcon/cursor_blink"
 FB_SIZE = "/sys/class/graphics/fb0/virtual_size"
 FB_DEPTH = "/sys/class/graphics/fb0/bits_per_pixel"
+#: The DRM device the locked player drives.
+DRM_CARD = "/dev/dri/card1"
 #: The depth :func:`~syncsummoner.device.playout.to_fb565` packs frames at.
 FB_BPP = 16
 #: SuperSpeed, below which the card offers only SD uncompressed modes.
@@ -215,7 +217,7 @@ class Doctor:
 
             open_transport = Transport.open
         self._open_transport = open_transport
-        self._playout = playout or Playout(host, width=fmt.width, height=fmt.height, runner=runner)
+        self._playout = playout or LoopPlayer(host, width=fmt.width, height=fmt.height, runner=runner)
         self._link = link or Link(host, runner=runner)
         self._recorder = recorder or Recorder(
             capture, width=fmt.width, height=fmt.height, fps=fmt.fps, mode=MJPEG
@@ -233,8 +235,9 @@ class Doctor:
 
     def source(self) -> list[Finding]:
         """Source host: reachable, link up, no console cursor, raster at the session format."""
-        files = (DEFAULT_BLANK, CURSOR_BLINK, FB_SIZE, FB_DEPTH)
+        files = (DEFAULT_BLANK, CURSOR_BLINK, FB_SIZE, FB_DEPTH, DEFAULT_PLAYER_PID)
         reads = "; ".join(f'echo "=$(cat {path} 2>/dev/null)"' for path in files)
+        reads += f'; echo "=$(fuser {DRM_CARD} 2>/dev/null)"'
         try:
             out = self._runner(f"{reads}; kmsprint 2>/dev/null || true").splitlines()
         except HostCommandError as err:
@@ -246,7 +249,10 @@ class Doctor:
                     "check the Pi is up and its key is authorized for BatchMode ssh",
                 )
             ]
-        blank, blink, size, depth = (line.strip().removeprefix("=") for line in out[: len(files)])
+        blank, blink, size, depth, player, holders = (
+            line.strip().removeprefix("=") for line in out[: len(files) + 1]
+        )
+        others = sorted(set(holders.split()) - {player})
         fmt, want = self.fmt, f"{self.fmt.width},{self.fmt.height}"
         found = [
             Finding("ssh.reachable", True, "source host answers"),
@@ -268,8 +274,14 @@ class Doctor:
                 f"framebuffer {size.replace(',', 'x')} at {depth} bpp",
                 f"set the Pi's framebuffer to {fmt.width}x{fmt.height} at {FB_BPP} bpp",
             ),
+            _check(
+                "source.drm_free",
+                not others,
+                f"{DRM_CARD} held by {', '.join(others) or 'nothing'} besides the player",
+                f"stop pid {', '.join(others)}: another DRM master keeps the locked player off the display",
+            ),
         ]
-        mode = KMS_CRTC.search("\n".join(out[len(files) :]))
+        mode = KMS_CRTC.search("\n".join(out[len(files) + 1 :]))
         if mode:
             width, height, rate = int(mode[1]), int(mode[2]), mode[3]
             found.append(
@@ -407,8 +419,11 @@ class Doctor:
         bars = generate("smpte_bars", width=fmt.width, height=fmt.height, rng=self._rng)
         with stage("loop", program=PASSTHRU, index=index) as result:
             Session(transport, sleep=self._sleep, clock=self._clock).load_program(PASSTHRU, link=self._link)
-            self._playout.show(with_state_index(bars, index))
-            frame = self._grab(index)
+            self._playout.show(with_state_index(bars, index), fps=fmt.fps)
+            try:
+                frame = self._grab(index)
+            finally:
+                self._playout.stop()
             result["captured"] = frame is not None
             sending = transmitting(transport.video_status(), fmt.name)
             result["transmitting"] = sending

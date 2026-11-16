@@ -116,8 +116,8 @@ to the Pi at 1920x1080@30 the same chain is fine. Pick one format for the whole
 pipeline and never vary it.
 
 The card returns frames at its own rate, not the session's: a 10 s pass at
-`1080p30` comes back as ~600 frames, about 60 fps. Nothing downstream counts
-frames — alignment is by the timecode strip and cuts are by time.
+`1080p30` comes back as ~600 frames, two per session frame
+([the card's cadence](#the-cards-cadence)).
 
 ## Signal comes from the Videomancer's transmitter; the card exposes none
 
@@ -224,40 +224,71 @@ A few lines of memory, and no internal frame feedback. Feedback effects need an
 external loop through Dual In, so the `feedback_gain` canonical axis is
 unmeasurable until that loop exists.
 
-## Playout framebuffer
+## Locked playout
+
+The Pi plays every stimulus with `syncsummoner.device.kmsplay`, a DRM/KMS player built on
+pykms. ffmpeg decodes the clip to raw `bgr565le` with no `-re`; the player prerolls two
+seconds of frames in RAM, then commits one atomic page flip per vblank to three RG16 dumb
+buffers. Each clip frame is held for exactly `refresh / fps` vblanks, so the frame clock is
+the display's pixel clock and flips cannot tear.
 
 | Property | Value |
 | --- | --- |
-| Framebuffer | `/dev/fb0`, 1920x1080, 16bpp, stride 3840 |
-| Word layout | BGR565: `rgb565le` bytes come back with red and blue exchanged |
-| Frame size | 4147200 bytes |
-| Compositor | none running, so DRM is free |
+| Device | `/dev/dri/card1`, connector `HDMI-A-1`, primary plane |
+| Mode | the EDID's preferred `1920x1080@30.00`, 74.25 MHz; kept, never re-set, when it divides the clip rate |
+| Format | RG16, the bytes `ffmpeg -pix_fmt bgr565le` writes (red and blue come back exchanged otherwise) |
+| DRM master | free: nothing holds `card1`, fbcon is an in-kernel client; `device doctor` fails `source.drm_free` otherwise |
+| Software decode | 1080p30 H.264 at about 1.85x real time on the Pi 4's CPU; `h264_v4l2m2m` stalled |
+| Scheduling | the pacing thread runs `SCHED_FIFO`, its ceiling raised with `sudo prlimit` for the player's shell only, with the garbage collector frozen |
 
-A frame is displayed by writing raw 16-bit little-endian words to `/dev/fb0`,
-blue in the high bits; `ffmpeg -pix_fmt bgr565le` produces them directly.
+Every flip-complete event's vblank sequence is checked against the vblank it was committed
+for and logged with its time (`flips.bin`). A late flip, an undecoded frame or a mode that
+does not divide the clip rate ends the player with a fault in `status.json`, which the host
+raises as `PlayoutError`. Without real-time scheduling a garbage-collector pause or the
+decoder's teardown delayed one commit past its vblank at the end of every clip; with it none
+has been missed.
 
-## Clip playout
+When the player exits, fbdev takes the display back, so it leaves its last frame in
+`/dev/fb0` and the picture stands. While it runs, fbdev blanking does nothing, so `Link`
+signals the player instead: `SIGUSR1` turns the CRTC off (the link drops and `dpms` reads
+`Off`), `SIGUSR2` turns it back on. The clip's timeline keeps running on the event clock
+meanwhile, and the frame due when the link returns is shown. The returning CRTC's vblanks
+sit at an arbitrary phase to the old ones, which the flip log records.
 
-Measured offline from recorded takes.
+## The card's cadence
 
-| Property | Value |
-| --- | --- |
-| Player | `ClipPlayer`: `ffmpeg -re` from `/dev/shm` into `/dev/fb0` |
-| Clip | 1080p30 H.264, timecoded |
-| Frame period | 33.3333 ms, a few ppm from nominal |
-| Captures per clip frame | two, the card returning about 60 fps |
-| Largest clip fitted | 822 MB, 351 s, in the Pi's tmpfs |
-| Upload of that clip | about 1.6 to 1.8 min |
+At 1920x1080 the card delivers about 60 fps whatever rate is asked for. From the locked
+30 Hz signal it delivers exactly two captures per frame, and the two are byte-identical MJPEG
+packets: over a minute, 898 pairs and the two partial ones at the ends, every strip on one
+cadence. uvcvideo's buffer sequence numbers have no gaps there; the recorder keeps each
+capture's sequence, timestamp and a digest of its bytes in a `.v4l2` sidecar, so a frame the
+driver loses shows as a sequence gap and the card's own repeats show which captures start a
+frame.
 
-Playout starts with a burst lasting a fraction of a second before settling to
-rate. A picture start read from the first seconds of a take can therefore be off
-by up to about 0.67 s against the steady clock: on `Porthole` the lead-in read
-1.23 s and the fitted clock 1.90 s. Takes are therefore spliced by the capture
-the clock fitted over the whole take attributes to each clip frame, never by a start time.
+## A program load breaks the capture
 
-The framebuffer is written without vsync, so a capture can show the strip one
-frame ahead of the picture above it; on some takes motion correlates best at a
-one-frame lead. Survival tests leads of 0 and 1 frames for this reason.
+A load stops the Videomancer's transmitter. The card then delivers nothing for a few
+hundred milliseconds at a time, with no gap in its sequence numbers, and relocks with its
+60 Hz grid at a new phase to the frames. Counting captures cannot carry a frame index across
+a load.
+
+| Load | Load call | Captures missing |
+| --- | --- | --- |
+| Passthru after Passthru | 3.0 to 4.1 s | two gaps, about 0.3 and 0.75 s |
+| Pinwheel after Passthru | 3.1 s | about 0.35 and 0.7 s |
+| YUV Amplifier after czartroniks/Fray | 9.2 s | |
+| czartroniks/Fray after Pinwheel | 13.7 s | |
+
+A load that changes author is the slow one. A locked take's lead-in is 20 s for that reason.
+
+Across eleven link-dropped Passthru loads in one recording, the capture time of each frame's
+first capture, against the Pi's flip time for that frame, moved by between -4.5 and +10.0 ms
+from one relock to the next, a spread of 14.4 ms. Two captures a frame put a frame's first
+capture within one capture period (16.7 ms) of the frame's flip plus a fixed latency, so that
+offset cannot move by half a frame. `compose.lock.attribute` therefore takes the captures
+that start a frame from the card's repeats, and names the frame each shows by the nearest
+flip time; every run of the eleven matched its strips. A run whose frame starts disagree is a
+`LockError`.
 
 ## The analog input decodes luma and sync only
 
@@ -270,7 +301,7 @@ ramp clipped at x=491 of 720, blue clipped to white, black lifted to purple.
 Colour work over the analog path needs that encoder calibrated first. The session
 runs HDMI, which carries chroma.
 
-## Capture is owned by ffmpeg
+## Capture is stored, never decoded, while it runs
 
 `VideoCapture.read` does not block: a 30-frame burst spanned 0.20-0.50 s, 20-92%
 of reads under 10 ms apart, handing back the previous buffer rather than waiting,
@@ -285,11 +316,12 @@ look faulted.
 | `ffmpeg -f v4l2 -input_format yuyv422 -c:v ffv1` | 29.8 fps |
 | `ffmpeg -f v4l2 -input_format mjpeg -c copy` | 59.8 fps |
 
-The host touches no frame while the rig runs. Under `-copyts` the stored
-presentation times are the card's own `CLOCK_MONOTONIC` capture times, the clock
-`time.monotonic` reads, so frames attribute to the setpoint being held when each
-arrived with no alignment step. `-t` must not be used with `-copyts`: it is read
-against the card's clock and ends the recording immediately.
+The host touches no frame while the rig runs: `syncsummoner.device.v4l2rec` dequeues
+the card's buffers with linuxpy and pipes them untouched into ffmpeg, which stores them
+(`-c:v copy` for MJPEG, FFV1 for an archive). The sidecar's timestamps are the driver's
+`CLOCK_MONOTONIC` buffer times, the clock `time.monotonic` reads, so frames attribute to
+the setpoint being held when each arrived with no alignment step. A recording's length is
+counted in frames at the rate the card actually runs.
 
 ## The state-index strip survives the chain
 

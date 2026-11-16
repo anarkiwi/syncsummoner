@@ -1,16 +1,14 @@
-"""Playout: BGR565 packing and framebuffer push, with no Pi and no network."""
+"""Playout: BGR565 packing, exact rates and flip-log judging, with no Pi and no network."""
 
 # pylint: disable=missing-function-docstring
 
-import subprocess
+from fractions import Fraction
 
 import numpy as np
 import pytest
 
-from syncsummoner.device import host, playout as po
+from syncsummoner.device import playout as po
 from syncsummoner.device.playout import Playout, to_fb565
-
-from .conftest import FakeClock
 
 
 class FakeRunner:
@@ -81,149 +79,75 @@ def test_frame_bytes_matches_measured_framebuffer():
     assert Playout(runner=FakeRunner()).frame_bytes == 4147200
 
 
-def test_show_pushes_one_framebuffer_write():
-    runner = FakeRunner()
-    Playout(runner=runner).show(frame((0.0, 0.0, 1.0)))
-    command, data = runner.calls[0]
-    assert command == "cat > /dev/fb0"
-    assert len(data) == 4147200
-    words = np.frombuffer(data, dtype="<u2")
-    assert np.all(words == words[0])
-    assert int(words[0]) >> 11 == round(235 / 255 * 31)
-
-
-def test_show_rejects_wrong_geometry():
+def test_encode_rejects_geometry_mismatch():
     with pytest.raises(ValueError, match=r"\(1080, 1920\)"):
-        Playout(runner=FakeRunner()).show(frame((0, 0, 0), 240, 320))
+        Playout(runner=FakeRunner()).encode(frame((0, 0, 0), 240, 320))
 
 
-def test_encode_rejects_geometry_mismatch_with_stride():
+def test_encode_packs_at_the_display_geometry():
     play = Playout(runner=FakeRunner(), width=8, height=4)
-    assert len(play.encode(frame((1, 1, 1), 4, 8))) == 64
+    assert len(play.encode(frame((1, 1, 1), 4, 8))) == 64 == play.frame_bytes
 
 
-def test_play_paces_a_sequence():
-    runner = FakeRunner()
-    clock = FakeClock()
-    play = Playout(runner=runner, width=2, height=2, sleep=clock.sleep, clock=clock)
-    frames = [frame((v / 4, 0, 0), 2, 2) for v in range(4)]
-    assert play.play(frames, fps=50.0) == 4
-    assert len(runner.calls) == 4
-    assert clock.now == pytest.approx(4 / 50.0)
+@pytest.mark.parametrize(
+    "fps, exact",
+    [
+        (29.97, Fraction(30000, 1001)),
+        (59.94, Fraction(60000, 1001)),
+        (23.976, Fraction(24000, 1001)),
+        (30.0, Fraction(30)),
+        (10.0, Fraction(10)),
+        (12.5, Fraction(25, 2)),
+        (7.5, Fraction(15, 2)),
+        (0.3, Fraction(3, 10)),
+        ("30000/1001", Fraction(30000, 1001)),
+        (Fraction(24), Fraction(24)),
+    ],
+)
+def test_rate_is_exact_and_recognises_ntsc(fps, exact):
+    assert po.rate(fps) == exact
 
 
-def test_play_does_not_sleep_when_already_behind():
-    clock = FakeClock()
-    runner = FakeRunner()
-
-    def slow(command, data):
-        runner(command, data)
-        clock.now += 1.0
-
-    play = Playout(runner=slow, width=2, height=2, sleep=clock.sleep, clock=clock)
-    assert play.play([frame((0, 0, 0), 2, 2)] * 3, fps=50.0) == 3
-    assert not clock.slept
+def flips(rows):
+    """A flip log from ``(v, seq, frame, flags)`` rows."""
+    return np.array([(v, seq, f, 0, flags) for v, seq, f, flags in rows], dtype=po.FLIP)
 
 
-def test_play_empty_sequence():
-    play = Playout(runner=FakeRunner(), width=2, height=2)
-    assert play.play([]) == 0
+@pytest.mark.parametrize(
+    "rows, hold, want",
+    [
+        ([], 1, (0, 0, 0, 0)),
+        ([(0, 100, 0, po.SEGMENT), (1, 101, 0, 0), (2, 102, 1, 0), (3, 103, 1, 0)], 2, (4, 1, 0, 0)),
+        ([(0, 100, 0, po.SEGMENT), (1, 102, 1, 0), (2, 103, 2, 0)], 1, (3, 1, 1, 0)),
+        ([(0, 100, 0, po.SEGMENT), (1, 101, 1, 0), (2, 102, 1, 0)], 1, (3, 1, 0, 1)),
+        (
+            [(0, 100, 0, po.SEGMENT), (1, 101, 1, 0), (9, 500, 1, po.SEGMENT), (10, 501, 10, 0)],
+            1,
+            (4, 2, 0, 0),
+        ),
+    ],
+    ids=["empty", "held", "missed", "stale", "resumed"],
+)
+def test_flip_summary_counts_misses_and_off_cadence_frames_within_segments(rows, hold, want):
+    got = po.flip_summary(flips(rows), hold)
+    assert (got["flips"], got["segments"], got["missed"], got["out_of_cadence"]) == want
 
 
-def test_play_rejects_bad_fps():
-    with pytest.raises(ValueError, match="positive"):
-        Playout(runner=FakeRunner()).play([], fps=0)
+def test_flip_records_match_the_players_own_layout():
+    fields = (3, 1003, 1, 123456789, po.SEGMENT)
+    assert np.frombuffer(po.RECORD.pack(*fields), dtype=po.FLIP)[0].tolist() == fields
 
 
-def test_default_runner_is_ssh(monkeypatch):
-    seen = {}
-
-    def fake_run(argv, **kwargs):
-        seen.update(argv=argv, input=kwargs["input"])
-        return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
-
-    monkeypatch.setattr(host.subprocess, "run", fake_run)
-    Playout(width=2, height=2).show(frame((0, 0, 0), 2, 2))
-    assert seen["argv"] == ["ssh", "-o", "BatchMode=yes", po.DEFAULT_HOST, f"cat > {po.DEFAULT_FB}"]
-    assert len(seen["input"]) == 8
+def test_the_player_program_shipped_is_the_module_run_on_the_pi():
+    source = po.player_source().decode()
+    assert source.startswith('"""Vsync-locked clip player') and "def main(" in source
+    assert "import numpy" not in source and "from syncsummoner" not in source
 
 
-class Recorder:
-    """Runner recording every command and payload it is handed."""
-
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, command, data=None):
-        self.calls.append((command, None if data is None else len(data)))
-        return ""
-
-
-def test_a_clip_player_uploads_once_and_plays_from_the_pi(tmp_path):
-    """The Pi decrypts every pushed byte, which caps a pushed pass at a few frames a second."""
-    from syncsummoner.device.playout import ClipPlayer
-
-    clip = tmp_path / "clip.mkv"
-    clip.write_bytes(b"x" * 2048)
-    runner = Recorder()
-    player = ClipPlayer("pi@rig", width=1920, height=1080, runner=runner)
-    assert player.upload(str(clip)) == 2048
-    with player.playing(fps=30.0):
-        pass
-    commands = [c for c, _ in runner.calls]
-    assert any(player.CLIP_PATH in c and c.startswith("cat >") for c in commands), "clip goes up once"
-    assert any("ffmpeg" in c and "-re" in c and str(player.frame_bytes) in c for c in commands)
-    assert any(c.startswith("kill -TERM") for c in commands), "and is stopped by pid, not by pattern"
-
-
-def test_a_clip_player_decodes_at_the_framebuffer_geometry():
-    from syncsummoner.device.playout import ClipPlayer
-
-    player = ClipPlayer("pi@rig", width=1280, height=720, runner=Recorder())
-    assert "scale=1280:720" in player.command().format(fps=25)
-
-
-def test_a_clip_player_allows_a_whole_clip_to_go_up(monkeypatch):
-    """A 449MB clip at ssh speed needs minutes, and the default runner gives thirty seconds."""
+def test_a_player_allows_a_whole_clip_to_go_up(monkeypatch):
     seen = []
     monkeypatch.setattr(po, "ssh_runner", lambda host, timeout: seen.append(timeout))
     po.ClipPlayer("pi@rig")
     po.Playout("pi@rig")
     assert seen[0] == po.UPLOAD_TIMEOUT >= 300.0
     assert seen[1] < seen[0], "a still frame does not need a clip's budget"
-
-
-def test_a_looping_clip_player_repeats_the_clip_and_a_render_does_not():
-    """Only an archive loops its clip; the input option has to precede the input it repeats."""
-    once = po.ClipPlayer("pi@rig", runner=Recorder()).command()
-    looped = po.ClipPlayer("pi@rig", loop=True, runner=Recorder()).command()
-    assert "-stream_loop" not in once
-    assert looped.index("-stream_loop -1") < looped.index(f"-i {po.ClipPlayer.CLIP_PATH}")
-    assert looped.replace("-stream_loop -1 ", "") == once
-
-
-class PidRunner(Recorder):
-    """Answers the pidfile read with ``pid`` and signal 0 with whether ``alive``."""
-
-    def __init__(self, pid, alive):
-        super().__init__()
-        self.pid, self.alive = pid, alive
-
-    def __call__(self, command, data=None):
-        super().__call__(command, data)
-        if command.startswith("cat "):
-            return self.pid
-        return po.RUNNING if self.alive else po.STOPPED
-
-
-@pytest.mark.parametrize(
-    "pid, alive, running",
-    [("4242\n", True, True), ("4242", False, False), ("", True, False), ("garbage", True, False)],
-)
-def test_a_clip_player_is_running_only_when_its_recorded_pid_answers(pid, alive, running):
-    runner = PidRunner(pid, alive)
-    assert po.ClipPlayer("pi@rig", runner=runner).is_running() is running
-    probes = [c for c, _ in runner.calls if c.startswith("kill -0")]
-    assert probes == (
-        ["kill -0 4242 2>/dev/null && echo RUNNING || echo STOPPED"] if pid[:1].isdigit() else []
-    )

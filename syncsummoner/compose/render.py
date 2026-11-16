@@ -22,12 +22,12 @@ from syncsummoner.device.profile import PARAM_MAX, ProgramProfile
 from syncsummoner.device.recorder import (
     BlankTakeError,
     TakeReport,
+    await_transmitting,
     inspect_take,
     require_input,
     require_route,
     require_signal,
     rig_state,
-    settle,
 )
 from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.compose.cut import Cut
@@ -35,7 +35,15 @@ from syncsummoner.compose.master import DEFAULT_CRF, X264
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
-from syncsummoner.probe.patterns import burn_timecode, read_timecode
+from syncsummoner.compose.lock import (  # pylint: disable=unused-import
+    LostTimecodeError,
+    attribute_take,
+    lock_path,
+    picked_path,
+    save_lock,
+    take_start,
+)
+from syncsummoner.probe.patterns import burn_timecode
 from syncsummoner.progress import LOG, human, meter, stage, track
 
 
@@ -43,8 +51,8 @@ class UnknownProgramError(RuntimeError):
     """A named program cannot be rendered, so no pass should be started."""
 
 
-class LostTimecodeError(RuntimeError):
-    """No take in a run kept a legible timecode strip, so nothing says where its picture starts."""
+class LeadInError(RuntimeError):
+    """The take's program had not finished loading when the clip's first frame played."""
 
 
 class UnsafeOutputError(RuntimeError):
@@ -66,6 +74,7 @@ class Offered(tuple):
         return offered
 
 
+PASSTHRU = "Passthru"
 #: Passes reloaded and retried after showing no picture while the Passthru control did.
 PASS_RETRIES = 1
 #: Program names shown from a listing that lacked a requested one.
@@ -108,8 +117,10 @@ class RenderConfig:
     probe_s: float = 2.0
     #: pyvmancer's opt-in stall guard for device waits; None waits for as long as the device is on USB.
     stall_s: float | None = None
-    #: Recorded before the clip is started, so the picture's own first frame is inside the take.
-    lead_s: float = 3.0
+    #: Strip-coded lead-in played under Passthru; the take's program loads inside it (docs/hardware.md).
+    lead_in_s: float = 20.0
+    #: Recorded past the clip's last frame, so the card's last captures of it are inside the take.
+    tail_s: float = 1.0
     #: Where the liveness probe is recorded before a take begins.
     probe_path: str = "/tmp/syncsummoner-probe.mkv"
     #: ssh target driving playout and the HDMI link; None takes the device layer's default.
@@ -137,69 +148,9 @@ class Rig:
     transport: Any = None
 
 
-def steady_lag(codes: Sequence[int | None], *, bits: int) -> int | None:
-    """The lag held by the frames that count up one per frame; ``None`` when none do.
-
-    Played at rate, consecutive frames decode to consecutive indices, so a real
-    alignment is a run of frames sharing one lag. A held frame keeps its index
-    while its lag grows, and a misread lands anywhere, so neither forms runs. A
-    run of ``k`` agreeing frames arises by chance with odds ``2**-(bits * (k - 1))``,
-    so among ``n`` frames only runs longer than ``1 + log2(n) / bits`` count, which
-    puts the expected number of chance runs under one. The lag with the most
-    frames in such runs wins.
-    """
-    n = len(codes)
-    if not n:
-        return None
-    known = np.array([c is not None for c in codes])
-    lags = np.arange(n) - np.array([0 if c is None else c for c in codes], dtype=np.int64)
-    breaks = np.flatnonzero(np.r_[True, ~(known[1:] & known[:-1] & (lags[1:] == lags[:-1]))])
-    lengths = np.diff(np.r_[breaks, n])
-    real = known[breaks] & (lengths > 1 + np.log2(n) / bits)
-    if not real.any():
-        return None
-    values, which = np.unique(lags[breaks[real]], return_inverse=True)
-    return int(values[np.bincount(which, weights=lengths[real]).argmax()])
-
-
-def picture_start(path: str | Path, *, config: RenderConfig, search_s: float | None = None) -> float | None:
-    """Seconds into a take at which the played clip's first frame lands.
-
-    Lead-in is not blank: it holds whatever the framebuffer last showed, which is
-    the previous play's final frame and carries that frame's own timecode. Played
-    at rate, every fresh frame has the same lag between where it sits in the take
-    and the frame it says it is; :func:`steady_lag` finds the run of frames that
-    agree on it, so neither that held frame nor a misread strip can move it. The
-    card returns frames at its own rate, so they are resampled to the session's
-    before an index means a time.
-    """
-    search = config.lead_s + 2.0 if search_s is None else search_s
-    argv = [
-        getattr(config, "ffmpeg", "ffmpeg"),
-        "-loglevel",
-        "error",
-        "-i",
-        str(path),
-        "-t",
-        f"{search:.3f}",
-        "-vf",
-        f"fps={config.fps},crop=iw:{config.strip_px}:0:ih-{config.strip_px}",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
-    ]
-    data = subprocess.run(argv, check=False, capture_output=True).stdout
-    stride = config.width * config.strip_px * 3
-    strips = np.frombuffer(data[: len(data) - len(data) % stride], np.uint8)
-    if not strips.size:
-        return None
-    strips = strips.reshape(-1, config.strip_px, config.width, 3).astype(np.float32) / 255.0
-    lag = steady_lag(
-        [read_timecode(s, bits=config.bits, strip_px=config.strip_px) for s in strips], bits=config.bits
-    )
-    return None if lag is None else max(0.0, lag / config.fps)
+def lead_frames(config: RenderConfig) -> int:
+    """Lead-in frames before clip frame 0."""
+    return int(round(config.lead_in_s * config.fps))
 
 
 def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:
@@ -260,8 +211,12 @@ def write_timecoded(
     config: RenderConfig,
     seconds: float | None = None,
     start: float = 0.0,
+    lead: int = 0,
 ) -> int:
-    """Write the source at session geometry with each frame's index burnt in.
+    """Write the source at session geometry with each frame's index burnt in, after a lead-in.
+
+    The lead-in is ``lead`` copies of the first frame (a locked take's is :func:`lead_frames`) numbered
+    ``-lead..-1``, wrapped to the strip's width. Returns the clip frames written, lead-in excluded.
 
     A clip the playout can identify frame by frame is what lets the source be
     played from the other end, where it can run at rate. ``start`` skips into it,
@@ -270,6 +225,7 @@ def write_timecoded(
     than the broken pipe writing to it produces.
     """
     total, frames = source_stream(source, config, seconds=seconds, start=start)
+    lead = int(lead)
     argv = [
         getattr(config, "ffmpeg", "ffmpeg"),
         "-loglevel",
@@ -299,11 +255,18 @@ def write_timecoded(
         argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     written = 0
+    wrap = (1 << config.bits) - 1
+
+    def stamp(frame: np.ndarray, index: int) -> bytes:
+        stamped = burn_timecode(frame, index & wrap, bits=config.bits, strip_px=config.strip_px)
+        return np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data
+
     try:
         for index, frame in enumerate(track(frames, desc="timecoding", total=total or None, unit="frame")):
-            stamped = burn_timecode(frame, index, bits=config.bits, strip_px=config.strip_px)
             try:
-                proc.stdin.write(np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data)
+                for before in range(-lead, 0) if index == 0 else ():
+                    proc.stdin.write(stamp(frame, before))
+                proc.stdin.write(stamp(frame, index))
             except BrokenPipeError:
                 break
             written = index + 1
@@ -314,7 +277,14 @@ def write_timecoded(
         proc.wait()
     if proc.returncode:
         raise RuntimeError(f"timecoding {out} failed: {said.splitlines()[-1] if said else 'no output'}")
-    LOG.info("timecoded %d frames into %s at %dx%d", written or total, out, config.width, config.height)
+    LOG.info(
+        "timecoded %d frames after a %d frame lead-in into %s at %dx%d",
+        written or total,
+        lead,
+        out,
+        config.width,
+        config.height,
+    )
     return written or total
 
 
@@ -345,8 +315,9 @@ def drive(
     clock=time.monotonic,
     sleep=time.sleep,
     tick_s: float = DRIVE_TICK_S,
+    start: float | None = None,
 ) -> int:
-    """Write the automation on a wall clock while the recorder captures.
+    """Write the automation on a wall clock while the recorder captures, from ``start`` (now by default).
 
     The host does nothing per frame: it wakes when a parameter is due, or on a
     tick to say how far through the pass it is, and sleeps again. The pass is
@@ -354,9 +325,12 @@ def drive(
     """
     order = np.argsort(auto.times, kind="stable")
     times, indices, values = auto.times[order], auto.indices[order], auto.values[order]
-    start, cursor, written = clock(), 0, 0
+    start, cursor, written = (clock() if start is None else start), 0, 0
     with meter(duration, desc="pass") as elapsed:
-        report = lambda now: elapsed.to(now - start)  # pylint: disable=unnecessary-lambda-assignment
+
+        def report(now: float) -> None:
+            elapsed.to(max(0.0, now - start))
+
         while cursor < times.size:
             _wait_until(start + float(times[cursor]), clock=clock, sleep=sleep, tick_s=tick_s, report=report)
             due = max(int(np.searchsorted(times, clock() - start, side="right")), cursor + 1)
@@ -370,50 +344,92 @@ def drive(
     return written
 
 
+def play_take(
+    rig: Rig,
+    recorder: Any,
+    out: str | Path,
+    *,
+    program: str | None,
+    seconds: float,
+    config: RenderConfig,
+    during: Callable[[float, float], Any] | None = None,
+) -> float:
+    """Record one locked take: the lead-in under Passthru, ``program`` loaded inside it, then the clip.
+
+    ``during(began, latency)`` runs once the program is up, ``began`` being when the lead-in
+    started; the lock record is saved beside the take. Returns when the load ended, on the
+    capture clock; a load that overran the lead-in is a :class:`LeadInError`.
+    """
+    lead, count = lead_frames(config), int(round(seconds * config.fps))
+    lead_s = lead / config.fps
+    with stage("passthru", program=PASSTHRU):
+        rig.session.load_program(PASSTHRU, link=rig.link)
+        require_route(rig.transport, program=PASSTHRU, route=config.route)
+        await_transmitting(rig.transport, program=PASSTHRU, timing=config.timing)
+    with stage("take", program=program or PASSTHRU, seconds=f"{lead_s + seconds:.1f}") as said:
+        with recorder.recording(out):
+            with rig.playout.playing(fps=config.fps) as player:
+                began = time.monotonic()
+                latency = 0.0
+                if program is not None:
+                    rig.session.load_program(program, link=rig.link)
+                    require_route(rig.transport, program=program, route=config.route)
+                    latency = write_latency(config, rig.transport)
+                    rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
+                    await_transmitting(rig.transport, program=program, timing=config.timing)
+                    require_input(rig.transport, program=program, source=config.source)
+                loaded = time.monotonic()
+                said["load_s"] = round(loaded - began, 2)
+                if loaded - began >= lead_s:
+                    raise LeadInError(
+                        f"{program}: loading took {loaded - began:.1f}s, past the {lead_s:.1f}s lead-in; "
+                        "raise lead_in_s"
+                    )
+                if during is not None:
+                    during(began, latency)
+                end = began + lead_s + seconds + config.tail_s
+                _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
+                hold = int(player.status().get("hold", 1))
+        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count)
+    return loaded
+
+
 def _attempt(
     rig: Rig, recorder: Any, out: str | Path, *, score: Score, autos: Mapping, config: RenderConfig
 ) -> tuple[str, TakeReport]:
-    """Load the score's program and record its pass; returns what was judged and its report.
+    """Record the score's pass with :func:`play_take` and judge it; returns what was judged and its report.
 
-    What was judged is ``load probe`` when the probe shows no picture, which ends the attempt
-    before the pass is driven, and ``take`` otherwise.
+    Clip frame 0 reaching the card before the load ended, on the capture clock, is a :class:`LeadInError`.
     """
     layer = min(score.layers, key=lambda item: item.index)
     program = layer.program
-    with rig.playout.playing(fps=config.fps):
-        with stage("load", program=program) as loaded:
-            rig.session.load_program(program, link=rig.link)
-            require_route(rig.transport, program=program, route=config.route)
-            latency = write_latency(config, rig.transport)
-            loaded["latency_ms"] = round(latency * 1e3, 1)
-            rig.session.set_params(rig.session.working_point(rig.transport.program_info()))
-            probe = settle(
-                recorder,
-                rig.transport,
-                program=program,
-                timing=config.timing,
-                probe_timeout_s=config.probe_timeout_s,
-                probe_path=config.probe_path,
-            )
-            require_input(rig.transport, program=program, source=config.source)
-    if not probe.mostly_picture:
-        return "load probe", probe
-    auto = schedule(
-        autos.get(layer.index, Automation.empty()),
-        latency_s=latency,
-        early_bias_s=config.early_bias_s,
-        cc_budget_hz=config.cc_budget_hz,
-    )
     signal = {"program": program, "timing": config.timing}
-    with stage("pass", program=program, seconds=f"{score.duration:.1f}") as written:
-        require_signal(rig.transport, when="as the pass began", **signal)
-        with recorder.recording(out, seconds=score.duration + config.lead_s):
-            with rig.playout.playing(fps=config.fps):
-                written["writes"] = drive(rig, auto, duration=score.duration)
-        rig.transport.verify_cc_map()
-        require_route(rig.transport, program=program, route=config.route)
-        require_signal(rig.transport, when="as the pass ended", **signal)
-    return "take", inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"))
+    written: dict = {}
+
+    def run(began: float, latency: float) -> None:
+        auto = schedule(
+            autos.get(layer.index, Automation.empty()),
+            latency_s=latency,
+            early_bias_s=config.early_bias_s,
+            cc_budget_hz=config.cc_budget_hz,
+        )
+        written["writes"] = drive(
+            rig, auto, duration=score.duration, start=began + lead_frames(config) / config.fps
+        )
+
+    loaded = play_take(rig, recorder, out, program=program, seconds=score.duration, config=config, during=run)
+    rig.transport.verify_cc_map()
+    require_route(rig.transport, program=program, route=config.route)
+    require_signal(rig.transport, when="as the pass ended", **signal)
+    found = attribute_take(out, config=config)
+    if found.frame0_ns / 1e9 <= loaded:
+        raise LeadInError(
+            f"{program}: clip frame 0 reached the card {loaded - found.frame0_ns / 1e9:.2f}s "
+            "before the load ended"
+        )
+    LOG.info("%s: %d automation writes", program, written.get("writes", 0))
+    start_s = float(found.picked[0]) / (found.per_frame * config.fps)
+    return "take", inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"), start_s=start_s)
 
 
 def verify_dark(
@@ -448,12 +464,11 @@ def render_played(
     start: float = 0.0,
     recorder: Any = None,
 ) -> TakeReport:
-    """Render one pass: the rig plays, ffmpeg records, the host only drives.
+    """Render one pass: the rig plays, the card records, the host only drives.
 
-    Nothing on the host touches a frame while the rig runs. The clip plays as the load's probe
-    stimulus, then again inside the recording, which opens on lead-in (:func:`picture_start`).
-    A load probe or take with no picture is a program verdict only after :func:`verify_dark`
-    passes; the program is then reloaded and its pass retried :data:`PASS_RETRIES` times.
+    Nothing on the host touches a frame while the rig runs; each take is :func:`_attempt`. A
+    take with no picture is a program verdict only after :func:`verify_dark` passes; the
+    program is then reloaded and its pass retried :data:`PASS_RETRIES` times.
     """
     layers = sorted(score.layers, key=lambda item: item.index)
     if not layers:
@@ -461,9 +476,11 @@ def render_played(
     config = RenderConfig() if config is None else config
     program = layers[0].program
     owned = rig is None
-    rig = open_rig(config, player=True, capture=False) if owned else rig
+    rig = open_rig(config, capture=False) if owned else rig
     if not prepared:
-        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
+        write_timecoded(
+            source, scratch, config=config, seconds=score.duration, start=start, lead=lead_frames(config)
+        )
     if recorder is None:
         from syncsummoner.device.recorder import Recorder
 
@@ -803,7 +820,9 @@ def render_cuts(
         human(len(fresh) * score.duration),
     )
     if (fresh or not Path(scratch).is_file()) and not prepared:
-        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
+        write_timecoded(
+            source, scratch, config=config, seconds=score.duration, start=start, lead=lead_frames(config)
+        )
         prepared = True
     for program in track(ordered, desc="passes", total=len(ordered), unit="program"):
         take = paths[program]
@@ -850,11 +869,12 @@ def checked_plan(
 ) -> tuple[list[Cut], dict[str, np.ndarray]]:
     """Judge every take against the clip it was fed, covering dead spans or failing the render.
 
-    Returns the covered plan and, per take, the capture showing each clip frame, which is
-    what :func:`splice` cuts by.
+    Every take is attributed exactly from its lock record (:func:`attribute_take`); returns
+    the covered plan and, per take, the capture showing each clip frame, which :func:`splice` cuts by.
     """
     from syncsummoner.compose.takecheck import DeadTakeError, check_takes
 
+    attributions = {name: attribute_take(take, config=config).picked for name, take in takes.items()}
     with stage("check", takes=len(takes)):
         report = check_takes(
             score,
@@ -863,6 +883,7 @@ def checked_plan(
             clip,
             strip_px=config.strip_px,
             bits=config.bits,
+            attributions=attributions,
             ffmpeg=getattr(config, "ffmpeg", "ffmpeg"),
         )
     for line in report.lines():
@@ -874,11 +895,11 @@ def checked_plan(
     return report.cuts, {name: t.picked for name, t in report.traces.items()}
 
 
-def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True) -> Rig:
+def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
     Imported here so compose never needs hardware. A recorded pass wants no
-    capture at all: ffmpeg opens the card itself, and a handle held here would
+    capture at all: the recorder opens the card itself, and a handle held here would
     keep it from doing so.
     """
     from syncsummoner.device import capture as capture_mod
@@ -897,9 +918,7 @@ def open_rig(config: RenderConfig, *, player: bool = False, capture: bool = True
             if capture
             else None
         ),
-        playout=(playout_mod.ClipPlayer if player else playout_mod.Playout)(
-            *host, width=config.width, height=config.height
-        ),
+        playout=playout_mod.ClipPlayer(*host, width=config.width, height=config.height),
         link=link_mod.Link(*host),
     )
 

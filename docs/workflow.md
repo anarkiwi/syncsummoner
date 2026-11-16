@@ -12,7 +12,7 @@ Everything below runs through `docker run`, on the rig described in
 ```
    Raspberry Pi 4B "videopi"                     LZX Videomancer
    +---------------------------+                +----------------------------+
-   | /dev/fb0, 1080p30         |     HDMI       | HDMI IN                    |
+   | KMS player, 1080p30       |     HDMI       | HDMI IN                    |
    | no compositor, DRM free   |===============>|                            |
    | plays the timecoded clip  |  source clip   | 6 knobs, 5 toggles,        |
    +-------------+-------------+                | crossfader (P12)           |
@@ -38,7 +38,7 @@ Everything below runs through `docker run`, on the rig described in
 | HDMI | Videomancer HDMI OUT | AVerMedia HDMI IN | the processed picture |
 | USB 3 | AVerMedia | workstation | the capture, as `/dev/video0` |
 | USB | Videomancer | workstation | CDC shell (`/dev/ttyACM0`) and MIDI (`/dev/snd/midiC*D0`) |
-| ethernet | videopi | workstation LAN | ssh: playout, and blanking the framebuffer to drop the link |
+| ethernet | videopi | workstation LAN | ssh: playout, and dropping the link |
 
 The Videomancer genlocks to its input and cannot convert, so the whole chain runs
 at one format. `1080p30` is this rig. The composite path into the analog input is
@@ -98,12 +98,14 @@ directory comes out owned by root. The wrapper above takes care of both.
 
 The Pi side has two requirements the workstation cannot supply for it: the ssh
 key must already work unattended (`BatchMode=yes` never prompts, so the host key
-has to be in the mounted `known_hosts` before the first run), and dropping the
-HDMI link writes `/sys/class/graphics/fb0/blank`, which needs passwordless sudo:
+has to be in the mounted `known_hosts` before the first run), and passwordless
+sudo: the player raises its real-time priority with `sudo -n prlimit`, and
+dropping the HDMI link with no player running writes
+`/sys/class/graphics/fb0/blank`:
 
 ```sh
 ssh pi@videopi 'echo ok'      # must succeed with no prompt
-ssh pi@videopi 'sudo -n true' # must not ask for a password; blanking is a sudo write
+ssh pi@videopi 'sudo -n true' # must not ask for a password; prlimit and blanking are sudo
 ```
 
 Check the rig answers before anything long starts:
@@ -116,10 +118,44 @@ ssh pi@videopi 'echo 0 | sudo tee /sys/class/graphics/fbcon/cursor_blink'
 ss device doctor --latency  # rig checks, plus MIDI CC latency and backlog at the session's frame rate
 ```
 
-That last line matters: a blinking console cursor inverts its cell on top of the
-framebuffer and lands in every take. The other pre-flight gotchas — parking the
-panel, one owner of `/dev/video0`, a capture card with no signal state of its own — are in
-[rig.md](rig.md#gotchas).
+The cursor line matters: between plays fbdev shows the framebuffer, and a
+blinking console cursor inverts its cell on top of it. The other pre-flight
+gotchas — parking the panel, one owner of `/dev/video0`, a capture card with no
+signal state of its own — are in [rig.md](rig.md#gotchas).
+
+### Check the frame clock
+
+A render attributes every clip frame to one capture exactly, which holds only if
+the Pi's player, the device and the card keep one clock
+([design.md](design.md#10-locked-frame-clock-and-exact-attribution)). Check that
+end to end before a long render:
+
+```sh
+ss lockcheck source.mkv --seconds 30 --source-host pi@videopi              # through Passthru
+ss lockcheck source.mkv --seconds 30 --program Pinwheel --source-host pi@videopi
+```
+
+It timecodes the footage into `--scratch` (`--prepared` plays one already
+timecoded), plays it with the render's lead-in (`--lead-in` overrides it),
+records `--take`, and prints one line, `LOCKED` or `NOT LOCKED`, with the Pi's
+flips and missed vblanks, the card's lost frames, gaps and off-cadence frame
+changes, strip agreement and, through Passthru, torn captures. It exits 1 unless
+locked; `--judge` re-judges a recorded `--take` without playing.
+
+A full clip through `Pinwheel`, loaded in the lead-in, with `--prepared`:
+
+```
+23:12:14 upload (clip=clip.mkv)
+23:13:46 upload done in 1.5 min: bytes=765352701
+23:13:46 passthru (program=Passthru)
+23:13:49 Passthru: cc-map: assigned P1..P12 -> CC0..11 (was: ok)
+23:13:50 passthru done in 4s
+23:13:50 take (program=Pinwheel seconds=369.8)
+23:13:58 Pinwheel: cc-map: assigned P1..P12 -> CC0..11 (was: ok)
+23:20:10 take done in 6.3 min: load_s=3.18
+23:21:02 pinwheel.mkv: 10493/10493 clip frames attributed at 2 captures a frame, 3 runs, clip in captures 475..22640 (repeats on cadence 100.0%, timestamps agree 100.0%, worst 0.00 of 16.67 ms), strips agree 21991/22257, 0 frames lost by the driver
+23:21:02 pinwheel.mkv: LOCKED: 10493/10493 clip frames attributed; Pi 11068 flips, 0 missed vblanks, 0 off cadence; card 0 lost frames, 0 gaps and 0 frame changes off cadence in the clip; strips 20986/20986 agree; 0/0 torn
+```
 
 ## Inputs
 
@@ -416,28 +452,15 @@ ss audition score.yaml --source source.mkv --audio track.flac \
      --cut-programs Derez,Lorenz,Scramble,Sfumato --takes takes/ -o audition.mp4
 ```
 
-A real 30 second excerpt costs about a minute, most of it the load:
+An excerpt costs a Passthru load, the lead-in and the excerpt. Each take logs its
+`passthru` and `take` stages (`load_s` is how much of the lead-in the program's load
+used), then its attribution summary, then the take's picture report.
 
-```
-09:56:57 audition: 10.0s from 20.0s
-09:57:03 timecoded 300 frames into timecoded.mkv at 1920x1080
-09:57:03 upload (clip=timecoded.mkv)
-09:57:04 upload done in 1s: bytes=948134
-09:57:05 load (program=Passthru)
-09:57:17 load done in 12s
-09:57:18 pass (program=Passthru seconds=10.0)
-09:57:32 pass done in 14s: writes=9
-09:57:34 audition.take.mp4: 185 frames: 184 picture, 1 uniform; luma range 235, motion +0.71, mean luma 0.383
-09:57:34 picture starts 1.20s into the take
-09:57:34 master (seconds=10.0 fades=1/1 out=audition.mp4)
-09:57:37 master done in 3s
-09:57:37 audition.mp4: 10.0s mastered from audition.take.mp4
-audition.mp4
-```
-
-The take is longer than the pass because it opens on lead-in, and holds more
-frames than 10 s at 30 implies because the card returns its own rate. What makes
-the finished clip right is neither of those but the `picture starts` line.
+The take is longer than the excerpt because it opens on the lead-in the program
+loads inside, and holds more captures than frames because the card runs its own
+cadence ([hardware.md](hardware.md#the-cards-cadence)). What makes the finished
+clip right is the attribution line: every clip frame has a capture, and the
+clip's run agrees on its cadence.
 
 Iterate here, not on the full render. A different `--seed`, `--style` or
 `--density` at step 2 is seconds of CPU; a full render is most of an hour.
@@ -458,52 +481,52 @@ What happens, in order:
    into a croppable edge strip, and the result is written to `--scratch` **once**;
    every pass replays that same file.
 2. Per program: the scratch is pushed over ssh into the Pi's `/dev/shm` and played
-   from there. Nothing is copied to the Pi by hand — the source stays on the
-   workstation, and the timecoded clip is the only thing that crosses, once per
-   pass. It has to fit in the Pi's tmpfs, which is half its RAM.
-3. Then the HDMI link is dropped, the program loaded, and the pass waits
-   for the picture to come back before recording — a load blacks the output for
-   12 to 19 seconds on this rig, and the take must not start inside that. The wait
-   polls the device's HDMI transmitter over serial until it drives the session
-   format, then records a short probe that must be mostly picture, all within a
-   40 s budget; exceeding it fails the pass rather than recording black. The
-   transmitter is checked again as the recording starts and once it ends.
-4. Recording starts, and a few seconds later the clip is played a second time,
-   from its first frame, for the take itself. The first play is only what gives
-   the liveness probe something moving to judge; it is over before the load
-   finishes, and a take recorded against it would be its last frame held still.
-5. The Pi decodes and blits the clip at rate while ffmpeg records the card and the
-   host writes only the parameters that are due. Each program is driven by its own
-   evolved layer; the take covers the whole timeline.
+   from there by the locked player ([rig.md](rig.md#playout)). Nothing is copied
+   to the Pi by hand — the source stays on the workstation, and the timecoded clip
+   is the only thing that crosses, once per pass. It has to fit in the Pi's tmpfs,
+   which is half its RAM.
+3. Passthru is loaded, recording starts, and the player starts the clip, which
+   opens on a strip-coded lead-in (`lead_in_s`, 20 s). The program is loaded
+   inside the lead-in with the HDMI link dropped, and the pass waits for the
+   transmitter to drive the session format within a 40 s budget; a load not done
+   before clip frame 0 is a `LeadInError`. The transmitter is checked again once
+   the take ends.
+4. From clip frame 0 the host writes only the parameters that are due while the
+   Pi flips the clip on its vblanks and the card's captures are stored untouched,
+   each with its sequence, timestamp and digest in `<take>.v4l2`. Each program is
+   driven by its own evolved layer; the take covers the whole timeline. When the
+   player stops, its flip log is saved as `<take>.lock.npz`.
+5. The take is attributed exactly
+   ([design.md](design.md#10-locked-frame-clock-and-exact-attribution)): per clip
+   frame, the capture nearest its centre, saved as `<take>.picked.npy` and logged
+   as one line (`take-Pinwheel.mkv: 5400/5400 clip frames attributed at 2 captures
+   a frame, ...`). A take that cannot be attributed frame for frame is a
+   `LockError`, and one whose clip frame 0 reached the card before the load ended
+   a `LeadInError`.
 6. Each pass lands in `--takes` as `take-<program>.mkv` (an `author/Name` program
    becomes `take-author_Name-<digest>.mkv`, the archive's name for it), and they are spliced
    together on the score's sections, in rotation, into `final.take.mp4`.
-7. The take opens on lead-in the picture has not reached yet, so no take is cut
-   by time. The take check (step 8) attributes every clip frame to the capture
-   nearest the centre of its display interval, by the player's clock fitted from
-   the timecode strip, or from the motion where a program destroys the strip
-   (`Pinwheel: aligned by motion, picture starts 1.918s`).
-8. Before the takes are spliced together, each is checked against the timecoded
-   clip it was fed: every capture is attributed to the clip frame it shows, and
-   every bar is judged `flat`, `frozen` or `unfollowed` on what it kept of the
+7. Before the takes are spliced together, each is checked against the timecoded
+   clip it was fed, frame for frame by its attribution, and every bar is judged `flat`, `frozen` or `unfollowed` on what it kept of the
    same bar of the clip. A dead run inside a cut is covered from another
    program's take alive across it (`Derez:   42.10-  46.20s frozen, covered by
    Lorenz`); a lone dead bar inside a `destroy` section stays. A run no take
    covers stops the render with `DeadTakeError: dead picture no take can cover:`
    and the program and time range, before anything is mastered.
-9. The splice writes one frame per clip frame at the clip's rate: frame `n` is the
+8. The splice writes one frame per clip frame at the clip's rate: frame `n` is the
    capture its cut's take shows clip frame `n` in. Every take is decoded once,
    forward, at full size, all at once, and nothing is seeked, so no cut is a frame
    early or late. A clip frame the chosen take has no capture of stops the splice
    with `SpliceError: <program>: no capture shows clip frames <from>-<to>s`.
-10. Mastering: black out the timecode strip
+9. Mastering: black out the timecode strip
    (cropped off the bottom edge and padded back, so the frame keeps its size and
    nothing is resampled), trim to the length both inputs cover, mux the track, fade the picture up from black and the audio up from
    silence over `--fade` seconds, and the same back down at the end.
 
-The capture card returns frames at its own rate — this one gives 60 for a
-`1080p30` session — so a take holds more frames than the session's rate implies.
-Attribution picks one capture per clip frame, so the splice is at the clip's rate.
+The capture card returns frames at its own rate
+([hardware.md](hardware.md#the-cards-cadence)), so a take holds more frames than
+the session's rate implies. Attribution picks one capture per clip frame, so the
+splice is at the clip's rate.
 
 `--fade-in` and `--fade-out` override each edge separately; `--fade 0` renders
 hard cuts at both ends. On a clip shorter than two fades, each is clamped to half
@@ -525,8 +548,11 @@ ss check score.yaml --source timecoded.mkv --takes takes/ \
 ss check score.yaml --source timecoded.mkv --master final.take.mp4
 ```
 
-`--source` is the render's `--scratch`. A spliced master is frame for frame the
-clip's, so it is checked on the identity clock: master frame `n` is clip frame `n`.
+`--source` is the render's `--scratch`. Each take is checked on its
+`<take>.picked.npy` (`Pinwheel: aligned by given`); a take without one, recorded
+before the locked player, has its clock fitted from its strip and motion, with a
+warning. A spliced master is frame for frame the clip's, so it is checked on the
+identity clock: master frame `n` is clip frame `n`.
 
 `--reuse-takes` cuts from any `take-<program>.mkv` already in `--takes` instead
 of rendering it again (`<program>: reusing take <path>`), so a render can be
@@ -579,8 +605,8 @@ A cut render says what it is about to cost before it starts the first pass —
 `N cuts over M programs: M passes of <length> plus a load and relock each, <total>
 of capture` — and every stage after that reports its own elapsed time.
 
-For a three minute piece at `1080p30`, per program: the load and relock, measured
-at 12 to 19 s, then three minutes of real-time capture. Eight programs is
+For a three minute piece at `1080p30`, per program: a Passthru load, the 20 s
+lead-in the program loads inside, then three minutes of real-time capture. Eight programs is
 therefore around half an hour of rig time, on top of one timecoded-source build.
 Nothing about a real-time capture makes that faster; what makes it cheap is not
 doing it twice, which is what the audition is for.
@@ -592,7 +618,7 @@ doing it twice, which is what the audition is for.
 | `check` | CPU | one decode per take |
 | `analyze` / `compose` | CPU | seconds to a minute |
 | `audition` | rig | one load plus the excerpt |
-| `render` | rig | (load + relock + duration) per program |
+| `render` | rig | (Passthru load + lead-in + duration) per program |
 | mastering | CPU | one encode |
 
 ## When it goes wrong
@@ -605,7 +631,7 @@ doing it twice, which is what the audition is for.
 | `the firmware reports no transmitter state` | `video status` has no `hdmi_tx` or `output.hdmi_connected`, so signal cannot be confirmed and nothing is recorded; update pyvmancer or the firmware |
 | `the transmitter is not driving ... as the pass began` / `as the pass ended` (or `sweep`) | the output dropped around a recording; the pass is failed rather than kept, and an archive goes on to its passthrough check |
 | output black everywhere, every program dark, Passthru included, while `video status` reads `hdmi` locked and transmitting | check front panel SETTINGS > Vid Route Mode: under any route but HDMI In (Dual In, for one) the processor is fed nothing. `device doctor` fails `video.route`; render, audition and archive check it before the run and after every load and stop with `RouteError` naming the value read. Set HDMI In, or pass `--route` for a rig meant to run on another route |
-| `the program outputs no picture` | the transmitter is up and the load probe or take was mostly uniform fields, while a Passthru control on the same rig showed a picture: the program outputs a constant, e.g. video black at 16, and was reloaded and retried once before this. Brightness and colour play no part, so dark or black-and-white footage is picture |
+| `the program outputs no picture` | the transmitter is up and the take was mostly uniform fields, while a Passthru control on the same rig showed a picture: the program outputs a constant, e.g. video black at 16, and was reloaded and retried once before this. Brightness and colour play no part, so dark or black-and-white footage is picture |
 | `RigFaultError: ... the Passthru control failed` | a program showed no picture and so did Passthru: the rig, not the program, is dark. The error carries the route, the input lock and the transmitter `vic`/`de`; check Vid Route Mode, the source, then power-cycle |
 | `the device does not offer ...` | the program listing, taken twice, lacked a named program; the error lists both listings' counts, the authors enumerated, a sample, and where a missing name was listed under another author. A listing pyvmancer finds inconsistent with the device's own count raises `ProgramListError`, and a reply spliced with another's `InterleavedReplyError`: close any other client on the serial port |
 | `transmitting 1080p30 but nothing captured` | the device sends video but the card delivered no frames: check the HDMI cable to the card and that nothing else holds `/dev/video0` |
@@ -615,14 +641,18 @@ doing it twice, which is what the audition is for.
 | small flickering square in every take | `fbcon` cursor blink on the Pi; disable it, `chvt` does not fix it |
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
-| `SpliceError: <program>: no capture shows clip frames ...` | the take was never aligned or ends early; check its `aligned by` line in the take check |
+| `SpliceError: <program>: no capture shows clip frames ...` | the take ends early, or a fitted take was never aligned; check its `aligned by` line in the take check |
 | `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or not following the clip, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
 | `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `--footage` and refit |
-| `timecode strip did not survive, so the picture start is unknown` | no take kept its strip; check the program, or that the pass recorded the clip at all |
+| `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
+| `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, cadence, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |
+| `LeadInError: ...` | the program's load ran past the lead-in, or clip frame 0 reached the card before it ended; raise `RenderConfig.lead_in_s` (`lockcheck --program NAME --lead-in S` tries a value) |
+| `PlayoutError: the Pi player faulted ...` | the player missed a vblank, ran out of decoded frames or met a mode that does not divide the clip rate; read its `status.json` and log in the Pi's `/dev/shm` player directory |
+| `source.drm_free` fails | another DRM master holds `/dev/dri/card1` (a compositor or a stray player); stop the pid it names |
 | pass dies uploading the clip | `/dev/shm` on the Pi is half its RAM; a long scratch at `crf 14` will not fit |
 | `Host key verification failed` | the mounted `known_hosts` has no entry for the Pi; `BatchMode` will not prompt for one |
 | `Permission denied (publickey)` | the mounted key is not the one the Pi authorizes |
-| `sudo: a password is required` | link blanking needs passwordless sudo on the Pi |
+| `sudo: a password is required` | the player's `prlimit` and link blanking need passwordless sudo on the Pi |
 | `Bad owner or permissions on ~/.ssh/config` | the container is running as root against your ssh config; use the `--user` form above |
 | `Permission denied` writing the scratch | files left by an earlier run as root; `sudo chown -R "$USER" .` in the work directory |
 | `cannot cache function ... no locator available` | numba has nowhere to write librosa's jit cache; the image sets `NUMBA_CACHE_DIR`, so rebuild it, or pass `-e NUMBA_CACHE_DIR=/tmp/numba-cache` |

@@ -303,9 +303,14 @@ Sections are split at the phrase grid before gestures are drawn (§9.5).
 
 Offline, multi-pass, all real-time captures.
 
-1. Burn timecode into a croppable edge strip of the source; play out over HDMI.
-2. Run the score's CC automation against the transport; capture the return.
-3. Align by timecode, crop the strip, write the pass.
+1. Burn a Gray-code frame index into a croppable edge strip of the source, after
+   a strip-coded lead-in; the Pi's locked player plays it over HDMI (§10).
+2. Per take: load Passthru, start recording, start the clip; the take's program
+   loads inside the lead-in (`LeadInError` if it is not up before clip frame 0),
+   the score's CC automation runs from clip frame 0, and the player's flip log is
+   kept beside the take (`<take>.lock.npz`).
+3. Attribute every clip frame to one capture exactly (§10), crop the strip, write
+   the pass.
 4. Check every take against the clip it was fed, bar by bar, and cover or fail
    before mastering (§9.6).
 5. Optionally re-feed pass output through a second program with its own score
@@ -336,6 +341,7 @@ syncsummoner audition score.yaml --seconds 30
 syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
 syncsummoner check score.yaml --source timecoded.mkv --takes takes/ --cut-programs A,B --splice cut.mp4
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4
+syncsummoner lockcheck source.mkv --take lockcheck.mkv [--program NAME]
 ```
 
 Standalone library entry point, which doubles as a seam test:
@@ -387,11 +393,10 @@ a 16-bit Gray-code clip frame index in the bottom strip, the picture above it.
 The clip and its record (`stimulus.mkv`, `stimulus.json`, with the clip's
 SHA-256, frame count, rate, bits and strip height) live in the archive
 directory, and every archive committed against it names it (schema 4). The Pi
-plays it with `ClipPlayer(loop=True)`: ffmpeg `-re -stream_loop -1` decoding
-from tmpfs into the framebuffer, uploaded once per run. An encoded clip is used
-because the player paces H.264 at the session rate and a few minutes of it fit
-tmpfs; looping keeps one uninterrupted picture under a whole sweep
-([hardware.md](hardware.md#clip-playout)).
+plays it with `ClipPlayer(loop=True)`, the locked player (§10) decoding the clip
+from tmpfs, uploaded once per run. An encoded clip is used because a few minutes
+of it fit tmpfs; looping keeps one uninterrupted picture under a whole sweep
+([hardware.md](hardware.md#locked-playout)).
 
 Setpoints attribute by capture time, as for the codeframe loop. The clip frame a
 capture shows comes from a `ClockModel` of the player: frame `n` is on show
@@ -425,8 +430,8 @@ area-scaled luma, for the source clip and for the attributed captures.
 | `motion_follow` | Pearson correlation of output TI with source TI, at lead 0 or 1 | Fisher z of `r` at the effective sample count must exceed the three-sigma one-sided level, Bonferroni-corrected over the two leads |
 | effective samples | `n (1 - ab) / (1 + ab)`, `a`, `b` the lag-one autocorrelations | TI series are autocorrelated; AR(1) correction (Bretherton et al. 1999) keeps the z honest |
 
-Lead 1 is tried because an unsynced framebuffer can scan out the strip one frame
-ahead of the picture above it.
+Lead 1 remains only for recordings made before the locked player, whose unsynced
+framebuffer could scan out the strip one frame ahead of the picture above it.
 
 ### 9.3 Profiles carry survival
 
@@ -475,9 +480,12 @@ rather than only at the segmentation's boundaries. The score records `bar` and
 
 `render_cuts` runs `checked_plan` on every take before splicing, and `check`
 runs it standalone. Each recording is decoded once (body at 160x90 luma, strip at
-full width, times from the decoder's own `showinfo`), traced by the strip clock
-and the motion clock, and the clock under which output motion follows the source
-best is kept. Each bar is then judged:
+full width, times from the decoder's own `showinfo`). A locked take is attributed
+exactly (§10) and `checked_plan` passes that attribution to `check_takes`;
+`check` reads it from `<take>.picked.npy`. Only a recording without one, an
+unlocked recording or a master, is traced by the strip clock and the motion
+clock, keeping the clock under which output motion follows the source best, and
+`check` warns that its clock is fitted. Each bar is then judged:
 
 | Fault | Condition |
 | --- | --- |
@@ -488,7 +496,7 @@ best is kept. Each bar is then judged:
 A dead run inside a cut is replaced by the take of another program alive across
 the whole run that follows best (highest mean z); a lone dead bar inside a
 `destroy` section stays. A run nothing covers raises `DeadTakeError` naming the
-program and time range. Where a strip reads, its clock stands unless the motion clock makes the
+program and time range. On a fitted trace, where a strip reads, its clock stands unless the motion clock makes the
 output's moving frames follow the source better by more than the critical z
 (chance among the lags searched), which a strip a program scrambled loses.
 
@@ -500,6 +508,57 @@ instead of fitting a clock, and `splice` cuts by it. The splice writes clip fram
 forward, in parallel, each handing over one frame at a time, so memory is bounded
 and no seek rounds a cut. A spliced master is therefore checked on the identity
 clock (`ClockModel.identity`).
+
+---
+
+## 10. Locked frame clock and exact attribution
+
+Every stimulus is played by `syncsummoner.device.kmsplay` on the Pi: atomic KMS
+page flips, each clip frame held `refresh / fps` vblanks, every flip logged with
+its vblank sequence and time, and any missed vblank a fault
+([hardware.md](hardware.md#locked-playout)). `ClipPlayer` plays an uploaded clip,
+`LoopPlayer` cycles uploaded raw frames through the same player at a rate that
+is a whole number of vblanks (10 fps by default). The card's captures are kept,
+with their driver sequence, timestamp and digest, in a `<take>.v4l2` sidecar by
+`syncsummoner.device.v4l2rec`
+([hardware.md](hardware.md#capture-is-stored-never-decoded-while-it-runs)).
+
+A take's clip opens on a lead-in (`RenderConfig.lead_in_s`, 20 s) whose strips
+number its frames `-L..-1`, wrapped to the strip's 16 bits, so captures from
+before the program load carry legible strips whatever the program does after it.
+
+`compose.lock.attribute_take(take, config=)` reads the take's strips, its sidecar
+and its lock record, and returns an `Attribution`:
+
+| Field | Meaning |
+| --- | --- |
+| `picked[j]` | per clip frame `j`, the capture index (into the take's stored frames, in order) nearest the frame's centre, the later on a tie; -1 where none shows it |
+| `shown[k]` | per capture, the clip frame it shows; negative in the lead-in |
+| `per_frame`, `lead` | captures per clip frame; lead-in frames played |
+| `runs` | gap-free runs of captures, each a `Run(first, last, slot, repeats, agree, worst_ms)`: its sub-frame slot, the share of frame changes on its cadence, the share of frame starts whose timestamp names that slot, and their worst timing error |
+| `frame0_ns` | when clip frame 0 reached the card, on the capture clock |
+| `drops`, `read`, `agreed` | frames the driver lost; legible strips, and those that read the frame `shown` says |
+
+`summary()` is one line of all of it. `picked` is saved as `<take>.picked.npy`.
+The call raises `LockError` unless every clip frame is attributed and the clip's
+run has unanimous frame starts, and `LostTimecodeError` for a take with no lock
+record, which is then unusable for a render.
+
+Within a gap-free run the card's cadence fixes which frame each capture shows up
+to one offset. The strips fix that offset for the anchoring run, in the lead-in,
+which also gives the fixed latency from a Pi flip to its capture. A program load
+breaks the capture, and the card relocks at a new phase
+([hardware.md](hardware.md#a-program-load-breaks-the-capture)); across it, the
+card's byte-identical repeats say which captures start a frame and the nearest
+Pi flip time, less that latency, names the frame. That is exact because, at two
+captures a frame, the relock moves the offset by less than half a frame, so
+attribution needs no strip after the load and survives a program that destroys
+it.
+
+`syncsummoner lockcheck` is the acceptance test of all of this on the rig: it
+plays a timecoded clip through Passthru, or a program loaded in the lead-in, and
+reports missed vblanks, driver drops, gaps, off-cadence frame changes, strip
+agreement and, under Passthru, tears (`compose.lockcheck`).
 
 ---
 
