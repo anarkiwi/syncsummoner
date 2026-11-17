@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from contextlib import contextmanager
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ BOOT_COUNT_KEY = 9
 CALIBRATION_SIZE = (96, 54)
 #: Plan rows: target clip frame, 1-based parameter, device value.
 PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
+#: Interpreter thread switch interval during a take, well inside the tick a late wake-up must make.
+SWITCH_S = 0.0005
 #: Where a take directory keeps the latest CC-to-picture latency a dry take measured.
 LATENCY_FILE = "cclatency.json"
 
@@ -389,6 +392,53 @@ def _play(
     """The take from playout start: lead-in writes, calibration, the live clock, then every planned write."""
     began = time.monotonic_ns()
     fps = float(config.fps)
+    switch = sys.getswitchinterval()
+    sys.setswitchinterval(SWITCH_S)
+    try:
+        _run(
+            rig,
+            out,
+            sender=sender,
+            poller=poller,
+            shell=shell,
+            player=player,
+            held=held,
+            program=program,
+            config=config,
+            lead=lead,
+            count=count,
+            dry=dry,
+            initial=initial,
+            start_state=start_state,
+            lead_in=lead_in,
+            began=began,
+            fps=fps,
+        )
+    finally:
+        sys.setswitchinterval(switch)
+
+
+def _run(
+    rig: Any,
+    out: str | Path,
+    *,
+    sender: Sender,
+    poller: Poller,
+    shell: Any,
+    player: Any,
+    held: dict,
+    program: str,
+    config: Any,
+    lead: int,
+    count: int,
+    dry: Mapping[int, int] | None,
+    initial: Mapping[int, int],
+    start_state: Mapping[int, int],
+    lead_in: LeadIn,
+    began: int,
+    fps: float,
+) -> None:
+    """The take's body, run with the interpreter switching threads often enough for the sender."""
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
     poller.start()

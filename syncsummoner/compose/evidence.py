@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.optimize import linprog
 from scipy.stats import chi2, norm
 
 from syncsummoner.aesthetics.survival import SIGMA
@@ -132,23 +133,40 @@ class Ticks:
 
 
 def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
-    """Intersect intervals that each hold one tick of a ``period`` grid into one bracket.
+    """The tick grid every readback change's interval ``(a, b]`` holds one tick of.
 
-    Each interval is moved by whole periods to sit nearest the first; an empty intersection
-    means the readback changed off the grid, which the landing model forbids.
+    ``period`` numbers the intervals' ticks; the grid's own phase and period are the Chebyshev
+    centre of the linear constraints ``a_i < phase + n_i period <= b_i``, so the host clock's rate
+    against the device's is measured, not assumed. No feasible grid means the readback changed off
+    any one grid, which the landing model forbids.
     """
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     if not a.size:
         raise EvidenceError("no readback changed, so the device's frame tick was never seen")
-    mid = 0.5 * (a + b)
-    shift = np.rint((mid - mid[0]) / period) * period
-    lo, hi = float((a - shift).max()), float((b - shift).min())
+    ref = 0.5 * (a[0] + b[0])
+    n = np.rint((0.5 * (a + b) - ref) / period)
+    lo_s, hi_s = a - ref, b - ref
+    grid = float(period)
+    if np.ptp(n) > 0:
+        scale = float(np.abs(n).max())
+        ones = np.ones_like(n)
+        solved = linprog(
+            [0.0, 0.0, -1.0],
+            A_ub=np.r_[np.c_[-ones, -n / scale, ones], np.c_[ones, n / scale, ones]],
+            b_ub=np.r_[n * period - lo_s, hi_s - n * period],
+            bounds=[(None, None)] * 3,
+            method="highs",
+        )
+        if not solved.success:
+            raise EvidenceError(f"readback changes fit no single tick grid across {a.size} changes")
+        grid = float(period + solved.x[1] / scale)
+    lo, hi = float((lo_s - n * grid).max()), float((hi_s - n * grid).min())
     if lo >= hi:
         raise EvidenceError(
             f"readback changes disagree on the device's frame tick by {(lo - hi) / 1e6:.2f} ms "
             f"across {a.size} changes"
         )
-    return Ticks(lo=lo, hi=hi, period=float(period), count=int(a.size))
+    return Ticks(lo=ref + lo, hi=ref + hi, period=grid, count=int(a.size))
 
 
 def observed_ticks(sends: np.ndarray, moves: np.ndarray, ticks: Ticks) -> np.ndarray:
@@ -193,9 +211,12 @@ def frame_of_tick(n: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) 
 
 
 def send_time(frames: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) -> np.ndarray:
-    """When to send a CC so it lands on each frame: midway between the ticks either side of its own."""
+    """When to send a CC so it lands on each frame: the latest instant the tick before its own can fall.
+
+    A sending thread can only wake late, never early, so this leaves almost a whole frame for it.
+    """
     tick = np.rint((times.at(frames) - delta - ticks.phase) / ticks.period)
-    return ticks.phase + (tick - 0.5) * ticks.period
+    return ticks.hi + (tick - 1) * ticks.period
 
 
 def toggle_landings(
@@ -294,6 +315,7 @@ class Landed:
     late: int
     early: int
     ambiguous: int
+    wake_ms: float = float("nan")
 
     @property
     def ok(self) -> bool:
@@ -307,7 +329,7 @@ class Landed:
         return (
             f"{len(self.rows)} writes scheduled: {self.missing} missing, {self.duplicated} duplicated, "
             f"{self.out_of_order} out of order, {self.late} late, {self.early} early, "
-            f"{self.ambiguous} on a tick"
+            f"{self.ambiguous} on a tick; sends woke at worst {self.wake_ms:.2f} ms after due"
         )
 
 

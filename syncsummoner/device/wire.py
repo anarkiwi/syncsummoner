@@ -196,7 +196,7 @@ class Sender:
         self.clock = clock
         self.sleep = self._stop.wait if sleep is None else sleep
         self.spin_ns = int(spin_ns)
-        self.sent: list[tuple[int, int, int, int, int]] = []
+        self.sent: list[tuple[int, int, int, int, int, int]] = []
         self.queued = 0
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -210,12 +210,12 @@ class Sender:
                 self.sleep((left - self.spin_ns) / 1e9)
         return False
 
-    def send(self, param: int, value: int, target: int) -> None:
-        """One write now, recorded with its send interval."""
+    def send(self, param: int, value: int, target: int, due: int | None = None) -> None:
+        """One write now, recorded with its send interval and when it was due (now, when not given)."""
         t0 = self.clock()
         wire = self.write(int(param), int(value))
         t1 = self.clock()
-        self.sent.append((t0, t1, int(param), int(wire), int(target)))
+        self.sent.append((t0, t1, int(param), int(wire), int(target), t0 if due is None else int(due)))
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -223,9 +223,10 @@ class Sender:
                 target, param, value = self._queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            if target is None or not self._wait(int(self.when(target))):
+            due = None if target is None else int(self.when(target))
+            if due is None or not self._wait(due):
                 return
-            self.send(param, value, target)
+            self.send(param, value, target, due)
 
     def plan(self, rows: Sequence[tuple[int, int, int]]) -> None:
         """Queue ``(target, param, value)`` rows, in send order."""
