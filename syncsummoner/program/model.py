@@ -27,6 +27,7 @@ from .declared import (
     REGISTER_BITS,
     REGISTER_COUNT,
     TIMING_REGISTER,
+    VALUE_MAX,
     Field,
     Kind,
     classes,
@@ -43,6 +44,7 @@ DEFAULT_CONFIG = "hd_hdmi"
 PACKAGE = "tq144:4k"
 PCF = "fpga/hardware/rev_b/constraints/pin_map.pcf"
 TIMING = "timing"
+VIDEO_IN = "ADV7611_D"
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ class ProgramModel:
         self.cache = root / program.key / f"{self.source}-{config}"
         self._net: hdl.Netlist | None = None
         self._lock = threading.Lock()
+        self.note = ""
 
     @property
     def params(self) -> tuple[ParamDecl, ...]:
@@ -138,14 +141,14 @@ class ProgramModel:
             return json.loads(path.read_text())
         value = compute()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
+        tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(value))
         tmp.replace(path)
         return value
 
     @property
     def netlist(self) -> hdl.Netlist:
-        """``program_top`` from source, or the whole chip from the bitstream, with ``registers_in`` as a port."""
+        """``program_top`` from source, or the chip from the bitstream, with ``registers_in`` as a port."""
         with self._lock:
             if self._net is None:
                 self._net = self._load()
@@ -170,13 +173,25 @@ class ProgramModel:
         (self.cache / "register-map.json").write_text(json.dumps(mapping, indent=1))
         return net
 
+    def latched(self) -> dict[int, tuple[int, ...]]:
+        """Bits of each control the bitstream latches from SPI: those its synthesised design reads."""
+        if self.source != "bitstream":
+            raise ValueError("latched bits come from a bitstream netlist")
+        _ = self.netlist
+        found = json.loads((self.cache / "register-map.json").read_text())
+        out = {}
+        for decl in self.params:
+            f = field(decl.parameter_id)
+            out[decl.parameter_id] = tuple(b for b in f.bits if f"r{f.register}[{b}]" in found)
+        return out
+
     def bitstream(self) -> bytes:
         """The package's bitstream for this IO configuration."""
         return self.program.package.bitstreams()[SectionType[self.config.upper()]]
 
     def _ties(self, state: np.ndarray, timing: int | None, free: Iterable[int]) -> tuple[dict, dict]:
         words = registers(self.params, state, timing)
-        loose = {name for name in free}
+        loose = set(free)
         ties, named = {}, {}
         for pid in loose:
             if pid == TIMING:
@@ -261,6 +276,17 @@ class ProgramModel:
         ties, _ = self._ties(state, timing, [])
         return hdl.fold(self.tools, hdl.tie(self.netlist, ties, {}), self.cache)
 
+    def visible(
+        self, state: np.ndarray, parameter_id: int, a: int, b: int, timing: int | None = None
+    ) -> bool:
+        """Whether ``a`` and ``b`` differ in any bit still reaching the video with the rest at ``state``."""
+        decl = self.decl(parameter_id)
+        if decl is None:
+            return False
+        live = self._reach(np.asarray(state, dtype=np.int64), timing, [parameter_id])[parameter_id]
+        mask = sum(1 << bit for bit in live) if len(field(parameter_id).bits) > 1 else int(bool(live))
+        return bool((int(register_value(decl, a)) ^ int(register_value(decl, b))) & mask)
+
     def step_matters(
         self, state: np.ndarray | None, parameter_id: int, a: int, b: int, timing: int | None = None
     ) -> Step:
@@ -269,10 +295,7 @@ class ProgramModel:
         decl = self.decl(parameter_id)
         if decl is None:
             return Step(parameter_id, a, b, False, "the program declares no such parameter")
-        live = self._reach(state, timing, [parameter_id])[parameter_id]
-        mask = sum(1 << bit for bit in live) if len(field(parameter_id).bits) > 1 else int(bool(live))
-        ra, rb = int(register_value(decl, a)), int(register_value(decl, b))
-        if not (ra ^ rb) & mask:
+        if not self.visible(state, parameter_id, a, b, timing):
             return Step(parameter_id, a, b, False, "the values differ only in bits no output depends on here")
         sa, sb = state.copy(), state.copy()
         sa[parameter_id - 1], sb[parameter_id - 1] = a, b
@@ -285,6 +308,35 @@ class ProgramModel:
 
         verdict = self._cached("step", key, compute)
         return Step(parameter_id, a, b, verdict["differs"], verdict["how"])
+
+    def carries_input(self, state: np.ndarray, timing: int | None = None) -> bool:
+        """Whether any video input bit is still in the fan-in cone of the outputs at ``state``."""
+        ties, _ = self._ties(np.asarray(state, dtype=np.int64), timing, [])
+        prefix = "data_in" if self.source == "rtl" else VIDEO_IN
+
+        def compute():
+            reached = hdl.reaching(hdl.fold(self.tools, hdl.tie(self.netlist, ties, {}), self.cache))
+            return any(name.startswith(prefix) for name in reached)
+
+        return self._cached("carries", {"ties": sorted(ties.items())}, compute)
+
+    def bypass(self, state: np.ndarray | None = None, timing: int | None = None) -> int | None:
+        """The declared switch that, turned on, leaves every other control dead and the input in the video.
+
+        None when the program has no such switch.
+        """
+        base = self.initial() if state is None else np.asarray(state, dtype=np.int64)
+        for decl in self.params:
+            if kind(decl)[0] is not Kind.BOOLEAN:
+                continue
+            on = base.copy()
+            on[decl.parameter_id - 1] = VALUE_MAX
+            live = self.live(on, timing, gates=False)
+            if not any(l.live for p, l in live.items() if p != decl.parameter_id) and self.carries_input(
+                on, timing
+            ):
+                return decl.parameter_id
+        return None
 
     def schedule(self, state: np.ndarray | None = None, timing: int | None = None) -> dict[int, np.ndarray]:
         """For each live control, one manual value per distinct setting the program can see in ``state``."""
@@ -301,11 +353,34 @@ class ProgramModel:
         return 0 if decl is None or not live_bits else len(classes(decl, tuple(live_bits)))
 
 
-def model(program: str | Program, library: Library | None = None, **kwargs) -> ProgramModel:
-    """The parameter model of a program by device name, program id, or :class:`Program`."""
+def model(
+    program: str | Program, library: Library | None = None, *, source: str | None = None, **kwargs
+) -> ProgramModel:
+    """The parameter model of a program by device name, program id, or :class:`Program`.
+
+    With no ``source``, the published VHDL is used only where it reads exactly the bits the
+    package's own bitstream latches; otherwise the bitstream is, with the mismatch in ``note``.
+    """
     library = library or Library.default()
     prog = library.find(program) if isinstance(program, str) else program
-    return ProgramModel(prog, library, **kwargs)
+    if source is not None or not prog.sources:
+        return ProgramModel(prog, library, source=source, **kwargs)
+    rtl = ProgramModel(prog, library, source="rtl", **kwargs)
+    chip = ProgramModel(prog, library, source="bitstream", **kwargs)
+    reads, latched = rtl.resolution(), chip.latched()
+    if reads == latched:
+        return rtl
+    differ = [
+        f"P{p} {_bits(reads[p])} where the bitstream latches {_bits(latched[p])}"
+        for p in reads
+        if reads[p] != latched[p]
+    ]
+    chip.note = "published source does not match the package: it reads " + "; ".join(differ)
+    return chip
+
+
+def _bits(bits: Sequence[int]) -> str:
+    return "[" + ",".join(map(str, sorted(bits, reverse=True))) + "]" if bits else "nothing"
 
 
 def parse_state(model_: ProgramModel, spec: str | None, overrides: Mapping[int, int] = ()) -> np.ndarray:

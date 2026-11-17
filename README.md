@@ -29,6 +29,11 @@ syncsummoner device doctor [--format 1080p30] [--loop] [--fix]   # rig diagnosti
 syncsummoner manifest /media/card/programs [--write]   # rebuild manifest.json from the .vmprog files
 syncsummoner lockcheck source.mkv [--program NAME]   # check the locked frame clock end to end, exit 1 unless exact
 
+syncsummoner program list   # programs on the card copy and firmware images
+syncsummoner program show NAME [--state initial|PRESET|v1,..,v12] [--set P=V] \
+                     [--timing ID] [--source rtl|bitstream] [--json]   # declared parameters, live bits and gates
+syncsummoner program step NAME P A B [--state ...]   # can one step of P from A to B change the picture
+
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/
 syncsummoner probe sim --program blur --image zoneplate.png
 syncsummoner probe archive --out archive/    # native frames for every program, resumable
@@ -41,7 +46,7 @@ syncsummoner profile show | diff | atlas --program bitcrush_displace
 syncsummoner analyze clip.mp4 --audio track.wav -o features.json
 
 syncsummoner compose clip.mp4 --audio track.wav --profiles profiles/ \
-                     --style glitchy --seed 7 --passes 8 [--wet 0.1,1] -o score.yaml
+                     --style glitchy --seed 7 --passes 8 -o score.yaml
 syncsummoner score show score.yaml --profiles profiles/   # what each layer drives, flagged
 
 syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4
@@ -51,6 +56,7 @@ syncsummoner check score.yaml --source timecoded.mkv --takes takes/ \
                    --cut-programs Derez,Lorenz,Scramble [--splice cut.mp4]   # dead picture per take
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
 syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv   # each write sent, read back, acted upon
+syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv --predict   # each verdict against the program model, contradictions flagged
 ```
 
 Every command logs each stage and its elapsed time to stderr (`-v` for detail,
@@ -64,6 +70,7 @@ through `docker run`.
 
 | Package | Role |
 | --- | --- |
+| `syncsummoner.program` | each program's declared parameters, and their liveness from its VHDL or bitstream |
 | `syncsummoner.device` | pyvmancer transport, session discipline, capture, playout |
 | `syncsummoner.probe` | stimulus battery, sweep plans, runner, frame archive, offline replay, GHDL simulation, profile fitting |
 | `syncsummoner.compose` | audio and video features, gesture vocabulary, planner, score IR, render |
@@ -73,6 +80,7 @@ through `docker run`.
 
 - [docs/workflow.md](docs/workflow.md) — worked example: clip and track in, finished render out
 - [docs/design.md](docs/design.md) — the design being realized
+- [docs/program-model.md](docs/program-model.md) — each program's parameters from its `.vmprog`, and which are live from its HDL
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
 - [docs/evidence.md](docs/evidence.md) — frame-locked parameter writes and the per-take proof they landed
 - [docs/contracts.md](docs/contracts.md) — normative cross-package signatures
@@ -91,6 +99,9 @@ docker build -f Dockerfile.gpu -t syncsummoner:gpu .        # Vulkan archive dec
 
 The `test-aesthetics` target installs only the aesthetics extra. It failing is
 the early warning that the extraction seam has leaked.
+
+The `runtime`, `lint` and `test` images build on the `hdl` target, which carries
+the HDL tools and upstream sources the program model reads.
 
 Pushing a `v*` tag runs the test target and publishes `runtime` to Docker Hub as
 `anarkiwi/syncsummoner`; it needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`

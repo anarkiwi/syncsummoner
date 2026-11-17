@@ -12,7 +12,7 @@ from syncsummoner.compose import lock as L
 from syncsummoner.compose import locktake as LT
 from syncsummoner.device import v4l2rec
 from syncsummoner.device.playout import FLIP
-from syncsummoner.device.profile import PARAM_MAX, ParamSpec, Role
+from syncsummoner.device.profile import PARAM_MAX, ParamSpec
 from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device.wire import SEND, Poller, Sender
 
@@ -27,38 +27,34 @@ SIDE = 4
 sleep_until_on = LT._sleep_until  # pylint: disable=protected-access
 
 
-def specs(roles=None):
-    """Twelve parameter specs, ``roles`` mapping index to role."""
-    roles = roles or {}
-    return [
-        ParamSpec(
-            index=i,
-            name="Bypass" if roles.get(i) is Role.BYPASS else f"p{i}",
-            native_min=0.0,
-            native_max=1.0,
-            role=roles.get(i, Role.EFFECT),
-        )
-        for i in range(1, 13)
-    ]
+def specs():
+    """Twelve parameter specs."""
+    return [ParamSpec(index=i, name=f"p{i}", native_min=0.0, native_max=1.0) for i in range(1, 13)]
 
 
-def info_with(roles=None):
-    """A program info carrying ``specs(roles)``."""
-    return types.SimpleNamespace(params=specs(roles))
+def info_with(dry=None):
+    """A program info whose program model names ``dry`` its bypass switch."""
+    return types.SimpleNamespace(params=specs(), name="Teletext", dry=dry)
 
 
-@pytest.mark.parametrize(
-    "roles, want",
-    [
-        ({1: Role.BYPASS, 12: Role.WET}, {1: PARAM_MAX}),
-        ({7: Role.BYPASS}, {7: PARAM_MAX}),
-        ({12: Role.WET}, None),
-        ({}, None),
-    ],
-)
-def test_the_dry_state_is_the_programs_own_bypass_and_no_slot_is_assumed(roles, want):
-    """Only a parameter the program labels Bypass is a dry state; P12 is nothing in particular."""
-    assert LT.dry_state(info_with(roles)) == want
+def bypass_of(info):
+    """The bypass a test's program info carries, standing in for the program model."""
+    return info.dry
+
+
+@pytest.mark.parametrize("dry, want", [(1, {1: PARAM_MAX}), (7, {7: PARAM_MAX}), (None, None)])
+def test_the_dry_state_is_the_bypass_the_program_model_finds(dry, want):
+    """The dry state is the model's bypass switch turned on; no slot or label stands in for one."""
+    assert LT.dry_state(info_with(dry), bypass_of) == want
+
+
+def test_without_a_declaration_or_a_model_there_is_no_bypass(monkeypatch, tmp_path):
+    """A program with no declaration, or one the library cannot find, has no dry state."""
+    assert LT.program_bypass(info_with()) is None
+    monkeypatch.setenv("SYNCSUMMONER_CARD", str(tmp_path))
+    monkeypatch.setenv("SYNCSUMMONER_FIRMWARE", str(tmp_path))
+    info = types.SimpleNamespace(name="Nothing", declared=types.SimpleNamespace(program_id="org.none"))
+    assert LT.program_bypass(info) is None
 
 
 def test_a_frame_plan_targets_the_first_frame_at_or_after_its_time_less_the_bias():
@@ -516,10 +512,10 @@ PLAN_ROWS = np.array(
 )
 
 
-def take_and_prove(monkeypatch, simulate, tmp_path, *, roles, working, boots=(7, 7), drop=None):
+def take_and_prove(monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7), drop=None):
     """A whole simulated take, then its evidence from the files it left."""
     sim = simulate(lead=120, count=30, drop=drop)
-    rig, recorder, load, loads = rigged(sim, info_with(roles), boots=boots)
+    rig, recorder, load, loads = rigged(sim, info_with(dry), boots=boots)
     out = tmp_path / "take.mkv"
     record = LT.locked_take(
         rig,
@@ -532,6 +528,7 @@ def take_and_prove(monkeypatch, simulate, tmp_path, *, roles, working, boots=(7,
         working=lambda info: working,
         load=load,
         lead_in=LEAD_IN,
+        bypass=bypass_of,
     )
     monkeypatch.setattr(L, "attribute_take", lambda *a, **k: sim.attribution(sim.size))
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: sim.frames)
@@ -546,7 +543,7 @@ def take_and_prove(monkeypatch, simulate, tmp_path, *, roles, working, boots=(7,
 def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypatch, simulate, tmp_path):
     """Calibrated on its bypass, every planned write lands on its frame, reads back and is received."""
     sim, rig, record, proof, loads = take_and_prove(
-        monkeypatch, simulate, tmp_path, roles={1: Role.BYPASS}, working={1: 0, 3: 0.5, 4: 100}
+        monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 3: 0.5, 4: 100}
     )
     assert [name for name, _ in loads] == ["Teletext"]
     assert record.delta == pytest.approx(DELTA, abs=2e6)
@@ -570,9 +567,7 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
 
 def test_a_write_the_device_drops_fails_the_readback(monkeypatch, simulate, tmp_path):
     """Sent on time but never applied: the readback disagrees on its slot from its frame on."""
-    proof = take_and_prove(
-        monkeypatch, simulate, tmp_path, roles={1: Role.BYPASS}, working={1: 0, 3: 0.5}, drop=(3, 600)
-    )[3]
+    proof = take_and_prove(monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 3: 0.5}, drop=(3, 600))[3]
     assert proof.landed.ok and not proof.applied.ok and not proof.ok
     assert set(proof.applied.disagree["slot"].tolist()) == {3}
     assert proof.applied.disagree["frame"].min() >= 5
@@ -591,7 +586,7 @@ def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch
     assert not rig.transport.device.shell.said
     LT.write_latency(tmp_path, lat_for(width=0.0, samples=1), "Other")
     _, _, record, proof, loads = take_and_prove(
-        monkeypatch, simulate, tmp_path, roles={}, working={3: 1.0, 4: 100}
+        monkeypatch, simulate, tmp_path, dry=None, working={3: 1.0, 4: 100}
     )
     assert [name for name, _ in loads] == ["Teletext", "Passthru", "Teletext"]
     assert record.dry is None and record.delta == pytest.approx(DELTA)
@@ -603,14 +598,14 @@ def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch
 def test_a_reboot_during_the_take_is_an_error_after_its_record_is_kept(monkeypatch, simulate, tmp_path):
     """The boot count rising fails the take, its wire record saved first."""
     with pytest.raises(LT.RebootError, match="from 7 to 8"):
-        take_and_prove(monkeypatch, simulate, tmp_path, roles={1: Role.BYPASS}, working={1: 0}, boots=(7, 8))
+        take_and_prove(monkeypatch, simulate, tmp_path, dry=1, working={1: 0}, boots=(7, 8))
     assert (tmp_path / "take.mkv.wire.npz").is_file()
 
 
 def test_a_lead_in_too_short_for_the_calibration_is_an_error(simulate, tmp_path):
     """The first write due before the clock is known is a lead-in time error, the monitor left off."""
     sim = simulate(lead=30, count=30)
-    rig, recorder, load, _ = rigged(sim, info_with({1: Role.BYPASS}))
+    rig, recorder, load, _ = rigged(sim, info_with(1))
     with pytest.raises(LT.LeadInTimeError, match="lengthen the lead-in"):
         LT.locked_take(
             rig,
@@ -623,6 +618,7 @@ def test_a_lead_in_too_short_for_the_calibration_is_an_error(simulate, tmp_path)
             working=lambda info: {1: 0},
             load=load,
             lead_in=LEAD_IN,
+            bypass=bypass_of,
         )
     assert rig.transport.device.shell.said[-1] == ("midi", "monitor", "off")
     assert (tmp_path / "t.mkv.wire.npz").is_file()

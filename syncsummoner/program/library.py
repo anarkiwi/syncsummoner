@@ -66,7 +66,7 @@ class Library:
     def default(cls, root: Path | None = None) -> "Library":
         """Paths from ``SYNCSUMMONER_*`` variables, else the gitignored ``captures/`` layout."""
         root = Path.cwd() if root is None else root
-        paths = {k: Path(os.environ.get(ENV[k]) or root / DEFAULTS[k]) for k in ENV}
+        paths = {k: Path(os.environ.get(var) or root / DEFAULTS[k]) for k, var in ENV.items()}
         return cls(**{k: p if p.exists() else None for k, p in paths.items()})
 
     @cached_property

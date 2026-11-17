@@ -44,16 +44,19 @@ def pack(toml: Path, work: Path, bitstreams: dict[str, bytes]) -> bytes:
 
 @pytest.fixture(scope="session", name="quilt_bytes")
 def quilt_bytes_fixture():
+    """The GPL Quilt package as installed on a card."""
     return (FIXTURES / "quilt" / "quilt.vmprog").read_bytes()
 
 
 @pytest.fixture(scope="session", name="library")
 def library_fixture():
+    """A library with only the SDK, for elaboration."""
     return Library(sdk=SDK)
 
 
 @pytest.fixture(scope="session", name="tiny")
 def tiny_fixture(tmp_path_factory, library):
+    """The tiny design packed by the SDK tools, modelled from its VHDL."""
     if not (SDK / "tools").is_dir() or not hdl.Tools().available():
         pytest.skip("SDK and HDL tools needed")
     work = tmp_path_factory.mktemp("tiny")

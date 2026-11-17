@@ -588,8 +588,8 @@ def test_evidence_proves_each_take_and_fails_on_any_unproven(monkeypatch, tmp_pa
         save_wire(take, program=np.array(take.stem.split("-")[1]))
     seen = []
 
-    def take_evidence(take, *, program, clip, config):
-        seen.append((Path(take).name, program, clip, config.fps, config.strip_px))
+    def take_evidence(take, *, program, clip, config, predict=False):
+        seen.append((Path(take).name, program, clip, config.fps, config.strip_px, predict))
         ok = program != "Lorenz"
         return SimpleNamespace(
             ok=ok, lines=lambda: [f"{program} proven {ok}"], to_json=lambda: f'{{"ok": {str(ok).lower()}}}'
@@ -599,13 +599,13 @@ def test_evidence_proves_each_take_and_fails_on_any_unproven(monkeypatch, tmp_pa
     argv = ["evidence", *map(str, takes), "--source", "tc.mkv", "--strip-px", "4"]
     assert cli.main(argv) == 1
     assert seen == [
-        ("take-Derez.mkv", "Derez", "tc.mkv", 30.0, 4),
-        ("take-Lorenz.mkv", "Lorenz", "tc.mkv", 30.0, 4),
+        ("take-Derez.mkv", "Derez", "tc.mkv", 30.0, 4, False),
+        ("take-Lorenz.mkv", "Lorenz", "tc.mkv", 30.0, 4, False),
     ]
     assert capsys.readouterr().out.splitlines() == ["Derez proven True", "Lorenz proven False"]
     assert locktake.evidence_path(takes[1]).read_text(encoding="utf-8") == '{"ok": false}'
-    assert cli.main(["evidence", str(takes[0]), "--source", "tc.mkv", "--program", "Other"]) == 0
-    assert seen[-1][1] == "Other"
+    assert cli.main(["evidence", str(takes[0]), "--source", "tc.mkv", "--program", "Other", "--predict"]) == 0
+    assert seen[-1][1] == "Other" and seen[-1][-1] is True
 
 
 def _check_stubs(monkeypatch, seen, *, failed=False):

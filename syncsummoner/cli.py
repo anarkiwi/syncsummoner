@@ -595,7 +595,9 @@ def _evidence_cmd(args: argparse.Namespace) -> int:
     failed = 0
     for take in args.takes:
         program = args.program or str(load_wire(take).get("program", Path(take).stem))
-        proof = locktake.take_evidence(take, program=program, clip=args.source, config=config)
+        proof = locktake.take_evidence(
+            take, program=program, clip=args.source, config=config, predict=args.predict
+        )
         locktake.evidence_path(take).write_text(proof.to_json(), encoding="utf-8")
         print("\n".join(proof.lines()))
         failed += not proof.ok
@@ -657,8 +659,6 @@ def _check_cmd(args: argparse.Namespace) -> int:
 
 def _program_cmd(args: argparse.Namespace) -> int:
     """List programs, or show or step one program's parameter model."""
-    import json
-
     from syncsummoner.program import Library, model, parse_state
     from syncsummoner.program.report import rows, table
 
@@ -955,6 +955,9 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     proof.add_argument("--program", help="the program the takes ran (default: as each wire record says)")
     proof.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
     proof.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
+    proof.add_argument(
+        "--predict", action="store_true", help="set each verdict against the program model's prediction"
+    )
     proof.set_defaults(func=_evidence_cmd)
 
     check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")

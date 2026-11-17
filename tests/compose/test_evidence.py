@@ -534,3 +534,16 @@ def test_evidence_reports_per_parameter_verdicts():
     said = json.loads(proof.to_json())
     assert said["ok"] is False and said["disagree"] == [[0, 2, 4, 20, 0]] and len(said["parameters"]) == 2
     assert said["late"] == [] and said["received"].startswith("4 messages")
+
+
+def test_predictions_join_each_verdict_and_flag_a_dead_step_that_moved():
+    from syncsummoner.program.predict import Prediction  # pylint: disable=import-outside-toplevel
+
+    proof = evidence()
+    proof.predicted = {1: Prediction(1, live=0, dead=3), 2: Prediction(2, live=4, dead=1)}
+    rows = {row["param"]: row for row in proof.table()}
+    assert rows[1]["check"] == "contradiction: predicted dead, but moved" and rows[1]["dead_steps"] == 3
+    assert rows[2]["check"] == "predicted live, did not move" and rows[2]["predicted"] == "live"
+    assert proof.contradictions == [1]
+    assert any("contradiction" in line for line in proof.lines())
+    assert "check" not in evidence().table()[0] and evidence().contradictions == []

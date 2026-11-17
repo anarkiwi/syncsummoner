@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 
 
-from .profile import PARAM_COUNT, PARAM_MAX, ParamKind
+from .profile import PARAM_COUNT, PARAM_MAX
 
 #: Parking every manual value at zero makes the additive sum equal the MIDI offset.
 PARK_REFERENCE = 0

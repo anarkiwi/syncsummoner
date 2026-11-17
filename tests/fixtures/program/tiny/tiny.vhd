@@ -12,6 +12,7 @@ architecture tiny of program_top is
   signal s_on   : std_logic                    := '0';
   signal s_bias : unsigned(3 downto 0)         := (others => '0');
   signal s_far  : std_logic                    := '0';
+  signal s_dry  : std_logic                    := '0';
   signal s_y    : unsigned(9 downto 0)         := (others => '0');
 begin
   process (clk)
@@ -21,7 +22,10 @@ begin
       s_on   <= registers_in(6)(0);
       s_bias <= unsigned(registers_in(1)(3 downto 0));
       s_far  <= registers_in(1)(9);
-      if s_on = '1' then
+      s_dry  <= registers_in(6)(1);
+      if s_dry = '1' then
+        s_y <= unsigned(data_in.y);
+      elsif s_on = '1' then
         s_y <= unsigned(data_in.y) + s_gain;
       elsif s_far = '1' then
         s_y <= unsigned(data_in.y) + s_bias;

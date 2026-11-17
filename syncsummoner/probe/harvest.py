@@ -20,6 +20,7 @@ from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.errors import DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.playout import DEFAULT_LOOP_FPS
+from syncsummoner.device.profile import ParamKind
 from syncsummoner.device.recorder import (
     BlankTakeError,
     RouteError,

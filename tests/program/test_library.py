@@ -3,6 +3,7 @@
 # pylint: disable=missing-function-docstring
 
 import struct
+from dataclasses import replace
 
 import pytest
 
@@ -56,4 +57,15 @@ def test_defaults_follow_the_environment(monkeypatch, tmp_path):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("SYNCSUMMONER_CARD", str(tmp_path))
     lib = Library.default(tmp_path / "nowhere")
-    assert lib.card == tmp_path and lib.sdk is None and lib.programs == []
+    assert lib.card == tmp_path and lib.sdk is None and not lib.programs
+
+
+def test_a_bare_name_prefers_the_built_in(tmp_path, quilt_bytes):
+    for folder in ("czartroniks", "lzx"):
+        (tmp_path / folder).mkdir()
+    (tmp_path / "czartroniks" / "quilt.vmprog").write_bytes(quilt_bytes)
+    lib = Library(card=tmp_path)
+    assert lib.find("Quilt").folder == "czartroniks"
+    builtin = replace(lib.programs[0], folder="")
+    lib.programs.append(builtin)
+    assert lib.find("Quilt") is builtin

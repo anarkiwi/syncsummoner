@@ -53,7 +53,8 @@ def table(m: ProgramModel, state: np.ndarray, timing: int | None = None) -> str:
     head = (
         f"{m.program.name}  {cfg.program_id} {cfg.version_text}  netlist: {m.source} ({m.config})"
         f"  from {m.program.origin}\n"
-        f"{'P':>3} {'name':<16} {'kind':<11} {'value':>5} {'drives':<10} {'reads':<12} "
+        + (f"{m.note}\n" if m.note else "")
+        + f"{'P':>3} {'name':<16} {'kind':<11} {'value':>5} {'drives':<10} {'reads':<12} "
         f"{'live bits':<12} {'levels':>6}  verdict"
     )
     lines = [head]
@@ -67,7 +68,8 @@ def table(m: ProgramModel, state: np.ndarray, timing: int | None = None) -> str:
                 else ", no single control revives it"
             )
         lines.append(
-            f"{r['param']:>3} {r['name'][:16]:<16} {kind:<11} {r['value']:>5} {r['register']:<10} {r['reads']:<12} "
+            f"{r['param']:>3} {r['name'][:16]:<16} {kind:<11} {r['value']:>5} {r['register']:<10} "
+            f"{r['reads']:<12} "
             f"{r['live_bits']:<12} {r['levels']:>6}  {verdict}"
         )
     return "\n".join(lines)

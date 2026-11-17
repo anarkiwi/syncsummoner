@@ -17,7 +17,7 @@ parameter_id = "rotary_potentiometer_1"
 control_mode = "linear"
 min_value = 0
 max_value = 1023
-initial_value = 0
+initial_value = 512
 name_label = "Gain"
 
 [[parameter]]
@@ -39,6 +39,12 @@ name_label = "Unread"
 [[parameter]]
 parameter_id = "toggle_switch_7"
 name_label = "Gain On"
+value_labels = ["Off", "On"]
+initial_value_label = "Off"
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Bypass"
 value_labels = ["Off", "On"]
 initial_value_label = "Off"
 

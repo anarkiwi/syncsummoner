@@ -22,7 +22,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import breadth_first_order
 
-from .declared import LATCHED_REGISTERS, REGISTER_BITS, REGISTER_COUNT, flat_bit
+from .declared import LATCHED_REGISTERS, REGISTER_BITS, REGISTER_COUNT
 
 PORT = "registers_in"
 ABC_GATES = "AND,NAND,OR,NOR,XOR,XNOR,ANDNOT,ORNOT,MUX"
@@ -108,7 +108,7 @@ class Netlist:
     @classmethod
     def load(cls, path: Path, top: str) -> "Netlist":
         """Read Yosys JSON."""
-        return cls(json.loads(Path(path).read_text()), top)
+        return cls(json.loads(Path(path).read_text(encoding="utf-8")), top)
 
 
 def _scratch(work: Path | None) -> Path:
@@ -316,7 +316,8 @@ def cosimulate(
         lib = json.dumps({"modules": {k: v for k, v in gold.design["modules"].items() if k != gold.top}})
         (tmp / "lib.json").write_text(lib)
         tools.yosys(
-            "read_json lib.json; read_json a.json; read_json b.json; setundef -zero -undriven -init -params gold gate;"
+            "read_json lib.json; read_json a.json; read_json b.json;"
+            " setundef -zero -undriven -init -params gold gate;"
             " select gold gate; write_verilog -noattr -selected designs.v",
             tmp,
         )
@@ -358,7 +359,7 @@ def cosimulate(
 
 
 def _graph(net: Netlist) -> tuple[list, list, dict]:
-    """Cells as (label, input sources) with sources a driving (cell, port, bit), a named input bit or a constant."""
+    """Cells as (label, input sources); a source is a driving (cell, port, bit), an input bit or a const."""
     cells = list(net.module["cells"].values())
     driver, labels, sources = {}, [], []
     for i, cell in enumerate(cells):
@@ -453,7 +454,8 @@ def equivalent(tools: Tools, gold: Netlist, gate: Netlist, *, seq: int = 4, time
         (tmp / "a.json").write_text(json.dumps({"modules": {**gold.design["modules"], "gold": gold.module}}))
         (tmp / "b.json").write_text(json.dumps(_alone(gate, "gate")))
         script = (
-            f"read_json a.json; delete {gold.top}; read_json b.json; equiv_make gold gate equiv; hierarchy -top equiv;"
+            f"read_json a.json; delete {gold.top}; read_json b.json; equiv_make gold gate equiv;"
+            " hierarchy -top equiv;"
             f" equiv_struct; equiv_simple -seq {seq}"
         )
         memories = any(c["type"].startswith("$mem") for c in gold.module["cells"].values())
@@ -555,12 +557,57 @@ def shadow_registers(
     want = ((pats[:, :, None] >> np.arange(REGISTER_BITS)) & 1).astype(bool).reshape(trials, -1)
     prev = np.vstack([np.zeros_like(want[:1]), want[:-1]])
     match = (after[:, :, None] == want[:, None, :]).all(0) & (before[1:, :, None] == prev[1:, None, :]).all(0)
+    ram = (before[:, :, None] == want[:, None, :]).all(0)
+    bit_of = [
+        module["netnames"][r]["bits"][offsets[i + 1] - 1 - col]
+        for i, r in enumerate(regs)
+        for col in range(offsets[i], offsets[i + 1])
+    ]
+    feeds = _ff_fanin(module)
     found: dict[tuple[int, int], list[str]] = {}
-    for col, k in zip(*np.nonzero(match)):
-        reg = int(np.searchsorted(offsets, col, side="right") - 1)
-        msb_first = offsets[reg + 1] - 1 - col
-        found.setdefault(divmod(int(k), REGISTER_BITS), []).append(f"{regs[reg]}:{msb_first}")
+    for k in range(want.shape[1]):
+        loads = {bit_of[c] for c in np.flatnonzero(ram[:, k])}
+        for col in np.flatnonzero(match[:, k]):
+            if feeds.get(bit_of[col], set()) & loads:
+                reg = int(np.searchsorted(offsets, col, side="right") - 1)
+                found.setdefault(divmod(k, REGISTER_BITS), []).append(
+                    f"{regs[reg]}:{offsets[reg + 1] - 1 - col}"
+                )
     return found
+
+
+def _ff_fanin(module: dict) -> dict[int, set[int]]:
+    """For each FF output bit, the FF output bits in the combinational fan-in of its data input."""
+    ffs, driver = {}, {}
+    for cell in module["cells"].values():
+        conns = cell["connections"]
+        if "Q" in conns and len(conns["Q"]) == 1 and "D" in conns:
+            ffs[conns["Q"][0]] = conns["D"]
+        else:
+            for port, d in cell.get("port_directions", {}).items():
+                if d == "output":
+                    for b in conns[port]:
+                        driver[b] = [
+                            x
+                            for p, dd in cell["port_directions"].items()
+                            if dd == "input"
+                            for x in conns[p]
+                            if isinstance(x, int)
+                        ]
+    out = {}
+    for q, d in ffs.items():
+        seen, stack, hit = set(), [b for b in d if isinstance(b, int)], set()
+        while stack:
+            b = stack.pop()
+            if b in seen:
+                continue
+            seen.add(b)
+            if b in ffs:
+                hit.add(b)
+            else:
+                stack.extend(driver.get(b, ()))
+        out[q] = hit
+    return out
 
 
 def _driven_by_ff(module: dict, net: dict) -> bool:
@@ -581,7 +628,8 @@ def decompile(tools: Tools, bitstream: bytes, pcf: Path, package: str, work: Pat
         tools.run(["icebox_vlog", "-d", package, "-s", "-p", str(pcf), "chip.asc"], work)
     )
     tools.yosys(
-        "read_verilog -lib +/ice40/cells_sim.v; read_verilog raw.v; hierarchy -top chip -purge_lib; proc; opt_clean;"
+        "read_verilog -lib +/ice40/cells_sim.v; read_verilog raw.v; hierarchy -top chip -purge_lib;"
+        " proc; opt_clean;"
         " write_verilog -noattr chip.v; write_json chip.json",
         work,
     )

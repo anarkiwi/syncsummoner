@@ -12,7 +12,7 @@ from pyvmancer import CcMapError
 
 from syncsummoner.device import journal as jn
 from syncsummoner.device import session as sess_mod
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamSpec
 from syncsummoner.device.session import (
     AddressingError,
     ParkError,
