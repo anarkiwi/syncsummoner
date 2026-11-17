@@ -192,7 +192,7 @@ def take_scores(judged: Any, start: Sequence[int]) -> tuple[np.ndarray, np.ndarr
     found, proof = judged.found, judged.proof
     count = found.picked.size
     out = judged.features.small[found.picked].astype(np.float32)
-    src = judged.source.small[found.lead : found.lead + count].astype(np.float32)
+    src = judged.source.small[found.source_offset : found.source_offset + count].astype(np.float32)
     d_out, d_src = matched.frame_change(out), matched.frame_change(src)
     frames, params = steps_of(proof.landed.rows, start)
     keep = (frames >= 0) & (frames < count)

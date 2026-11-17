@@ -64,6 +64,21 @@ class RigFaultError(RuntimeError):
     """A program showed no picture and the Passthru control on the same rig showed none either."""
 
 
+class MissingProfileError(RuntimeError):
+    """A layer's program has no profile, so its pass would play no automation at all."""
+
+
+def require_profiles(score: Score, profiles: Mapping[str, ProgramProfile]) -> None:
+    """Refuse a score with a layer whose program has no profile, naming it and where profiles were read."""
+    missing = sorted({layer.program for layer in score.layers} - set(profiles))
+    if missing:
+        where = getattr(profiles, "directory", None)
+        raise MissingProfileError(
+            f"no profile for {', '.join(missing)} in {where if where is not None else 'the profiles given'}: "
+            "a layer without one would render no automation; fit one with `syncsummoner probe run`"
+        )
+
+
 class Offered(tuple):
     """Program names a device listed, with the authors it enumerated; None on firmware without authors."""
 
@@ -113,8 +128,6 @@ class RenderConfig:
     probe_s: float = 2.0
     #: pyvmancer's opt-in stall guard for device waits; None waits for as long as the device is on USB.
     stall_s: float | None = None
-    #: Strip-coded lead-in: the program held dry, or loaded inside it with no dry control (docs/evidence.md).
-    lead_in_s: float = 40.0
     #: Recorded past the clip's last frame, so the card's last captures of it are inside the take.
     tail_s: float = 1.0
     #: Where the liveness probe is recorded before a take begins.
@@ -144,16 +157,6 @@ class Rig:
     transport: Any = None
 
 
-def lead_frames(config: RenderConfig) -> int:
-    """Lead-in frames before clip frame 0."""
-    return int(round(config.lead_in_s * config.fps))
-
-
-def tail_frames(config: RenderConfig) -> int:
-    """Strip-coded lead-out frames after the clip's last: as many as the lead-in, which a load fits."""
-    return lead_frames(config)
-
-
 def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:
     """Remove the timecode strip before anything else looks at the frame."""
     return frame[: frame.shape[0] - strip_px]
@@ -166,13 +169,11 @@ def write_timecoded(
     config: RenderConfig,
     seconds: float | None = None,
     start: float = 0.0,
-    lead: int | None = None,
-    tail: int | None = None,
+    lead: int,
+    tail: int,
     cache: str | Path | None = None,
 ) -> int:
-    """:func:`.timecode.write_timecoded`, with a locked take's lead-in and -out unless given."""
-    lead = lead_frames(config) if lead is None else int(lead)
-    tail = tail_frames(config) if tail is None else int(tail)
+    """:func:`.timecode.write_timecoded` at the session's raster."""
     return timecode.write_timecoded(
         source, out, config=config, seconds=seconds, start=start, lead=lead, tail=tail, cache=cache
     )
@@ -205,13 +206,14 @@ def play_take(
     program: str | None,
     seconds: float,
     config: RenderConfig,
+    clip: timecode.ClipLayout,
 ) -> float:
-    """Record one locked take with no automation: the lead-in under Passthru, ``program`` loaded inside it.
+    """Record one locked take of the whole ``clip`` with no automation, ``program`` loaded in its lead-in.
 
-    Passthru comes back for the lead-out. The lock record is saved beside the take. Returns when the
-    load ended, on the capture clock; a load that overran the lead-in or lead-out is a :class:`LeadInError`.
+    Passthru carries the lead-in and comes back for the lead-out; the lock record is saved beside the
+    take. Returns when the load ended; a load that overran the lead-in or lead-out is a :class:`LeadInError`.
     """
-    lead, count, tail = lead_frames(config), int(round(seconds * config.fps)), tail_frames(config)
+    lead, count, tail = clip.lead, int(round(seconds * config.fps)), clip.tail
     lead_s = lead / config.fps
     with stage("passthru", program=PASSTHRU):
         rig.session.load_program(PASSTHRU, link=rig.link)
@@ -232,7 +234,7 @@ def play_take(
                 if loaded - began >= lead_s:
                     raise LeadInError(
                         f"{program}: loading took {loaded - began:.1f}s, past the {lead_s:.1f}s lead-in; "
-                        "raise lead_in_s"
+                        "timecode the clip with a longer one"
                     )
                 end = began + lead_s + seconds
                 _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
@@ -240,7 +242,9 @@ def play_take(
                     rig.session.load_program(PASSTHRU, link=rig.link)
                     await_transmitting(rig.transport, program=PASSTHRU, timing=config.timing)
                     if time.monotonic() - end >= tail / config.fps:
-                        raise LeadInError(f"{program}: Passthru loaded past the lead-out; raise lead_in_s")
+                        raise LeadInError(
+                            f"{program}: Passthru loaded past the lead-out; timecode a longer one"
+                        )
                 end += tail / config.fps + config.tail_s
                 _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
                 hold = int(player.status().get("hold", 1))
@@ -261,13 +265,14 @@ def _attempt(
     autos: Mapping,
     config: RenderConfig,
     clip: str | Path,
+    layout: timecode.ClipLayout,
 ) -> tuple[str, TakeReport]:
     """Record the score's pass with every write frame-locked, then prove it; returns what was judged.
 
     The take's evidence (:func:`~syncsummoner.compose.locktake.take_evidence`) is saved beside
     it, and a take not proven is reported; frames the capture driver lost are a :class:`TakeFaultError`.
     """
-    from syncsummoner.compose import locktake  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import locktake, session  # pylint: disable=import-outside-toplevel
 
     layer = min(score.layers, key=lambda item: item.index)
     program = layer.program
@@ -281,7 +286,7 @@ def _attempt(
         require_input(rig.transport, program=name, source=config.source)
         return rig.transport.program_info()
 
-    locktake.locked_take(
+    session.locked_take(
         rig,
         recorder,
         out,
@@ -291,6 +296,7 @@ def _attempt(
         plan=plan,
         working=rig.session.working_point,
         load=load,
+        clip=layout,
     )
     rig.transport.verify_cc_map()
     require_route(rig.transport, program=program, route=config.route)
@@ -349,21 +355,29 @@ def render_played(
     start: float = 0.0,
     recorder: Any = None,
 ) -> TakeReport:
-    """Render one pass: the rig plays, the card records, the host only drives.
+    """Render one pass, its program loaded once: the rig plays, the card records, the host only drives.
 
-    Nothing on the host touches a frame while the rig runs; each take is :func:`_attempt`. A
-    take with no picture is a program verdict only after :func:`verify_dark` passes; the
-    program is then reloaded and its pass retried :data:`PASS_RETRIES` times.
+    A layer with no profile is refused; each take is :func:`_attempt`, and one with no picture is a
+    program verdict only after :func:`verify_dark` passes, then retried :data:`PASS_RETRIES` times.
     """
     layers = sorted(score.layers, key=lambda item: item.index)
     if not layers:
         raise ValueError("score has no layers to render")
     config = RenderConfig() if config is None else config
     program = layers[0].program
+    require_profiles(score, profiles)
+    layout = ensure_clip(
+        source,
+        scratch,
+        program,
+        config=config,
+        directory=Path(out).parent,
+        seconds=score.duration,
+        start=start,
+        prepared=prepared,
+    )
     owned = rig is None
-    rig = open_rig(config, capture=False) if owned else rig
-    if not prepared:
-        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
+    rig = open_rig(config, capture=False, directory=Path(out).parent) if owned else rig
     if recorder is None:
         from syncsummoner.device.recorder import Recorder
 
@@ -375,7 +389,7 @@ def render_played(
             sent["bytes"] = rig.playout.upload(str(scratch))
         for attempt in range(PASS_RETRIES + 1):
             judged, report = _attempt(
-                rig, recorder, out, score=score, autos=autos, config=config, clip=scratch
+                rig, recorder, out, score=score, autos=autos, config=config, clip=scratch, layout=layout
             )
             if report.mostly_picture:
                 return report
@@ -447,6 +461,48 @@ def unknown_programs(programs: Sequence[str], available: Sequence[str] | None) -
         return []
     offered = set(available)
     return [name for name in dict.fromkeys(programs) if name not in offered]
+
+
+def ensure_clip(
+    source: Any,
+    scratch: str | Path,
+    program: str,
+    *,
+    config: RenderConfig,
+    directory: str | Path,
+    seconds: float,
+    start: float = 0.0,
+    prepared: bool = False,
+) -> timecode.ClipLayout:
+    """The timecoded clip at ``scratch``, its lead-in and lead-out long enough for ``program``'s session.
+
+    One too short is timecoded again, never shorter than it was; a ``prepared`` one is only checked.
+    """
+    from syncsummoner.compose import locktake, session  # pylint: disable=import-outside-toplevel
+
+    dry = locktake.dry_state(program, locktake.declared_bypass) is not None
+    lead, tail = session.session_frames(locktake.LeadIn(), config.fps, dry=dry, directory=directory)
+    try:
+        have = timecode.clip_layout(scratch) if Path(scratch).is_file() else None
+    except timecode.LayoutError:
+        have = None
+    if have is not None and have.lead >= lead and have.tail >= tail:
+        return have
+    if prepared:
+        raise timecode.LayoutError(
+            f"{scratch} holds {have} and {program}'s session needs a {lead}-frame lead-in "
+            f"and a {tail}-frame lead-out"
+        )
+    write_timecoded(
+        source,
+        scratch,
+        config=config,
+        seconds=seconds,
+        start=start,
+        lead=max(lead, have.lead if have else 0),
+        tail=max(tail, have.tail if have else 0),
+    )
+    return timecode.clip_layout(scratch)
 
 
 #: 4:2:0 at full range, what the card's MJPEG decodes to, so a splice converts no level.
@@ -641,8 +697,8 @@ def render_cuts(
     """Render one pass per program and splice between them on the score's sections.
 
     A program the score already evolved a layer for is driven by that layer;
-    anything else falls back to the first. The timecoded source is built once and
-    replayed by every pass. The cuts are :func:`~syncsummoner.compose.cut.cut_plan`'s: the
+    anything else falls back to the first. Each pass timecodes the source as its session
+    needs, never shorter than before. The cuts are :func:`~syncsummoner.compose.cut.cut_plan`'s: the
     plan the score was composed against, else ``programs`` in rotation over its sections,
     where naming more than there are sections leaves the surplus unrendered, which is
     said rather than silently done. With ``reuse``, a program whose take is
@@ -686,16 +742,13 @@ def render_cuts(
             ", ".join(unused),
         )
     LOG.info(
-        "%d cuts over %d programs: %d passes of %s plus a load and relock each, %s of capture",
+        "%d cuts over %d programs: %d passes of %s, one load each, %s of capture",
         len(plan),
         len(ordered),
         len(fresh),
         human(score.duration),
         human(len(fresh) * score.duration),
     )
-    if (fresh or not Path(scratch).is_file()) and not prepared:
-        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
-        prepared = True
     _passes(
         ordered,
         fresh,
@@ -708,6 +761,7 @@ def render_cuts(
             config=config,
             scratch=scratch,
             prepared=prepared,
+            start=start,
         ),
     )
     plan, picked = checked_plan(score, plan, paths, scratch, config=config)
@@ -813,13 +867,14 @@ def checked_plan(
     return report.cuts, {name: t.picked for name, t in report.traces.items()}
 
 
-def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
+def open_rig(config: RenderConfig, *, capture: bool = True, directory: str | Path | None = None) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
-    Imported here so compose never needs hardware. A recorded pass wants no
-    capture at all: the recorder opens the card itself, and a handle held here would keep it from doing so.
-    A device wait seeing nothing for a lead-in, sized to hold a load, fails unless ``stall_s`` is set.
+    A recorded pass wants no capture: the recorder opens the card itself. A device wait seeing nothing for
+    longer than the longest load ``directory`` timed fails, unless ``stall_s`` says otherwise.
     """
+    from syncsummoner.compose.session import load_bound  # pylint: disable=import-outside-toplevel
+
     from syncsummoner.device import capture as capture_mod
     from syncsummoner.device import link as link_mod
     from syncsummoner.device import playout as playout_mod
@@ -827,7 +882,7 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     from syncsummoner.device import transport as transport_mod
 
     transport = transport_mod.Transport.open(
-        stall=config.lead_in_s if config.stall_s is None else config.stall_s
+        stall=load_bound(directory) if config.stall_s is None else config.stall_s
     )
     host = () if config.source_host is None else (config.source_host,)
     return Rig(

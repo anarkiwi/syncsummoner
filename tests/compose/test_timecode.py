@@ -172,6 +172,29 @@ def test_an_encoded_clip_reads_back_its_wrapped_lead_in_every_frame_and_its_lead
     features = decoded.features(out, decoded.Spec.of(CONFIG))
     assert L.signed(features.codes, CONFIG.bits).tolist() == list(range(-4, 7))
     assert (np.round(features.times * 1000) == np.round(np.arange(11) * 1000 / CONFIG.fps)).all()
+    assert T.clip_layout(out) == T.ClipLayout(lead=4, frames=5, tail=2), "the clip says how its frames lie"
+
+
+def test_a_clip_without_its_layout_tags_is_a_layout_error(tmp_path):
+    """A clip timecoded before its layout was tagged cannot say where its lead-in ends."""
+    plain = tmp_path / "plain.mkv"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=16x16:d=0.2",
+            "-c:v",
+            "ffv1",
+            str(plain),
+        ],
+        check=True,
+    )
+    with pytest.raises(T.LayoutError, match="timecode it again"):
+        T.clip_layout(plain)
 
 
 def test_a_program_that_turns_the_picture_over_leaves_no_legible_strip(tmp_path):
@@ -208,7 +231,7 @@ def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):
 
     monkeypatch.setattr(T.subprocess, "Popen", popen)
     with pytest.raises(RuntimeError, match="Permission denied"):
-        R.write_timecoded(source, tmp_path / "tc.mkv", config=CONFIG, cache=tmp_path)
+        R.write_timecoded(source, tmp_path / "tc.mkv", config=CONFIG, lead=2, tail=2, cache=tmp_path)
     assert not list(tmp_path.glob("timecoded-*"))
 
 

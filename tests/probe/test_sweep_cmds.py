@@ -10,6 +10,7 @@ import pytest
 
 from syncsummoner import cli
 from syncsummoner.compose import response as response_mod
+from syncsummoner.compose import timecode
 from syncsummoner.compose.evidence import DISAGREE, LANDED
 from syncsummoner.probe import decoded
 from syncsummoner.probe import locked as L
@@ -40,7 +41,7 @@ def test_of_takes_groups_takes_by_program(monkeypatch):
     rows = np.zeros(1, dtype=response_mod.ev.LANDED)
     rows["landed"], rows["param"], rows["wire"], rows["sent"] = 10, 1, 5, 0
     seen = SimpleNamespace(
-        found=SimpleNamespace(picked=np.arange(50), lead=0),
+        found=SimpleNamespace(picked=np.arange(50), lead=0, source_offset=0),
         features=fake_features(50),
         source=fake_features(50),
         proof=SimpleNamespace(landed=SimpleNamespace(rows=rows)),
@@ -62,7 +63,7 @@ def plan_states():
 def test_sweep_plan_cuts_the_cover_into_takes(tmp_path, monkeypatch, capsys):
     hold = tmp_path / "hold.json"
     hold.write_text(json.dumps({"program": "p", "settle": 1, "hold": 3}))
-    monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(1200 + 12 + 1200))
+    monkeypatch.setattr(timecode, "clip_layout", lambda clip: timecode.ClipLayout(1200, 12, 1200))
     monkeypatch.setattr("syncsummoner.program.model", lambda name: SimpleNamespace(name=name))
     monkeypatch.setattr(gates, "cover", lambda m, gating=None: "cover")
     monkeypatch.setattr(L, "levels", lambda found: plan_states())
@@ -118,6 +119,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
     for k in range(len(chunks)):
         assert cli.main(["probe", "sweep", "collect", str(plan), "--chunk", str(k)]) == 0
     monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(100))
+    monkeypatch.setattr(timecode, "clip_layout", lambda clip: timecode.ClipLayout(30, 40, 30))
 
     def concat(_videos, out, **_kw):
         out.write_bytes(b"joined")
@@ -126,6 +128,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
     assert cli.main(["probe", "sweep", "commit", str(plan), "--archive", str(tmp_path / "a")]) == 0
     meta = FrameArchive(tmp_path / "a").meta("p")
     assert meta["key_material"] == "rc4" and meta["stimulus"]["frames"] == 100
+    assert meta["stimulus"]["lead"] == 30, "the archive names the clip's own lead-in"
     assert (tmp_path / "a" / "c.mkv").is_symlink() and '"measured"' in capsys.readouterr().out
 
 
@@ -150,7 +153,7 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
         received=None,
     )
     seen = SimpleNamespace(
-        proof=proof, found=SimpleNamespace(picked=np.arange(n), shown=np.arange(n), lead=3)
+        proof=proof, found=SimpleNamespace(picked=np.arange(n), shown=np.arange(n), lead=3, source_offset=3)
     )
     monkeypatch.setattr(judge, "judge_take", lambda *a, **k: seen)
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: {"t_ns": np.arange(n, dtype=np.int64)})
@@ -197,7 +200,7 @@ def test_sweep_plan_takes_a_recorded_cover_and_joint_moves(tmp_path, monkeypatch
     hold.write_text(json.dumps({"program": "p", "settle": 0, "hold": 2}))
     cover_file = tmp_path / "cover.json"
     cover_file.write_text(json.dumps({"states": [[0] * 12], "chosen": [0], "stepped": {"0": [1]}}))
-    monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(2 * 1200 + 40))
+    monkeypatch.setattr(timecode, "clip_layout", lambda clip: timecode.ClipLayout(1200, 40, 1200))
     fake = SimpleNamespace(resolution=lambda: {1: (0, 1), 11: (0,), 6: (0, 1)})
     monkeypatch.setattr("syncsummoner.program.model", lambda name: fake)
     monkeypatch.setattr(gates, "representatives", lambda m, p, bits: np.array([0, 512]))

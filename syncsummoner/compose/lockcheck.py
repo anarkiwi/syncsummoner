@@ -7,14 +7,13 @@ read the frame the line says, and, under Passthru, no capture may show a neighbo
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from syncsummoner.compose import render
+from syncsummoner.compose import render, timecode
 from syncsummoner.compose.lock import signed
 from syncsummoner.probe import decoded
 from syncsummoner.progress import LOG, stage
@@ -117,7 +116,7 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
     if clip is not None:
         with stage("tears", take=str(take)) as said:
             source = decoded.features(clip, spec, ffmpeg=ffmpeg).small[
-                found.lead : found.lead + found.picked.size
+                found.source_offset : found.source_offset + found.picked.size
             ]
             judged, torn = tears(features.small[found.picked, 0], source[:, 0])
             said.update(judged=judged, torn=torn)
@@ -137,11 +136,24 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
 
 
 def clip_seconds(clip: str | Path, config: Any) -> float:
-    """A prepared clip's length between its lead-in and lead-out, from its frame count."""
-    argv = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets"]
-    argv += ["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(clip)]
-    packets = int(subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip())
-    return (packets - render.lead_frames(config) - render.tail_frames(config)) / config.fps
+    """A prepared clip's length between its lead-in and lead-out, from its layout."""
+    return timecode.clip_layout(clip).frames / config.fps
+
+
+def check_frames(directory: str | Path, fps: float, lead_in_s: float | None = None) -> tuple[int, int]:
+    """A lockcheck clip's lead-in and lead-out: ``lead_in_s`` each, else what a load inside each needs.
+
+    A program loaded in the lead-in is a session with no dry control, sized by the loads ``directory`` timed.
+    """
+    from syncsummoner.compose import session  # pylint: disable=import-outside-toplevel
+
+    if lead_in_s is not None:
+        return (session.frames_of(lead_in_s, fps),) * 2
+    loads, lead_in = session.load_bound(directory), session.LeadIn()
+    return (
+        session.lead_in_frames(lead_in, fps, dry=False, load_s=loads),
+        session.lead_out_frames(lead_in, fps, dry=False, load_s=loads, latency_s=0.0),
+    )
 
 
 def lockcheck(
@@ -165,7 +177,15 @@ def lockcheck(
     try:
         with stage("upload", clip=str(clip)) as sent:
             sent["bytes"] = rig.playout.upload(str(clip))
-        render.play_take(rig, recorder, take, program=program, seconds=seconds, config=config)
+        render.play_take(
+            rig,
+            recorder,
+            take,
+            program=program,
+            seconds=seconds,
+            config=config,
+            clip=timecode.clip_layout(clip),
+        )
     finally:
         if owned:
             rig.transport.close()

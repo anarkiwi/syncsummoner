@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,11 +24,38 @@ from syncsummoner.probe.patterns import timecode_row
 from syncsummoner.progress import LOG, track
 
 #: Bumped whenever what a timecoded clip holds, or how it is encoded, changes; older clips are then rebuilt.
-TIMECODE_SCHEMA = 1
+TIMECODE_SCHEMA = 2
 #: How a timecoded clip is encoded; part of its cache key.
 TIMECODE_X264 = ("-c:v", "libx264", "-crf", "14", "-preset", "veryfast", "-pix_fmt", "yuv420p")
 #: Matroska tag naming the key a timecoded clip was built for.
 TIMECODE_TAG = "SYNCSUMMONER_TIMECODE"
+#: Matroska tags holding a timecoded clip's lead-in and lead-out lengths, in frames.
+LEAD_TAG, TAIL_TAG = "SYNCSUMMONER_LEAD", "SYNCSUMMONER_TAIL"
+
+
+class LayoutError(RuntimeError):
+    """A clip does not say how its lead-in, clip and lead-out frames lie."""
+
+
+@dataclass(frozen=True)
+class ClipLayout:
+    """A timecoded clip's frames: ``lead`` lead-in, ``frames`` of the clip, ``tail`` lead-out."""
+
+    lead: int
+    frames: int
+    tail: int
+
+
+def clip_layout(path: str | Path, *, ffprobe: str = "ffprobe") -> ClipLayout:
+    """How a timecoded clip's frames lie, from the tags it was written with and its packet count."""
+    argv = [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets", "-of", "json"]
+    argv += ["-show_entries", "stream=nb_read_packets:format_tags", str(path)]
+    said = json.loads(subprocess.run(argv, check=True, capture_output=True, text=True).stdout)
+    tags = {k.upper(): v for k, v in said.get("format", {}).get("tags", {}).items()}
+    if LEAD_TAG not in tags or TAIL_TAG not in tags:
+        raise LayoutError(f"{path} carries no {LEAD_TAG}/{TAIL_TAG} tags: timecode it again")
+    lead, tail = int(tags[LEAD_TAG]), int(tags[TAIL_TAG])
+    return ClipLayout(lead, int(said["streams"][0]["nb_read_packets"]) - lead - tail, tail)
 
 
 def timecode_key(
@@ -168,6 +196,10 @@ def _encode_timecoded(
         *TIMECODE_X264,
         "-metadata",
         f"{TIMECODE_TAG}={key}",
+        "-metadata",
+        f"{LEAD_TAG}={lead}",
+        "-metadata",
+        f"{TAIL_TAG}={tail}",
         "-f",
         "matroska",
         str(out),

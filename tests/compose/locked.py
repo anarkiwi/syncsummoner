@@ -11,8 +11,10 @@ import numpy as np
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import judge as J
 from syncsummoner.compose import locktake
+from syncsummoner.compose import session as session_mod
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import Layer, Score, Section
+from syncsummoner.compose.timecode import ClipLayout
 from syncsummoner.device.playout import FLIP
 from syncsummoner.device.v4l2rec import FRAME, sidecar
 from syncsummoner.probe import decoded
@@ -182,9 +184,11 @@ class Played:
         return 1
 
     @contextlib.contextmanager
-    def playing(self, *, fps):
+    def playing(self, *, fps, spans=None):
         """Play for the block."""
-        self.log.append(("play", fps, self.clock.now))
+        self.log.append(
+            ("play", fps, self.clock.now) if spans is None else ("play", fps, self.clock.now, spans)
+        )
         yield self
         self.log.append(("stop",))
 
@@ -210,8 +214,10 @@ class Played:
         self.log.append(("recorded",))
 
 
-#: A session the standard take was played at: its lead-in and clip in frames, and a short tail.
-LOCKED = R.RenderConfig(width=160, height=24, fps=30.0, strip_px=8, bits=16, lead_in_s=8 / 30, tail_s=0.05)
+#: A session the standard take was played at, with a short tail.
+LOCKED = R.RenderConfig(width=160, height=24, fps=30.0, strip_px=8, bits=16, tail_s=0.05)
+#: The standard take's clip: its lead-in, clip and lead-out in frames.
+CLIP = ClipLayout(lead=8, frames=6, tail=8)
 
 
 @dataclasses.dataclass
@@ -246,10 +252,11 @@ def locked_pass(monkeypatch, played=None, transport=None, *, proof=None, **kwarg
         lambda *a, **k: decoded.Features({"codes": rig.take.codes, "luma": np.zeros(0)}, ""),
     )
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+    monkeypatch.setattr(R, "ensure_clip", lambda *a, **k: CLIP)
     proofs = list(proof or [Proof()])
 
-    def locked_take(rig_, recorder, out, *, program, seconds, config, plan, working, load):
-        lead, count = R.lead_frames(config), int(round(seconds * config.fps))
+    def locked_take(rig_, recorder, out, *, program, seconds, config, plan, working, load, clip):
+        lead, count = clip.lead, int(round(seconds * config.fps))
         working(load(program))
         with recorder.recording(out), rig_.playout.playing(fps=config.fps) as player:
             rig.log.append(("drive", program, plan.size))
@@ -262,7 +269,7 @@ def locked_pass(monkeypatch, played=None, transport=None, *, proof=None, **kwarg
         rig.log.append(("evidence", program, str(clip), Path(take_path).name))
         return proofs.pop(0) if len(proofs) > 1 else proofs[0]
 
-    monkeypatch.setattr(locktake, "locked_take", locked_take)
+    monkeypatch.setattr(session_mod, "locked_take", locked_take)
     monkeypatch.setattr(locktake, "take_evidence", take_evidence)
     monkeypatch.setattr(J, "inspect_luma", lambda luma, start: rig.log.append(("inspect", start)) or PROBED)
     return rig
@@ -275,7 +282,7 @@ def render_locked(rig, out, config=LOCKED, program="Teletext"):
         score,
         "clip.mkv",
         out,
-        profiles={},
+        profiles={program: object()},
         rig=rig.rig,
         config=config,
         scratch="tc.mkv",

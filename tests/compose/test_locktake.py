@@ -11,14 +11,15 @@ import pytest
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import locktake as LT
+from syncsummoner.compose import session as SS
 from syncsummoner.device import v4l2rec
-from syncsummoner.device.playout import FLIP
 from syncsummoner.device.profile import PARAM_MAX, ParamSpec
 from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device import wire as W
 from syncsummoner.device.wire import SEND, Echoes, Poller, Sender
 from syncsummoner.probe import decoded
 from syncsummoner.program.model import Bypass
+from syncsummoner.compose.timecode import ClipLayout
 from tests.compose import locked
 
 FPS = 30.0
@@ -29,7 +30,6 @@ S0 = 5_000_000_000
 T0 = S0 + 50_000_000
 TAU = T0 + 0.3 * P
 SIDE = 4
-sleep_until_on = LT._sleep_until  # pylint: disable=protected-access
 
 
 def specs():
@@ -394,26 +394,40 @@ class Sim:
 
     Played frame ``f`` starts at ``T0 + f * P``, is captured a quarter frame either side of
     ``T0 + (f + 0.5) * P`` and shows the state latched at tick ``f - 2``; a write latches on the
-    first tick at or after it is sent.
+    first tick at or after it is sent; ``counts`` lays the frames out as a session's takes from frame 0.
     """
 
-    def __init__(self, *, lead, count, tail=20, drop=None):
-        self.now, self.lead, self.count = S0, lead, count
+    def __init__(self, *, lead, count, tail=20, drop=None, counts=None):
+        counts = [count] if counts is None else list(counts)
+        self.now, self.lead, self.count, self.counts = S0, lead, sum(counts), counts
         self.dry = switch(1)
-        self.size = 2 * (lead + count + tail)
+        frames = lead + self.count + tail
+        self.size = 2 * frames
         self.writes = []
         self.drop = drop
         self.poller = self.sender = None
         self.next_poll = 0
         rng = np.random.default_rng(3)
-        self.base = rng.uniform(0, 60, (lead + count + tail, 3, SIDE, SIDE)).astype(np.float32)
+        self.clip = rng.uniform(0, 60, (max(counts) + tail, 3, SIDE, SIDE)).astype(np.float32)
+        self.clip_frame = np.r_[
+            np.zeros(lead, np.int64),
+            *[np.arange(c) for c in counts],
+            counts[-1] + np.arange(tail),
+        ]
+        self.base = self.clip[self.clip_frame]
         self.base[:lead] = 30 + rng.uniform(0, 2, (lead, 3, SIDE, SIDE))
+        code = np.r_[np.arange(-lead, 0), self.clip_frame[lead:]]
         self.frames = np.zeros(self.size, FRAME)
         self.frames["sequence"] = np.arange(self.size)
         self.frames["t_ns"] = np.rint(T0 + (np.arange(self.size) + 0.5) * P / 2)
         self.frames["digest"] = np.arange(self.size) // 2 + 1
-        self.codes = (np.arange(self.size) // 2 - lead) & locked.WRAP
-        self.flips = locked.flip_log(lead + count + tail, 2)
+        self.codes = np.repeat(code, 2) & locked.WRAP
+        self.flips = locked.flip_log(frames, 2)
+        self.files = {}
+
+    def source(self, lead):
+        """The clip file's pictures: ``lead`` lead-in copies of its first frame, then the clip."""
+        return np.r_[np.repeat(self.clip[:1], lead, axis=0), self.clip].astype(np.uint8)
 
     def clock(self):
         """Simulated ``CLOCK_MONOTONIC``."""
@@ -445,16 +459,30 @@ class Sim:
         """Captures the card has delivered by now."""
         return int(np.count_nonzero(self.frames["t_ns"] <= self.now))
 
-    def images(self, size=None):
-        """Every capture so far as an image."""
-        size = self.stored() if size is None else size
-        return np.rint([self.picture(k) for k in range(size)]).astype(np.uint8)
+    def images(self, size=None, at=None):
+        """Every capture so far as an image, or those ``at``."""
+        at = np.arange(self.stored() if size is None else size) if at is None else at
+        return np.rint([self.picture(k) for k in at]).astype(np.uint8)
 
     def attribution(self, size=None):
         """The attribution of the first ``size`` captures from their strips and bytes."""
         size = self.stored() if size is None else size
         frames = self.frames[:size]
         return L.attribute(self.codes[:size], frames, self.flips, hold=2, lead=self.lead, count=self.count)
+
+    def roll(self, path, opens, closes):
+        """Captures from ``opens`` go to ``path``, the file before keeping those before ``closes``."""
+        last = list(self.files)[-1]
+        self.files[last] = (self.files[last][0], closes)
+        self.files[str(path)] = (opens, np.inf)
+
+    def captures(self, path):
+        """The captures ``path`` holds by now, as indices into the card's."""
+        if str(path) not in self.files:
+            raise FileNotFoundError(path)
+        opens, closes = self.files[str(path)]
+        t = self.frames["t_ns"][: self.stored()]
+        return np.flatnonzero((t >= opens) & (t < closes))
 
     def poll_next(self):
         """Advance to the next poll and run it: what a sender waiting on its echo sees."""
@@ -527,12 +555,23 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
     transport = types.SimpleNamespace(
         device=types.SimpleNamespace(shell=shell, midi=midi), set_param=set_param
     )
+    played = []
 
     @contextlib.contextmanager
-    def held(*_, **__):
+    def playing(*, fps, spans=None):
+        played.append((fps, spans))
         yield types.SimpleNamespace(status=lambda: {"hold": 2})
 
-    playout = types.SimpleNamespace(playing=held, flips=lambda: np.zeros(3, FLIP))
+    @contextlib.contextmanager
+    def recording(path):
+        sim.files = {str(path): (-np.inf, np.inf)}
+        yield "proc"
+        sim.now = max(sim.now, int(sim.frames["t_ns"][-1]))
+
+    playout = types.SimpleNamespace(playing=playing, flips=lambda: sim.flips, played=played)
+    recorder = types.SimpleNamespace(
+        recording=recording, roll=lambda proc, path, opens, closes: sim.roll(path, opens, closes)
+    )
     rig = types.SimpleNamespace(
         transport=transport, session=types.SimpleNamespace(park_values=[0] * 12), playout=playout
     )
@@ -542,12 +581,12 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
         shell.loads.append((len(said), sim.poller is None and sim.sender is None))
         return info
 
-    return rig, types.SimpleNamespace(recording=held), load, loads
+    return rig, recorder, load, loads
 
 
 @pytest.fixture(name="simulate")
 def fixture_simulate(monkeypatch):
-    """Run :func:`locktake.locked_take` against a :class:`Sim`, threads replaced by its sleeps."""
+    """Run :func:`session.locked_session` against a :class:`Sim`, threads replaced by its sleeps."""
 
     def build(**kw):
         sim = Sim(**kw)
@@ -587,32 +626,49 @@ def fixture_simulate(monkeypatch):
             def stop(self):
                 sim.sender = None
 
-        monkeypatch.setattr(LT, "Echoes", SimEchoes)
-        monkeypatch.setattr(LT, "Poller", SimPoller)
-        monkeypatch.setattr(LT, "Sender", SimSender)
+        def live(path, **_):
+            at = sim.captures(path)
+            return sim.codes[at], sim.images(at=at)
+
+        monkeypatch.setattr(SS, "Echoes", SimEchoes)
+        monkeypatch.setattr(SS, "Poller", SimPoller)
+        monkeypatch.setattr(SS, "Sender", SimSender)
+        monkeypatch.setattr(SS, "time", types.SimpleNamespace(monotonic_ns=sim.clock, sleep=sim.sleep))
         monkeypatch.setattr(LT, "time", types.SimpleNamespace(monotonic_ns=sim.clock, sleep=sim.sleep))
-        monkeypatch.setattr(LT, "_sleep_until", lambda t: sleep_until_on(t, clock=sim.clock, sleep=sim.sleep))
-        monkeypatch.setattr(LT, "_read_sidecar", lambda take: sim.frames[: sim.stored()])
-        monkeypatch.setattr(LT, "read_live", lambda *a, **k: (np.zeros(sim.stored(), np.int64), sim.images()))
+        monkeypatch.setattr(SS, "_read_sidecar", lambda take: sim.frames[sim.captures(take)])
+        monkeypatch.setattr(SS, "read_live", live)
         monkeypatch.setattr(
-            LT, "live_attribution", lambda *a, **k: (sim.attribution(), sim.frames[: sim.stored()])
+            SS,
+            "live_attribution",
+            lambda *a, **k: (L.require_anchor(sim.attribution(), "take"), sim.frames[: sim.stored()]),
         )
         return sim
 
     return build
 
 
-def config_for(lead_in_s, **kw):
+def config_for(**kw):
     """A session's settings as the take reads them."""
-    return types.SimpleNamespace(
-        fps=FPS, lead_in_s=lead_in_s, strip_px=8, bits=16, tail_s=0.2, ffmpeg="ffmpeg", **kw
-    )
+    return types.SimpleNamespace(fps=FPS, strip_px=8, bits=16, tail_s=0.2, ffmpeg="ffmpeg", **kw)
 
 
 LEAD_IN = LT.LeadIn(toggles=3, toggle_s=(0.2, 0.25), settle_s=0.3, wet_s=0.5, poll_s=0.005)
 PLAN_ROWS = np.array(
     [(0, 3, 512), (0, 4, 100), (5, 3, 600), (9, 4, 200), (20, 3, 100), (20, 5, 900)], dtype=LT.PLAN
 )
+
+
+def ends_for(dry, directory):
+    """The lead-in and lead-out a simulated session derives: its loads take no time."""
+    SS.record_load(directory, "Passthru", 0, 0)
+    return SS.session_frames(LEAD_IN, FPS, dry=dry, directory=directory)
+
+
+def session_for(simulate, tmp_path, *, dry, counts, **kw):
+    """A simulation laid out as the session its takes will derive, and the clip it plays."""
+    lead, tail = ends_for(dry, tmp_path)
+    sim = simulate(lead=lead, count=sum(counts), tail=tail + 12, counts=counts, **kw)
+    return sim, ClipLayout(lead=lead, frames=max(counts), tail=tail + 12)
 
 
 def take_and_prove(
@@ -629,35 +685,36 @@ def take_and_prove(
     plan=None,
 ):
     """A whole simulated take, then its evidence from the files it left."""
-    sim = simulate(lead=120, count=30, drop=drop)
     info = info_with(dry)
+    sim, clip = session_for(simulate, tmp_path, dry=info.dry is not None, counts=[30], drop=drop)
     sim.dry = info.dry or sim.dry
     rig, recorder, load, loads = rigged(sim, info, boots=boots, lose=lose)
     out = tmp_path / "take.mkv"
-    record = LT.locked_take(
+    record = SS.locked_take(
         rig,
         recorder,
         out,
         program="Teletext",
         seconds=1.0,
-        config=config_for(4.0) if config is None else config,
+        config=config_for() if config is None else config,
         plan=PLAN_ROWS if plan is None else plan,
         working=lambda info: working,
         load=load,
+        clip=clip,
         lead_in=LEAD_IN,
-        bypass=bypass_of,
+        bypass=lambda name: info.dry,
     )
     monkeypatch.setattr(L, "attribute_take", lambda *a, **k: sim.attribution(sim.size))
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: sim.frames)
-    clip = sim.base.astype(np.uint8)
+    clip_pictures = sim.base.astype(np.uint8)
     monkeypatch.setattr(
         LT.decoded,
         "features",
         lambda path, spec, **k: decoded.Features(
-            {"small": clip if str(path) == "clip.mkv" else sim.images(sim.size)}, ""
+            {"small": clip_pictures if str(path) == "clip.mkv" else sim.images(sim.size)}, ""
         ),
     )
-    proof = LT.take_evidence(out, program="Teletext", clip="clip.mkv", config=config_for(4.0))
+    proof = LT.take_evidence(out, program="Teletext", clip="clip.mkv", config=config_for())
     return sim, rig, record, proof, loads
 
 
@@ -692,7 +749,12 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     )
     assert record.plan[0].tolist() == (-15, 1, 0) and record.plan[-1].tolist() == (30, 1, PARAM_MAX)
     lock = np.load(tmp_path / "take.mkv.lock.npz")
-    assert (int(lock["lead"]), int(lock["count"]), int(lock["tail"])) == (120, 30, 120)
+    assert (int(lock["lead"]), int(lock["count"]), int(lock["tail"])) == (
+        sim.lead,
+        30,
+        ends_for(True, tmp_path)[1],
+    )
+    assert rig.playout.played == [(FPS, [(0, sim.lead + 30 + int(lock["tail"]))])]
     calibration = record.sends[record.sends["target"] == ev.CALIBRATION]
     assert calibration["value"].tolist() == [0, PARAM_MAX] * 3
     assert (tmp_path / "take.mkv.wire.npz").is_file() and (tmp_path / "take.mkv.lock.npz").is_file()
@@ -781,6 +843,7 @@ def test_a_calibration_the_picture_cannot_show_lands_by_the_band_on_file(monkeyp
     def unseen(*_a, **_k):
         raise ev.EvidenceError("no calibration write showed in the picture")
 
+    monkeypatch.setattr(SS, "measure_latency", unseen)
     monkeypatch.setattr(LT, "measure_latency", unseen)
     LT.write_latency(tmp_path, lat_for(width=0.0, samples=1), "Other")
     record = take_and_prove(monkeypatch, simulate, tmp_path, dry=1, working={1: 0})[2]
@@ -792,25 +855,34 @@ def test_a_calibration_the_picture_cannot_show_lands_by_the_band_on_file(monkeyp
 def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch, simulate, tmp_path):
     """No latency yet is refused before anything plays; with one, the take probes ticks and holds."""
     sim = simulate(lead=120, count=30)
-    rig, recorder, load, loads = rigged(sim, info_with({}))
-    kw = {"program": "Teletext", "seconds": 1.0, "config": config_for(4.0), "plan": PLAN_ROWS}
+    rig, recorder, load, loads = rigged(sim, info_with())
+    kw = {"program": "Teletext", "seconds": 1.0, "config": config_for(), "plan": PLAN_ROWS}
     with pytest.raises(LT.NoLatencyError):
-        LT.locked_take(
-            rig, recorder, tmp_path / "t.mkv", working=lambda info: {}, load=load, lead_in=LEAD_IN, **kw
+        SS.locked_take(
+            rig,
+            recorder,
+            tmp_path / "t.mkv",
+            working=lambda info: {},
+            load=load,
+            lead_in=LEAD_IN,
+            clip=ClipLayout(120, 30, 20),
+            bypass=lambda name: None,
+            **kw,
         )
-    assert not rig.transport.device.shell.said
+    assert not rig.transport.device.shell.said and not loads
     LT.write_latency(tmp_path, lat_for(width=0.0, samples=1), "Other")
     _, rig, record, proof, loads = take_and_prove(
         monkeypatch, simulate, tmp_path, dry=None, working={3: 1.0, 4: 100}
     )
-    assert [name for name, _ in loads] == ["Teletext", "Passthru", "Teletext", "Passthru"]
+    assert [name for name, _ in loads] == ["Passthru", "Teletext", "Passthru"]
     shell = rig.transport.device.shell
     at, quiet = shell.loads[-1]
     assert quiet and shell.said[at - 1] == ("midi", "monitor", "off")
     timed = json.loads(str(np.load(tmp_path / "take.mkv.wire.npz")["loads"]))
     assert [x["program"] for x in timed] == ["Teletext", "Passthru"]
     assert all(x["t0_ns"] <= x["t1_ns"] for x in timed) and timed[0]["t1_ns"] <= timed[1]["t0_ns"]
-    assert loads[-1][1] >= T0 + (120 + 30) * P
+    lead = ends_for(False, tmp_path)[0]
+    assert loads[-1][1] >= T0 + (lead + 30) * P and loads[1][1] < T0 + lead * P
     assert record.dry is None and record.delta == pytest.approx(DELTA)
     assert not (record.sends["target"] == ev.CALIBRATION).any()
     assert proof.ok, proof.lines()
@@ -824,23 +896,31 @@ def test_a_reboot_during_the_take_is_an_error_after_its_record_is_kept(monkeypat
     assert (tmp_path / "take.mkv.wire.npz").is_file()
 
 
-def test_a_lead_in_too_short_for_the_calibration_is_an_error(simulate, tmp_path):
-    """The first write due before the clock is known is a lead-in time error, the monitor left off."""
-    sim = simulate(lead=30, count=30)
+def test_a_clock_measured_slower_than_real_time_is_a_lead_in_error(monkeypatch, simulate, tmp_path):
+    """Decoding the lead-in slower than it was recorded leaves the first write due; the monitor left off."""
+    sim, clip = session_for(simulate, tmp_path, dry=True, counts=[30])
     rig, recorder, load, _ = rigged(sim, info_with(1))
-    with pytest.raises(LT.LeadInTimeError, match="lengthen the lead-in"):
-        LT.locked_take(
+
+    def slow(*_a, **_k):
+        found = sim.attribution()
+        sim.now += 10 * sim.lead * int(P)
+        return found, sim.frames[: sim.stored()]
+
+    monkeypatch.setattr(SS, "live_attribution", slow)
+    with pytest.raises(LT.LeadInTimeError, match="past the lead-in this session derived"):
+        SS.locked_take(
             rig,
             recorder,
             tmp_path / "t.mkv",
             program="Teletext",
             seconds=1.0,
-            config=config_for(1.0),
+            config=config_for(),
             plan=PLAN_ROWS,
             working=lambda info: {1: 0},
             load=load,
+            clip=clip,
             lead_in=LEAD_IN,
-            bypass=bypass_of,
+            bypass=lambda name: info_with(1).dry,
         )
     assert rig.transport.device.shell.said[-1] == ("midi", "monitor", "off")
     assert (tmp_path / "t.mkv.wire.npz").is_file()

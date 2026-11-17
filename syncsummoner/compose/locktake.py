@@ -7,33 +7,27 @@ write is then sent midway between the ticks around its frame's. See docs/evidenc
 
 from __future__ import annotations
 
-import gc
 import json
-import sys
-from contextlib import contextmanager
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import frameline
-from syncsummoner.compose.lock import capture_times, changes, live_attribution, read_live, save_lock
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, snap_toggles
+from syncsummoner.compose.lock import capture_times, changes
+from syncsummoner.device.profile import PARAM_MAX
 from syncsummoner.device import wire as W
-from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
+from syncsummoner.device.wire import Sender
 from syncsummoner.probe import decoded
-from syncsummoner.probe.decoded import CALIBRATION_SIZE
-from syncsummoner.progress import LOG, meter
+from syncsummoner.progress import LOG
 
 #: Settings key the device counts its boots in.
 BOOT_COUNT_KEY = 9
 #: Plan rows: target clip frame, 1-based parameter, device value.
 PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
-#: Interpreter thread switch interval during a take, well inside the tick a late wake-up must make.
-SWITCH_S = 0.0005
 #: Where a take directory keeps the latest CC-to-picture latency a dry take measured.
 LATENCY_FILE = "ccpicture.json"
 
@@ -81,12 +75,27 @@ def program_bypass(info: Any) -> Any:
         return None
 
 
-def dry_state(info: Any, bypass: Callable[[Any], Any] = program_bypass) -> dict[int, int] | None:
+def declared_bypass(program: str) -> Any:
+    """:func:`program_bypass` from the program's declaration, before it is loaded."""
+    from syncsummoner.device.declared import (  # pylint: disable=import-outside-toplevel
+        UndeclaredProgramError,
+        declaration,
+    )
+
+    try:
+        declared = declaration(program)
+    except UndeclaredProgramError as err:
+        LOG.warning("%s: no bypass from a declaration: %s", program, err)
+        return None
+    return program_bypass(type("Declared", (), {"name": program, "declared": declared})())
+
+
+def dry_state(subject: Any, bypass: Callable[[Any], Any] = program_bypass) -> dict[int, int] | None:
     """The write that returns a program's input unprocessed: its bypass control set to its bypass value.
 
-    None when it has none, so its lead-in cannot carry the strip. No slot or label is assumed.
+    ``bypass(subject)`` finds it; None when there is none, so the lead-in cannot carry the strip.
     """
-    pick = bypass(info)
+    pick = bypass(subject)
     return None if pick is None else {pick.parameter_id: pick.value}
 
 
@@ -325,13 +334,6 @@ def read_latency(directory: str | Path) -> ev.Latency:
     return found
 
 
-def _sleep_until(
-    t_ns: int, *, clock: Callable[[], int] = time.monotonic_ns, sleep: Callable[[float], None] = time.sleep
-) -> None:
-    while (left := t_ns - clock()) > 0:
-        sleep(min(left / 1e9, 0.5))
-
-
 def calibrate(sender: Sender, dry: Mapping[int, int], initial: Mapping[int, int], lead_in: LeadIn) -> None:
     """Toggle the dry control between dry and the take's wet value at random intervals, ending dry."""
     rng = np.random.default_rng(lead_in.seed)
@@ -340,295 +342,6 @@ def calibrate(sender: Sender, dry: Mapping[int, int], initial: Mapping[int, int]
     for index in range(2 * lead_in.toggles):
         time.sleep(float(rng.uniform(*lead_in.toggle_s)))
         sender.send(slot, wet if index % 2 == 0 else dry_value, int(ev.CALIBRATION))
-
-
-def locked_take(
-    rig: Any,
-    recorder: Any,
-    out: str | Path,
-    *,
-    program: str,
-    seconds: float,
-    config: Any,
-    plan: np.ndarray,
-    working: Callable[[Any], Mapping[int, Any]],
-    load: Callable[[str], Any],
-    lead_in: LeadIn = LeadIn(),
-    bypass: Callable[[Any], Any] = program_bypass,
-) -> Record:
-    """Record ``program`` playing the clip with every planned write sent for its frame.
-
-    ``load(name)`` loads a program and checks the rig, returning its program info, and
-    ``working(info)`` gives its working point; ``bypass(info)`` gives its dry setting, set again
-    for the strip-coded lead-out, as long as the lead-in, or Passthru reloaded for it with none.
-    A rise in the boot count is a :class:`RebootError`.
-    """
-    shell = rig.transport.device.shell
-    midi = rig.transport.device.midi
-    fps = float(config.fps)
-    lead, count = int(round(config.lead_in_s * fps)), int(round(seconds * fps))
-    booted = boot_count(shell)
-    info = load(program)
-    dry = dry_state(info, bypass)
-    initial = initial_state(working(info), plan)
-    park = np.asarray(rig.session.park_values, dtype=np.int64)
-    encode = encoder(midi.cc_map, high_resolution=getattr(midi, "high_resolution", True))
-
-    def write(param: int, value: int) -> int:
-        offset = int(np.clip(value - park[param - 1], 0, PARAM_MAX))
-        rig.transport.set_param(param, offset)
-        return int(midi.get_param(param)) + int(park[param - 1])
-
-    loads: list[dict] = []
-
-    def timed(name: str) -> Any:
-        began = time.monotonic_ns()
-        said = load(name)
-        loads.append({"program": name, "t0_ns": began, "t1_ns": time.monotonic_ns()})
-        return said
-
-    if dry is None:
-        read_latency(Path(out).parent)
-        load("Passthru")
-    start_state = {**initial, **(dry or {})}
-    slots = np.arange(1, PARAM_COUNT + 1)
-    start_vector = snap_toggles(slots, [start_state.get(i, int(park[i - 1])) for i in slots])
-    wet = wet_at(lead_in, fps)
-    asked = plan_rows(plan, dry, initial, wet_frame=wet, dry_frame=count).copy()
-    asked["value"] = snap_toggles(asked["param"], asked["value"])
-    rows = schedule(asked, start_vector)
-    echoes = Echoes()
-    sender = Sender(write, echoes=echoes, encode=encode)
-    poller = Poller(shell, interval_s=lead_in.poll_s, echoes=echoes)
-    held: dict[str, Any] = {"rows": rows, "delta": float("nan"), "loaded": None}
-    try:
-        with (
-            recorder.recording(out),
-            rig.playout.playing(fps=fps) as player,
-            _monitored(shell, poller, sender),
-        ):
-            if dry is None:
-                timed(program)
-            _play(
-                rig,
-                out,
-                sender=sender,
-                poller=poller,
-                shell=shell,
-                player=player,
-                held=held,
-                program=program,
-                config=config,
-                lead=lead,
-                count=count,
-                dry=dry,
-                initial=initial,
-                start=start_vector,
-                park=park,
-                lead_in=lead_in,
-                reload=timed if dry is None else None,
-            )
-            hold = int(player.status().get("hold", 1))
-        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=lead, wet=True)
-    finally:
-        asked = held["loaded"]
-        save_wire(
-            out,
-            plan=held["rows"],
-            initial=np.asarray(park, dtype=np.int64),
-            start=start_vector.astype(np.int64),
-            sends=sender.array(),
-            resent=sender.resent(),
-            delta=np.float64(held["delta"]),
-            latency=np.array(json.dumps(held.get("latency", {}))),
-            cc_map=np.asarray(midi.cc_map, dtype=np.int64),
-            loaded=np.array(
-                json.dumps(
-                    {}
-                    if asked is None
-                    else {
-                        "fpga": asked.payload,
-                        "error": asked.error,
-                        "t0_ns": asked.t0_ns,
-                        "t1_ns": asked.t1_ns,
-                    }
-                )
-            ),
-            dry=np.array(json.dumps(dry)),
-            loads=np.array(json.dumps(loads)),
-            program=np.array(program),
-            names=np.array(json.dumps({int(spec.index): spec.name for spec in info.params})),
-            **poller.arrays(),
-        )
-        rebooted = boot_count(shell)
-        if rebooted != booted:
-            raise RebootError(
-                f"{program}: the device's boot count went from {booted} to {rebooted} during the take"
-            )
-    return Record(
-        plan=held["rows"],
-        initial=np.asarray(park, dtype=np.int64),
-        sends=sender.array(),
-        arrays=poller.arrays(),
-        delta=held["delta"],
-        dry=dry,
-        loaded={} if held["loaded"] is None else {"fpga": held["loaded"].payload},
-        cc_map=np.asarray(midi.cc_map, dtype=np.int64),
-        resent=sender.resent(),
-    )
-
-
-def _play(
-    rig: Any,
-    out: str | Path,
-    *,
-    sender: Sender,
-    poller: Poller,
-    shell: Any,
-    player: Any,
-    held: dict,
-    program: str,
-    config: Any,
-    lead: int,
-    count: int,
-    dry: Mapping[int, int] | None,
-    initial: Mapping[int, int],
-    start: np.ndarray,
-    park: np.ndarray,
-    lead_in: LeadIn,
-    reload: Callable[[str], Any] | None = None,
-) -> None:
-    """The take from playout start: lead-in writes, calibration, the live clock, the plan, the lead-out.
-
-    The cyclic collector is off meanwhile: a full collection holds the interpreter lock for longer
-    than the half frame a send has to make its tick, stalling the sender and the poller together.
-    """
-    began = time.monotonic_ns()
-    switch = sys.getswitchinterval()
-    sys.setswitchinterval(SWITCH_S)
-    collecting = gc.isenabled()
-    gc.disable()
-    try:
-        _run(
-            rig,
-            out,
-            sender=sender,
-            poller=poller,
-            shell=shell,
-            player=player,
-            held=held,
-            program=program,
-            config=config,
-            lead=lead,
-            count=count,
-            dry=dry,
-            initial=initial,
-            start=start,
-            park=park,
-            lead_in=lead_in,
-            began=began,
-            reload=reload,
-        )
-    finally:
-        sys.setswitchinterval(switch)
-        if collecting:
-            gc.enable()
-
-
-def _run(
-    rig: Any,
-    out: str | Path,
-    *,
-    sender: Sender,
-    poller: Poller,
-    shell: Any,
-    player: Any,
-    held: dict,
-    program: str,
-    config: Any,
-    lead: int,
-    count: int,
-    dry: Mapping[int, int] | None,
-    initial: Mapping[int, int],
-    start: np.ndarray,
-    park: np.ndarray,
-    lead_in: LeadIn,
-    began: int,
-    reload: Callable[[str], Any] | None = None,
-) -> None:
-    """The take's body, run with the interpreter switching threads often enough for the sender.
-
-    Every write is acknowledged before the next goes: the start state, each slot not already parked
-    at its value, then the calibration toggles and the plan. With ``reload``, Passthru is loaded for the
-    lead-out once the clip has played, the sender, poller and monitor stopped first so the load is the shell's
-    only client; either way the lead-out is held as long as the lead-in's wet stretch.
-    """
-    shell.command("midi", "monitor", "on")
-    del shell.log_lines[:]
-    poller.start()
-    for slot in np.flatnonzero(start != park) + 1:
-        sender.send(int(slot), int(start[slot - 1]), ev.START)
-    time.sleep(lead_in.settle_s)
-    if dry is not None:
-        calibrate(sender, dry, initial, lead_in)
-    hold = int(player.status().get("hold", 1))
-    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    codes, images = read_live(
-        out, strip_px=config.strip_px, bits=config.bits, size=CALIBRATION_SIZE, ffmpeg=ffmpeg
-    )
-    found, frames = live_attribution(
-        out, rig.playout.flips(), codes, config=config, hold=hold, lead=lead, count=count
-    )
-    times = ev.frame_times(found)
-    sends, wire = sender.array(), poller.arrays()
-    toggled = sends["target"] == ev.CALIBRATION
-    if dry is not None:
-        cc_map = rig.transport.device.midi.cc_map
-        echo = W.echoed(sends, wire["receipts"], wire["reads"], cc_map)
-        try:
-            lat = measure_latency(images, frames, found, sends[toggled], times, taken=echo[toggled])
-        except ev.EvidenceError as err:
-            LOG.warning("%s: %s; landing by the band dry takes measured", program, err)
-            lat = read_latency(Path(out).parent)
-        else:
-            write_latency(Path(out).parent, lat, program)
-            LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
-    else:
-        lat = read_latency(Path(out).parent)
-    held["delta"], held["latency"] = lat.delta, lat.as_dict()
-    clock = Clock.of(found, lat)
-    rows = held["rows"]
-    first_due = clock.when(int(rows["target"][0])) if rows.size else clock.when(0)
-    if time.monotonic_ns() >= first_due:
-        raise LeadInTimeError(
-            f"{program}: the clock was measured {(time.monotonic_ns() - first_due) / 1e9:.2f}s after the "
-            "first write was due; lengthen the lead-in"
-        )
-    clock.extend(_read_sidecar(out))
-    sender.when = clock.when
-    sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
-    sender.start()
-    _sleep_until(clock.when(-1) - int(clock.ticks.period))
-    held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
-    settle = -wet_at(lead_in, float(config.fps))
-    end = int(clock.times.at(count + (0 if reload else settle))) + int(config.tail_s * 1e9)
-    with meter((end - began) / 1e9, desc="take") as progress:
-        while (now := time.monotonic_ns()) < end:
-            time.sleep(min(1.0, (end - now) / 1e9))
-            clock.extend(_read_sidecar(out))
-            progress.to((time.monotonic_ns() - began) / 1e9)
-    sender.drain(timeout_s=1.0)
-    if reload is not None:
-        _reload_quiet(sender, poller, shell, reload)
-        _sleep_until(time.monotonic_ns() + int(clock.times.period * settle))
-
-
-def _reload_quiet(sender: Sender, poller: Poller, shell: Any, reload: Callable[[str], Any]) -> None:
-    """Load Passthru for the lead-out with the sender, poller and monitor stopped: the shell's only client."""
-    sender.stop()
-    poller.stop()
-    shell.command("midi", "monitor", "off")
-    reload("Passthru")
 
 
 def plan_rows(
@@ -649,26 +362,6 @@ def plan_rows(
     return np.concatenate(rows)
 
 
-@contextmanager
-def _monitored(shell: Any, poller: Poller, sender: Sender) -> Iterator[None]:
-    """Stop the sender and poller and turn the monitor off however the take ends."""
-    try:
-        yield
-    finally:
-        sender.stop()
-        poller.stop()
-        try:
-            shell.command("midi", "monitor", "off")
-        except Exception as err:  # pylint: disable=broad-exception-caught
-            LOG.warning("midi monitor left on: %s", err)
-
-
-def _read_sidecar(take: str | Path) -> np.ndarray:
-    from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
-
-    return read_log(take)
-
-
 def state_at(initial: np.ndarray, plan: np.ndarray, frame: int) -> np.ndarray:
     """The parameter vector the plan holds from ``frame`` on, starting from ``initial``."""
     state = np.asarray(initial, dtype=np.int64).copy()
@@ -680,7 +373,10 @@ def state_at(initial: np.ndarray, plan: np.ndarray, frame: int) -> np.ndarray:
 def loaded_before(
     program: str, wire: Mapping[str, Any], ticks: ev.Ticks, times: ev.FrameTimes, delta: float
 ) -> dict:
-    """Whether the device ran ``program`` and read back frame 0's parameters before frame 0's tick."""
+    """Whether the device ran ``program`` and read back frame 0's parameters before frame 0's tick.
+
+    A later take of a session reads back the state the take before left; its frame 0 lands on the tick.
+    """
     said = json.loads(str(wire["loaded"]))
     try:
         fpga = json.loads(said.get("fpga") or "{}")
@@ -690,7 +386,8 @@ def loaded_before(
         fpga.get("state") == "running"
         and str(fpga.get("program", "")).casefold() == program.rpartition("/")[2].casefold()
     )
-    want = state_at(wire["start"], wire["plan"], 0)
+    later = "session" in wire and json.loads(str(wire["session"])).get("index", 0) > 0
+    want = state_at(wire["start"], wire["plan"], -1 if later else 0)
     reads = wire["reads"]
     tick0 = np.rint((times.at(0) - delta - ticks.phase) / ticks.period)
     cutoff = ticks.lo + tick0 * ticks.period
@@ -802,14 +499,15 @@ def take_evidence(
     spec = decoded.Spec.of(config)
     features = decoded.features(take, spec, ffmpeg=ffmpeg) if features is None else features
     source = decoded.features(clip, spec, ffmpeg=ffmpeg) if source is None else source
-    wire = load_wire(take)
+    whole = load_wire(take)
+    wire = own_wire(whole)
     if names is None:
         names = {int(k): v for k, v in json.loads(str(wire["names"])).items()} if "names" in wire else {}
     found = attribute_take(take, config=config, features=features) if found is None else found
     frames = read_log(take)
     times = ev.frame_times(found)
     sends = wire["sends"]
-    echo = take_echo(wire)
+    echo, every = take_echo(wire), take_echo(whole)
     resent = wire.get("resent")
     images = features.small
     lat = take_latency(take, wire, (images, frames, found, times), echo)
@@ -818,15 +516,17 @@ def take_evidence(
     landed_rows = ev.landed(
         plan, sends, ticks, times, delta, echo=echo, resent=resent, spread=line_spread(found)
     )
+    reads = wire["reads"]
+    reads = reads[(reads["t0_ns"] >= frames["t_ns"][0]) & (reads["t0_ns"] <= frames["t_ns"][-1])]
     applied_rows = ev.applied(
-        wire["reads"], sends, wire["initial"], ticks, times, delta, echo=echo, resent=resent
+        reads, whole["sends"], wire["initial"], ticks, times, delta, echo=every, resent=whole.get("resent")
     )
     got = None
     if echo is not None:
-        got = W.received(W.expected_messages(sends, wire["cc_map"]), wire["receipts"], sends)
+        got = own_received(whole)
     count = found.picked.size
     out = images[found.picked].astype(np.float32)
-    src = source.small[found.lead : found.lead + count].astype(np.float32)
+    src = source.small[found.source_offset : found.source_offset + count].astype(np.float32)
     luma_range = np.ptp(out[:, 0].reshape(count, -1), axis=1)
     rows = landed_rows.rows
     sent = (rows["sent"] >= 0) & (rows["landed"] != ev.CALIBRATION)
@@ -861,6 +561,32 @@ def line_spread(found: Any) -> tuple[float, float]:
     least, most = found.line.polygon.at(n)
     line = found.line.origin + n * found.line.period
     return float(np.min(least - line, initial=0.0)), float(np.max(most - line, initial=0.0))
+
+
+def own_wire(wire: Mapping[str, Any]) -> dict:
+    """A wire record cut to the sends its take owns, resent copies renumbered.
+
+    A take recorded alone owns every send.
+    """
+    own = np.asarray(wire.get("own", np.ones(wire["sends"].size, dtype=bool)), dtype=bool)
+    resent = np.asarray(wire.get("resent", np.zeros(0, np.int64)), dtype=np.int64)
+    kept = np.searchsorted(np.flatnonzero(own), resent[own[resent]]) if resent.size else resent
+    return {**wire, "sends": wire["sends"][own], "resent": kept}
+
+
+def own_received(wire: Mapping[str, Any]) -> W.Received:
+    """The receipts of the messages a take's own sends carried, out of every send of its session."""
+    sends = wire["sends"]
+    own = np.asarray(wire.get("own", np.ones(sends.size, dtype=bool)), dtype=bool)
+    expected = W.expected_messages(sends, wire["cc_map"])
+    whole = W.received(expected, wire["receipts"], sends)
+    lost = own[whole.missing["send"]]
+    mine = int(np.count_nonzero(own[expected["send"]]))
+    matched = mine - int(lost.sum())
+    others = whole.matched - matched
+    return replace(
+        whole, sent=mine, received=whole.received - others, matched=matched, missing=whole.missing[lost]
+    )
 
 
 def take_echo(wire: Mapping[str, Any]) -> np.ndarray | None:

@@ -186,3 +186,17 @@ def test_a_clip_that_arrives_different_is_a_playout_error(tmp_path):
     with pytest.raises(po.PlayoutError, match="hashes"):
         po.ClipPlayer(runner=ClipHost(corrupt=True)).upload(str(clip))
     assert po.file_digest(clip, chunk=1) == hashlib.sha256(b"abc").hexdigest()
+
+
+def test_a_clip_player_plays_only_the_spans_asked_for():
+    player = po.ClipPlayer(runner=FakeRunner())
+    assert "--spans" not in player.command(Fraction(30))
+    command = player.command(Fraction(30), [(10, 40), (20, 50)])
+    assert command.split("--spans ")[1].split()[0] == "10:40,20:50"
+
+
+def test_a_loop_player_refuses_spans():
+    player = po.LoopPlayer(runner=FakeRunner())
+    assert "--spans" not in player.command(Fraction(10), None)
+    with pytest.raises(ValueError, match="plays no spans"):
+        player.command(Fraction(10), [(0, 3)])

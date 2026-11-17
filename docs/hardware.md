@@ -406,7 +406,7 @@ teletect/RamBend), the lag every line admits on one side meets the other's.
 | YUV Amplifier after czartroniks/Fray | 9.2 s | |
 | czartroniks/Fray after Pinwheel | 13.7 s | |
 
-A load that changes author is the slow one. A program loaded inside a locked take's lead-in, which only a program with no dry control still is, needs most of its 40 s for that reason: a load that enumerates another author takes about 20 s inside the take.
+A load that changes author is the slow one: one that enumerates another author takes about 20 s. A session's lead-in holds a load only for a program with no dry control, and is sized by the longest load the takes directory has timed (`loads.json`), so a slow load timed once is held for after.
 
 Across eleven link-dropped Passthru loads in one recording, the capture time of each frame's
 first capture, against the Pi's flip time for that frame, moved by between -4.5 and +10.0 ms

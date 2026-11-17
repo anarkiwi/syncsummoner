@@ -48,39 +48,66 @@ lands gains nothing from a narrower window.
 
 ## Frame-locked sends
 
-1. The program is loaded before playout and held dry for the lead-in by its
-   bypass setting (`locktake.dry_state`). This is the control setting that the
-   program's HDL shows leaves every other control dead and the input reaching
-   the video: a declared switch turned on, otherwise a fader such as a Mix at the
-   end of its range that returns the input exactly (`ProgramModel.bypass`,
-   [program-model.md](program-model.md)). No slot or label is assumed to do the
-   same thing across programs. The strip-coded lead-in then passes through unprocessed,
-   so the take is one gap-free run that the strips anchor; no load interrupts it.
-2. The dry control is toggled at random intervals and each toggle's first frame in
-   the lead-in's picture measures the latency band.
-3. While the recording runs, its stored captures are read (`lock.read_live`) and
-   attributed (`lock.live_attribution`), giving the frame line from the lead-in's strips.
-4. Each planned write for frame `j` is sent half a frame before the instant it must
+Takes are recorded in sessions (`locktake.locked_session`, `compose.session`): a program is
+loaded once and all its takes, a sweep's chunks or a render's pass, play back to back. The Pi
+plays the end of the clip's strip-coded lead-in, each take's clip frames from frame 0 in turn and
+a lead-out as one stream (`--spans`, `session.Layout.spans`), so the card never relocks and one
+frame line spans the session. The recorder rolls from one take's file to the next on the capture
+clock, both files keeping the captures every admitted line puts within a frame of the boundary
+(`v4l2rec`'s `roll T0 T1 PATH`); takes stay separate files with their own sidecars. A failed take
+is recaptured alone, as a session of one, which loads again.
+
+1. A program with a bypass setting (`locktake.dry_state`) is loaded before playout and held
+   dry by it. This is the control setting that the program's HDL shows leaves every other control
+   dead and the input reaching the video: a declared switch turned on, otherwise a fader such as a
+   Mix at the end of its range that returns the input exactly (`ProgramModel.bypass`,
+   [program-model.md](program-model.md)), found from the declaration before anything loads. No slot
+   or label is assumed to do the same thing across programs. No Passthru plays at all.
+2. Once the start state has settled and `lock.ANCHOR_FRAMES` frames have started unprocessed, the
+   dry control is toggled at random intervals and each toggle's first frame in the lead-in's
+   picture measures the latency band.
+3. While the recording runs, its stored captures are read (`lock.read_live`) and attributed
+   (`lock.live_attribution`), giving the frame line from the lead-in's strips; a lead-in whose
+   strips name no two frames is an `AnchorError`, never relaxed.
+4. Each planned write for session frame `j` is sent half a frame before the instant it must
    precede (`evidence.send_time`): the live clock can err either way and a send can
    wake late. The take runs with a short interpreter switch interval so the sending
    thread wakes promptly; each send records when it was due, and the report gives the
-   worst wake-up. The frame line is carried on while the take runs (`locktake.Clock.extend`):
-   each capture the growing sidecar shows starting a frame, its bytes differing from the
-   capture before's, is named by the line so far and narrows it, as the offline fit does.
+   worst wake-up. The frame line is carried on over every take's captures as the session runs
+   (`locktake.Clock.extend`): each capture starting a frame, its bytes differing from the capture
+   before's, is named by the line so far and narrows it, as the offline fit does.
 5. Two seconds before clip frame 0 the dry control is set to its take value; the
    last readback before frame 0's latch must equal frame 0's planned parameters,
-   and `fpga status` must name the program (`locktake.loaded_before`).
-6. On the frame after the clip's last the dry control is set dry again, and the take
-   runs on as long as the lead-in's wet stretch into the clip's lead-out, whose strips
-   then pin the frame line's far end.
+   and `fpga status` must name the program (`locktake.loaded_before`). A later take's frame 0
+   lands on its tick, so its last readback must equal the state the take before left.
+6. On the frame after the last take's last the dry control is set dry again, held as long as the
+   lead-in's wet stretch and `ANCHOR_FRAMES` more, whose strips pin the line's far end.
 
-A program with no bypass setting keeps the old lead-in: Passthru
-under the strips, the program loaded inside it, the outage bridged by the Pi's flip
-log; Passthru is loaded again for the lead-out. Its latency band is where every dry
-take's `Latency.bounds` meet (`ccpicture.json`, start-basis records only; a judged dry take
-records its own); `render --cut-programs` renders such programs after a dry one. However
-wide that band, it only widens such a take's landing windows; bands that do not meet at all
-contradict each other and stop the take.
+A program with no bypass setting has Passthru only at the session's ends: the lead-in plays
+under Passthru, the program is loaded once `ANCHOR_FRAMES` frames have started, the outage
+bridged by the Pi's flip log, and Passthru is loaded again after the last take. Its latency band
+is where every dry take's `Latency.bounds` meet (`ccpicture.json`, start-basis records only; a
+judged dry take records its own); `render --cut-programs` renders such programs after a dry one.
+However wide that band, it only widens such a take's landing windows; bands that do not meet at
+all contradict each other and stop the take.
+
+The lead-in holds exactly what it must (`session.lead_in_frames`): with a bypass, the start
+state's settle, the anchor and the toggles at their longest; without one, the anchor, the longest
+load timed (`loads.json`, every load of every session) and the settle. The clock is then measured
+from what was recorded, which the host decodes faster than real time, so it takes at most as long
+again; a bypass's wet stretch follows. The lead-out (`session.lead_out_frames`) holds the dry state
+as long as the lead-in held the wet one, or Passthru's load and its first landed frame, then the
+anchor. A clock measured after the first write was due is a `LeadInTimeError`, a load past the
+lead-in fails `loaded_before`, and a clip whose lead-in or lead-out is shorter than the session's
+is refused before anything plays. Device waits fail as stalled once they see nothing for longer
+than the longest load timed (`render.open_rig`), unless `--stall` says otherwise.
+
+Each take's lock record carries the session's id, its whole capture log, the strips read on it
+(its anchors) and when a program processed the picture (`lock.session_record`). Takes 2..n carry
+no anchor of their own: each is attributed on the session's line through every capture of the
+session, then cut to its own captures and clip frames (`lock.View`). Each take's wire record holds
+every send of the session, those it owns marked (`own`): its landings and receipts are judged on
+its own sends, its readbacks against every send while it recorded.
 
 The boot count (settings key 9) is read before and after every take; any rise is a
 `RebootError`.

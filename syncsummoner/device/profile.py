@@ -215,6 +215,14 @@ class MeasurementRecord:
         )
 
 
+class Profiles(dict):
+    """Program profiles by program name, with the directory they were read from."""
+
+    def __init__(self, profiles: Mapping[str, Any] = (), directory: Any = None):
+        super().__init__(profiles)
+        self.directory = directory
+
+
 @dataclass
 class ProgramProfile:
     """Fitted behaviour of one program: what each parameter does, and where it breaks."""

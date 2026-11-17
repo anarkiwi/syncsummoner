@@ -7,8 +7,9 @@ or the captures' bytes show; each capture shows the frame its time falls in on t
 
 from __future__ import annotations
 
+import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -26,6 +27,29 @@ class LockError(RuntimeError):
 
 class LostTimecodeError(RuntimeError):
     """A take carries no lock record, so nothing says which capture shows which clip frame."""
+
+
+class AnchorError(LockError):
+    """The lead-in's unprocessed captures name too few frames by strip to fix the frame line."""
+
+
+#: Frames an unprocessed stretch must show for its strips to fix the frame line: a start is strip-named
+#: only when the capture before it shows the frame before (:func:`anchors`), and a run is fixed only by
+#: named starts on two frames (:func:`_lines`), so the frame before the first named one counts too.
+ANCHOR_FRAMES = 3
+
+
+def require_anchor(found: "Attribution", what: str) -> "Attribution":
+    """``found`` once its lead-in's strips fixed its frame line; an :class:`AnchorError` naming ``what`` else.
+
+    Nothing else numbers a session's frames, so a lead-in that leaves it to the Pi's flips is refused.
+    """
+    if not found.anchored:
+        raise AnchorError(
+            f"{what}: the lead-in's unprocessed captures name no two frames by strip, so they do not fix "
+            f"the frame line; it must show {ANCHOR_FRAMES} consecutive legible strip-coded frames"
+        )
+    return found
 
 
 @dataclass(frozen=True)
@@ -63,6 +87,15 @@ class Attribution:
     resolution: float = 0.0
     ambiguity: np.ndarray | None = None
     clock: tuple = ()
+    #: Whether the strips fixed the first run's line, the lead-in's.
+    anchored: bool = True
+    #: The clip file's index of clip frame 0, when its lead-in is not ``lead``.
+    source_lead: int | None = None
+
+    @property
+    def source_offset(self) -> int:
+        """The clip file's index of clip frame 0: its own lead-in, which a session plays only the end of."""
+        return self.lead if self.source_lead is None else self.source_lead
 
     @property
     def period_ns(self) -> float:
@@ -140,6 +173,31 @@ class Attribution:
             f"{self.behind} behind, {self.faults} a boundary off, {self.rejected} lead strips off the line; "
             f"{self.strays} byte changes off the line in the clip; {self.drops} frames lost by the driver"
         )
+
+
+@dataclass(frozen=True)
+class View:
+    """One take of a session: its clip frames ``offset..offset+count-1`` of the session's, and the
+    session captures it holds, ``captures``, rising.
+    """
+
+    offset: int
+    count: int
+    captures: np.ndarray
+
+    def picked(self, picked: np.ndarray) -> np.ndarray:
+        """The take's own capture showing each of its clip frames, -1 where the take holds none."""
+        mine = picked[self.offset : self.offset + self.count]
+        if not self.captures.size:
+            return np.full(mine.size, -1, dtype=np.int64)
+        at = np.clip(np.searchsorted(self.captures, mine), 0, self.captures.size - 1)
+        return np.where((mine >= 0) & (self.captures[at] == mine), at, -1)
+
+    def span(self, run: np.ndarray) -> tuple[int, int]:
+        """The take's own first and last capture of a run given by session captures."""
+        lo = int(np.searchsorted(self.captures, run[0])) if run.size else 0
+        hi = int(np.searchsorted(self.captures, run[-1], side="right")) - 1 if run.size else -1
+        return lo, hi
 
 
 def displays(flips: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
@@ -221,7 +279,9 @@ def attribute(
     tail: int = 0,
     bits: int = 16,
     trusted: np.ndarray | None = None,
+    view: View | None = None,
 ) -> Attribution:
+    # A ``view`` attributes one take of the session whose captures these are.
     """Attribute every capture of a take to the clip frame it shows.
 
     ``codes`` are the captures' strip codes, ``frames`` their V4L2 records and ``flips`` the Pi's
@@ -246,48 +306,57 @@ def attribute(
     named, group = anchors(dry, seg)
     digest = frames["digest"]
     k = np.flatnonzero(np.r_[False, seg[1:] == seg[:-1]] & (changes(digest) | (named >= 0)))
-    runs = np.unique(seg)
-    lines, clocks = _lines(tau, k, seg, (named, group), (jitter, resolution), (shown_at, hold * vblank))
+    lines, clocks, fixed = _lines(
+        tau, k, seg, (named, group), (jitter, resolution), (shown_at, hold * vblank)
+    )
     main_run = max(lines, key=lambda s: int(np.count_nonzero(seg == s)))
-    main, mine = lines[main_run], np.flatnonzero(seg == main_run)
+    main = lines[main_run]
     shown = np.full(tau.size, -1 - lead, dtype=np.int64)
     uncertain = np.zeros(tau.size, dtype=bool)
-    tied = 0
+    tie = np.zeros(tau.size, dtype=bool)
     for s, line in lines.items():
         at = np.flatnonzero(seg == s)
         n, on, ties = _frames(line, tau[at], digest[at], resolution)
-        shown[at], uncertain[at] = n - lead, on
-        tied += ties
-    starts = np.r_[True, (shown[1:] != shown[:-1]) | (seg[1:] != seg[:-1])]
+        shown[at], uncertain[at], tie[at] = n - lead, on, ties
+    begins = np.r_[True, (shown[1:] != shown[:-1]) | (seg[1:] != seg[:-1])]
     per_frame = max(1, int(round(main.period / capture)))
     picked = _pick(shown, tau, seg, lines, lead, count, resolution)
     diff = np.where(legible, clip - shown, 0)
-    stray = np.concatenate([k[seg[k] == s][line.strays] for s, line in lines.items()]).astype(np.int64)
+    stray = np.zeros(tau.size, dtype=bool)
+    stray[np.concatenate([k[seg[k] == s][line.strays] for s, line in lines.items()]).astype(np.int64)] = True
+    view = View(0, count, np.arange(tau.size)) if view is None else view
+    mine, first = view.captures, view.offset
+    stray &= (shown >= first) & (shown < first + view.count)
+    run_of = seg[mine]
+    in_main = mine[seg[mine] == main_run]
     return Attribution(
-        picked=picked,
-        shown=shown,
-        starts=starts,
+        picked=view.picked(picked),
+        shown=shown[mine] - first,
+        starts=begins[mine],
         per_frame=per_frame,
-        lead=lead,
+        lead=lead + first,
         line=main,
         capture_ns=capture,
         jitter_ns=jitter,
-        frame0_ns=float(main.origin + lead * main.period),
-        runs=int(runs.size),
-        slips=_slips(lines, tau, seg, per_frame),
-        uncertain=int(uncertain.sum()),
-        tied=int(tied),
-        drops=int(np.clip(np.diff(frames["sequence"]) - 1, 0, None).sum()),
-        read=int(legible.sum()),
-        agreed=int(np.count_nonzero(legible & (diff == 0))),
-        ahead=int(np.count_nonzero(diff > 0)),
-        faults=int(np.count_nonzero(uncertain & (np.abs(diff) == 1))),
-        strays=int(np.count_nonzero((shown[stray] >= 0) & (shown[stray] < count))),
+        frame0_ns=float(main.origin + (lead + first) * main.period),
+        runs=int(np.unique(run_of).size),
+        slips=_slips({s: lines[s] for s in np.unique(run_of) if s in lines}, tau[mine], run_of, per_frame),
+        uncertain=int(uncertain[mine].sum()),
+        tied=int(tie[mine].sum()),
+        drops=int(np.clip(np.diff(frames["sequence"][mine]) - 1, 0, None).sum()),
+        read=int(legible[mine].sum()),
+        agreed=int(np.count_nonzero(legible[mine] & (diff[mine] == 0))),
+        ahead=int(np.count_nonzero(diff[mine] > 0)),
+        faults=int(np.count_nonzero(uncertain[mine] & (np.abs(diff[mine]) == 1))),
+        strays=int(np.count_nonzero(stray[mine])),
         rejected=int(sum(line.rejected for line in lines.values())),
-        span=(int(mine[0]), int(mine[-1])),
+        span=view.span(np.flatnonzero(seg == main_run) if not in_main.size else in_main),
         resolution=resolution,
-        ambiguity=_ambiguity(seg, clocks),
-        clock=tuple(clocks.values()),
+        ambiguity=_ambiguity(seg, clocks)[mine],
+        clock=tuple(
+            {**said, "run": int(said["run"] - run_of[0])} for s, said in clocks.items() if s in set(run_of)
+        ),
+        anchored=seg[0] in fixed,
     )
 
 
@@ -299,8 +368,10 @@ def _ambiguity(seg: np.ndarray, clocks: dict) -> np.ndarray:
     return out
 
 
-def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, error: tuple, pi: tuple) -> dict:
-    """Each run's frame line through its starts ``k``, within ``error``: the capture jitter and resolution.
+def _lines(
+    tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, error: tuple, pi: tuple
+) -> tuple:
+    """Each run's frame line through its starts ``k``, within ``error``, its clock numbering, the runs fixed.
 
     ``pi`` is ``(shown_at, period)``: when the Pi first showed each frame, and its frame period.
 
@@ -325,8 +396,9 @@ def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, err
 
     fixed = sorted((s for s in runs if spans(s)), key=lambda s: -int((own[s] >= 0).sum()))
     if not fixed:
-        raise LockError(
-            "no run of captures carries two legible strip-coded frames, so nothing fixes the line"
+        raise AnchorError(
+            "no run of captures carries two legible strip-coded frames, so nothing fixes the line; "
+            f"an unprocessed stretch must show {ANCHOR_FRAMES} consecutive legible strip-coded frames"
         )
 
     def fitted(s: int, period: tuple[float, float] | None) -> frameline.Line:
@@ -358,6 +430,7 @@ def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, err
         own[s] = np.full_like(own[s], -1)
         lines[s] = fitted(s, period)
     clocks = _clocked(lines, between, fixed, [tau, k, seg, own], resolution)
+    anchored = [s for s in fixed if (own[s] >= 0).any()]
     for s in runs:
         if not (own[s] >= 0).any() and s not in clocks:
             try:
@@ -365,7 +438,7 @@ def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, err
             except LockError as err:
                 LOG.warning("captures in run %d are left unattributed: %s", s, err)
                 del lines[s]
-    return lines, clocks
+    return lines, clocks, anchored
 
 
 def _clocked(lines: dict, between: list[int], fixed: list[int], seen: list, resolution: float) -> dict:
@@ -473,12 +546,12 @@ def _bridge(
 
 def _frames(
     line: frameline.Line, tau: np.ndarray, digest: np.ndarray, resolution: float
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each capture's frame: the side of its nearest boundary every admitted line puts it, else its bytes'.
 
     The admitted range is widened by the line's slack, and a capture within the timestamps' ``resolution``
     of it is on its side. Bytes equal to the capture before's are its frame, to the next's the next;
-    equal to both or neither, any choice measures alike and the line's stands, counted in the count returned.
+    equal to both or neither, any choice measures alike and the line's stands, marked in the mask returned.
     """
     b = np.rint((tau - line.origin) / line.period).astype(np.int64)
     lo, hi = line.polygon.at(b)
@@ -491,7 +564,7 @@ def _frames(
     n = np.where(
         new | (sure & same_after), b, np.where(old | (sure & same_before), b - 1, line.frame_of(tau))
     )
-    return n, on, int(np.count_nonzero(on & ~sure))
+    return n, on, on & ~sure
 
 
 def _pick(
@@ -535,16 +608,47 @@ def picked_path(take: str | Path) -> Path:
 
 
 def save_lock(
-    take: str | Path, flips: np.ndarray, *, hold: int, lead: int, count: int, tail: int = 0, wet: bool = False
+    take: str | Path,
+    flips: np.ndarray,
+    *,
+    hold: int,
+    lead: int,
+    count: int,
+    tail: int = 0,
+    wet: bool = False,
+    **session: Any,
 ) -> None:
-    """Keep what attribution needs from the Pi next to the take; ``wet`` when a program played the clip."""
-    np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count, tail=tail, wet=wet)
+    """Keep what attribution needs from the Pi next to the take; ``wet`` when a program played the clip.
+
+    A take of a session also keeps the session's own (:func:`session_record`), ``lead``, ``count``
+    and ``tail`` then being the session's.
+    """
+    np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count, tail=tail, wet=wet, **session)
+
+
+def session_record(said: dict, log: np.ndarray, codes: np.ndarray, span: tuple[float, float] | None) -> dict:
+    """A session's share of each take's lock record: ``said`` (its id, this take's index, every take's
+    clip frame offset and count, the clip's own lead-in), the session's whole capture log, the strip code
+    read at each capture (its anchors; -1 where none was read), and when a program processed the picture.
+    """
+    return {
+        "session": np.array(json.dumps({**said, "processed": span})),
+        "session_log": log,
+        "session_codes": np.asarray(codes, dtype=np.int64),
+    }
+
+
+def session_log(logs: Sequence[np.ndarray]) -> np.ndarray:
+    """One capture log from a session's takes' logs: every capture once, in the card's order.
+
+    Takes recorded back to back share the captures either side of each roll (:mod:`~.v4l2rec`).
+    """
+    whole = np.concatenate(list(logs)) if logs else np.zeros(0)
+    return whole[np.unique(whole["sequence"], return_index=True)[1]] if whole.size else whole
 
 
 def save_clock(take: str | Path, clock: Sequence[dict]) -> None:
     """Keep the capture clock's numbering of the take's runs in its lock record, every other key as it was."""
-    import json  # pylint: disable=import-outside-toplevel
-
     with np.load(lock_path(take)) as record:
         kept = {key: record[key] for key in record.files if key != "clock"}
     np.savez(lock_path(take), **kept, clock=np.array(json.dumps(list(clock))))
@@ -552,14 +656,15 @@ def save_clock(take: str | Path, clock: Sequence[dict]) -> None:
 
 def read_clock(take: str | Path) -> list[dict]:
     """The capture clock's numbering of the take's runs as its lock record keeps it; none if never judged."""
-    import json  # pylint: disable=import-outside-toplevel
-
     with np.load(lock_path(take)) as record:
         return json.loads(str(record["clock"])) if "clock" in record.files else []
 
 
 def _trusted(take: str | Path, record: Any, frames: np.ndarray) -> np.ndarray | None:
-    span = processed(take, record, frames)
+    if "session" in record.files:
+        span = json.loads(str(record["session"]))["processed"]
+    else:
+        span = processed(take, record, frames)
     if span is None:
         return None
     t = frames["t_ns"].astype(np.float64)
@@ -595,8 +700,6 @@ def processed(take: str | Path, record: Any, frames: np.ndarray) -> tuple[float,
 
 def _written_span(wire: Any, count: int) -> tuple[float, float] | None:
     """:func:`processed` from a wire record: the dry control's writes, else the loads it recorded."""
-    import json  # pylint: disable=import-outside-toplevel
-
     from syncsummoner.compose.evidence import START  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.wire import echoed  # pylint: disable=import-outside-toplevel
 
@@ -646,17 +749,20 @@ def attribute_take(
             )
         codes = features.codes
     frames = read_log(take)
-    found = attribute(
-        codes,
-        frames,
-        record["flips"],
-        hold=int(record["hold"]),
-        lead=int(record["lead"]),
-        count=int(record["count"]),
-        tail=int(record["tail"]) if "tail" in record else 0,
-        bits=config.bits,
-        trusted=_trusted(take, record, frames),
-    )
+    if "session" in record.files:
+        found = _session_take(take, record, codes, frames, bits=config.bits)
+    else:
+        found = attribute(
+            codes,
+            frames,
+            record["flips"],
+            hold=int(record["hold"]),
+            lead=int(record["lead"]),
+            count=int(record["count"]),
+            tail=int(record["tail"]) if "tail" in record else 0,
+            bits=config.bits,
+            trusted=_trusted(take, record, frames),
+        )
     LOG.info("%s: %s", take, found.summary())
     if not found.complete:
         raise LockError(f"{take}: {found.summary()}")
@@ -664,6 +770,45 @@ def attribute_take(
         raise LockError(f"{take}: the strips or bytes contradict the frame line: {found.summary()}")
     np.save(picked_path(take), found.picked)
     return found
+
+
+def _session_take(
+    take: str | Path, record: Any, codes: np.ndarray, frames: np.ndarray, *, bits: int
+) -> Attribution:
+    """A session take's attribution: the session's frame line, through every capture of the session.
+
+    The take's own strips stand where the session read none; a lead-out strip, read as the last take's
+    clip frame, is renumbered to the session's. The lead-in's strips must fix it (:func:`require_anchor`).
+    """
+    said = json.loads(str(record["session"]))
+    log = record["session_log"]
+    whole = np.array(record["session_codes"], dtype=np.int64)
+    at = np.searchsorted(log["sequence"], frames["sequence"])
+    if at.size and (at.max() >= log.size or not np.array_equal(log["sequence"][at], frames["sequence"])):
+        raise LockError(f"{take}: its captures are not the session's {said['id']}")
+    own = np.asarray(codes, dtype=np.int64)[: at.size]
+    whole[at[: own.size]] = np.where(own >= 0, own, whole[at[: own.size]])
+    t = log["t_ns"].astype(np.float64)
+    span = said["processed"]
+    trusted = None if span is None else (t < span[0]) | (t > span[1])
+    after = (whole >= 0) & (signed(whole, bits) >= 0) & (t > (np.inf if span is None else span[1]))
+    whole[after] = (whole[after] + said["offsets"][-1]) & ((1 << bits) - 1)
+    index = int(said["index"])
+    found = attribute(
+        whole,
+        log,
+        record["flips"],
+        hold=int(record["hold"]),
+        lead=int(record["lead"]),
+        count=int(record["count"]),
+        tail=int(record["tail"]),
+        bits=bits,
+        trusted=trusted,
+        view=View(int(said["offsets"][index]), int(said["counts"][index]), at),
+    )
+    return replace(
+        require_anchor(found, f"{take} (session {said['id']})"), source_lead=int(said["source_lead"])
+    )
 
 
 def read_live(
@@ -710,7 +855,7 @@ def live_attribution(
         flips.size,
     )
     found = attribute(codes[:size], frames[:size], flips, hold=hold, lead=lead, count=count, bits=config.bits)
-    return found, frames[:size]
+    return require_anchor(found, str(take)), frames[:size]
 
 
 def take_start(take: str | Path, *, config: Any) -> float:

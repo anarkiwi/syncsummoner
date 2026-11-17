@@ -15,12 +15,16 @@ from pyvmancer import CcMapError
 
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import locktake
+from syncsummoner.compose import session as compose_session
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
+from syncsummoner.compose.session import record_load
+from syncsummoner.compose.timecode import ClipLayout
 from syncsummoner.compose.vocabulary import Automation
+from syncsummoner.device.profile import Profiles
 from syncsummoner.probe.patterns import read_timecode
 from tests.compose import PROBED, rig_transport
-from tests.compose.locked import LOCKED, Clock, Proof, locked_pass, render_locked
+from tests.compose.locked import CLIP, LOCKED, Clock, Proof, locked_pass, render_locked
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
 
@@ -47,7 +51,7 @@ def test_timecode_absent_or_washed_out_reads_none():
     assert read_timecode(burned * 0.1, bits=16, strip_px=4) is None
 
 
-def test_open_rig_builds_from_the_device_layer(monkeypatch):
+def test_open_rig_builds_from_the_device_layer(monkeypatch, tmp_path):
     built = {}
 
     def module(name, **attrs):
@@ -86,8 +90,11 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
     R.open_rig(dataclasses.replace(CONFIG, source_host="pi@rig"))
     assert built["link"][0] == ("pi@rig",) and built["playout"][0] == ("pi@rig",)
-    R.open_rig(dataclasses.replace(CONFIG, stall_s=5.0))
-    assert stalls == [CONFIG.lead_in_s, CONFIG.lead_in_s, 5.0], "a wait seeing nothing past a load fails"
+    R.open_rig(dataclasses.replace(CONFIG, stall_s=5.0), directory=tmp_path)
+    record_load(tmp_path, "Teletext", 0, 3_000_000_000)
+    record_load(tmp_path, "Passthru", 0, 2_000_000_000)
+    R.open_rig(CONFIG, directory=tmp_path)
+    assert stalls == [None, None, 5.0, 3.0], "a wait seeing nothing past the longest load timed fails"
 
 
 def test_enforce_safety_passes_safe_output_through():
@@ -308,13 +315,13 @@ def test_a_take_plans_only_the_writes_inside_its_clip(monkeypatch, tmp_path):
     """Writes are targeted on clip frames; one due past the clip's last frame is never sent."""
     rig = locked_pass(monkeypatch)
     planned = []
-    take_fn = locktake.locked_take
+    take_fn = compose_session.locked_take
 
     def capture(*args, plan, **kw):
         planned.append(plan.copy())
         return take_fn(*args, plan=plan, **kw)
 
-    monkeypatch.setattr(locktake, "locked_take", capture)
+    monkeypatch.setattr(compose_session, "locked_take", capture)
     auto = Automation.of([0.0, 0.05, 0.3], 2, [100, 200, 300])
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {0: auto})
     render_locked(rig, tmp_path / "take.mkv")
@@ -326,7 +333,7 @@ def test_a_take_plans_only_the_writes_inside_its_clip(monkeypatch, tmp_path):
 def test_a_passthru_take_loads_nothing_inside_its_lead_in(monkeypatch, tmp_path):
     rig = locked_pass(monkeypatch, clock=Clock(5.0))
     out = tmp_path / "take.mkv"
-    loaded = R.play_take(rig.rig, rig, out, program=None, seconds=0.2, config=LOCKED)
+    loaded = R.play_take(rig.rig, rig, out, program=None, seconds=0.2, config=LOCKED, clip=CLIP)
     assert rig.steps == ["load", "record", "play", "stop", "recorded", "flips"] and loaded == 5.0
     assert L.lock_path(out).is_file()
 
@@ -334,7 +341,7 @@ def test_a_passthru_take_loads_nothing_inside_its_lead_in(monkeypatch, tmp_path)
 def test_a_lockcheck_take_loads_its_program_inside_the_lead_in(monkeypatch, tmp_path):
     rig = locked_pass(monkeypatch, load_s={"Teletext": 0.1})
     out = tmp_path / "take.mkv"
-    loaded = R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED)
+    loaded = R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED, clip=CLIP)
     assert [step[1] for step in rig.log if step[0] == "load"] == ["Passthru", "Teletext", "Passthru"]
     assert rig.steps[:5] == ["load", "record", "play", "load", "params"] and loaded == pytest.approx(0.1)
     assert rig.clock.now == pytest.approx((8 + 6 + 8) / 30 + LOCKED.tail_s)
@@ -345,7 +352,9 @@ def test_a_lockcheck_take_loads_its_program_inside_the_lead_in(monkeypatch, tmp_
 def test_passthru_loading_past_the_lead_out_is_a_lead_in_error(monkeypatch, tmp_path):
     rig = locked_pass(monkeypatch, load_s={"Passthru": 0.3})
     with pytest.raises(R.LeadInError, match="Teletext: Passthru loaded past the lead-out"):
-        R.play_take(rig.rig, rig, tmp_path / "take.mkv", program="Teletext", seconds=0.2, config=LOCKED)
+        R.play_take(
+            rig.rig, rig, tmp_path / "take.mkv", program="Teletext", seconds=0.2, config=LOCKED, clip=CLIP
+        )
     assert not L.lock_path(tmp_path / "take.mkv").exists()
 
 
@@ -353,14 +362,77 @@ def test_a_load_that_overruns_the_lead_in_is_a_lead_in_error(monkeypatch, tmp_pa
     rig = locked_pass(monkeypatch, load_s={"Teletext": 0.3})
     out = tmp_path / "take.mkv"
     with pytest.raises(
-        R.LeadInError, match=r"Teletext: loading took 0.3s, past the 0.3s lead-in; raise lead_in_s"
+        R.LeadInError,
+        match=r"Teletext: loading took 0.3s, past the 0.3s lead-in; timecode the clip with a longer one",
     ):
-        R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED)
+        R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED, clip=CLIP)
     assert not L.lock_path(out).is_file()
 
 
-def test_lead_frames_rounds_the_lead_in_to_whole_frames():
-    assert [R.lead_frames(dataclasses.replace(LOCKED, lead_in_s=s)) for s in (0.99, 1.01, 0.0)] == [30, 30, 0]
+@pytest.fixture(name="clipped")
+def fixture_clipped(monkeypatch, tmp_path):
+    """``ensure_clip`` over a scratch clip whose layout is ``have``, needing ``need``; writes logged."""
+    state = {"need": (10, 4), "have": ClipLayout(8, 6, 8), "written": []}
+    monkeypatch.setattr(locktake, "dry_state", lambda program, bypass: {1: 1023})
+    monkeypatch.setattr(compose_session, "session_frames", lambda lead_in, fps, **kw: state["need"])
+
+    def written(*_, **kw):
+        state["written"].append((kw["lead"], kw["tail"]))
+        state["have"] = ClipLayout(kw["lead"], 6, kw["tail"])
+
+    monkeypatch.setattr(R, "write_timecoded", written)
+    monkeypatch.setattr(R.timecode, "clip_layout", lambda path: state["have"])
+    (tmp_path / "tc.mkv").write_bytes(b"x")
+    return state
+
+
+def test_a_clip_too_short_for_a_session_is_timecoded_again_never_shorter(clipped, tmp_path):
+    got = R.ensure_clip(
+        "src.mkv", tmp_path / "tc.mkv", "Teletext", config=LOCKED, directory=tmp_path, seconds=0.2
+    )
+    assert clipped["written"] == [(10, 8)] and got == ClipLayout(10, 6, 8)
+    clipped["need"] = (9, 8)
+    assert (
+        R.ensure_clip(
+            "src.mkv", tmp_path / "tc.mkv", "Teletext", config=LOCKED, directory=tmp_path, seconds=0.2
+        )
+        == got
+    )
+    assert clipped["written"] == [(10, 8)], "a clip long enough is reused as it is"
+
+
+def test_a_prepared_clip_too_short_for_a_session_is_refused(clipped, tmp_path):
+    with pytest.raises(R.timecode.LayoutError, match="10-frame lead-in"):
+        R.ensure_clip(
+            "src.mkv",
+            tmp_path / "tc.mkv",
+            "Teletext",
+            config=LOCKED,
+            directory=tmp_path,
+            seconds=0.2,
+            prepared=True,
+        )
+    assert not clipped["written"]
+
+
+def test_a_layer_with_no_profile_is_refused_before_the_rig_is_touched(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch)
+    score = Score(
+        duration=0.2, fps=30.0, sections=[Section(0.0, 0.2, "A")], layers=[Layer("Teletext", 0, [])]
+    )
+    with pytest.raises(R.MissingProfileError, match=r"no profile for Teletext in /profiles/here"):
+        R.render_played(
+            score,
+            "clip.mkv",
+            tmp_path / "take.mkv",
+            profiles=Profiles({"Other": object()}, directory="/profiles/here"),
+            rig=rig.rig,
+            config=LOCKED,
+            scratch="tc.mkv",
+            prepared=True,
+            recorder=rig,
+        )
+    assert not rig.log
 
 
 def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_path):
@@ -395,8 +467,8 @@ def test_each_cut_program_is_driven_by_its_own_evolved_layer(monkeypatch, tmp_pa
     assert seen == {"Good": ["ramp"], "Other": ["hold"], "Unplanned": ["ramp"]}
 
 
-def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_path):
-    """Burning it per pass would cost minutes a program for a clip that never changes."""
+def test_each_cut_pass_sizes_the_timecoded_source_for_its_own_session(monkeypatch, tmp_path):
+    """The cut builds no clip itself: each pass lengthens it only if its program's session needs more."""
     built, passes = [], []
     monkeypatch.setattr(R, "splice", lambda *a, **k: None)
     monkeypatch.setattr(R, "write_timecoded", lambda source, out, **kw: built.append(out) or 1)
@@ -421,7 +493,7 @@ def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_
         scratch=tmp_path / "tc.mkv",
         pass_render=fake_render,
     )
-    assert built == [tmp_path / "tc.mkv"] and passes == [True, True]
+    assert not built and passes == [False, False]
 
 
 def test_cut_render_makes_room_for_its_takes(monkeypatch, tmp_path):

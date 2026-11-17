@@ -673,10 +673,17 @@ def test_lockcheck_timecodes_the_footage_plays_it_and_exits_on_the_verdict(monke
     argv = ["lockcheck", "film.mp4", "--take", str(take), "--scratch", clip, "--format", "1080p30"]
     assert cli.main(argv + ["--seconds", "4", "--start", "2", "--lead-in", "2"]) == (0 if ok else 1)
     source, out, kw = seen["timecoded"]
-    assert (source, out, kw["seconds"], kw["start"], kw["lead"]) == ("film.mp4", clip, 4.0, 2.0, 60)
+    assert (source, out, kw["seconds"], kw["start"], kw["lead"], kw["tail"]) == (
+        "film.mp4",
+        clip,
+        4.0,
+        2.0,
+        60,
+        60,
+    )
     played, kw = seen["played"]
     assert (played, kw["clip"], kw["program"], kw["seconds"]) == (str(take), clip, None, 3.0)
-    assert kw["config"].lead_in_s == 2.0 and take.parent.is_dir() and "judged" not in seen
+    assert take.parent.is_dir() and "judged" not in seen
     assert capsys.readouterr().out.strip() == ("LOCKED" if ok else "NOT LOCKED")
 
 

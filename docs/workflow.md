@@ -136,7 +136,8 @@ ss lockcheck source.mkv --seconds 30 --program Pinwheel --source-host pi@videopi
 ```
 
 It timecodes the footage into `--scratch` (`--prepared` plays one already
-timecoded), plays it with the render's lead-in (`--lead-in` overrides it),
+timecoded), plays it with the lead-in and lead-out a load inside each needs, sized by the
+loads `loads.json` beside `--take` has timed (`--lead-in` sets both),
 records `--take`, and prints one line, `LOCKED` or `NOT LOCKED`, with the Pi's
 flips and missed vblanks, the card's lost frames, gaps and picture changes off
 a frame start, strip agreement and, through Passthru, torn captures. It exits 1 unless
@@ -219,7 +220,8 @@ ss probe hold takes/take-*.mkv --source clip.mkv --out holds/      # settle and 
 ss probe sweep regions NAME --cover cover-NAME.json --hold holds/hold-NAME.json --source clip.mkv \
   --audio track.m4a --takes sweep/ --budget-s 1500 [--joint 11:6] [--seed N]
 ss probe sweep plan NAME --structural --hold holds/hold-NAME.json --source clip.mkv --takes sweep/
-ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi   # rig, one take
+ss probe sweep capture sweep/sweep-NAME.json --source-host pi@videopi   # rig, every take in one session
+ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi   # recapture one take alone
 ss probe sweep collect sweep/sweep-NAME.json --chunk K   # judge it, keep its archive rows
 ss probe sweep collect sweep/sweep-NAME.json --chunk K --hold holds/hold-NAME.json   # waiting the settle a probe hold measured
 ss probe sweep commit sweep/sweep-NAME.json --archive archive/

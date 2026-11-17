@@ -118,8 +118,10 @@ def test_frame_limit_counts_at_the_cards_actual_rate(seconds, rate, frames):
     assert vr.frame_limit(seconds, rate) == frames
 
 
-@pytest.mark.parametrize(("typed", "asked"), [(b"xyq", True), ("q", True), (b"xyz", False), (b"", False)])
-def test_q_on_stdin_asks_for_a_stop_and_a_closed_stdin_does_not(typed, asked):
+@pytest.mark.parametrize(
+    ("typed", "asked"), [(b"xy\nq", True), ("q", True), (b"xyq", False), (b"xyz", False), (b"", False)]
+)
+def test_q_starting_a_line_asks_for_a_stop_and_a_closed_stdin_does_not(typed, asked):
     flag = threading.Event()
     vr.watch_stdin(io.BytesIO(typed) if isinstance(typed, bytes) else io.StringIO(typed), flag)
     assert flag.is_set() is asked
@@ -174,3 +176,41 @@ def test_a_failed_write_is_raised_and_stops_the_recording():
     frames = (capture(k, 10, k, b"x") for k in range(1000))
     with pytest.raises(BrokenPipeError):
         vr.record(frames, Broken(), io.BytesIO(), stop=lambda: False, backlog=2)
+
+
+def test_a_roll_splits_the_captures_between_files_sharing_those_either_side_of_it():
+    """Captures from the roll's opening go to the new file, those before its closing to the old one too."""
+    logs, closed = {}, []
+
+    def opener(path):
+        logs[path] = (io.BytesIO(), io.BytesIO())
+        return vr.Output(*logs[path], close=lambda: closed.append(path))
+
+    outputs = vr.Outputs(opener("a.mkv"), opener)
+    rolled = threading.Event()
+
+    def frames():
+        for k in range(8):
+            if k == 2:
+                outputs.roll(4_000, 6_000, "b.mkv")
+                rolled.set()
+            yield capture(k, 0, k, bytes([k]))
+
+    assert vr.record(frames(), None, None, stop=lambda: False, outputs=outputs) == 8 and rolled.is_set()
+    seq = {
+        p: np.frombuffer(log.getvalue(), dtype=vr.FRAME)["sequence"].tolist() for p, (_, log) in logs.items()
+    }
+    assert seq == {"a.mkv": [0, 1, 2, 3, 4, 5], "b.mkv": [4, 5, 6, 7]}
+    assert logs["b.mkv"][0].getvalue() == bytes([4, 5, 6, 7])
+    assert closed == ["a.mkv"], "the old file is closed once the captures move past it"
+
+
+def test_a_recording_with_one_file_cannot_roll():
+    with pytest.raises(ValueError, match="cannot roll"):
+        vr.Outputs(vr.Output(io.BytesIO(), io.BytesIO())).roll(0, 1, "b.mkv")
+
+
+def test_a_roll_line_on_stdin_reaches_the_outputs_and_a_q_inside_a_path_stops_nothing():
+    flag, rolls = threading.Event(), []
+    vr.watch_stdin(io.BytesIO(b"roll 5 9 /q/take.mkv\nbogus\nq"), flag, lambda *a: rolls.append(a))
+    assert rolls == [(5, 9, "/q/take.mkv")] and flag.is_set()

@@ -115,8 +115,8 @@ def slots(
 ) -> list[Slot]:
     """Settings placed one after another on the clip, a new take each time it runs out, within ``budget_s``.
 
-    A take restarts the clip and costs ``overhead_s`` beside its frames; each setting is held for what
-    the footage after its ``guard`` needs (:func:`hold_at`).
+    The takes play back to back in one session, which costs ``overhead_s`` beside their frames; each
+    setting is held for what the footage after its ``guard`` needs (:func:`hold_at`).
     """
     effect = _filled(effect_sizes(ti, edges))
     out: list[Slot] = []
@@ -126,7 +126,7 @@ def slots(
         if not need:
             if at == 0:
                 raise SweepError("no setting's follow test reaches its power anywhere on this clip")
-            take, at, spent = take + 1, 0, spent + overhead_s
+            take, at = take + 1, 0
             continue
         if spent + (guard + need) / fps > budget_s:
             return out

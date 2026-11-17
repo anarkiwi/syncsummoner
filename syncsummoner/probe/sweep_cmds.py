@@ -28,8 +28,7 @@ def _hold_cmd(args: argparse.Namespace) -> int:
 
 def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     """Cut a program's covering sweep into locked takes one hold a level, from its measured hold."""
-    from syncsummoner.compose.render import RenderConfig, lead_frames, tail_frames
-    from syncsummoner.probe import decoded
+    from syncsummoner.compose.timecode import clip_layout
     from pyvmancer.midi import ParamKind, param_kind
 
     from syncsummoner.device.profile import PARAM_COUNT
@@ -38,12 +37,10 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.program import model
     from syncsummoner.program.gates import Gating, cover, representatives
 
-    config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     held = json.loads(Path(args.hold).read_text(encoding="utf-8"))
     if held["program"] != args.program:
         raise ValueError(f"{args.hold} measured {held['program']}, not {args.program}")
-    clip = decoded.features(args.source, decoded.Spec.of(config), workers=args.workers)
-    frames = int(clip.small.shape[0]) - lead_frames(config) - tail_frames(config)
+    frames = clip_layout(args.source).frames
     m = model(args.program)
     toggles = [p for p in range(1, PARAM_COUNT + 1) if param_kind(p) is ParamKind.TOGGLE]
     values = (
@@ -98,8 +95,10 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     import numpy as np
     from pyvmancer.midi import ParamKind, param_kind
 
-    from syncsummoner.compose.locktake import read_latency
-    from syncsummoner.compose.render import RenderConfig, lead_frames, tail_frames
+    from syncsummoner.compose.locktake import LeadIn, read_latency
+    from syncsummoner.compose.session import session_frames
+    from syncsummoner.compose.render import RenderConfig
+    from syncsummoner.compose.timecode import clip_layout
     from syncsummoner.device.profile import PARAM_COUNT
     from syncsummoner.probe import decoded
     from syncsummoner.probe.locked import joint, plan_path, write_plan
@@ -123,19 +122,15 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         raise ValueError(f"{args.hold} measured {held['program']}, not {args.program}")
     record = json.loads(Path(args.cover).read_text(encoding="utf-8"))
     clip = decoded.features(args.source, decoded.Spec.of(config), workers=args.workers)
-    ti = clip_ti(clip.luma, lead_frames(config), tail_frames(config))
+    layout = clip_layout(args.source)
+    ti = clip_ti(clip.luma, layout.lead, layout.tail)
     edges = downbeat_frames(args.audio, config.fps)
     lat = read_latency(args.latency or args.takes)
     guard = guard_frames(int(held["settle"]), lat.hi - lat.lo, 1e9 / config.fps)
-    placed = slots(
-        ti,
-        edges,
-        guard=guard,
-        budget_s=args.budget_s,
-        overhead_s=2 * config.lead_in_s + config.tail_s,
-        fps=config.fps,
-    )
     m = model(args.program)
+    ends = session_frames(LeadIn(), config.fps, dry=m.bypass() is not None, directory=args.takes, band=lat)
+    overhead_s = sum(ends) / config.fps + config.tail_s
+    placed = slots(ti, edges, guard=guard, budget_s=args.budget_s, overhead_s=overhead_s, fps=config.fps)
     values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
     states = np.asarray(record["states"], dtype=np.int64)
     chosen = [int(i) for i in record["chosen"]]
@@ -165,9 +160,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         "guard_frames": guard,
         "hold_frames": {"min": int(hold.min()), "median": float(np.median(hold)), "max": int(hold.max())},
         "budget_s": args.budget_s,
-        "rig_s": float(
-            sum(c.frames for c in chunks) / config.fps + len(chunks) * (2 * config.lead_in_s + config.tail_s)
-        ),
+        "rig_s": float(sum(c.frames for c in chunks) / config.fps + overhead_s),
         "seed": args.seed,
     }
     path = write_plan(
@@ -194,20 +187,22 @@ def _sweep_take(directory: str, program: str, chunk: int) -> Path:
 
 
 def _sweep_cmd(args: argparse.Namespace) -> int:  # pragma: no cover - needs the rig
-    """Capture one chunk of a sweep plan as a locked take; 2 on a take fault."""
+    """Capture a plan's chunks back to back as one session, or one chunk alone; 2 on any take's fault."""
     from syncsummoner.compose.render import RenderConfig
     from syncsummoner.probe.locked import capture, read_plan
 
     chunks, said = read_plan(args.plan)
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px, source_host=args.source_host)
-    out = _sweep_take(Path(args.plan).parent, said["program"], args.chunk)
-    record = capture(config, chunks[args.chunk], out, program=said["program"], clip=said["source"])
-    meta = out.with_name(out.name + ".meta.json")
-    kept = json.loads(meta.read_text(encoding="utf-8")) if meta.is_file() else {}
-    kept[f"attempt-{args.attempt}"] = record
-    meta.write_text(json.dumps(kept, indent=1, default=str), encoding="utf-8")
-    LOG.info("%s chunk %d: %s", said["program"], args.chunk, record.get("fault", "captured"))
-    return 2 if "fault" in record else 0
+    picked = range(len(chunks)) if args.chunk is None else [args.chunk]
+    outs = [_sweep_take(Path(args.plan).parent, said["program"], k) for k in picked]
+    records = capture(config, [chunks[k] for k in picked], outs, program=said["program"], clip=said["source"])
+    for k, out, record in zip(picked, outs, records):
+        meta = out.with_name(out.name + ".meta.json")
+        kept = json.loads(meta.read_text(encoding="utf-8")) if meta.is_file() else {}
+        kept[f"attempt-{args.attempt}"] = record
+        meta.write_text(json.dumps(kept, indent=1, default=str), encoding="utf-8")
+        LOG.info("%s chunk %d: %s", said["program"], k, record.get("fault", "captured"))
+    return 2 if any("fault" in r for r in records) else 0
 
 
 def settled_by(chunk: Any, program: str, hold: str | None, plan: str) -> tuple[Any, dict]:
@@ -240,7 +235,8 @@ def _sweep_commit_cmd(args: argparse.Namespace) -> int:
     """Join a program's collected sweep takes into its archive, keyed on name and firmware."""
     import hashlib
 
-    from syncsummoner.compose.render import RenderConfig, lead_frames
+    from syncsummoner.compose.render import RenderConfig
+    from syncsummoner.compose.timecode import clip_layout
     from syncsummoner.probe import decoded
     from syncsummoner.probe.archive import FrameArchive
     from syncsummoner.probe.locked import commit_sweep, read_plan
@@ -272,7 +268,7 @@ def _sweep_commit_cmd(args: argparse.Namespace) -> int:
         "fps": config.fps,
         "bits": config.bits,
         "strip_px": config.strip_px,
-        "lead": lead_frames(config),
+        "lead": clip_layout(clip).lead,
         "source": str(clip),
     }
     meta = commit_sweep(
@@ -338,9 +334,11 @@ def add_parsers(probe_sub: Any) -> None:
     regions.add_argument("--seed", type=int, default=0, help="seed of the scrambled Sobol design")
     regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")
     regions.set_defaults(func=_sweep_regions_cmd)
-    run = sweep_sub.add_parser("capture", help="capture one take of a plan on the rig")
+    run = sweep_sub.add_parser(
+        "capture", help="capture a plan's takes back to back on the rig, its program loaded once"
+    )
     run.add_argument("plan")
-    run.add_argument("--chunk", type=int, required=True)
+    run.add_argument("--chunk", type=int, help="capture only this take, alone, as for a recapture")
     run.add_argument("--attempt", type=int, default=1)
     run.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     run.set_defaults(func=_sweep_cmd)

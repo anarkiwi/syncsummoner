@@ -458,3 +458,41 @@ def test_realtime_asks_for_fifo_at_the_pacing_priority_and_reports_a_refusal(mon
     monkeypatch.setattr(K.os, "sched_setscheduler", setscheduler)
     assert K.realtime() is (refused is None)
     assert asked == [(0, K.os.SCHED_FIFO, K.REALTIME_PRIORITY)]
+
+
+def test_a_span_is_trimmed_before_it_is_scaled():
+    argv = K.decode_argv("c.mkv", 8, 6, loop=False, span=(3, 9))
+    assert argv[argv.index("-vf") + 1] == "trim=start_frame=3:end_frame=9,scale=8:6"
+
+
+def test_spans_parse_as_ranges_and_refuse_empty_or_backward_ones():
+    assert K.parse_spans("0:5,2:9") == [(0, 5), (2, 9)]
+    for bad in ("", "5:5", "3:1", "-1:4", "1:2:3"):
+        with pytest.raises(ValueError):
+            K.parse_spans(bad)
+
+
+def test_spans_play_as_one_stream_each_next_decoder_started_before_it_is_due(monkeypatch):
+    started, procs = [], []
+    real = K._decoder  # pylint: disable=protected-access
+
+    def decoder(argv):
+        started.append(argv[-1])
+        procs.append(real(argv))
+        return procs[-1]
+
+    def argv_for(path, width, height, *, loop, span):
+        del path, width, height, loop
+        data = bytes(range(span[0], span[1]))
+        return [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({data!r})", f"{span[0]}"]
+
+    monkeypatch.setattr(K, "_decoder", decoder)
+    monkeypatch.setattr(K, "decode_argv", argv_for)
+    stream = K.span_frames("c.mkv", 1, 1, [(0, 2), (5, 7), (1, 2)], 1)
+    assert next(stream) == b"\x00" and started == ["0", "5"], "the next span decodes while this one plays"
+    assert list(stream) == [b"\x01", b"\x05", b"\x06", b"\x01"] and started == ["0", "5", "1"]
+    procs.clear()
+    closed = K.span_frames("c.mkv", 1, 1, [(0, 2), (5, 7)], 1)
+    next(closed)
+    closed.close()
+    assert len(procs) == 2 and all(p.poll() is not None for p in procs), "closing early reaps both decoders"
