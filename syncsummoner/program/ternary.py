@@ -10,9 +10,11 @@ import itertools
 from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable
+from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import breadth_first_order
 
 from .observe import GATES, Cell, Circuit, next_state
 
@@ -208,6 +210,52 @@ class Ternary:
                 live = x[b] if p == "C" else sensitised(fn, [q, *tris], k + 1) & x[b]
                 held.append((row, b, live))
         return sens, held
+
+    def reach(
+        self, ties: np.ndarray, fixed: Sequence[Mapping[int, bool]], sources: Sequence[Iterable[int]]
+    ) -> np.ndarray:
+        """Rows each lane's ``sources`` (nets) can change, through every pin sensitised in that lane:
+        controls at ``ties`` (0/1, or -1 for X), the nets in ``fixed`` at their values, the rest X.
+        """
+        lanes = ties.shape[0]
+        alg = Rails(lanes)
+        z = np.zeros((self.size, lanes), dtype=bool)
+        o = np.zeros((self.size, lanes), dtype=bool)
+        z[self.zero], o[self.one] = True, True
+        for k, net in self.circuit.controls().items():
+            z[self.index[net]], o[self.index[net]] = ties[:, k] == 0, ties[:, k] == 1
+        for i, nets in enumerate(fixed):
+            for net, v in nets.items():
+                z[self.index[net], i], o[self.index[net], i] = not v, v
+        self._forward(z, o, alg)
+        x = ~(z | o)
+        sens, held = self._edges(z, o, x)
+        src = [src for _, src, _ in sens] + [np.array([b]) for _, b, _ in held]
+        dst = [outs for outs, _, _ in sens] + [np.array([row]) for row, _, _ in held]
+        live = [live for _, _, live in sens] + [live[None, :] for _, _, live in held]
+        for box in self.boxes:
+            ins = np.array([self.at(b) for bits in box.ins.values() for b in bits], dtype=np.int64)
+            outs = np.array([self.at(b) for bits in box.outs.values() for b in bits], dtype=np.int64)
+            src.append(np.repeat(ins, outs.size))
+            dst.append(np.tile(outs, ins.size))
+            live.append(np.repeat(x[ins], outs.size, axis=0))
+        src, dst, live = np.concatenate(src), np.concatenate(dst), np.concatenate(live)
+        seen = np.zeros_like(x)
+        for i, nets in enumerate(sources):
+            start = [self.index[n] for n in nets]
+            if not start:
+                continue
+            keep = live[:, i]
+            graph = csr_matrix(
+                (
+                    np.ones(int(keep.sum()) + len(start)),
+                    (np.r_[src[keep], [self.size] * len(start)], np.r_[dst[keep], start]),
+                ),
+                shape=(self.size + 1, self.size + 1),
+            )
+            seen[breadth_first_order(graph, self.size, return_predecessors=False)[1:], i] = True
+        seen[[self.zero, self.one, self.unknown]] = False
+        return seen
 
     def observed(self, ties: np.ndarray) -> np.ndarray:
         """Rows with a sensitised path to an output, by lane."""

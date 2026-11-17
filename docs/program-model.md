@@ -156,12 +156,45 @@ of other controls, and the cover search uses it.
 
 **Fallback.** No condition may grow past one net's share of the memory the
 process may use: `MemAvailable` (cut to the cgroup's `memory.max`) over CUDD's
-node size and the net count. A program that exceeds it is answered by the
-vectorised ternary simulator (`program.ternary`), one lane per tie set. It uses
-the same register rules and exact local sensitisation, but every free signal is
-X. Dead there is a sound proof under that tie set. It loses only the identity of
-passed-through bits, so it can call live what the BDDs call dead. `ProgramModel.method`
-says which was used, and `observe.exhausted` in the cache records why.
+node size and the net count. `observe.exhausted` in the cache records a program
+that exceeds it, and the SAT miter (`program.sat`) answers it instead, query by
+query, on one incremental CaDiCaL instance (PySAT):
+
+- **Miter.** Two copies of the gate-level netlist share every free signal
+  (control bit, input bit, storage output) as a pair of variables held equal
+  unless the pair's enable is left free. A query is a set of assumptions: the
+  tie set on copy *a*, the source bit 0 in *a* and 1 in *b*, the settled
+  storage at its values, and the enables of the storage that can differ. A
+  black box's outputs are equal in both copies wherever all its inputs are.
+- **Registers.** The rules above, applied exactly: a storage bit loads a
+  constant where its next state with every enable fired is that constant for
+  every value of the free signals and untied controls, else keeps its initial
+  value where its next state from that value is that value, to the least
+  fixpoint. Random concrete lanes (64-bit words) refute most candidates, and
+  each sweep's model refutes more until one solve proves the rest together.
+  A free storage bit can differ where its next states can, to the least
+  fixpoint, grown from lanes that differ and then from models.
+- **Observability.** A source is observable where some model makes an output
+  differ. The ternary simulator first screens every tie set in lanes, which
+  proves most dead sources, and bounds the rest to the nets their sensitised
+  pins reach: nets outside cannot differ, so their copies are assumed equal.
+  Random lanes then find most live sources. The nets that never differ in a
+  lane are proven equal in topological order, each from those before, while
+  the output query races them at a doubling share of the conflicts spent.
+- **Held controls.** A tie set settles storage only on its tied bits, so a
+  control left untied is free there, which over-approximates holding it. A
+  held setting is decided exactly by tying it: `ProgramModel.revivable` and
+  the cover's revivals refute a set of gates with its controls untied, then
+  complete it gate by gate over their resolution classes, the first class the
+  rest can still complete kept, as the conditions do.
+
+SAT and the BDDs agree wherever the BDDs' leaves are exact; where a function of
+two free signals cancels (`x ^ x`), the miter calls dead what the BDDs call
+live. Only where the miter cannot be built does the vectorised ternary simulator
+(`program.ternary`) answer, one lane per tie set: the same register rules and
+exact local sensitisation, every free signal X, so it can call live what the
+others call dead. `ProgramModel.method` says which answered, and the log names
+it. `--method bdd|sat|ternary` on the `program` commands forces one.
 
 - **Resolution** is the live set with every register free.
 - **Gates** of a parameter dead in a state are the other controls (and timing)

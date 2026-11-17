@@ -2,7 +2,8 @@
 
 Live means a written bit is observable at the video (:mod:`.observe`); revivals are read off each
 parameter's observability condition, restricted to the state, as the smallest sets of controls whose
-settings over their resolution classes satisfy it (by the ternary simulator where there is no condition);
+settings over their resolution classes satisfy it (by SAT where there is no condition, by the ternary
+simulator where there is no miter either);
 the states they reach are covered by a lexicographic 0-1 programme (fewest states, then steps).
 """
 
@@ -283,12 +284,14 @@ class Gating:
     def revivals(self, state: np.ndarray, st: Status) -> list[Revival]:
         """Every way of making ``st.param`` live by moving the fewest other controls from ``state``.
 
-        Answered from the parameter's observability condition where the program has one, else by the
-        ternary simulator.
+        Answered from the parameter's observability condition where the program has one, else by SAT,
+        else by the ternary simulator.
         """
         p = st.param
         others = [q for q in sorted(self.read) if q != p]
         if self.m.conditions({p, *([TIMING] if self.timing is None else [])}) is None:
+            if self.m.method == "sat":
+                return self._solved(state, p, others)
             return self._simulated(state, p, others)
         bdd, u = self._condition(p)
         held = {
@@ -311,6 +314,54 @@ class Gating:
             moves = (*((g, self._classes[g][1][j]) for g, j in zip(qs, picks)), (qs[-1], (lo + hi) // 2))
             found.append(Revival(p, moves, tuple(spans) if len(qs) == 1 else ()))
         return found
+
+    def _alive(self, states: Sequence[np.ndarray], p: int, free: Sequence[int]) -> list[bool]:
+        """Per state, whether ``p`` is live by SAT with the controls in ``free`` left free."""
+        ties = [self.m.ties(s, self.timing, [p, *free]) for s in states]
+        return self.m.exact.alive(ties, declared.field(p).flat)
+
+    def _solved(self, state: np.ndarray, p: int, others: list[int]) -> list[Revival]:
+        """:meth:`revivals` by SAT, in the order and form the conditions give them.
+
+        A set of gates is tried with its controls free, which refutes it exactly; a set that survives is
+        completed one gate at a time over its classes, the first that the rest can still complete kept.
+        """
+        if not self._alive([state], p, others)[0]:
+            return []
+        for size in range(1, len(others) + 1):
+            sets = list(itertools.combinations(others, size))
+            found = []
+            for qs in track(sets, desc=f"P{p} gates of {size}", unit="set"):
+                if self._alive([state], p, qs)[0]:
+                    found += self._complete(state, p, qs, ())
+            if found:
+                return found
+        return []
+
+    def _complete(self, state: np.ndarray, p: int, qs: Sequence[int], picks: tuple) -> list[Revival]:
+        """The revival through ``qs`` with the first gates held at the class indices ``picks``."""
+        moved = _apply(state, ((g, self._classes[g][1][j]) for g, j in zip(qs, picks)))
+        gate = qs[len(picks)]
+        groups, reps = self._classes[gate]
+        if len(picks) < len(qs) - 1:
+            rest = qs[len(picks) + 1 :]
+            for j, v in enumerate(reps):
+                nxt = _apply(moved, [(gate, v)])
+                if self._alive([nxt], p, rest)[0]:
+                    found = self._complete(state, p, qs, (*picks, j))
+                    if found:
+                        return found
+            return []
+        ok = self._alive([_apply(moved, [(gate, v)]) for v in reps], p, ())
+        full = np.zeros(VALUE_MAX + 1, dtype=bool)
+        for g, hit in zip(groups, ok):
+            full[g] = hit
+        spans = intervals(full)
+        if not spans:
+            return []
+        lo, hi = max(spans, key=lambda s: s[1] - s[0])
+        head = tuple((g, self._classes[g][1][j]) for g, j in zip(qs, picks))
+        return [Revival(p, (*head, (gate, (lo + hi) // 2)), tuple(spans) if len(qs) == 1 else ())]
 
     def _simulated(self, state: np.ndarray, p: int, others: list[int]) -> list[Revival]:
         if not self._could(state, p, others):

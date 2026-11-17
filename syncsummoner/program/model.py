@@ -23,7 +23,7 @@ import numpy as np
 
 from syncsummoner.progress import LOG, track
 
-from . import hdl, observe
+from . import hdl, observe, sat
 from .declared import (
     CORE_REGISTERS,
     LATCHED_REGISTERS,
@@ -126,6 +126,7 @@ class ProgramModel:
         tools: hdl.Tools | None = None,
         cache: Path | None = None,
         source: str | None = None,
+        method: str | None = None,
     ):
         self.program = program
         self.library = library
@@ -138,6 +139,9 @@ class ProgramModel:
         self._circuit: observe.Circuit | None = None
         self._conditions: dict[frozenset, observe.Conditions] = {}
         self._ternary: Ternary | None = None
+        self._exact: sat.Exact | None = None
+        #: ``bdd``, ``sat`` or ``ternary`` to answer by that method alone; None for the BDDs, then SAT.
+        self.prefer = method
         self.method: str | None = None
         #: Bytes the BDDs may use; None for what the process may use when an analysis starts.
         self.memory: int | None = None
@@ -253,6 +257,12 @@ class ProgramModel:
                     ties[k] = (words.get(reg, 0) >> bit) & 1 if reg < LATCHED_REGISTERS else 0
         return ties, named
 
+    def ties(self, state: np.ndarray, timing: int | None, free: Iterable[int]) -> dict[int, int]:
+        """Each ``registers_in`` bit held at ``state``, by flat position, with ``free`` (and an unset
+        ``timing``) left out.
+        """
+        return self._ties(np.asarray(state, dtype=np.int64), timing, free)[0]
+
     @property
     def circuit(self) -> observe.Circuit:
         """The netlist in Yosys's gate library: one Yosys run per build, cached as ``gates.json``."""
@@ -288,7 +298,7 @@ class ProgramModel:
     def prepare(self, keys: Iterable[Iterable]) -> None:
         """Build the missing analyses of several freed sets at once, one process per CPU."""
         todo = [k for k in {frozenset(k) for k in keys} if not self._path(k).exists()]
-        if len(todo) < 2 or self.method == "ternary" or (self.cache / "observe.exhausted").exists():
+        if len(todo) < 2 or self._spent():
             return
         start = time.monotonic()
         jobs = [self._job(k) for k in todo]
@@ -298,16 +308,20 @@ class ProgramModel:
         self.timings["observe"] = self.timings.get("observe", 0.0) + time.monotonic() - start
         self.timings["analyses"] = self.timings.get("analyses", 0) + len(jobs)
 
+    def _spent(self) -> bool:
+        """Whether the BDDs do not answer: another method is preferred, or they outgrew memory."""
+        return self.prefer not in (None, "bdd") or (self.cache / "observe.exhausted").exists()
+
     def conditions(self, free: Iterable = ()) -> observe.Conditions | None:
         """Observability conditions over the controls, with those in ``free`` (and ``timing``) varying.
 
-        None once this program's BDDs have outgrown memory, so the ternary simulator answers (``method``).
+        None once this program's BDDs have outgrown memory, so the SAT miter answers, or the ternary
+        simulator where the miter cannot be built (``method``).
         """
         key = frozenset(free)
         circuit = self.circuit
         with self._lock:
-            spent = self.cache / "observe.exhausted"
-            if self.method != "ternary" and key not in self._conditions and not spent.exists():
+            if not self._spent() and key not in self._conditions:
                 path = self._path(key)
                 if not path.exists():
                     start = time.monotonic()
@@ -316,13 +330,35 @@ class ProgramModel:
                     self.timings["analyses"] = self.timings.get("analyses", 0) + 1
                 if path.exists():
                     self._conditions[key] = observe.Conditions.load(path, CONTROL_BITS)
-            method = "ternary" if spent.exists() else "bdd"
+            method = self.method if self.method in ("sat", "ternary") else "bdd"
+            if self._spent() and method == "bdd":
+                method = "ternary" if self.prefer == "ternary" else self._build_exact(circuit)
             if method != self.method:
                 self.method = method
                 LOG.info("%s: liveness by %s", self.program.name, method)
             if method == "ternary" and self._ternary is None:
                 self._ternary = Ternary(circuit)
             return self._conditions.get(key) if method == "bdd" else None
+
+    def _build_exact(self, circuit: observe.Circuit) -> str:
+        """``sat`` once the miter is built, else ``ternary`` with the reason logged."""
+        start = time.monotonic()
+        try:
+            self._exact = sat.Exact(circuit, keep=PARAM_COUNT + 1)
+        except (MemoryError, RuntimeError, ValueError) as err:
+            LOG.warning("%s: the SAT miter cannot be built (%s)", self.program.name, err)
+            return "ternary"
+        self.timings["miter"] = time.monotonic() - start
+        return "sat"
+
+    @property
+    def exact(self) -> sat.Exact:
+        """The SAT miter's queries, once the BDDs no longer answer."""
+        if self._exact is None:
+            self.conditions(())
+        if self._exact is None:
+            raise RuntimeError(f"{self.program.name} is answered by {self.method}, not SAT")
+        return self._exact
 
     def _reach(self, state: np.ndarray, timing: int | None, free: Sequence) -> dict[int, list[int]]:
         """Live bits of each freed control, with everything else tied to ``state``."""
@@ -336,6 +372,9 @@ class ProgramModel:
         cond = self.conditions({*free, *([TIMING] if timing is None else [])})
         if cond is not None:
             seen = [{k: cond.live(f"c{k}", t) for p in pids for k in field(p).flat} for t in ties]
+        elif self.method == "sat":
+            flat = [k for p in pids for k in field(p).flat]
+            seen = [dict(zip(flat, self._exact.live(t, flat))) for t in ties]
         else:
             lanes = self._ternary.live(_lanes(ties))
             seen = [
@@ -359,14 +398,37 @@ class ProgramModel:
     ) -> bool:
         """Whether some held setting of the controls in ``free`` makes ``param`` live, the rest at ``state``.
 
-        Exact from ``param``'s own conditions; the ternary simulator answers with ``free`` left as X.
+        Exact from ``param``'s own conditions or by SAT over the settings of ``free`` one control at a
+        time; the ternary simulator answers with ``free`` left as X.
         """
         state = np.asarray(state, dtype=np.int64)
         cond = self.conditions({param, *([TIMING] if timing is None else [])})
+        if cond is None and self.method == "sat":
+            return self._settings(state, timing, param, list(free)) is not None
         if cond is None:
             return bool(self._reach(state, timing, [param, *free])[param])
         ties, _ = self._ties(state, timing, [param, *free])
         return any(cond.live(f"c{k}", ties) for k in field(param).flat)
+
+    def _settings(
+        self, state: np.ndarray, timing: int | None, param: int, free: Sequence[int]
+    ) -> list[int] | None:
+        """A held manual value of each control in ``free``, in order, making ``param`` live by SAT,
+        or None. Each prefix is kept only when the rest, left free, can still complete it.
+        """
+        bits = field(param).flat
+        if not self._exact.alive([self._ties(state, timing, [param, *free])[0]], bits)[0]:
+            return None
+        if not free:
+            return []
+        head, rest = free[0], list(free[1:])
+        for group in track(classes(self.decl(head), field(head).bits), desc=f"P{param} by P{head}"):
+            moved = state.copy()
+            moved[head - 1] = group[len(group) // 2]
+            tail = self._settings(moved, timing, param, rest)
+            if tail is not None:
+                return [int(moved[head - 1]), *tail]
+        return None
 
     def reach_many(
         self, states: Sequence[np.ndarray], free: Sequence[int], timing: int | None = None
@@ -471,6 +533,8 @@ class ProgramModel:
         cond = self.conditions([TIMING] if timing is None else [])
         if cond is not None:
             return cond.live(VIDEO, ties)
+        if self.method == "sat":
+            return self._exact.carries([ties])[0]
         lanes = self._ternary.live(_lanes([ties]))
         return any(bool(v[0]) for name, v in lanes.items() if name.startswith(prefix))
 
@@ -522,6 +586,8 @@ class ProgramModel:
                 break
             heard = self._heard(base, timing, parameter_id, free)
             ok = None if heard is None else ok & ~heard
+        if ok is None and self.method == "sat":
+            return MANUAL[self._passes_sat(base, timing, parameter_id, others)]
         if ok is None:
             return MANUAL[self._passes_ternary(base, timing, parameter_id, others)]
         return MANUAL[ok[register_value(decl, MANUAL)]]
@@ -538,6 +604,23 @@ class ProgramModel:
         ties, _ = self._ties(base, timing, [*free, param])
         names = names or [f"c{k}" for q in free for k in field(q).flat]
         return cond.heard(names, ties, field(param).flat)
+
+    def _passes_sat(
+        self, base: np.ndarray, timing: int | None, param: int, others: Sequence[int]
+    ) -> np.ndarray:
+        """:meth:`passes` by SAT, per setting of ``param``: the input observable, and no bit of the
+        other controls, varying together.
+        """
+        groups = classes(self.decl(param), field(param).bits)
+        states = np.repeat(base[None, :], len(groups), axis=0)
+        states[:, param - 1] = [g[len(g) // 2] for g in groups]
+        heard = np.flatnonzero(self._exact.carries([self._ties(s, timing, [])[0] for s in states]))
+        flat = [k for q in others for k in field(q).flat]
+        alive = self._exact.alive([self._ties(states[i], timing, others)[0] for i in heard], flat)
+        ok = np.zeros(VALUE_MAX + 1, dtype=bool)
+        for i, live in zip(heard, alive):
+            ok[groups[i]] = not live
+        return ok
 
     def _passes_ternary(
         self, base: np.ndarray, timing: int | None, param: int, others: Sequence[int]
