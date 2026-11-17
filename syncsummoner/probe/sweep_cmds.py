@@ -33,10 +33,10 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     from pyvmancer.midi import ParamKind, param_kind
 
     from syncsummoner.device.profile import PARAM_COUNT
-    from syncsummoner.probe.locked import carried, levels, plan_path, plan_sweep, write_plan
+    from syncsummoner.probe.locked import carried, joint, levels, plan_path, plan_sweep, recorded, write_plan
     from syncsummoner.probe.store import slug
     from syncsummoner.program import model
-    from syncsummoner.program.gates import Gating, cover
+    from syncsummoner.program.gates import Gating, cover, representatives
 
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     held = json.loads(Path(args.hold).read_text(encoding="utf-8"))
@@ -46,7 +46,18 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     frames = int(clip.small.shape[0]) - lead_frames(config)
     m = model(args.program)
     toggles = [p for p in range(1, PARAM_COUNT + 1) if param_kind(p) is ParamKind.TOGGLE]
-    states = carried(levels(cover(m, gating=Gating(m, steps=not args.structural))), toggles)
+    values = (
+        {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
+        if args.cover or args.joint
+        else {}
+    )
+    if args.cover:
+        states = recorded(json.loads(Path(args.cover).read_text(encoding="utf-8")), values)
+    else:
+        states = levels(cover(m, gating=Gating(m, steps=not args.structural)))
+    for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
+        states = joint(states, selector, mover, values)
+    states = carried(states, toggles)
     chunks = plan_sweep(states, settle=int(held["settle"]), hold=int(held["hold"]), frames=frames)
     path = write_plan(
         plan_path(args.takes, slug(args.program)),
@@ -172,6 +183,14 @@ def add_parsers(probe_sub: Any) -> None:
     plan.add_argument("--takes", required=True, help="the sweep's takes directory")
     plan.add_argument(
         "--structural", action="store_true", help="cover by the folded cone alone, as program cover"
+    )
+    plan.add_argument("--cover", help="a cover as `program cover --json` wrote it, in place of searching one")
+    plan.add_argument(
+        "--joint",
+        action="append",
+        default=[],
+        metavar="SELECTOR:MOVER",
+        help="also hold SELECTOR at each setting with a MOVER move under each (repeatable)",
     )
     plan.set_defaults(func=_sweep_plan_cmd)
     run = sweep_sub.add_parser("capture", help="capture one take of a plan on the rig")
