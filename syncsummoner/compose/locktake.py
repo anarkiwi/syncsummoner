@@ -728,16 +728,19 @@ def loaded_before(
     return {"ok": bool(running and agree and early), "summary": summary, "want": want.tolist()}
 
 
-def judged_steps(program: str, start: np.ndarray, rows: np.ndarray) -> np.ndarray | None:
-    """The program model's verdict on each landed write's step, from the state it was taken in.
+def judged_steps(
+    program: str, start: np.ndarray, rows: np.ndarray, count: int
+) -> tuple[np.ndarray, ev.Regime] | None:
+    """The program model's verdict on each landed write's step, and the switch regime of ``count`` frames.
 
     None when the model cannot be built, so the take is judged without it.
     """
     from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
-    from syncsummoner.program.predict import classify  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program.predict import classify, regimes  # pylint: disable=import-outside-toplevel
 
     try:
-        return classify(model(program), start, rows)
+        built = model(program)
+        return classify(built, start, rows), ev.Regime(*regimes(built, start, rows, count))
     except (KeyError, RuntimeError, OSError) as err:
         LOG.warning("%s: no step verdicts from the program model: %s", program, err)
         return None
@@ -822,7 +825,7 @@ def take_evidence(
     luma_range = np.ptp(out[:, 0].reshape(count, -1), axis=1)
     rows = landed_rows.rows
     sent = rows["sent"] >= 0
-    kinds = judged_steps(program, wire["start"], rows) if predict else None
+    kinds, regime = (judged_steps(program, wire["start"], rows, count) if predict else None) or (None, None)
     moved = ev.acted_upon(
         out,
         src,
@@ -831,6 +834,7 @@ def take_evidence(
         rows["param"][sent],
         names,
         kinds=None if kinds is None else kinds[sent],
+        regime=regime,
     )
     return ev.Evidence(
         program=program,
