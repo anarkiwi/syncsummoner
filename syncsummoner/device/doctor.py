@@ -136,7 +136,7 @@ def last_frame(path: str | Path, width: int, height: int, *, ffmpeg: str = "ffmp
 
 
 def latency_param(info: Any) -> int:
-    """A program's first continuous parameter on a knob, short of the crossfader; else P1."""
+    """A program's first declared continuous parameter on a knob; else P1."""
     return next(
         (
             p.index

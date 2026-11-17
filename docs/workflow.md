@@ -15,7 +15,7 @@ Everything below runs through `docker run`, on the rig described in
    | KMS player, 1080p30       |     HDMI       | HDMI IN                    |
    | no compositor, DRM free   |===============>|                            |
    | plays the timecoded clip  |  source clip   | 6 knobs, 5 toggles,        |
-   +-------------+-------------+                | crossfader (P12)           |
+   +-------------+-------------+                | fader (P12)                |
                  |                              |                            |
                  | ethernet                     | HDMI OUT ------------------+---+
                  | ssh, BatchMode:              | CVBS / S-video (alternate) |   |
@@ -295,29 +295,42 @@ opt-in guard for unattended runs: it fails a wait once nothing the device report
 has changed for that long. It is off by default.
 
 An archive keeps the device's own `program info` reply beside its frames, and a
-refit carries it into every parameter's name, native range and role. An archive
+refit carries it into every parameter's name and native range. An archive
 recorded before that is back-filled from the device without re-archiving: each
-program is loaded once and asked, a few seconds apiece, resumably. The SD card's
-manifest and `.vmprog` files cannot stand in for this, since firmware built-ins are
-absent from them and the card is only readable over the same serial link.
+program is loaded once and asked, a few seconds apiece, resumably.
 
 ```sh
 ss probe names --archive archive/      # program info into each archive, resumable
 ss probe refit --archive archive/ --out profiles/
 ```
 
-Each parameter's `role` decides what the composer may do with it, and comes from
-the label its program gives it:
+What the composer may do with a parameter is its `kind`, and that comes from the
+program's own declaration, never from its slot or its label: the `control_mode` and
+`value_labels` in the config payload of the program's `.vmprog`. The declaration is
+found by device name in a copy of the card's `programs/` directory
+(`captures/card/programs`, or `$SYNCSUMMONER_CARD`) or, for a firmware built-in,
+inside the firmware `.uf2` image (`captures/firmware`, or `$SYNCSUMMONER_FIRMWARE`).
+A program declared in neither stops with `UndeclaredProgramError`, which names both
+places; copy the card or the firmware image there and run again.
 
-| Role | Labelled | Composer |
+| Kind | Declared as | Composer |
 | --- | --- | --- |
-| `bypass` | `Bypass` | never driven, held off for the whole pass |
-| `wet` | P12 as `Mix`, `Blend`, `Fade`, `Wet` or left unnamed | driven only by `morph`, within the score's wet range |
-| `momentary` | `Reset`, `Trigger`, `Retrig`, `Serve`, `Fire`, `Impulse` | only pulsed by `punch`, and released |
-| `effect` | anything else | any gesture |
+| `boolean` | boolean control mode, or two value labels | only pulsed by `punch`, and released |
+| `quantized` | more than two value labels, or a stepped control mode | any other gesture, over its declared levels |
+| `continuous` | any other control mode | any other gesture |
+| `unused` | not declared | never driven |
 
-A profile with unnamed parameters (`p1` to `p12`) has every slot an `effect`
-except P12, so it will drive a bypass blind: refit it from a named archive.
+Every pass starts from the program's declared initial values, and every parameter
+a gesture leaves alone stays at its own. Which of the declared parameters can
+reach the picture at a given setting is a different question, answered exactly
+from the program's HDL by `ss program show` and `ss program step`
+([program-model.md](program-model.md)):
+
+```sh
+ss program list                                  # every program the card copy and firmware declare
+ss program show Pinwheel                         # register bits, levels, live bits and gates at the initial values
+ss program step Pinwheel 3 0 512 --set 12=1023   # can this one step change the picture
+```
 
 A profile fitted before 0.2.0 still composes, off the inferences the planner used
 to make for itself. It will not carry the measured curves the objective now scores
@@ -393,12 +406,6 @@ construction. What came out:
 grep -E '^(duration|bpm)' score.yaml
 ```
 
-The wet range is how far into the effect the wet control is driven, as fractions
-of its travel. Neither end blacks the output on any archived program, so it is a
-look rather than a limit: `default` and `smooth` stay within 0.10..0.50, `glitchy`
-reaches fully wet at 0.10..1.00, and `--wet 0.3,1` sets it outright. A score
-records its range; one written before it did renders within 0.10..0.50.
-
 Before spending rig time on it, see what the score will actually drive:
 
 ```sh
@@ -406,25 +413,22 @@ ss score show score.yaml --profiles profiles/
 ```
 
 ```
-wet range 0.10..0.50 (102..512)
 layer 2: Breakout
-   P1  Ball Spd         effect    continuous   23 writes     0..1023 ends 898   hold x1, hysteresis_loop x3, morph x1
+   P1  Ball Spd         continuous   23 writes     0..1023 ends 898   hold x1, hysteresis_loop x3
    ...
-   P7  Serve            momentary boolean       6 writes     0..1023 ends 0     punch x3
-   P11 Bypass           bypass    boolean    undriven
-   P12 Mix              wet       continuous   39 writes   102..512  ends 512   morph x3
+   P7  Serve            boolean       6 writes     0..1023 ends 0     punch x3
+   P11 Bypass           boolean    undriven
 layer 4: Pinwheel
    ...
-   P12 Chroma Crush     effect    continuous   84 writes   416..748  ends 748   cliff_cross x2
-   gestures that write nothing: morph x6
+   P12 Chroma Crush     continuous   84 writes   416..748  ends 748   cliff_cross x2
 ```
 
-Every layer lists all twelve parameters by name with their role, how many writes
-the render will send, the range they cover, where they end, and which gestures
-asked for them; that is the same plan the render plays. A line marked `!` is a
-bypass being driven or a toggle left on at the end of the pass; a layer marked
-`!` has no profile or drives nothing, and gestures that render nothing are
-listed under their layer. It exits 1 when anything is flagged.
+Every layer lists all twelve parameters by name with their declared kind, how many
+writes the render will send, the range they cover, where they end, and which
+gestures asked for them; that is the same plan the render plays. A line marked `!`
+is a toggle left latched on at the end of the pass; a layer marked `!` has no
+profile or drives nothing, and gestures that render nothing are listed under their
+layer. It exits 1 when anything is flagged.
 
 ## 3. Audition before committing the rig
 
@@ -453,8 +457,10 @@ ss audition score.yaml --source source.mkv --audio track.flac \
 ```
 
 An excerpt costs a program load, the lead-in and the excerpt. The program is
-loaded before playout and held dry through the lead-in while its bypass is toggled
-to time the device ([evidence.md](evidence.md)); each take logs the measured
+loaded before playout and held dry through the lead-in by its bypass switch (the
+declared switch that, turned on, leaves every other control dead in its HDL),
+toggled to time the device; one with none loads inside a Passthru
+lead-in ([evidence.md](evidence.md)). Each take logs the measured
 CC-to-picture latency, its attribution summary, the evidence report (every write's
 landing frame, readback and receipt counts, and one line per parameter: acted upon
 or not, and why), then the take's picture report. A take whose capture driver lost
@@ -465,7 +471,10 @@ more captures than frames because the card runs its own cadence
 ([hardware.md](hardware.md#the-cards-cadence)). What makes the finished clip right
 is the attribution line: every clip frame has a capture, and the clip's run agrees
 on its cadence. `ss evidence takes/take-Derez.mkv --source timecoded.mkv` prints a
-take's evidence again from its sidecars.
+take's evidence again from its sidecars; with `--predict` it sets each parameter's
+verdict against the program model's prediction for the take's steps, and flags a
+parameter predicted dead in every step that the picture shows moved as a
+contradiction ([program-model.md](program-model.md)).
 
 Iterate here, not on the full render. A different `--seed`, `--style` or
 `--density` at step 2 is seconds of CPU; a full render is most of an hour.

@@ -733,6 +733,8 @@ class Evidence:
     received: Received | None
     moved: list[Moved]
     loaded: dict = field(default_factory=dict)
+    #: The program model's per-parameter prediction for the take's steps (``syncsummoner.program.predict``).
+    predicted: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -773,9 +775,26 @@ class Evidence:
                     "steps_needed": verdict.steps_needed,
                     "with": list(verdict.partners),
                     "why_not": None if verdict.moved else why_not(verdict, verdict.name, agree, on_time),
+                    **self._prediction(verdict),
                 }
             )
         return out
+
+    def _prediction(self, verdict: Moved) -> dict:
+        guess = self.predicted.get(verdict.param)
+        if guess is None:
+            return {}
+        return {
+            "predicted": guess.verdict,
+            "live_steps": guess.live,
+            "dead_steps": guess.dead,
+            "check": guess.check(verdict.moved),
+        }
+
+    @property
+    def contradictions(self) -> list[int]:
+        """Parameters the program model calls dead in every step that the picture shows moved anyway."""
+        return [row["param"] for row in self.table() if row.get("check", "").startswith("contradiction")]
 
     def schedule(self) -> list[dict]:
         """Undetermined parameters and the steps a sweep would need to decide each."""
@@ -807,6 +826,7 @@ class Evidence:
                 f"{row['sent']}/{row['writes']} sent, {row['on_target']} on target, "
                 f"readback {row['readback']}, z {row['z']:+.2f} "
                 f"(lag {row['lag']}, critical {row['critical_z']:.2f}): {verdict}"
+                + (f"; {row['check']}" if "check" in row else "")
             )
         return said
 

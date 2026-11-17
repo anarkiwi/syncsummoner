@@ -14,24 +14,11 @@ from typing import Any, Mapping
 import numpy as np
 import yaml
 
-from syncsummoner.device.profile import PARAM_MAX, Axis, ProgramProfile, Role
+from syncsummoner.device.profile import Axis, ProgramProfile
 from syncsummoner.compose.features import Section
 from syncsummoner.compose.vocabulary import GESTURES, Automation, GestureContext
 
-__all__ = ["DEFAULT_WET", "Section", "GestureInstance", "Layer", "Score", "control_rate"]
-
-#: Wet range, as fractions of the wet control's travel, of a score that does not state its own.
-DEFAULT_WET = (0.10, 0.50)
-
-
-def clamp_wet(auto: Automation, profile: ProgramProfile, wet: tuple[float, float]) -> Automation:
-    """Clip automation of the profile's wet control into ``wet``, fractions of its travel."""
-    mask = np.isin(auto.indices, [p.index for p in profile.by_role(Role.WET)])
-    if not mask.any():
-        return auto
-    lo, hi = (round(frac * PARAM_MAX) for frac in wet)
-    values = np.where(mask, np.clip(auto.values, lo, hi), auto.values).astype(np.int32)
-    return replace(auto, values=values)
+__all__ = ["Section", "GestureInstance", "Layer", "Score", "control_rate"]
 
 
 def control_rate(fps: float) -> float:
@@ -174,12 +161,6 @@ class Score:
         """Read a score from disk."""
         return cls.from_yaml(Path(path).read_text(encoding="utf-8"))
 
-    @property
-    def wet(self) -> tuple[float, float]:
-        """The wet range every layer's wet control is driven within."""
-        lo, hi = self.meta.get("wet", DEFAULT_WET)
-        return float(lo), float(hi)
-
     def section_at(self, t: float) -> Section | None:
         """Section containing a time, or ``None``."""
         return next((s for s in self.sections if s.start <= t < s.end), None)
@@ -224,7 +205,7 @@ class Score:
     def render_layer(self, layer: Layer, profile: ProgramProfile, *, rate: float | None = None) -> Automation:
         """Expand one layer's gesture instances into merged parameter automation."""
         parts = [auto for _, auto in self.gesture_automations(layer, profile, rate=rate)]
-        return clamp_wet(Automation.concat(parts), profile, self.wet)
+        return Automation.concat(parts)
 
     def gesture_automations(
         self, layer: Layer, profile: ProgramProfile, *, rate: float | None = None
@@ -244,7 +225,6 @@ class Score:
                 axis=Axis(inst.axis),
                 rng=np.random.default_rng((self.seed, program_key(layer.program), inst.seed, i)),
                 targets=inst.targets,
-                wet=self.wet,
             )
             parts.append((inst, gesture(profile, ctx)))
         return parts

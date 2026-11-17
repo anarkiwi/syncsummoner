@@ -26,6 +26,8 @@ from pyvmancer.video import VideoStatus
 
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
 from syncsummoner.probe.runner import raw_params
+from syncsummoner.program.vmprog import ControlMode
+from tests.declared import Declarations, config, decl, toggle
 from tests.transmitter import LIVE, Live
 
 COLORBARS_INFO = {
@@ -46,6 +48,20 @@ COLORBARS_INFO = {
         {"name": "Fader", "min": 0, "max": 100},
     ],
 }
+
+
+#: What Colorbars' own ``.vmprog`` declares: P1 and P4 are left undeclared.
+COLORBARS_DECLARED = config(
+    "Colorbars",
+    decl(2, "Posterize", mode=ControlMode.STEPS_8, initial=0, display=(0, 7)),
+    decl(3, "Mix", initial=1023),
+    decl(5, "Gain", initial=512, display=(0, 25)),
+    decl(6, "Steps", high=3, initial=2, labels=("1", "2", "3", "4"), display=(1, 4)),
+    *(toggle(pid, name) for pid, name in zip(range(7, 11), ("Level", "Pattern", "Blue Only", "Mono"))),
+    toggle(11, "Bypass", initial=0),
+    decl(12, "Fader", initial=0),
+)
+DECLARED = Declarations(COLORBARS_DECLARED)
 
 
 class FakeShell(Live):

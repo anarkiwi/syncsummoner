@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, MeasurementRecord, Source
+from syncsummoner.device.profile import PARAM_COUNT, MeasurementRecord, Source
+from syncsummoner.device.session import to_device
 from syncsummoner.probe import patterns
 
 __all__ = ["run_plan", "frame_metrics", "measurement", "settle_frames", "raw_params", "STABILITY_ORDER"]
@@ -23,10 +24,10 @@ STABILITY_ORDER = ("static", "periodic", "quasiperiodic", "chaotic")
 
 
 def raw_params(vector):
-    """Parameter vector as the device's 12 raw 0..1023 values; booleans sit at the rails."""
+    """Parameter vector as the device's 12 raw 0..1023 values, coerced as :func:`to_device` coerces them."""
     raw = np.zeros(PARAM_COUNT, dtype=np.int64)
     for index, value in vector.items():
-        raw[index - 1] = PARAM_MAX if value is True else 0 if value is False else round(value * PARAM_MAX)
+        raw[index - 1] = to_device(value)
     return tuple(int(v) for v in raw)
 
 

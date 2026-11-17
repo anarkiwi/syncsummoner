@@ -1,8 +1,8 @@
-"""What a score will actually drive: every written parameter by name, role and range.
+"""What a score will actually drive: every written parameter by name, kind and range.
 
 The render plays :func:`~syncsummoner.compose.planner.plan_automation`, not the
 gestures, so this reads the same plan and attributes each parameter to the
-gestures that wrote it, flagging writes no role allows.
+gestures that wrote it, flagging a toggle the plan leaves latched on.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import numpy as np
 
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score, control_rate
-from syncsummoner.device.profile import BOOL_THRESHOLD, PARAM_MAX, ParamKind, ProgramProfile, Role
+from syncsummoner.device.profile import BOOL_THRESHOLD, ParamKind, ProgramProfile
 
 __all__ = ["LayerAudit", "ParamUse", "audit", "format_audit"]
 
@@ -26,7 +26,6 @@ class ParamUse:
 
     index: int
     name: str
-    role: Role
     kind: ParamKind
     writes: int = 0
     low: int | None = None
@@ -48,12 +47,7 @@ class LayerAudit:
 
 
 def _flags(spec, values: np.ndarray) -> tuple[str, ...]:
-    flags = []
-    if spec.role is Role.BYPASS:
-        flags.append("bypass driven")
-    if spec.kind is ParamKind.BOOLEAN and values[-1] >= BOOL_THRESHOLD:
-        flags.append("latched on")
-    return tuple(flags)
+    return ("latched on",) if spec.kind is ParamKind.BOOLEAN and values[-1] >= BOOL_THRESHOLD else ()
 
 
 def _layer(score: Score, layer: Layer, profile: ProgramProfile | None, plan, rate: float) -> LayerAudit:
@@ -70,13 +64,12 @@ def _layer(score: Score, layer: Layer, profile: ProgramProfile | None, plan, rat
     for spec in profile.params:
         values = plan.values[plan.indices == spec.index]
         if not values.size:
-            params.append(ParamUse(spec.index, spec.name, spec.role, spec.kind))
+            params.append(ParamUse(spec.index, spec.name, spec.kind))
             continue
         params.append(
             ParamUse(
                 spec.index,
                 spec.name,
-                spec.role,
                 spec.kind,
                 writes=int(values.size),
                 low=int(values.min()),
@@ -110,16 +103,15 @@ def _driven(use: ParamUse) -> str:
     return f"{use.writes:>4} writes  {use.low:>4}..{use.high:<4} ends {use.final:<4}  {by}"
 
 
-def format_audit(score: Score, layers: list[LayerAudit]) -> str:
+def format_audit(layers: list[LayerAudit]) -> str:
     """Plain-text report, one block per layer, flagged lines marked ``!``."""
-    lo, hi = score.wet
-    lines = [f"wet range {lo:.2f}..{hi:.2f} ({round(lo * PARAM_MAX)}..{round(hi * PARAM_MAX)})"]
+    lines = []
     for layer in layers:
         lines.append(f"layer {layer.index}: {layer.program}" + "".join(f"  ! {f}" for f in layer.flags))
         for use in layer.params:
             mark = "!" if use.flags else " "
             lines.append(
-                f" {mark} P{use.index:<2} {use.name[:16]:<16} {use.role.value:<9} {use.kind.value:<10} "
+                f" {mark} P{use.index:<2} {use.name[:16]:<16} {use.kind.value:<10} "
                 + _driven(use)
                 + "".join(f"  ! {f}" for f in use.flags)
             )

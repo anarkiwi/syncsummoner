@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -20,7 +20,7 @@ from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.errors import DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.playout import DEFAULT_LOOP_FPS
-from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
+from syncsummoner.device.profile import ParamKind
 from syncsummoner.device.recorder import (
     BlankTakeError,
     RouteError,
@@ -33,7 +33,6 @@ from syncsummoner.device.recorder import (
     settle,
 )
 from syncsummoner.device.session import Session
-from syncsummoner.device.transport import ProgramInfo
 from syncsummoner.probe import codeframes, plans
 from syncsummoner.probe.archive import GAP, FrameRow
 from syncsummoner.probe.runner import raw_params
@@ -201,15 +200,10 @@ class HarvestReport:
 
 
 def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) -> list[dict]:
-    """Sobol vectors over every used parameter, the crossfader swept like any other.
-
-    Pinning the crossfader open produced false blank takes (Bitcullis, Corollas);
-    it now sweeps 0..100% same as any other continuous effect.
-    """
-    spec = [replace(p, kind=ParamKind.CONTINUOUS) if p.index == CROSSFADER_INDEX else p for p in info.params]
-    if not any(p.kind is not ParamKind.UNUSED for p in spec):
+    """Sobol vectors over every declared parameter, each sampled as its kind."""
+    if not info.used:
         return [{}]
-    return list(plans.sobol(spec, n=config.setpoints, rng=rng))
+    return list(plans.sobol(info.params, n=config.setpoints, rng=rng))
 
 
 class ReadbackError(RuntimeError):
@@ -575,7 +569,7 @@ def harvest_program(
     if player is not None and not player.is_running():
         player.start(fps=config.loop_fps)
     payload = transport.program_payload()
-    info = ProgramInfo.from_json(payload)
+    info = transport.describe(payload)
     base = session.working_point(info)
     session.set_params(base)
     settle(

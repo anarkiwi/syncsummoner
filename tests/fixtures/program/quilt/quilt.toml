@@ -1,0 +1,263 @@
+# Quilt — recursive-subdivision improv quilt.
+#
+# A loosely grid-based field of randomly coloured and textured rectangular
+# patches.  Each coarse grid cell recursively splits into nested sub-rectangles
+# (log-cabin / crazy-quilt), each leaf getting a fabric colour and a procedural
+# texture.  P12 (Density) is the master recursion control; K2 re-randomises the
+# whole layout.  K3 Evolve is bipolar: centre freezes the quilt as it stands,
+# right changes one random piece at a time (its colour OR its texture), left
+# snakes the change from each piece to one it touches along a meandering path.  K4 is the whole Luma Mod control: at 0
+# it is off; above that the input video's luma (averaged per cell) drives the
+# piecing density and cells darker than the threshold are hidden (black) — it
+# needs a video input.  S8 Relief: Flat (soft emboss) or Puffed (deep emboss with
+# patches shaded darker toward their seams, like padding).  S10 sets the
+# piecing style.
+# Textures are always on and the split jitter is fixed.
+#
+# program_type is "processing" because Luma Mod reads the input; the program
+# draws its own picture and generates its own avid (see quilt.vhd).
+
+[program]
+processing_delay_clks = 28
+program_id = "com.czartroniks.quilt"
+program_version = "1.0.3"
+abi_version = ">=1.0,<2.0"
+program_name = "Quilt"
+author = "czartroniks"
+license = "GPL-3.0"
+categories = ["Pattern", "Craft", "Demo"]
+program_type = "processing"
+hardware_compatibility = ["rev_b"]
+core = "yuv444_30b"
+description = "Recursive patchwork quilt of coloured, embossed rectangles; input luma can sculpt the piecing."
+url = "https://github.com/lzxindustries/videomancer-community-programs"
+
+# --- Rotary Potentiometers (Knobs 1-6) ---
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+name_label = "Grid Scale"
+value_labels = ["Large", "Big", "Medium", "Small"]
+initial_value_label = "Large"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_2"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 300
+name_label = "Seed"
+suffix_label = ""
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_3"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 512
+display_min_value = -100
+display_max_value = 100
+name_label = "Evolve"
+suffix_label = "%"
+# BIPOLAR.  Centre = frozen as it stands.  Turn RIGHT and pieces change one at
+# a time in scattered order; turn LEFT and the change snakes instead, hopping
+# from each piece to one it touches along a meandering (Hilbert-curve) path that
+# differs every lap.  Either way the far end laps the whole quilt in well under
+# a second.
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_4"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 0
+display_min_value = 0
+display_max_value = 100
+name_label = "Threshold"
+suffix_label = "%"
+# 0 = Luma Mod off entirely.  Above the deadband, the input luma (a per-cell
+# block average from the previous frame) drives per-cell piecing density and
+# cells darker than the threshold are hidden (black).  Needs a video input.
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_5"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 0
+display_min_value = 0
+display_max_value = 15
+name_label = "Palette Tint"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_6"
+name_label = "Texture Scale"
+value_labels = ["Fine", "Small", "Medium", "Coarse"]
+initial_value_label = "Fine"
+
+# --- Toggle Switches (7-11, binary) ---
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "Seams"
+value_labels = ["Off", "On"]
+initial_value_label = "On"
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Relief"
+value_labels = ["Flat", "Puffed"]
+initial_value_label = "Puffed"
+
+[[parameter]]
+parameter_id = "toggle_switch_9"
+name_label = "Grid"
+value_labels = ["Square", "Not Square"]
+initial_value_label = "Square"
+
+[[parameter]]
+parameter_id = "toggle_switch_10"
+name_label = "Piecing"
+value_labels = ["Crazy", "Log Cabin"]
+initial_value_label = "Crazy"
+
+[[parameter]]
+parameter_id = "toggle_switch_11"
+name_label = "Palette"
+value_labels = ["Fabric", "Rainbow"]
+initial_value_label = "Fabric"
+
+# --- Linear Potentiometer (Fader 12) ---
+
+[[parameter]]
+parameter_id = "linear_potentiometer_12"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 700
+display_min_value = 0
+display_max_value = 100
+name_label = "Density"
+suffix_label = "%"
+
+# --- Presets ---
+
+[[preset]]
+name = "Crazy Quilt"
+rotary_potentiometer_1 = 600       # medium grid
+rotary_potentiometer_2 = 300
+rotary_potentiometer_3 = 512       # evolve: centre = frozen
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 350       # small texture
+toggle_switch_7 = 1                # seams on
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0                # square grid
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 0               # fabric
+linear_potentiometer_12 = 820      # high density
+
+[[preset]]
+name = "Log Cabin"
+rotary_potentiometer_1 = 200       # big blocks
+rotary_potentiometer_2 = 512
+rotary_potentiometer_3 = 512       # evolve: centre = frozen
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 600       # medium texture
+toggle_switch_7 = 1
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0
+toggle_switch_10 = 1               # log cabin piecing
+toggle_switch_11 = 0
+linear_potentiometer_12 = 600
+
+[[preset]]
+name = "Off-Grid"
+rotary_potentiometer_1 = 300       # biggish cells so overlap reads clearly
+rotary_potentiometer_2 = 740
+rotary_potentiometer_3 = 512       # evolve: centre = frozen
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 350       # fine texture
+toggle_switch_7 = 1
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 1                # not square -> off-grid overlapping rectangles
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 0
+linear_potentiometer_12 = 600
+
+[[preset]]
+name = "Solid Patches"
+rotary_potentiometer_1 = 600
+rotary_potentiometer_2 = 880
+rotary_potentiometer_3 = 512       # evolve: centre = frozen
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 300
+toggle_switch_7 = 1
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 0
+linear_potentiometer_12 = 420      # lower density -> bigger patches
+
+[[preset]]
+name = "Rainbow Crazy"
+rotary_potentiometer_1 = 800       # small grid
+rotary_potentiometer_2 = 140
+rotary_potentiometer_3 = 512       # evolve: centre = frozen
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 256
+rotary_potentiometer_6 = 350       # fine texture
+toggle_switch_7 = 1
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 1               # rainbow palette
+linear_potentiometer_12 = 900      # max density
+
+[[preset]]
+name = "Luma Mod"
+rotary_potentiometer_1 = 600       # medium cells: fine enough to carry a silhouette
+rotary_potentiometer_2 = 420
+rotary_potentiometer_3 = 512       # evolve: centre = frozen
+rotary_potentiometer_4 = 512       # luma mod on, cut at mid grey (needs video in)
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 350       # fine texture
+toggle_switch_7 = 1
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 0
+linear_potentiometer_12 = 1023     # full range so bright video fully subdivides
+
+[[preset]]
+name = "Evolving"
+rotary_potentiometer_1 = 600       # medium grid
+rotary_potentiometer_2 = 300
+rotary_potentiometer_3 = 760       # evolve right: random order
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 350       # small texture
+toggle_switch_7 = 1                # seams on
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0                # square grid
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 0               # fabric
+linear_potentiometer_12 = 700
+
+[[preset]]
+name = "Snake"
+rotary_potentiometer_1 = 600       # medium grid
+rotary_potentiometer_2 = 300
+rotary_potentiometer_3 = 260       # evolve left: snaking walk
+rotary_potentiometer_4 = 0         # luma mod off
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 350       # small texture
+toggle_switch_7 = 1                # seams on
+toggle_switch_8 = 1                # puffed
+toggle_switch_9 = 0                # square grid
+toggle_switch_10 = 0               # crazy piecing
+toggle_switch_11 = 0               # fabric
+linear_potentiometer_12 = 700

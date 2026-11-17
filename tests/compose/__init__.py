@@ -16,7 +16,6 @@ from syncsummoner.device.profile import (
     ProgramProfile,
     Source,
     Tongue,
-    classify_role,
 )
 from tests import transmitter as tx
 
@@ -67,12 +66,11 @@ def _spec(index, axis, kind=ParamKind.CONTINUOUS, cliffs=(), hysteresis=False, d
         dead_zone=dead_zone,
         cliffs=list(cliffs),
         hysteresis=hysteresis,
-        role=classify_role(index, f"p{index}"),
     )
 
 
 def make_profile(program: str = "glitch", *, source: Source = Source.HW, rich: bool = True):
-    """A fitted profile with a cliff atlas, a lock map, a boolean, a fader and settle times."""
+    """A fitted profile with a cliff atlas, a lock map, a boolean and settle times."""
     params = [
         _spec(1, Axis.TEXTURE_SCALE, dead_zone=(0, 96)),
         _spec(2, Axis.MOTION_RATE, cliffs=[Cliff(at=640, jump=0.6, metrics=("clip_frac", "ic"))]),

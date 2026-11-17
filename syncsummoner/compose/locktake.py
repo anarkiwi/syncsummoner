@@ -61,16 +61,30 @@ class LeadIn:
     seed: int = 0
 
 
-def dry_state(info: Any) -> dict[int, int] | None:
-    """The write that returns a program's input unprocessed: the parameter the program itself labels
-    its bypass, turned on. None when it labels none, so its lead-in cannot carry the strip.
+def program_bypass(info: Any) -> int | None:
+    """The declared switch the program's HDL shows returns its input with every other control dead.
 
-    No slot is assumed to do the same thing in every program.
+    None when the program has no declaration, no such switch, or the model cannot be built.
     """
-    for spec in info.params:
-        if spec.name.strip().casefold() == "bypass":
-            return {spec.index: PARAM_MAX}
-    return None
+    from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
+
+    declared = getattr(info, "declared", None)
+    if declared is None:
+        return None
+    try:
+        return model(declared.program_id).bypass()
+    except (KeyError, RuntimeError, OSError) as err:
+        LOG.warning("%s: no bypass from the program model: %s", info.name, err)
+        return None
+
+
+def dry_state(info: Any, bypass: Callable[[Any], int | None] = program_bypass) -> dict[int, int] | None:
+    """The write that returns a program's input unprocessed: its bypass switch turned on.
+
+    None when it has none, so its lead-in cannot carry the strip. No slot or label is assumed.
+    """
+    pick = bypass(info)
+    return None if pick is None else {pick: PARAM_MAX}
 
 
 def frame_plan(auto: Any, *, fps: float, early_bias_s: float) -> np.ndarray:
@@ -261,11 +275,13 @@ def locked_take(
     working: Callable[[Any], Mapping[int, Any]],
     load: Callable[[str], Any],
     lead_in: LeadIn = LeadIn(),
+    bypass: Callable[[Any], int | None] = program_bypass,
 ) -> Record:
     """Record ``program`` playing the clip with every planned write sent for its frame.
 
     ``load(name)`` loads a program and checks the rig, returning its program info, and
-    ``working(info)`` gives its working point. A rise in the boot count is a :class:`RebootError`.
+    ``working(info)`` gives its working point; ``bypass(info)`` names its dry switch. A rise in the
+    boot count is a :class:`RebootError`.
     """
     shell = rig.transport.device.shell
     midi = rig.transport.device.midi
@@ -273,7 +289,7 @@ def locked_take(
     lead, count = int(round(config.lead_in_s * fps)), int(round(seconds * fps))
     booted = boot_count(shell)
     info = load(program)
-    dry = dry_state(info)
+    dry = dry_state(info, bypass)
     initial = initial_state(working(info), plan)
     park = rig.session.park_values
 
@@ -548,10 +564,31 @@ def loaded_before(
     return {"ok": bool(running and agree and early), "summary": summary, "want": want.tolist()}
 
 
+def predicted(program: str, wire: Mapping[str, Any]) -> dict:
+    """The program model's prediction for the take's planned steps; empty when the model cannot be built."""
+    from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program.predict import predict  # pylint: disable=import-outside-toplevel
+
+    try:
+        return predict(model(program), wire["start"], wire["plan"])
+    except (KeyError, RuntimeError, OSError) as err:
+        LOG.warning("%s: no prediction from the program model: %s", program, err)
+        return {}
+
+
 def take_evidence(
-    take: str | Path, *, program: str, clip: str | Path, config: Any, names: Mapping[int, str] | None = None
+    take: str | Path,
+    *,
+    program: str,
+    clip: str | Path,
+    config: Any,
+    names: Mapping[int, str] | None = None,
+    predict: bool = False,
 ) -> ev.Evidence:
-    """The three links for a recorded take, from its wire record, its attribution and its picture."""
+    """The three links for a recorded take, from its wire record, its attribution and its picture.
+
+    With ``predict``, each parameter's verdict is set against the program model's prediction.
+    """
     from syncsummoner.compose.lock import attribute_take  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.wire import load_wire  # pylint: disable=import-outside-toplevel
@@ -609,6 +646,7 @@ def take_evidence(
         received=got,
         moved=moved,
         loaded=loaded_before(program, wire, ticks, times, delta),
+        predicted=predicted(program, wire) if predict else {},
     )
 
 

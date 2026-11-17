@@ -11,14 +11,23 @@ from pyvmancer.const import ShellErrorCode
 from pyvmancer.shell import Reply
 
 from syncsummoner.device import transport as tr
-from syncsummoner.device.profile import PARAM_COUNT, ParamKind, Role
+from syncsummoner.device.declared import UndeclaredProgramError
+from syncsummoner.device.profile import PARAM_COUNT, ParamKind
 from tests.transmitter import DEAD, LIVE, UNREPORTED, at
 
-from .conftest import COLORBARS_INFO, FakeDevice, FakeShell, GatedLink, videomancer
+from .conftest import (
+    COLORBARS_DECLARED,
+    COLORBARS_INFO,
+    DECLARED,
+    FakeDevice,
+    FakeShell,
+    GatedLink,
+    videomancer,
+)
 
 
 def test_program_info_derives_kinds(device):
-    info = tr.Transport(device).program_info()
+    info = tr.Transport(device, DECLARED).program_info()
     kinds = [p.kind for p in info.params]
     assert info.name == "Colorbars"
     assert info.program_id == 3
@@ -34,51 +43,41 @@ def test_program_info_derives_kinds(device):
     assert len(info.used) == 10
 
 
-def test_program_info_names_roles_and_keeps_the_wet_control_continuous(device):
-    port = tr.Transport(device)
+def test_program_info_takes_labels_from_the_device_and_kinds_from_the_declaration(device):
+    port = tr.Transport(device, DECLARED)
     info = port.program_info()
-    assert [p.role for p in info.params if p.role is not Role.EFFECT] == [Role.BYPASS, Role.WET]
-    assert info.params[10].name == "Bypass" and info.params[11].kind is ParamKind.CONTINUOUS
+    assert [p.name for p in info.params] == [p["name"] for p in COLORBARS_INFO["parameters"]]
+    assert info.declared is COLORBARS_DECLARED and DECLARED.asked[-1] == "Colorbars"
+    assert info.params[11].kind is ParamKind.CONTINUOUS and info.params[11].steps is None
+    assert (info.params[4].native_min, info.params[4].native_max) == (0.0, 25.0)
     assert port.program_payload() == COLORBARS_INFO, "the reply is archived exactly as the device gave it"
-    unnamed = tr.ProgramInfo.from_json(
-        {"parameters": [{"name": f"Null {i}", "min": 0, "max": 100} for i in range(1, 13)]}
-    )
-    assert unnamed.params[11].role is Role.WET and unnamed.params[11].kind is ParamKind.CONTINUOUS
-    assert unnamed.params[11].steps is None and unnamed.params[10].kind is ParamKind.UNUSED
 
 
-def test_quantized_threshold_follows_sample_budget():
-    info = tr.ProgramInfo.from_json({"parameters": [{"name": "Steps", "min": 0, "max": 40}]}, steps=64)
-    assert info.params[0].kind is ParamKind.QUANTIZED
-    assert info.params[0].steps == 41
+def test_a_program_loaded_by_author_is_declared_by_that_name(device):
+    port = tr.Transport(device, DECLARED)
+    port.load_program("czartroniks/Colorbars")
+    port.program_info()
+    assert DECLARED.asked[-1] == "czartroniks/Colorbars"
 
 
-def test_degenerate_range_is_unused():
-    info = tr.ProgramInfo.from_json({"parameters": [{"name": "Odd", "min": 5, "max": 5}]})
-    assert info.params[0].kind is ParamKind.UNUSED
+def test_an_undeclared_program_is_an_error_not_a_guess(device):
+    port = tr.Transport(device, DECLARED)
+    with pytest.raises(UndeclaredProgramError, match="'Isotherm'"):
+        port.describe({**COLORBARS_INFO, "name": "Isotherm"})
 
 
-@pytest.mark.parametrize(
-    "name,kind",
-    [
-        ("-", ParamKind.UNUSED),
-        ("", ParamKind.UNUSED),
-        ("  ", ParamKind.UNUSED),
-        ("Null 4", ParamKind.UNUSED),
-        ("null 11", ParamKind.UNUSED),
-        ("None", ParamKind.UNUSED),
-        ("Mix", ParamKind.CONTINUOUS),
-        ("Nullify", ParamKind.CONTINUOUS),
-        ("Null gate", ParamKind.CONTINUOUS),
-    ],
-)
-def test_slot_names(name, kind):
-    info = tr.ProgramInfo.from_json({"parameters": [{"name": name, "min": 0, "max": 100}]})
-    assert info.params[0].kind is kind
+def test_without_a_declaration_every_slot_is_unused():
+    info = tr.ProgramInfo.from_json(COLORBARS_INFO)
+    assert not info.used and not info.initial and info.params[10].name == "Bypass"
+
+
+def test_initial_is_the_declared_state_in_device_units(device):
+    info = tr.Transport(device, DECLARED).program_info()
+    assert info.initial == {2: 0, 3: 1023, 5: 512, 6: 682, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0}
 
 
 def test_program_info_loads_when_not_current(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.program_info("Isotherm")
     assert device.shell.loads == ["Isotherm"]
     assert device.program == "Isotherm"
@@ -86,7 +85,7 @@ def test_program_info_loads_when_not_current(device):
 
 
 def test_program_info_skips_load_when_current(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.load_program("Colorbars")
     device.calls.clear()
     port.program_info("Colorbars")
@@ -94,7 +93,7 @@ def test_program_info_skips_load_when_current(device):
 
 
 def test_a_device_reporting_the_plain_name_does_not_stand_in_for_another_author(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     assert port.current_program() == "Colorbars"
     port.program_info("czartroniks/Colorbars")
     assert device.shell.loads == ["Colorbars"]
@@ -103,7 +102,7 @@ def test_a_device_reporting_the_plain_name_does_not_stand_in_for_another_author(
 
 
 def test_qualified_names_load_once_and_reload_when_the_author_changes(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.load_program("czartroniks/Teletext")
     device.shell.calls.clear()
     port.program_info("czartroniks/Teletext")
@@ -117,15 +116,19 @@ def test_qualified_names_load_once_and_reload_when_the_author_changes(device):
 
 def test_programs_are_passed_through_qualified(device):
     device.programs = lambda: ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
-    assert tr.Transport(device).programs() == ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
+    assert tr.Transport(device, DECLARED).programs() == [
+        "Teletext",
+        "czartroniks/Teletext",
+        "boneoh/RGB Bit Crush",
+    ]
 
 
 def test_current_program_falls_back_to_status(device):
-    assert tr.Transport(device).current_program() == "Colorbars"
+    assert tr.Transport(device, DECLARED).current_program() == "Colorbars"
 
 
 def test_program_state_prefers_combined(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     device.shell.manual[:] = 100
     port.set_param(1, 400)
     assert port.program_state()[0] == 500
@@ -135,24 +138,24 @@ def test_program_state_prefers_combined(device):
 def test_program_state_accepts_per_slot_dicts(device):
     device.shell.state_shape = "slots"
     device.shell.manual[:] = 7
-    assert np.all(tr.Transport(device).program_state() == 7)
+    assert np.all(tr.Transport(device, DECLARED).program_state() == 7)
 
 
 def test_program_state_skips_unusable_candidates(device):
     device.shell.state_shape = "odd"
-    assert np.all(tr.Transport(device).program_state() == 3)
+    assert np.all(tr.Transport(device, DECLARED).program_state() == 3)
 
 
 def test_program_state_ignores_non_mapping_payload(device):
     device.shell.state_shape = "list"
     device.shell.manual[:] = 11
-    assert np.all(tr.Transport(device).program_state() == 11)
+    assert np.all(tr.Transport(device, DECLARED).program_state() == 11)
 
 
 def test_program_state_falls_back_to_manual(device):
     device.shell.state_shape = "empty"
     device.shell.manual[:] = 42
-    assert np.all(tr.Transport(device).program_state() == 42)
+    assert np.all(tr.Transport(device, DECLARED).program_state() == 42)
 
 
 def test_program_state_raises_without_vector():
@@ -164,38 +167,26 @@ def test_program_state_raises_without_vector():
 
 
 def test_set_manual_is_zero_based_and_clipped(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.set_manual(12, 5000)
     assert ("set_modulation", 11, 1023) in device.shell.calls
 
 
-def test_sweepable_skips_booleans_unused_and_the_crossfader():
-    info = tr.ProgramInfo.from_json(
-        {
-            "name": "X",
-            "parameters": [
-                {"name": "Posterize", "min": 0, "max": 7},
-                {"name": "Smoothing", "min": 0, "max": 100},
-                {"name": "-", "min": 0, "max": 100},
-                {"name": "Flag", "min": 0, "max": 1},
-            ]
-            + [{"name": f"Null {i}", "min": 0, "max": 100} for i in range(5, 12)]
-            + [{"name": "Mix", "min": 0, "max": 100}],
-        }
-    )
-    assert [p.index for p in info.sweepable()] == [1, 2]
-    assert [p.index for p in info.sweepable(1)] == [1]
-    assert [p.index for p in info.sweepable(exclude=[1])] == [2]
+def test_sweepable_is_every_declared_continuous_or_quantized_slot():
+    info = tr.ProgramInfo.from_json(COLORBARS_INFO, COLORBARS_DECLARED)
+    assert [p.index for p in info.sweepable()] == [2, 3, 5, 6, 12]
+    assert [p.index for p in info.sweepable(1)] == [2]
+    assert [p.index for p in info.sweepable(exclude=[2, 12])] == [3, 5, 6]
 
 
 @pytest.mark.parametrize("index", [0, 13, -1])
 def test_index_validation(device, index):
     with pytest.raises(ValueError, match="1..12"):
-        tr.Transport(device).set_param(index, 0.5)
+        tr.Transport(device, DECLARED).set_param(index, 0.5)
 
 
 def test_video_status_parses_nested(device):
-    status = tr.Transport(device).video_status()
+    status = tr.Transport(device, DECLARED).video_status()
     assert status.timing == "720p60"
     assert status.input_source == "analog"
     assert status.locked is True
@@ -207,7 +198,7 @@ def test_video_status_defaults_to_unlocked():
 
 
 def test_transport_verbs(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.set_video_timing("720p60")
     port.transport_play()
     port.transport_stop()
@@ -223,7 +214,7 @@ def test_transport_verbs(device):
 
 
 def test_msgs_per_param(device):
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     assert port.msgs_per_param == 2
     device.midi.high_resolution = False
     assert port.msgs_per_param == 1
@@ -232,7 +223,7 @@ def test_msgs_per_param(device):
 
 
 def test_context_manager_closes(device):
-    with tr.Transport(device) as port:
+    with tr.Transport(device, DECLARED) as port:
         assert port.device is device
     assert device.closed
 
@@ -246,7 +237,7 @@ def test_open_uses_pyvmancer(monkeypatch):
 
     monkeypatch.setattr(tr.vm.Videomancer, "open", staticmethod(fake_open))
     lines = []
-    port = tr.Transport.open(serial="E464B0605F113625", report=lines.append, stall=300.0)
+    port = tr.Transport.open(serial="E464B0605F113625", report=lines.append, stall=300.0, library=DECLARED)
     assert seen["serial"] == "E464B0605F113625"
     shell = port.device.shell
     shell.report("still loading X")
@@ -258,7 +249,7 @@ def test_open_uses_pyvmancer(monkeypatch):
 def test_resync_delegates_to_the_device_library():
     """The timing bounce is device protocol; pyvmancer owns and tests it."""
     device = FakeDevice()
-    assert tr.Transport(device).resync() is True
+    assert tr.Transport(device, DECLARED).resync() is True
     assert any(c[0] == "resync" for c in device.shell.calls)
 
 
@@ -370,7 +361,7 @@ def test_transmitting_needs_an_active_transmitter_at_the_session_timing(payload,
 def test_a_link_gated_load_restores_the_link_on_the_reply_then_waits_for_the_run():
     device = FakeDevice()
     link = GatedLink(device.shell)
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.load_program("Passthru", hold=link.quiet)
     assert ("load", "Passthru", False) in device.shell.calls, "the command runs with the link down"
     assert link.calls == ["down", "up"] and device.shell.program == "Passthru"
@@ -389,7 +380,7 @@ def test_waiting_for_the_run_inside_the_hold_never_ends():
 
 def test_a_liveness_wait_cannot_run_while_the_link_is_held_down():
     device = FakeDevice()
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     early = port.watch("waiting for the transmitter")
 
     @contextlib.contextmanager
@@ -410,7 +401,7 @@ def test_a_load_refused_with_the_link_down_still_restores_it():
     device = FakeDevice()
     device.shell.load_error = 7
     link = GatedLink(device.shell)
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     with pytest.raises(ShellError):
         port.load_program("Passthru", hold=link.quiet)
     assert link.calls == ["down", "up"] and device.shell.link_up
@@ -426,13 +417,13 @@ def test_a_load_answering_other_than_ok_raises_after_restoring_the_link():
     )
     link = GatedLink(device.shell)
     with pytest.raises(VmancerError, match="busy"):
-        tr.Transport(device).load_program("Passthru", hold=link.quiet)
+        tr.Transport(device, DECLARED).load_program("Passthru", hold=link.quiet)
     assert link.calls == ["down", "up"]
 
 
 def test_progress_lines_say_when_the_link_is_down():
     device = FakeDevice()
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     lines = []
     report = port.annotate(lines.append)
 
@@ -455,7 +446,7 @@ def test_firmware_without_authors_loads_plain_names_without_enumerating():
         raise ShellError(ShellErrorCode.PARSE_ERROR, "usage: programs authors")
 
     device.shell.authors = authors
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     port.load_program("Passthru")
     port.load_program("Colorbars")
     assert device.shell.loads == ["Passthru", "Colorbars"]
@@ -475,14 +466,14 @@ def test_an_authors_failure_is_never_read_as_firmware_without_authors(error):
 
     device.shell.authors = authors
     with pytest.raises(type(error)):
-        tr.Transport(device).load_program("Passthru")
+        tr.Transport(device, DECLARED).load_program("Passthru")
     assert not device.shell.loads
 
 
 def test_authors_and_route_are_read_from_the_device():
     """The authors listing and Vid Route Mode, as the render's listing error and route check use them."""
     device = FakeDevice()
-    port = tr.Transport(device)
+    port = tr.Transport(device, DECLARED)
     assert port.authors() == ["lzx", "czartroniks"] and port.route() == 1
     device.shell.routed = 4
     assert port.route() == 4
@@ -495,4 +486,4 @@ def test_firmware_without_authors_reports_none():
         raise ShellError(ShellErrorCode.UNKNOWN_COMMAND, "unknown command")
 
     device.shell.authors = authors
-    assert tr.Transport(device).authors() is None
+    assert tr.Transport(device, DECLARED).authors() is None

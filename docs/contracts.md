@@ -162,14 +162,41 @@ proxy reads its objective back out of it rather than inferring it. A profile
 written before those curves existed loads with `measured == {}` and composes off
 the older inferences.
 
-`ParamSpec.role` (`profile.Role`: `effect`, `bypass`, `wet`, `momentary`) is what a
-gesture may do with the parameter, from `classify_role(index, name)` over the
-label the device reports. Profile schema 2 stores it; a schema 1 profile loads with
-it derived from its stored name. `ProgramInfo.from_json` sets it and keeps a `wet`
-slot continuous whatever its native range. `Transport.program_payload()` is the
+`ParamSpec.kind` (`boolean`, `quantized` with `steps` levels, `continuous`, `unused`)
+is the program's own declaration: the `control_mode` and `value_labels` of its
+`.vmprog` config payload, and nothing else. No slot index and no label carries a
+meaning of its own. `ProgramInfo.from_json(data, declared)` takes the device's labels
+from `data` and every kind from `declared` (a `program.ProgramConfig`); a slot
+`declared` leaves out is `unused`. `Transport.program_info()` looks the declaration
+up by device name in the default `program.Library` and raises
+`device.declared.UndeclaredProgramError` when no single `.vmprog` declares the
+program. `Session.working_point(info)` is each declared slot's initial value in
+device units. `Transport.program_payload()` is the
 unparsed `program info` reply, which `FrameArchive.commit(program_info=...)` and
 `FrameArchive.annotate(...)` store under `archive.PROGRAM_INFO` in the archive
 metadata, and `names.archived_specs(meta)` turns back into specs for a refit.
+
+## `syncsummoner.program`
+
+```python
+Library.default() -> Library   # card copy, firmware .uf2, SDK and community sources, from SYNCSUMMONER_{CARD,FIRMWARE,SDK,COMMUNITY}
+Library.find(name) -> Program  # device name, bare built-in name or program id; KeyError unless exactly one
+model(name, library=None, *, config="hd_hdmi", source=None) -> ProgramModel   # source: "rtl" | "bitstream"
+ProgramModel.params -> tuple[ParamDecl, ...]          # as declared
+ProgramModel.field(pid) -> Field                      # the register bits the control lands in
+ProgramModel.resolution() -> dict[int, tuple[int, ...]]   # bits read at all, every register free
+ProgramModel.live(state=None, timing=None, *, gates=True) -> dict[int, Liveness]   # .live_bits, .gated_by
+ProgramModel.step_matters(state, pid, a, b, timing=None) -> Step   # .matters: True | False | None, .how
+ProgramModel.schedule(state=None, timing=None) -> dict[int, np.ndarray]   # one value per distinguishable setting
+parse_state(model, spec, overrides=()) -> np.ndarray   # "initial", a preset name, or 12 values
+predict.predict(model, start, plan, timing=None) -> dict[int, Prediction]   # .verdict live | dead | untested
+Prediction.check(moved) -> str   # "contradiction: ..." when predicted dead but moved
+```
+
+`state` is twelve manual values; `None` is the declared initial values.
+`Step.matters` is `False` by proof, `True` by a concrete witness, and `None` when
+neither was found; `.how` says which. [program-model.md](program-model.md) describes the
+method.
 
 ## `syncsummoner.probe`
 
@@ -234,6 +261,6 @@ render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
 locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias
 locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
-locktake.take_evidence(take, *, program, clip, config, names=None) -> evidence.Evidence   # the three links; .ok is the hard check
+locktake.take_evidence(take, *, program, clip, config, names=None, predict=False) -> evidence.Evidence   # the three links; .ok is the hard check
 evidence.send_time(frames, ticks, times, delta) -> ns   # half a frame before the instant each frame's write must precede
 ```

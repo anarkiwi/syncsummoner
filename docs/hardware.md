@@ -53,8 +53,8 @@ Park the panel before measuring; `Session.park()` exists for it.
 
 P1-P6 continuous, P7-P11 boolean, P12 fader, 10-bit. Booleans resolve `on` at a
 combined value >= 512 of 1024. `program info` reports per-parameter names and
-native ranges over serial and names unused parameters `-`, so no `.vmprog` TOML
-parsing is needed. A parameter with native range `0..7` has 8 meaningful
+native ranges over serial and names unused parameters `-`; each parameter's kind
+comes from the program's `.vmprog` declaration. A parameter with native range `0..7` has 8 meaningful
 positions, not 1024; sampling it at 32 steps wastes rig time. See
 `ParamSpec.sample_values`.
 
@@ -96,7 +96,7 @@ time less 15 ms.
 
 ## P12 is not a crossfader
 
-pyvmancer and this project's profile code call P12 a crossfader that gates every program's output. That is false. On the
+pyvmancer calls P12 a crossfader that gates every program's output. That is false. On the
 still lead-in, against Passthru's capture of the same picture (noise 0.12 mean
 absolute difference in 8-bit codes):
 

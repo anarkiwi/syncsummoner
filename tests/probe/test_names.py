@@ -7,11 +7,12 @@ import json
 import pytest
 from pyvmancer.errors import DeviceGoneError, ShellError
 
-from syncsummoner.device.profile import ParamKind, Role
+from syncsummoner.device.declared import UndeclaredProgramError
+from syncsummoner.device.profile import ParamKind
 from syncsummoner.probe import names as N
 from syncsummoner.probe.archive import PROGRAM_INFO, ArchiveError, FrameArchive
 from syncsummoner.probe.harvest import GONE_NOTE
-from tests.device.conftest import COLORBARS_INFO
+from tests.device.conftest import COLORBARS_INFO, DECLARED
 from tests.probe.test_archive import KEY, rows
 
 
@@ -99,12 +100,14 @@ def test_a_device_gone_from_usb_ends_the_run(archive):
     assert said[-1] == GONE_NOTE
 
 
-def test_archived_specs_carry_names_ranges_and_roles(archive):
-    assert N.archived_specs(archive.meta("Alpha")) is None
-    specs = N.archived_specs(archive.meta("Gamma"))
+def test_archived_specs_carry_device_names_and_declared_kinds(archive):
+    assert N.archived_specs(archive.meta("Alpha"), "Alpha", DECLARED) is None
+    specs = N.archived_specs(archive.meta("Gamma"), "Colorbars", DECLARED)
     assert [s.name for s in specs] == [p["name"] for p in COLORBARS_INFO["parameters"]]
-    assert specs[10].role is Role.BYPASS and specs[11].role is Role.WET
+    assert specs[10].kind is ParamKind.BOOLEAN and specs[0].kind is ParamKind.UNUSED
     assert specs[11].kind is ParamKind.CONTINUOUS and specs[11].native_max == 100
+    with pytest.raises(UndeclaredProgramError):
+        N.archived_specs(archive.meta("Gamma"), "Gamma", DECLARED)
 
 
 def test_a_commit_can_carry_the_reply_itself(tmp_path):

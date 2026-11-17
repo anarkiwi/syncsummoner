@@ -19,8 +19,18 @@ from syncsummoner.device.host import HostCommandError
 from syncsummoner.device.recorder import MJPEG, RecorderError
 from syncsummoner.device.transport import ProgramInfo, Transport
 from syncsummoner.probe.patterns import generate
+from syncsummoner.program.vmprog import ControlMode
+from tests.declared import config, decl, toggle
 
-from .conftest import COLORBARS_INFO, FakeClock, FakeDevice, FakeMidiPort, FakeShell
+from .conftest import (
+    COLORBARS_DECLARED,
+    COLORBARS_INFO,
+    DECLARED,
+    FakeClock,
+    FakeDevice,
+    FakeMidiPort,
+    FakeShell,
+)
 
 FMT = Format("1080p30", 1920, 1080, 30.0)
 KMSPRINT = """Connector 0 (35) HDMI-A-1 (connected)
@@ -170,7 +180,7 @@ def rig(tmp_path):
             runner=pi,
             sysfs=sysfs(tmp_path, speed),
             formats=(lambda node: formats) if isinstance(formats, str) else formats,
-            open_transport=lambda: Transport(device),
+            open_transport=lambda: Transport(device, DECLARED),
             playout=player,
             link=FakeLink(pi),
             recorder=kw.pop("recorder", FakeRecorder()),
@@ -375,7 +385,7 @@ def test_loop_passes_on_a_clean_chain(rig, captured):
 def test_loop_catches_a_red_blue_swap_at_any_gain(rig, captured):
     doc = rig()
     captured(doc, lambda frame: 0.4 * swap_rb(frame) + 0.05)
-    found = by_check(doc.loop(Transport(doc.dev)))
+    found = by_check(doc.loop(Transport(doc.dev, DECLARED)))
     assert found["loop.index"].ok
     assert not found["loop.bars"].ok
     assert found["loop.bars"].detail == "bars read white cyan yellow green magenta blue red"
@@ -386,7 +396,7 @@ def test_loop_reports_a_stale_frame(rig, captured):
     other = generate("smpte_bars", width=FMT.width, height=FMT.height, rng=None)
     captured(doc, lambda frame: dr.with_state_index(other, 3) if frame is not None else None)
     doc._rng = np.random.default_rng(1)  # pylint: disable=protected-access
-    found = by_check(doc.loop(Transport(doc.dev)))
+    found = by_check(doc.loop(Transport(doc.dev, DECLARED)))
     assert found["loop.signal"].ok and not found["loop.index"].ok
 
 
@@ -402,7 +412,7 @@ def test_loop_judges_the_signal_by_the_transmitter_not_the_picture(rig, captured
     video = {k: v for k, v in VIDEO.items() if k != "hdmi_tx"}
     doc = rig(shell=RigShell(video if transmitter is None else dict(video, hdmi_tx=transmitter)))
     captured(doc)
-    found = doc.loop(Transport(doc.dev))
+    found = doc.loop(Transport(doc.dev, DECLARED))
     assert [f.check for f in found] == ["loop.signal"] and not found[0].ok
     assert found[0].detail == detail and "video status" in found[0].fix
 
@@ -411,7 +421,7 @@ def test_loop_takes_achromatic_high_contrast_as_picture(rig, captured):
     """Grey bars carry no chroma at all; with the transmitter up they are picture, only miscoloured."""
     doc = rig()
     captured(doc, lambda frame: np.repeat(frame.mean(axis=2, keepdims=True), 3, axis=2))
-    found = by_check(doc.loop(Transport(doc.dev)))
+    found = by_check(doc.loop(Transport(doc.dev, DECLARED)))
     assert found["loop.signal"].ok and found["loop.signal"].detail == "picture captured"
     assert found["loop.index"].ok and not found["loop.bars"].ok
 
@@ -420,7 +430,7 @@ def test_loop_reports_a_uniform_field_as_no_picture(rig, captured):
     """Video black at 16 with the transmitter up is a program carrying nothing, not the bars."""
     doc = rig()
     captured(doc, lambda frame: np.full((FMT.height, FMT.width, 3), 16 / 255, np.float32))
-    found = doc.loop(Transport(doc.dev))
+    found = doc.loop(Transport(doc.dev, DECLARED))
     assert [f.check for f in found] == ["loop.signal"] and not found[0].ok
     assert found[0].detail == "the device outputs a uniform field" and "Passthru" in found[0].fix
 
@@ -428,7 +438,7 @@ def test_loop_reports_a_uniform_field_as_no_picture(rig, captured):
 def test_loop_with_nothing_captured(rig, captured):
     doc = rig(recorder=FakeRecorder(fail=10**6))
     captured(doc)
-    found = doc.loop(Transport(doc.dev))
+    found = doc.loop(Transport(doc.dev, DECLARED))
     assert found[0].detail == "nothing captured" and not found[0].ok
 
 
@@ -521,23 +531,26 @@ def test_pyvmancer_refuses_a_toggle_before_writing(rig):
 def test_a_modulated_parameter_is_reported_not_raised(rig):
     refusal = VmancerError("P[3] have modulation sources [7]; disable them first")
     doc = rig(measure=Measure(refusal))
-    found = doc.latency(Transport(doc.dev))
+    found = doc.latency(Transport(doc.dev, DECLARED))
     assert [(f.check, f.ok, f.detail) for f in found] == [("midi.latency", False, f"skipped: {refusal}")]
 
 
 def test_latency_without_midi_or_timing_or_restore(rig):
     doc = rig(measure=Measure(measured(timing=None, restored=False)))
     doc.dev.has_midi = False
-    assert by_check(doc.latency(Transport(doc.dev)))["midi.latency"].detail == "skipped: no MIDI link is open"
+    assert (
+        by_check(doc.latency(Transport(doc.dev, DECLARED)))["midi.latency"].detail
+        == "skipped: no MIDI link is open"
+    )
     doc.dev.has_midi = True
-    found = by_check(doc.latency(Transport(doc.dev)))
+    found = by_check(doc.latency(Transport(doc.dev, DECLARED)))
     assert not found["midi.latency"].ok and "midi.backlog" not in found
     assert not found["midi.restored"].ok and found["midi.restored"].detail == "P[3] did not read back [40]"
 
 
 def test_write_latency_times_single_writes_on_the_programs_first_knob(rig):
     measure = Measure(measured(single=0.031, restored=False))
-    transport = Transport(rig().dev)
+    transport = Transport(rig().dev, DECLARED)
     assert dr.write_latency(transport, measure=measure) == pytest.approx(0.031)
     assert measure.calls[0][1]["params"] == (3,) and measure.calls[0][1]["rates"] == ()
 
@@ -547,25 +560,22 @@ def test_write_latency_times_single_writes_on_the_programs_first_knob(rig):
     [VmancerError("P[3] have modulation sources [7]"), ValueError("toggles"), measured(single=np.nan)],
 )
 def test_write_latency_is_none_when_refused_or_unconverged(rig, result):
-    assert dr.write_latency(Transport(rig().dev), measure=Measure(result)) is None
+    assert dr.write_latency(Transport(rig().dev, DECLARED), measure=Measure(result)) is None
 
 
 def test_write_latency_needs_midi(rig):
     doc, measure = rig(), Measure()
     doc.dev.has_midi = False
-    assert dr.write_latency(Transport(doc.dev), measure=measure) is None and not measure.calls
+    assert dr.write_latency(Transport(doc.dev, DECLARED), measure=measure) is None and not measure.calls
 
 
-def test_latency_param_skips_unused_quantized_and_toggles():
-    nulls = {
-        "name": "Passthru",
-        "parameters": [{"name": f"Null {i}", "min": 0, "max": 100} for i in range(12)],
-    }
-    assert dr.latency_param(ProgramInfo.from_json(nulls)) == 1
-    assert dr.latency_param(ProgramInfo.from_json(COLORBARS_INFO)) == 3
-    toggles_only = dict(COLORBARS_INFO, parameters=COLORBARS_INFO["parameters"][:2] + [{"name": "-"}] * 4)
-    toggles_only["parameters"] += [{"name": "Level", "min": 0, "max": 100}] * 6
-    assert dr.latency_param(ProgramInfo.from_json(toggles_only)) == 1
+def test_latency_param_is_the_first_declared_continuous_knob():
+    assert dr.latency_param(ProgramInfo.from_json(COLORBARS_INFO)) == 1
+    assert dr.latency_param(ProgramInfo.from_json(COLORBARS_INFO, COLORBARS_DECLARED)) == 3
+    toggles_only = config("Toggles", *(toggle(i) for i in range(7, 12)), decl(2, mode=ControlMode.STEPS_4))
+    assert dr.latency_param(ProgramInfo.from_json(COLORBARS_INFO, toggles_only)) == 1
+    faded = config("Faded", toggle(7), decl(12, "Blend"))
+    assert dr.latency_param(ProgramInfo.from_json(COLORBARS_INFO, faded)) == 12
 
 
 def test_cli_doctor_reports_json_and_exit_status(monkeypatch, rig, capsys):

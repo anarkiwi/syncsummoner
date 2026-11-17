@@ -389,7 +389,7 @@ def _score_cmd(args: argparse.Namespace) -> int:
 
     score = Score.load(Path(args.score))
     layers = audit(score, _profiles_in(Path(args.profiles)))
-    print(format_audit(score, layers))
+    print(format_audit(layers))
     return 1 if any(layer.flags or any(p.flags for p in layer.params) for layer in layers) else 0
 
 
@@ -437,22 +437,11 @@ def _compose_cmd(args: argparse.Namespace) -> int:
         density=args.density,
         n_passes=args.passes,
         fps=fps,
-        wet=_wet(args.wet),
     )
     score.save(Path(args.output))
     LOG.info("%s: %d layers over %.1fs", args.output, len(score.layers), score.duration)
     print(args.output)
     return 0
-
-
-def _wet(text: str | None) -> tuple[float, float] | None:
-    """A ``LO,HI`` wet range in fractions of travel, or None to take the style's own."""
-    if not text:
-        return None
-    lo, hi = (float(part) for part in text.split(","))
-    if not 0.0 <= lo <= hi <= 1.0:
-        raise ValueError(f"--wet wants 0 <= LO <= HI <= 1, got {text!r}")
-    return lo, hi
 
 
 def _numbers(kind: type) -> Any:
@@ -606,7 +595,9 @@ def _evidence_cmd(args: argparse.Namespace) -> int:
     failed = 0
     for take in args.takes:
         program = args.program or str(load_wire(take).get("program", Path(take).stem))
-        proof = locktake.take_evidence(take, program=program, clip=args.source, config=config)
+        proof = locktake.take_evidence(
+            take, program=program, clip=args.source, config=config, predict=args.predict
+        )
         locktake.evidence_path(take).write_text(proof.to_json(), encoding="utf-8")
         print("\n".join(proof.lines()))
         failed += not proof.ok
@@ -664,6 +655,33 @@ def _check_cmd(args: argparse.Namespace) -> int:
         )
         print(args.splice)
     return 1 if report.failed else 0
+
+
+def _program_cmd(args: argparse.Namespace) -> int:
+    """List programs, or show or step one program's parameter model."""
+    from syncsummoner.program import Library, model, parse_state
+    from syncsummoner.program.report import rows, table
+
+    library = Library.default()
+    if args.program_cmd == "list":
+        for prog in library.programs:
+            src = "rtl" if prog.sources else "bitstream"
+            print(f"{prog.name:<40} {prog.package.config.program_id:<40} {src:<9} {prog.origin}")
+        return 0
+    m = model(args.name, library, config=args.config, source=args.source)
+    sets = dict(tuple(map(int, s.split("=", 1))) for s in args.set)
+    state = parse_state(m, args.state, sets)
+    if args.program_cmd == "step":
+        step = m.step_matters(state, args.param, args.a, args.b, args.timing)
+        print(
+            json.dumps(step.__dict__)
+            if args.json
+            else f"P{step.parameter_id} {step.a}->{step.b}: "
+            f"{ {True: 'changes', False: 'no change', None: 'undetermined'}[step.matters]} ({step.how})"
+        )
+        return 0
+    print(json.dumps(rows(m, state, args.timing), indent=1) if args.json else table(m, state, args.timing))
+    return 0
 
 
 def _route(text: str) -> int | None:
@@ -738,6 +756,31 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     manifest.add_argument("programs", type=Path, help="the card's programs directory")
     manifest.add_argument("--write", action="store_true", help="replace manifest.json (default: check only)")
     manifest.set_defaults(func=_manifest_cmd)
+
+    program = sub.add_parser(
+        "program", help="each program's declared parameters and which are live, from its HDL"
+    )
+    program_sub = program.add_subparsers(dest="program_cmd", required=True)
+    program_sub.add_parser("list", help="programs found on the card copy and firmware images")
+    for name, text in (
+        ("show", "register bits, levels, liveness and gates"),
+        ("step", "can one step change it"),
+    ):
+        node = program_sub.add_parser(name, help=text)
+        node.add_argument("name", help="device name (author/Name), bare built-in name, or program id")
+        if name == "step":
+            node.add_argument("param", type=int, help="parameter_id 1..12")
+            node.add_argument("a", type=int, help="manual value before")
+            node.add_argument("b", type=int, help="manual value after")
+        node.add_argument("--state", help="initial (default), a preset name, or 12 comma-separated values")
+        node.add_argument("--set", action="append", default=[], metavar="P=V", help="override one control")
+        node.add_argument("--timing", type=int, help="video timing id held in register 8 (default: free)")
+        node.add_argument("--config", default="hd_hdmi", help="IO configuration (default: hd_hdmi)")
+        node.add_argument(
+            "--source", choices=("rtl", "bitstream"), help="netlist source (default: rtl if published)"
+        )
+        node.add_argument("--json", action="store_true")
+    program.set_defaults(func=_program_cmd)
 
     probe = sub.add_parser("probe", help="measure device behaviour")
     probe_sub = probe.add_subparsers(dest="probe_cmd", required=True)
@@ -823,7 +866,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
 
     score_cmd = sub.add_parser("score", help="inspect a composed score")
     score_sub = score_cmd.add_subparsers(dest="score_cmd", required=True)
-    show = score_sub.add_parser("show", help="what each layer drives, by name and role, flagging misuse")
+    show = score_sub.add_parser("show", help="what each layer drives, by name and kind, flagging misuse")
     show.add_argument("score")
     show.add_argument("--profiles", default="profiles/")
     show.set_defaults(func=_score_cmd)
@@ -845,7 +888,6 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
     compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
     compose.add_argument("--format", help="session format the score is written for, e.g. 1080p30")
-    compose.add_argument("--wet", help="LO,HI wet range, fractions of the wet control (default: per style)")
     compose.add_argument("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
@@ -913,6 +955,9 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     proof.add_argument("--program", help="the program the takes ran (default: as each wire record says)")
     proof.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
     proof.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
+    proof.add_argument(
+        "--predict", action="store_true", help="set each verdict against the program model's prediction"
+    )
     proof.set_defaults(func=_evidence_cmd)
 
     check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")

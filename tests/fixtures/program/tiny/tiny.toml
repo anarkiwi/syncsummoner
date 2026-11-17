@@ -1,0 +1,54 @@
+[program]
+program_id = "org.syncsummoner.tiny"
+program_version = "1.0.0"
+abi_version = ">=1.0,<2.0"
+program_name = "Tiny"
+author = "syncsummoner"
+license = "Apache-2.0"
+categories = ["Test"]
+program_type = "processing"
+hardware_compatibility = ["rev_b"]
+core = "yuv444_30b"
+description = "Gain gated by a switch, bias gated by the top bit of its own knob."
+processing_delay_clks = 4
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 512
+name_label = "Gain"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_2"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 100
+name_label = "Bias"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_3"
+control_mode = "steps_4"
+min_value = 0
+max_value = 1023
+initial_value = 0
+name_label = "Unread"
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "Gain On"
+value_labels = ["Off", "On"]
+initial_value_label = "Off"
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Bypass"
+value_labels = ["Off", "On"]
+initial_value_label = "Off"
+
+[[preset]]
+name = "Gain"
+rotary_potentiometer_1 = 512
+toggle_switch_7 = 1

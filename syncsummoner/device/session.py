@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 
 
-from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, Role
+from .profile import PARAM_COUNT, PARAM_MAX
 
 #: Parking every manual value at zero makes the additive sum equal the MIDI offset.
 PARK_REFERENCE = 0
@@ -31,9 +31,8 @@ STABLE_READS = 2
 def default_park() -> np.ndarray:
     """Park reference: zero everywhere, so the additive sum equals the CC offset.
 
-    A crossfader parked at max clips every offset for it to zero, since offsets
-    are non-negative; parking it at zero like everything else is what lets it
-    address its full range instead of sitting pinned open.
+    Offsets are non-negative, so a slot parked anywhere above zero could not reach
+    the bottom of its range.
     """
     return np.full(PARAM_COUNT, PARK_REFERENCE, dtype=int)
 
@@ -183,31 +182,10 @@ class Session:
             )
         return got
 
-    def working_point(self, info: Any, *, exclude: Iterable[int] = ()) -> dict[int, float | bool]:
-        """A mid-scale operating point with any bypass held off, excluding driven slots.
-
-        The crossfader is forced in at mid-scale like any other continuous
-        effect even where a program calls it unused, because it gates output
-        regardless of what the program reports.
-        """
+    def working_point(self, info: Any, *, exclude: Iterable[int] = ()) -> dict[int, int]:
+        """Each declared slot's own initial value in device units, short of ``exclude``."""
         skip = set(exclude)
-        values: dict[int, float | bool] = {}
-        for spec in info.params:
-            if spec.index in skip:
-                continue
-            if spec.role is Role.BYPASS:
-                values[spec.index] = False
-            elif spec.index == CROSSFADER_INDEX:
-                values[spec.index] = 0.5
-            elif spec.kind is ParamKind.UNUSED:
-                continue
-            elif spec.kind is ParamKind.BOOLEAN:
-                values[spec.index] = False
-            elif "mix" in spec.name.lower():
-                values[spec.index] = 1.0
-            else:
-                values[spec.index] = 0.5
-        return values
+        return {index: value for index, value in info.initial.items() if index not in skip}
 
     def _note(self, kind: str, **detail: Any) -> None:
         """Record an action, when a journal is attached."""

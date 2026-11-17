@@ -13,8 +13,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
+# Yosys, GHDL with its Yosys plugin, Project IceStorm and Icarus, as one pinned upstream build.
+FROM debian:trixie-slim AS hdl-tools
+ARG OSS_CAD_SUITE=2026-11-01
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL "https://github.com/YosysHQ/oss-cad-suite-build/releases/download/${OSS_CAD_SUITE}/oss-cad-suite-linux-x64-$(echo ${OSS_CAD_SUITE} | tr -d -).tgz" \
+        | tar -xz -C /opt \
+    && rm -rf /var/lib/apt/lists/*
+
+# The SDK core RTL and the community program sources the liveness analysis elaborates.
+FROM debian:trixie-slim AS upstream
+ARG VIDEOMANCER_SDK=606b6686caf0a211840f453019f4eb9911b545ca
+ARG VIDEOMANCER_COMMUNITY=a51fa544b89e2ed09a6169e9f6abf5549e8e885b
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+RUN for spec in "videomancer-sdk ${VIDEOMANCER_SDK}" "videomancer-community-programs ${VIDEOMANCER_COMMUNITY}"; do \
+        set -- $spec; git init -q /opt/upstream/$1 \
+        && git -C /opt/upstream/$1 fetch -q --depth 1 https://github.com/lzxindustries/$1 $2 \
+        && git -C /opt/upstream/$1 checkout -q FETCH_HEAD && rm -rf /opt/upstream/$1/.git; \
+    done
+
+FROM base AS hdl
+RUN apt-get update && apt-get install -y --no-install-recommends zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=hdl-tools /opt/oss-cad-suite /opt/oss-cad-suite
+COPY --from=upstream /opt/upstream /opt/upstream
+ENV SYNCSUMMONER_HDL_BIN=/opt/oss-cad-suite/bin \
+    SYNCSUMMONER_SDK=/opt/upstream/videomancer-sdk \
+    SYNCSUMMONER_COMMUNITY=/opt/upstream/videomancer-community-programs
+
 # Dependency-only layers. Copying pyproject alone keeps these cached across source edits.
-FROM base AS deps-full
+FROM hdl AS deps-full
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md LICENSE ./
@@ -34,7 +63,7 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9"
 
 # The image the rig is driven from: ffmpeg for capture and mastering, ssh for the Pi.
-FROM base AS runtime
+FROM hdl AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg openssh-client libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md LICENSE ./

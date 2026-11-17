@@ -97,11 +97,14 @@ cleanly later. That requires enforcement, not intent.
 
 ## 3. Probe — discovery and measurement
 
-The device exposes 24 programs, 12 parameters each (11 knobs plus the crossfader
-as parameter 12), three macros (Time / Space / Slope), full MIDI CC addressing,
+The device exposes 24 programs, 12 parameters each (11 knobs plus the fader as
+parameter 12), three macros (Time / Space / Slope), full MIDI CC addressing,
 and a USB CDC serial command interface for program and preset management. That is
-enough to drive an unattended sweep. Program parameter names and ranges come from
-`.vmprog` TOML metadata rather than being hardcoded.
+enough to drive an unattended sweep. No slot means the same in every program: each
+parameter's kind and initial value come from the program's own `.vmprog`
+declaration (`syncsummoner.program`), its label from the device's `program info`,
+and which parameters can reach the picture in a given state from the program's HDL
+([program-model.md](program-model.md)).
 
 ### 3.1 Stimulus battery
 
@@ -188,7 +191,7 @@ source: hw
 params:
   - id: 3
     name: threshold                # the device's own label, from program info
-    role: effect                   # effect | bypass | wet | momentary
+    kind: continuous               # boolean | quantized | continuous | unused, as declared
     axis: color_destruction        # canonical axis assignment
     response: [...]                # metric vs value curve
     sensitivity: 0.82
@@ -255,12 +258,12 @@ Each primitive carries a musical anchor and consumes a specific profile field.
 | `cliff_cross` | downbeat | cliff atlas |
 | `detune_drift` | across N bars | tongue map, near-lock offset |
 | `lock_snap` | section boundary | tongue centers |
-| `punch` | onset | effect buttons, momentary, pulsed and released |
-| `morph` | phrase | the wet control, across the score's wet range |
-
-No gesture drives a `bypass`; only `morph` drives the `wet` control; a
-`momentary` is only pulsed.
+| `punch` | onset | boolean parameters, pulsed and released |
 | `hysteresis_loop` | 2-bar | path-dependent parameters |
+
+A gesture picks only parameters of the declared kinds it drives: `punch` the
+booleans, every other gesture the continuous and quantized ones; an `unused` slot
+is never written.
 
 ### 4.4 Timing rules
 
