@@ -1,0 +1,35 @@
+[program]
+program_id = "org.syncsummoner.mix"
+program_version = "1.0.0"
+abi_version = ">=1.0,<2.0"
+program_name = "Mix"
+author = "syncsummoner"
+license = "Apache-2.0"
+categories = ["Test"]
+program_type = "processing"
+hardware_compatibility = ["rev_b"]
+core = "yuv444_30b"
+description = "A gain or an inversion, crossfaded with the input by the fader."
+processing_delay_clks = 4
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 512
+name_label = "Gain"
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "Invert"
+value_labels = ["Off", "On"]
+initial_value_label = "Off"
+
+[[parameter]]
+parameter_id = "linear_potentiometer_12"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 1023
+name_label = "Mix"

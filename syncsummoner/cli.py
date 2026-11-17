@@ -666,6 +666,19 @@ def _program_cmd(args: argparse.Namespace) -> int:
             f"{ {True: 'changes', False: 'no change', None: 'undetermined'}[step.matters]} ({step.how})"
         )
         return 0
+    if args.program_cmd == "bypass":
+        found = m.bypass(state, args.timing)
+        if args.json:
+            print(json.dumps(None if found is None else found.__dict__))
+        elif found is None:
+            print(f"{m.program.name}: no setting is proven to pass the input with every other control dead")
+        else:
+            decl = m.decl(found.parameter_id)
+            print(
+                f"{m.program.name}: P{found.parameter_id} {decl.name} at {found.value}, proven at "
+                f"{len(found.proven)} values {min(found.proven)}..{max(found.proven)}"
+            )
+        return 0
     if args.program_cmd == "cover":
         print(gates.report(m, state, args.timing, as_json=args.json))
         return 0
@@ -755,6 +768,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         ("show", "register bits, levels, liveness and gates"),
         ("step", "can one step change it"),
         ("cover", "what makes each parameter live, and the fewest base states that step every one live"),
+        ("bypass", "the control setting proven to return the input with every other control dead"),
     ):
         node = program_sub.add_parser(name, help=text)
         node.add_argument("name", help="device name (author/Name), bare built-in name, or program id")

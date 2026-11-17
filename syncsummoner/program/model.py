@@ -65,6 +65,8 @@ def timing_bits() -> tuple[int, ...]:
 
 #: Core-only words, free inputs of every query.
 LOOSE_BITS = tuple(flat_bit(r, b) for r in CORE_REGISTERS for b in range(REGISTER_BITS))
+#: Every manual value a control takes.
+MANUAL = np.arange(VALUE_MAX + 1)
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,22 @@ class Step:
     b: int
     matters: bool | None
     how: str
+
+
+@dataclass(frozen=True)
+class Bypass:
+    """A setting of one control the model proves returns the input with every other control dead.
+
+    ``value`` is the manual value written to bypass; ``proven`` every manual value the proof covers.
+    """
+
+    parameter_id: int
+    value: int
+    proven: tuple[int, ...]
+
+    def holds(self, manual: np.ndarray | int) -> np.ndarray:
+        """Whether each manual value of the control is a proven bypass."""
+        return np.isin(np.asarray(manual, dtype=np.int64), self.proven)
 
 
 def _hash(obj) -> str:
@@ -456,10 +474,11 @@ class ProgramModel:
         lanes = self._ternary.live(_lanes([ties]))
         return any(bool(v[0]) for name, v in lanes.items() if name.startswith(prefix))
 
-    def bypass(self, state: np.ndarray | None = None, timing: int | None = None) -> int | None:
-        """The declared switch that, turned on, leaves every other control dead and the input in the video.
+    def bypass(self, state: np.ndarray | None = None, timing: int | None = None) -> Bypass | None:
+        """The control setting that returns the input with every other control dead, None if there is none.
 
-        None when the program has no such switch.
+        A declared switch turned on that leaves every other control dead at ``state`` comes first; else
+        the first control with settings :meth:`passes` proves, written at the middle of their longest run.
         """
         base = self.initial() if state is None else np.asarray(state, dtype=np.int64)
         for decl in self.params:
@@ -471,8 +490,71 @@ class ProgramModel:
             if not any(l.live for p, l in live.items() if p != decl.parameter_id) and self.carries_input(
                 on, timing
             ):
-                return decl.parameter_id
+                same = register_value(decl, MANUAL) == register_value(decl, VALUE_MAX)
+                return Bypass(decl.parameter_id, VALUE_MAX, tuple(MANUAL[same].tolist()))
+        for decl in self.params:
+            proven = self.passes(decl.parameter_id, base, timing)
+            if proven.size:
+                runs = np.split(proven, np.flatnonzero(np.diff(proven) > 1) + 1)
+                run = max(runs, key=len)
+                return Bypass(decl.parameter_id, int(run[len(run) // 2]), tuple(proven.tolist()))
         return None
+
+    def passes(
+        self, parameter_id: int, state: np.ndarray | None = None, timing: int | None = None
+    ) -> np.ndarray:
+        """Manual values of one control at which the input reaches the video and no bit of any other
+        declared control does, for every value of them together; undeclared words are held at ``state``.
+
+        Each other control dead alone at ``state`` is necessary, so the joint analysis is built only
+        for a control that passes that first.
+        """
+        base = self.initial() if state is None else np.asarray(state, dtype=np.int64)
+        decl = self.decl(parameter_id)
+        if decl is None:
+            return MANUAL[:0]
+        others = [d.parameter_id for d in self.params if d.parameter_id != parameter_id]
+        wild = [] if timing is not None else [TIMING]
+        self.prepare([{q, *wild} for q in others] + [set(wild)])
+        ok = self._heard(base, timing, parameter_id, [], [VIDEO])
+        for free in [*([q] for q in others), *([others] if others else [])]:
+            if ok is None or not ok.any():
+                break
+            heard = self._heard(base, timing, parameter_id, free)
+            ok = None if heard is None else ok & ~heard
+        if ok is None:
+            return MANUAL[self._passes_ternary(base, timing, parameter_id, others)]
+        return MANUAL[ok[register_value(decl, MANUAL)]]
+
+    def _heard(
+        self, base: np.ndarray, timing: int | None, param: int, free: Sequence[int], names=None
+    ) -> np.ndarray | None:
+        """Per register value of ``param``, whether ``names`` (the bits of ``free``) can reach the video
+        for some value of ``free``, the rest at ``base``; None once the BDDs have outgrown memory.
+        """
+        cond = self.conditions({*free, *([TIMING] if timing is None else [])})
+        if cond is None:
+            return None
+        ties, _ = self._ties(base, timing, [*free, param])
+        names = names or [f"c{k}" for q in free for k in field(q).flat]
+        return cond.heard(names, ties, field(param).flat)
+
+    def _passes_ternary(
+        self, base: np.ndarray, timing: int | None, param: int, others: Sequence[int]
+    ) -> np.ndarray:
+        """:meth:`passes` by the ternary simulator, the other controls left as X, per manual value."""
+        groups = classes(self.decl(param), field(param).bits)
+        states = np.repeat(base[None, :], len(groups), axis=0)
+        states[:, param - 1] = [g[0] for g in groups]
+        dead = [not any(r.values()) for r in self._reach_many(states, timing, list(others))]
+        ties = [self._ties(s, timing, [])[0] for s in states]
+        prefix = "data_in" if self.source == "rtl" else VIDEO_IN
+        lanes = self._ternary.live(_lanes(ties))
+        heard = np.any([v for name, v in lanes.items() if name.startswith(prefix)], axis=0)
+        ok = np.zeros(VALUE_MAX + 1, dtype=bool)
+        for g, d, h in zip(groups, dead, heard):
+            ok[g] = d and bool(h)
+        return ok
 
     def schedule(self, state: np.ndarray | None = None, timing: int | None = None) -> dict[int, np.ndarray]:
         """For each live control, one manual value per distinct setting the program can see in ``state``."""

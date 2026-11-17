@@ -63,3 +63,14 @@ def tiny_fixture(tmp_path_factory, library):
     package = read_package(pack(FIXTURES / "tiny" / "tiny.toml", work, {"hd_hdmi.bin": b"\0" * 64}))
     program = Program(package, "tiny", "test", (FIXTURES / "tiny" / "tiny.vhd",))
     return ProgramModel(program, library, cache=tmp_path_factory.mktemp("cache"))
+
+
+@pytest.fixture(scope="session", name="mixer")
+def mixer_fixture(tmp_path_factory, library):
+    """A crossfade of the input and its processed form on the fader, with no bypass switch."""
+    if not (SDK / "tools").is_dir() or not hdl.Tools().available():
+        pytest.skip("SDK and HDL tools needed")
+    work = tmp_path_factory.mktemp("mix")
+    package = read_package(pack(FIXTURES / "mix" / "mix.toml", work, {"hd_hdmi.bin": b"\0" * 64}))
+    program = Program(package, "mix", "test", (FIXTURES / "mix" / "mix.vhd",))
+    return ProgramModel(program, library, cache=tmp_path_factory.mktemp("cache"))

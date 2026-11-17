@@ -16,8 +16,9 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
+import numpy as np
 from dd import cudd
 
 from syncsummoner.progress import track
@@ -231,6 +232,22 @@ class Conditions:
         sub = {f"c{k}": bool(v) for k, v in ties.items() if f"c{k}" in self.bdd.vars}
         with self._lock:
             return self.bdd.let(sub, u) != self.bdd.false
+
+    def heard(self, names: Iterable[str], ties: Mapping[int, int], bits: Sequence[int]) -> np.ndarray:
+        """Per value of the controls ``bits`` (``bits[i]`` its ``2**i`` place), whether some source in
+        ``names`` is observable for some value of every control in neither ``ties`` nor ``bits``.
+        """
+        keep = {f"c{k}" for k in bits}
+        out = np.zeros(1 << len(bits), dtype=bool)
+        with self._lock:
+            u = self.bdd.false
+            for name in names:
+                u |= self.condition(name)
+            u = self.bdd.let({f"c{k}": bool(v) for k, v in ties.items() if f"c{k}" in self.bdd.vars}, u)
+            u = self.bdd.exist(self.bdd.support(u) - keep, u)
+            for a in self.bdd.pick_iter(u, care_vars=keep):
+                out[sum(int(a[f"c{k}"]) << i for i, k in enumerate(bits))] = True
+        return out
 
     def condition(self, name: str) -> cudd.Function:
         """The observability condition of one input bit (false when it is never observable)."""

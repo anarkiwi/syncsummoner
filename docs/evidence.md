@@ -48,11 +48,13 @@ lands gains nothing from a narrower window.
 
 ## Frame-locked sends
 
-1. The program is loaded before playout and held dry for the lead-in: its bypass
-   switch turned on (`locktake.dry_state`), the declared switch that, turned on,
-   leaves every other control dead and the input reaching the video in the program's
-   HDL (`ProgramModel.bypass`, [program-model.md](program-model.md)); no slot or
-   label is assumed to do the same thing across programs. The strip-coded lead-in then passes through unprocessed,
+1. The program is loaded before playout and held dry for the lead-in by its
+   bypass setting (`locktake.dry_state`). This is the control setting that the
+   program's HDL shows leaves every other control dead and the input reaching
+   the video: a declared switch turned on, otherwise a fader such as a Mix at the
+   end of its range that returns the input exactly (`ProgramModel.bypass`,
+   [program-model.md](program-model.md)). No slot or label is assumed to do the
+   same thing across programs. The strip-coded lead-in then passes through unprocessed,
    so the take is one gap-free run that the strips anchor; no load interrupts it.
 2. The dry control is toggled at random intervals and each toggle's first frame in
    the lead-in's picture measures the latency band.
@@ -72,7 +74,7 @@ lands gains nothing from a narrower window.
    runs on as long as the lead-in's wet stretch into the clip's lead-out, whose strips
    then pin the frame line's far end.
 
-A program with no bypass switch keeps the old lead-in: Passthru
+A program with no bypass setting keeps the old lead-in: Passthru
 under the strips, the program loaded inside it, the outage bridged by the Pi's flip
 log; Passthru is loaded again for the lead-out. Its latency band is where every dry
 take's `Latency.bounds` meet (`ccpicture.json`, start-basis records only; a judged dry take

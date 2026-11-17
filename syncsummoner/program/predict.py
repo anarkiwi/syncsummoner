@@ -61,14 +61,21 @@ def regimes(
     """Each clip frame's switch regime as a bit code, and the bit each switch holds in it.
 
     The switches are the controls a one-bit field drives: the ones a non-knob-gated
-    parameter's gating class ties (:func:`gating_class`). No switches leave one regime.
+    parameter's gating class ties (:func:`gating_class`). A bypass on any other control
+    (:meth:`~syncsummoner.program.model.ProgramModel.bypass`) adds one bit, set on the frames it
+    holds a proven bypass setting. No switches and no such bypass leave one regime.
     """
     switches = [d for d in model.params if len(field(d.parameter_id).bits) == 1]
     state = frame_states(start, rows, count)
     code = np.zeros(count, dtype=np.int64)
     for bit, decl in enumerate(switches):
         code |= register_value(decl, state[:, decl.parameter_id - 1]).astype(np.int64) << bit
-    return code, {d.parameter_id: 1 << bit for bit, d in enumerate(switches)}
+    own = {d.parameter_id: 1 << bit for bit, d in enumerate(switches)}
+    dry = model.bypass()
+    if dry is not None and dry.parameter_id not in own:
+        own[dry.parameter_id] = 1 << len(switches)
+        code |= dry.holds(state[:, dry.parameter_id - 1]).astype(np.int64) << len(switches)
+    return code, own
 
 
 def gating_class(model: ProgramModel, state: np.ndarray, param: int, gated: frozenset[int]) -> tuple:

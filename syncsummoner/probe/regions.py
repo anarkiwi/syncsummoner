@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from scipy.stats import qmc
@@ -26,6 +26,7 @@ __all__ = [
     "design",
     "distinct",
     "region_dims",
+    "without_bypass",
     "effect_sizes",
     "guard_frames",
     "hold_at",
@@ -161,14 +162,26 @@ def allot(total: int, dims: Sequence[int]) -> list[int]:
     return [int(2 ** math.floor(math.log2(s))) if s >= 1 else 0 for s in share]
 
 
-def region_dims(record: Mapping, values: Mapping[int, np.ndarray], bypass: int | None) -> list[list[int]]:
+def region_dims(record: Mapping, values: Mapping[int, np.ndarray]) -> list[list[int]]:
     """Per chosen regime of a cover record, the parameters a design samples: those stepped there that
-    the program reads, its bypass switch aside, since turning it on leaves every other control dead.
+    the program reads at more than one of ``values`` (from :func:`without_bypass`, so never its bypass).
     """
     return [
-        [int(p) for p in record["stepped"].get(str(i), []) if p in values and p != bypass]
+        [int(p) for p in record["stepped"].get(str(i), []) if len(values.get(p, ())) > 1]
         for i in record["chosen"]
     ]
+
+
+def without_bypass(values: Mapping[int, np.ndarray], bypass: Any) -> dict[int, np.ndarray]:
+    """``values`` less the bypass's proven settings, which leave every other control dead.
+
+    ``bypass`` is a :class:`~syncsummoner.program.model.Bypass` or None.
+    """
+    out = dict(values)
+    if bypass is not None and bypass.parameter_id in out:
+        mine = np.asarray(out[bypass.parameter_id])
+        out[bypass.parameter_id] = mine[~bypass.holds(mine)]
+    return out
 
 
 def design(

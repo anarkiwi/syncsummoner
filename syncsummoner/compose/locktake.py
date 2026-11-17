@@ -63,10 +63,11 @@ class LeadIn:
     seed: int = 0
 
 
-def program_bypass(info: Any) -> int | None:
-    """The declared switch the program's HDL shows returns its input with every other control dead.
+def program_bypass(info: Any) -> Any:
+    """The control setting the program's HDL shows returns its input with every other control dead.
 
-    None when the program has no declaration, no such switch, or the model cannot be built.
+    A :class:`~syncsummoner.program.model.Bypass`; None when the program has no declaration, no such
+    setting, or the model cannot be built.
     """
     from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
 
@@ -80,13 +81,13 @@ def program_bypass(info: Any) -> int | None:
         return None
 
 
-def dry_state(info: Any, bypass: Callable[[Any], int | None] = program_bypass) -> dict[int, int] | None:
-    """The write that returns a program's input unprocessed: its bypass switch turned on.
+def dry_state(info: Any, bypass: Callable[[Any], Any] = program_bypass) -> dict[int, int] | None:
+    """The write that returns a program's input unprocessed: its bypass control set to its bypass value.
 
     None when it has none, so its lead-in cannot carry the strip. No slot or label is assumed.
     """
     pick = bypass(info)
-    return None if pick is None else {pick: PARAM_MAX}
+    return None if pick is None else {pick.parameter_id: pick.value}
 
 
 def frame_plan(auto: Any, *, fps: float, early_bias_s: float) -> np.ndarray:
@@ -353,13 +354,13 @@ def locked_take(
     working: Callable[[Any], Mapping[int, Any]],
     load: Callable[[str], Any],
     lead_in: LeadIn = LeadIn(),
-    bypass: Callable[[Any], int | None] = program_bypass,
+    bypass: Callable[[Any], Any] = program_bypass,
 ) -> Record:
     """Record ``program`` playing the clip with every planned write sent for its frame.
 
     ``load(name)`` loads a program and checks the rig, returning its program info, and
-    ``working(info)`` gives its working point; ``bypass(info)`` names its dry switch, turned back on
-    for the strip-coded lead-out, as long as the lead-in, or Passthru reloaded for it with no switch.
+    ``working(info)`` gives its working point; ``bypass(info)`` gives its dry setting, set again
+    for the strip-coded lead-out, as long as the lead-in, or Passthru reloaded for it with none.
     A rise in the boot count is a :class:`RebootError`.
     """
     shell = rig.transport.device.shell

@@ -2,10 +2,11 @@
 
 from .declared import Field, Kind, field, kind, register_value
 from .library import Library, Program
-from .model import Liveness, ProgramModel, Step, model, parse_state
+from .model import Bypass, Liveness, ProgramModel, Step, model, parse_state
 from .vmprog import PackageError, ParamDecl, ProgramConfig, read_package
 
 __all__ = [
+    "Bypass",
     "Field",
     "Kind",
     "Library",
