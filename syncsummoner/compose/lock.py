@@ -190,7 +190,7 @@ def attribute(
     flip log; the clip played ``lead`` lead-in frames, ``count`` clip frames and ``tail`` lead-out.
     """
     seg = frameline.segments(frames["t_ns"], frames["sequence"])
-    resolution = float(np.gcd.reduce(np.diff(frames["t_ns"]))) if frames.size > 1 else 0.0
+    resolution = float(np.gcd.reduce(frames["t_ns"])) if frames.size else 0.0
     capture, jitter = frameline.capture_line(frames["t_ns"], frames["sequence"], seg)
     tau = capture_times(frames["t_ns"], frames["sequence"], seg, capture)
     starts, up, _, vblank = displays(flips)
@@ -330,20 +330,21 @@ def _bridge(line: frameline.Line, lag: tuple[float, float], rate: float, shown_a
 def _frames(
     line: frameline.Line, tau: np.ndarray, digest: np.ndarray, resolution: float
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Each capture's frame on the line, one an admitted boundary may cross going by its bytes.
+    """Each capture's frame: the side of its nearest boundary every admitted line puts it, else its bytes'.
 
-    A boundary crosses a capture further than the timestamps' ``resolution`` inside it. Bytes equal to
-    the capture before's are its frame, to the next's the next; equal to both or neither, any choice
-    measures alike and the line's stands, counted in the count returned.
+    The admitted range is widened by the line's slack, and a capture within the timestamps' ``resolution``
+    of it is on its side. Bytes equal to the capture before's are its frame, to the next's the next;
+    equal to both or neither, any choice measures alike and the line's stands, counted in the count returned.
     """
-    n = line.frame_of(tau)
-    b = np.rint((tau - line.origin) / line.period)
+    b = np.rint((tau - line.origin) / line.period).astype(np.int64)
     lo, hi = line.polygon.at(b)
-    on = (lo + resolution < tau) & (tau < hi - resolution)
+    new = hi + line.slack <= tau + resolution
+    old = lo - line.slack >= tau - resolution
+    on = ~(new | old)
     same_before = np.r_[False, digest[1:] == digest[:-1]]
     same_after = np.r_[digest[:-1] == digest[1:], False]
     sure = on & (same_before != same_after)
-    n = np.where(sure, np.where(same_before, b - 1, b).astype(np.int64), n)
+    n = np.where(new | (sure & same_after), b, np.where(old | (sure & same_before), b - 1, line.frame_of(tau)))
     return n, on, int(np.count_nonzero(on & ~sure))
 
 
