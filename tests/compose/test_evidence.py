@@ -473,6 +473,13 @@ def test_fisher_z_of_uniform_p_is_standard_normal():
     assert ev.fisher_z(np.zeros(0)) == (0.0, 0.0)
 
 
+def test_fisher_z_in_logs_combines_p_values_too_small_for_a_float():
+    p = np.random.default_rng(1).uniform(size=40)
+    assert mt.fisher_z_log(np.log(p))[0] == pytest.approx(mt.fisher_z(p)[0])
+    tiny = mt.fisher_z_log(np.full(30, -2000.0))
+    assert np.isfinite(tiny[0]) and tiny[0] > mt.fisher_z_log(np.full(30, -1000.0))[0] > 30
+
+
 def test_fisher_z_discounts_serially_dependent_p():
     p = np.repeat(np.random.default_rng(3).uniform(0.01, 0.2, size=8), 10)
     z, n_eff = ev.fisher_z(p)

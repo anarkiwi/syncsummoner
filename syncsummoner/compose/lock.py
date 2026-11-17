@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -539,6 +539,23 @@ def save_lock(
 ) -> None:
     """Keep what attribution needs from the Pi next to the take; ``wet`` when a program played the clip."""
     np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count, tail=tail, wet=wet)
+
+
+def save_clock(take: str | Path, clock: Sequence[dict]) -> None:
+    """Keep the capture clock's numbering of the take's runs in its lock record, every other key as it was."""
+    import json  # pylint: disable=import-outside-toplevel
+
+    with np.load(lock_path(take)) as record:
+        kept = {key: record[key] for key in record.files if key != "clock"}
+    np.savez(lock_path(take), **kept, clock=np.array(json.dumps(list(clock))))
+
+
+def read_clock(take: str | Path) -> list[dict]:
+    """The capture clock's numbering of the take's runs as its lock record keeps it; none if never judged."""
+    import json  # pylint: disable=import-outside-toplevel
+
+    with np.load(lock_path(take)) as record:
+        return json.loads(str(record["clock"])) if "clock" in record.files else []
 
 
 def _trusted(take: str | Path, record: Any, frames: np.ndarray) -> np.ndarray | None:

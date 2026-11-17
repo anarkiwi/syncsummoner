@@ -346,3 +346,16 @@ def test_a_processed_run_is_numbered_by_its_highest_candidate_and_spans_to_its_l
     found = attribute(played)
     assert found.shown[middle].tolist() == highest.shown[middle].tolist()
     assert (found.ambiguity[middle] == 2).all() and not highest.ambiguity.any()
+
+
+def test_the_clocks_numbering_round_trips_through_the_lock_record(tmp_path):
+    played = take(STANDARD)
+    path = tmp_path / "take.mkv"
+    L.save_lock(path, played.flips, **played.kw, wet=True)
+    assert L.read_clock(path) == []
+    said = [{"run": 2, "candidates": [7, 8], "selection": {"shift": 1, "numbering": 7, "margin_z": 4.5}}]
+    L.save_clock(path, said)
+    L.save_clock(path, said)
+    record = np.load(L.lock_path(path))
+    assert L.read_clock(path) == said and record["flips"].tolist() == played.flips.tolist()
+    assert bool(record["wet"]) and int(record["count"]) == played.count

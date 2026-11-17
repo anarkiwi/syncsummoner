@@ -373,3 +373,26 @@ def test_the_union_of_candidate_leads_is_searched_at_a_bound_sized_to_it(monkeyp
     kept_of(1, 0)
     kept_of(1, 2)
     assert asked == [len(aesthetics.LEADS), len(aesthetics.LEADS) + 2]
+
+
+def followed(lead, settings=6, n=300, seed=3):
+    """Per setting, source and output SI/TI whose output TI follows the source's ``lead`` frames later."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(settings):
+        src_ti = np.abs(np.cumsum(rng.normal(0, 1, n))) + 1.0
+        out_ti = np.r_[np.full(lead, np.nan), src_ti[: n - lead]] + rng.normal(0, 0.05, n)
+        out.append((np.ones(n), src_ti, np.ones(n), out_ti))
+    return out
+
+
+def test_pooled_follow_selects_the_shift_whose_own_leads_reach_the_programs_delay():
+    pooled = R.pooled_follow(followed(2), 1)
+    said = R.select_shift(pooled)
+    assert pooled[1] > pooled[0] and said["shift"] == 1 and said["margin_z"] > said["critical_z"]
+
+
+def test_a_delay_every_shift_reaches_selects_none():
+    said = R.select_shift(R.pooled_follow(followed(1), 1))
+    assert said["shift"] is None and abs(said["pooled_z"][0] - said["pooled_z"][1]) < 1e-9
+    assert R.select_shift(np.array([4.0]))["shift"] == 0

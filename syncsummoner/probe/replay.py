@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
 import cv2  # pylint: disable=no-member  ; cv2 is a compiled extension pylint cannot introspect
 import numpy as np
+from scipy.stats import norm
 from threadpoolctl import threadpool_limits
 
 from syncsummoner import aesthetics
@@ -52,6 +53,8 @@ __all__ = [
     "replay",
     "replay_program",
     "setpoints",
+    "pooled_follow",
+    "select_shift",
     "survival_metrics",
 ]
 
@@ -172,6 +175,61 @@ def _clock(
     return (model, "motion") if model is not None else (None, "none")
 
 
+def _measured(frames: list, captures: np.ndarray, index: np.ndarray, series: tuple, period: int) -> tuple:
+    """Source and output SI and TI over the clip frames ``captures`` show at unwrapped ``index``.
+
+    SI is read at each capture and TI against the capture of the clip frame before.
+    """
+    order = np.argsort(index)
+    captures, span = captures[order], index[order] - index[order[0]]
+    unit = [frames[c].astype(np.float32) / np.float32(255.0) for c in captures]
+    out_si, out_ti = np.full(int(span[-1]) + 1, np.nan), np.full(int(span[-1]) + 1, np.nan)
+    out_si[span] = [aesthetics.spatial_information(frame) for frame in unit]
+    for k in np.flatnonzero(np.diff(span) == 1) + 1:
+        out_ti[span[k]] = aesthetics.temporal_information(unit[k - 1], unit[k])
+    clip = (index[order[0]] + np.arange(span[-1] + 1)) % period
+    return series[0][clip], series[1][clip], out_si, out_ti
+
+
+def pooled_follow(measured: list[tuple], ambiguity: int) -> np.ndarray:
+    """Per shift ``a`` back from the highest candidate, the run's settings' follow evidence pooled into one z.
+
+    Each setting is scored at that shift's own leads; its best lead's z, Bonferroni over those leads, is
+    a one-sided p, and the settings' p values combine by Fisher in logs (:func:`matched.fisher_z_log`).
+    """
+    from syncsummoner.compose.matched import fisher_z_log  # pylint: disable=import-outside-toplevel
+
+    leads = len(aesthetics.LEADS)
+    out = np.zeros(int(ambiguity) + 1)
+    for a in range(out.size):
+        found = [
+            aesthetics.survival_stats(*m, leads=[lead + a for lead in aesthetics.LEADS]) for m in measured
+        ]
+        z = np.array([f.z for f in found if f.frames > 2 and np.isfinite(f.z)])
+        log_p = np.minimum(0.0, np.log(leads) + norm.logsf(z))
+        out[a] = fisher_z_log(log_p)[0] if log_p.size else 0.0
+    return out
+
+
+def select_shift(pooled: np.ndarray) -> dict:
+    """The shift whose pooled follow beats every other's past the bound for a difference, if one does.
+
+    A difference of two unit z scores has twice their variance; the bound is Bonferroni over the shifts.
+    """
+    from syncsummoner.compose.matched import critical  # pylint: disable=import-outside-toplevel
+
+    best = int(np.argmax(pooled))
+    others = np.delete(pooled, best)
+    margin = float(np.min(pooled[best] - others) / np.sqrt(2.0)) if others.size else float("inf")
+    bound = critical(pooled.size)
+    return {
+        "pooled_z": [float(z) for z in pooled],
+        "shift": best if margin > bound else None,
+        "margin_z": margin,
+        "critical_z": bound,
+    }
+
+
 def _kept(
     frames: list, captures: np.ndarray, index: np.ndarray, series: tuple, period: int, ambiguity: int = 0
 ) -> dict:
@@ -185,18 +243,10 @@ def _kept(
     """
     if captures.size == 0:
         return {}
-    order = np.argsort(index)
-    captures, span = captures[order], index[order] - index[order[0]]
-    unit = [frames[c].astype(np.float32) / np.float32(255.0) for c in captures]
-    out_si, out_ti = np.full(int(span[-1]) + 1, np.nan), np.full(int(span[-1]) + 1, np.nan)
-    out_si[span] = [aesthetics.spatial_information(frame) for frame in unit]
-    for k in np.flatnonzero(np.diff(span) == 1) + 1:
-        out_ti[span[k]] = aesthetics.temporal_information(unit[k - 1], unit[k])
-    clip = (index[order[0]] + np.arange(span[-1] + 1)) % period
+    measured = _measured(frames, captures, index, series, period)
     shifts = range(int(ambiguity) + 1)
     union = sorted({lead + a for lead in aesthetics.LEADS for a in shifts})
     bound = aesthetics.critical_z(len(union))
-    measured = (series[0][clip], series[1][clip], out_si, out_ti)
     kept = aesthetics.survival_stats(*measured, leads=union)
     verdicts = {
         aesthetics.survival_stats(*measured, leads=[lead + a for lead in aesthetics.LEADS]).z > bound

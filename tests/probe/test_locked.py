@@ -263,3 +263,42 @@ def test_rows_carry_how_many_frames_earlier_the_clock_also_admits():
     assert back.ambiguity == 1
     old = {k: v for k, v in rows[-1].as_row().items() if k != "ambiguity"}
     assert FrameRow.from_row(old).ambiguity == 0
+
+
+def clocked_rows(ambiguity=1):
+    """Two runs of three captures: the first strip-named, the second clock-numbered with ``ambiguity``."""
+    rows = [
+        FrameRow(
+            frame=c,
+            program="p",
+            params=(0,) * 12,
+            setpoint=c // 2,
+            shown=10 + c,
+            ambiguity=ambiguity * (c >= 3),
+        )
+        for c in range(6)
+    ]
+    return rows, np.repeat([0, 2], 3)
+
+
+@pytest.mark.parametrize("pooled,numbering", [((1.0, 9.0), 7), ((5.0, 5.2), None)], ids=["chosen", "union"])
+def test_a_clock_numbered_run_takes_the_numbering_its_settings_pool_to(monkeypatch, pooled, numbering):
+    from syncsummoner.probe import replay  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(replay, "pooled_follow", lambda measured, span: np.array(pooled))
+    monkeypatch.setattr(replay, "_measured", lambda *a: ())
+    rows, seg = clocked_rows()
+    clock = [{"run": 2, "candidates": [7, 8]}]
+    got = L.number_runs(rows, clock, seg, np.zeros((6, 2, 2)), (np.zeros(20), np.zeros(20)))
+    assert clock[0]["selection"]["numbering"] == numbering
+    if numbering is None:
+        assert [r.shown for r in got] == [r.shown for r in rows] and [r.ambiguity for r in got][3:] == [1] * 3
+    else:
+        assert [r.shown for r in got] == [10, 11, 12, 12, 13, 14] and not any(r.ambiguity for r in got)
+
+
+def test_a_uniquely_numbered_run_records_its_one_numbering():
+    rows, seg = clocked_rows(ambiguity=0)
+    clock = [{"run": 2, "candidates": [7]}]
+    assert L.number_runs(rows, clock, seg, np.zeros((6, 2, 2)), ()) == rows
+    assert clock[0]["selection"] == {"shift": 0, "numbering": 7}
