@@ -302,3 +302,32 @@ def test_a_uniquely_numbered_run_records_its_one_numbering():
     clock = [{"run": 2, "candidates": [7]}]
     assert L.number_runs(rows, clock, seg, np.zeros((6, 2, 2)), ()) == rows
     assert clock[0]["selection"] == {"shift": 0, "numbering": 7}
+
+
+def test_pooled_numbering_follows_the_clip_only_when_its_series_counts_the_lead_in():
+    """Rows name played frames, lead-in included; scored against a series without it, nothing is chosen."""
+    from syncsummoner import aesthetics  # pylint: disable=import-outside-toplevel
+
+    rng = np.random.default_rng(3)
+    lead, count = 30, 400
+    field = np.cumsum(rng.standard_normal((16, 400)), axis=1)
+    pan = np.cumsum(rng.integers(0, 4, size=lead + count))
+    clip = np.stack([np.roll(field, -int(p), axis=1)[:, :16] for p in pan])
+    clip = np.rint(255 * (clip - clip.min()) / np.ptp(clip)).astype(np.uint8)
+    rows, seg = [], []
+    for k in range(4):
+        for n in range(lead + 100 * k, lead + 100 * k + 90):
+            rows.append(
+                FrameRow(frame=len(rows), program="p", params=(0,) * 12, setpoint=k, shown=n, ambiguity=1)
+            )
+            seg.append(2)
+    seg = np.array(seg)
+    luma = clip[[r.shown for r in rows]]
+    aligned = aesthetics.information(clip.astype(np.float32) / 255.0)
+    clock = [{"run": 2, "candidates": [7, 8]}]
+    L.number_runs(list(rows), clock, seg, luma, aligned)
+    assert clock[0]["selection"]["shift"] == 0
+    offset = aesthetics.information(clip[lead:].astype(np.float32) / 255.0)
+    clock = [{"run": 2, "candidates": [7, 8]}]
+    L.number_runs(list(rows), clock, seg, luma, offset)
+    assert clock[0]["selection"]["shift"] != 0
