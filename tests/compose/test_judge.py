@@ -42,7 +42,10 @@ def stubbed_fixture(monkeypatch):
     seen = {"decoded": [], "check": None}
     luma = np.arange(20, dtype=np.uint8).reshape(20, 1, 1).repeat(4, axis=1)
     found = types.SimpleNamespace(
-        picked=np.array([5, 7, 9]), per_frame=2, summary=lambda: "3/3 clip frames attributed"
+        picked=np.array([5, 7, 9]),
+        per_frame=2,
+        first_capture=4,
+        summary=lambda: "3/3 clip frames attributed",
     )
 
     def features(path, spec, **kw):

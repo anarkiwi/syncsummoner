@@ -20,12 +20,7 @@ TICKS = ev.Ticks(lo=TRUE_TICK - 400_000.0, hi=TRUE_TICK + 600_000.0, period=PERI
 DELTA = 1.25 * PERIOD
 LEAD = 4
 FRAMES = 40
-TIMES = ev.FrameTimes(
-    ns=TRUE_TICK + DELTA + (np.arange(FRAMES + LEAD) - LEAD) * PERIOD,
-    lead=LEAD,
-    origin=TRUE_TICK + DELTA,
-    period=PERIOD,
-)
+TIMES = ev.FrameTimes(lead=LEAD, origin=TRUE_TICK + DELTA, period=PERIOD)
 PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
 WAKE = 100_000.0
 WRITE = 200_000.0
@@ -59,28 +54,21 @@ def device_reads(sends, initial, *, start, stop, every=4_000_000, length=2_000_0
     return out
 
 
-def test_frame_times_take_each_frames_first_capture_and_fit_the_line():
-    k = np.arange(2 * (FRAMES + LEAD))
-    t = 1e9 + k * PERIOD / 2 + np.where(k % 2, 3e5, 0.0)
-    shown = k // 2 - LEAD
-    runs = [types.SimpleNamespace(first=0, last=k.size - 1, slot=0)]
-    times = ev.frame_times(t, shown, runs, 2, LEAD)
-    assert np.allclose(times.ns, 1e9 + np.arange(FRAMES + LEAD) * PERIOD)
-    assert times.origin == pytest.approx(1e9 + LEAD * PERIOD) and times.period == pytest.approx(PERIOD)
-    with pytest.raises(ev.EvidenceError):
-        ev.frame_times(t[:1], shown[:1], [types.SimpleNamespace(first=0, last=0, slot=0)], 2, LEAD)
+def test_frame_times_are_the_attributions_line_from_clip_frame_0():
+    found = types.SimpleNamespace(lead=LEAD, frame0_ns=1e9 + 0.3, period_ns=PERIOD * (1 + 5e-5))
+    times = ev.frame_times(found)
+    assert (times.lead, times.origin, times.period) == (LEAD, 1e9 + 0.3, PERIOD * (1 + 5e-5))
+    n = np.array([-LEAD, 0, 3, FRAMES + 5])
+    assert times.at(n).tolist() == pytest.approx((1e9 + 0.3 + n * PERIOD * (1 + 5e-5)).tolist())
+    assert times.frame_of(times.at(7) + 0.4 * PERIOD) == 7 and times.frame_of(times.at(7) - 0.4 * PERIOD) == 7
 
 
-def test_frame_times_fall_back_to_the_line_where_no_capture_started_a_frame():
-    ns = TIMES.ns.copy()
-    ns[LEAD + 3] = np.nan
-    times = ev.FrameTimes(ns=ns + 1e5, lead=LEAD, origin=TIMES.origin, period=PERIOD)
-    at = times.at(np.array([2, 3, -LEAD - 1, FRAMES + 5]))
-    assert at[0] == pytest.approx(TIMES.origin + 2 * PERIOD + 1e5)
-    assert at[1:].tolist() == pytest.approx(
-        (TIMES.origin + np.array([3, -LEAD - 1, FRAMES + 5]) * PERIOD).tolist()
-    )
-    assert times.frame_of(TIMES.origin + 7 * PERIOD + 0.4 * PERIOD) == 7
+def test_a_latency_bounds_the_devices_own_by_the_lines_its_captures_admit():
+    lat = ev.Latency(lo=DELTA - 1e5, hi=DELTA + 2e5, samples=3, period=PERIOD, line_lo=-4e5, line_hi=3e5)
+    assert lat.bounds == (DELTA - 5e5, DELTA + 5e5)
+    said = lat.as_dict()
+    assert (said["line_lo"], said["line_hi"], said["basis"]) == (-4e5, 3e5, ev.BASIS)
+    assert ev.Latency(lo=1.0, hi=2.0, samples=0, period=PERIOD).bounds == (1.0, 2.0)
 
 
 def test_after_finds_the_first_tick_and_its_clearance():

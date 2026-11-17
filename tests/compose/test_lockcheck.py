@@ -69,21 +69,30 @@ def test_a_clean_take_is_locked(tmp_path, monkeypatch, strips, read):
 def test_a_lost_frame_in_the_clip_is_not_locked(tmp_path, monkeypatch):
     path = recorded(tmp_path, monkeypatch, take(STANDARD))
     report = LC.judge(path, config=CONFIG)
-    assert not report.ok and (report.drops, report.gaps, report.off_cadence) == (1, 1, 3)
+    assert not report.ok and (report.drops, report.gaps, report.off_cadence) == (1, 1, 0)
     assert (
         report.summary().startswith("NOT LOCKED: 6/6")
-        and "card 1 lost frames, 1 gaps and 3" in report.summary()
+        and "card 1 lost frames, 1 gaps and 0" in report.summary()
     )
+
+
+def test_a_picture_settling_off_a_frame_start_is_not_locked(tmp_path, monkeypatch):
+    played = take(CLEAN)
+    k = int(np.flatnonzero(played.shown() == 2)[0])
+    assert played.shown()[k + 1] == 2
+    played.frames["digest"][k + 1] = 999
+    report = LC.judge(recorded(tmp_path, monkeypatch, played), config=CONFIG)
+    assert not report.ok and (report.drops, report.gaps, report.off_cadence) == (0, 0, 1)
+    assert report.attributed == 6 and report.line.startswith("6/6 clip frames attributed")
 
 
 @pytest.mark.parametrize("torn", [None, 3])
 def test_a_passthru_take_is_judged_for_tears_on_the_captures_attributed(tmp_path, monkeypatch, torn):
     played = take(CLEAN)
     clip = stack(played.lead + played.count + 1, seed=1)
-    captures = clip[played.slots // played.per_frame].copy()
-    picked = played.picked()
+    captures = clip[played.frame].copy()
     if torn is not None:
-        captures[picked[torn], :4] = clip[played.lead + torn + 1, :4]
+        captures[played.shown() == torn, :4] = clip[played.lead + torn + 1, :4]
     path = recorded(
         tmp_path, monkeypatch, played, luma={"clip.mkv": clip, str(tmp_path / "take.mkv"): captures}
     )
@@ -98,8 +107,8 @@ def encode(path, n, fps=30):
     subprocess.run(argv, input=frames.tobytes(), check=True)
 
 
-def test_a_clip_is_measured_after_its_lead_in_and_read_small(tmp_path):
-    encode(tmp_path / "clip.mkv", 9)
+def test_a_clip_is_measured_between_its_lead_in_and_lead_out(tmp_path):
+    encode(tmp_path / "clip.mkv", 12)
     config = R.RenderConfig(fps=30.0, lead_in_s=0.1)
     assert LC.clip_seconds(tmp_path / "clip.mkv", config) == pytest.approx(6 / 30)
 

@@ -96,7 +96,9 @@ def test_a_program_destroying_the_strips_is_attributed_from_its_lead_in_and_lead
 
 
 def test_a_strip_less_run_after_an_outage_is_numbered_through_the_pis_lag():
-    played = take(((0, 299, 0.2), (400, 23999, 0.7, 50)), ppm=-50.0, jitter_ns=500_000, wet=(1200, 11700), **FULL)
+    played = take(
+        ((0, 299, 0.2), (400, 23999, 0.7, 50)), ppm=-50.0, jitter_ns=500_000, wet=(1200, 11700), **FULL
+    )
     found = attribute(played)
     assert found.runs == 2 and found.shown.tolist() == played.shown().tolist()
     assert played.shows(found.picked) and found.drops == 50
@@ -117,12 +119,23 @@ def test_identical_captures_over_a_slip_measure_alike_whichever_frame_they_are_g
     digest = played.frames["digest"]
     first = {int(f): int(digest[np.flatnonzero(played.frame == f)[0]]) for f in np.unique(played.frame)}
     assert all(digest[k] == first[j + played.lead] for j, k in enumerate(found.picked))
-    assert found.tied > 0 and found.shown[played.frame < 3000].tolist() == played.shown()[played.frame < 3000].tolist()
+    assert (
+        found.tied > 0
+        and found.shown[played.frame < 3000].tolist() == played.shown()[played.frame < 3000].tolist()
+    )
 
 
 @pytest.mark.parametrize("frame", [600, 3000], ids=["lead-in", "clip"])
 def test_a_frame_line_that_bends_past_the_jitter_is_refused(tmp_path, frame):
-    played = take(((0, 11999, 0.0),), jitter_ns=300_000, ppm=-500.0, kink=(frame, 4_166_667), lead=1200, count=4500, hold=1)
+    played = take(
+        ((0, 11999, 0.0),),
+        jitter_ns=300_000,
+        ppm=-500.0,
+        kink=(frame, 4_166_667),
+        lead=1200,
+        count=4500,
+        hold=1,
+    )
     found = attribute(played)
     assert found.faults + found.strays > 0
     with pytest.raises(L.LockError, match="contradict the frame line"):
@@ -212,7 +225,7 @@ def test_a_take_with_no_lock_record_is_lost(tmp_path):
     [
         (((0, 7, 0.0), (21, 27, 0.3)), 6, None, r"4/6 clip frames attributed"),
         (CLEAN, 8, None, r"6/8 clip frames attributed"),
-        (CLEAN, 6, "stray", "contradict the frame line"),
+        (((0, 59, 0.0),), 22, "stray", "contradict the frame line"),
     ],
     ids=["outage", "short", "stray"],
 )
@@ -220,9 +233,8 @@ def test_an_inexact_take_is_refused_and_nothing_kept(tmp_path, runs, count, code
     played = take(runs, count=count)
     if codes == "stray":
         frame = played.frame
-        k = next(i for i in range(17, frame.size - 1) if frame[i] == frame[i - 1] != frame[i + 1])
-        played.frames["digest"][k - 1] = played.frames["digest"][k - 2]
-        played.frames["digest"][k] = 999
+        k = next(i for i in range(40, frame.size - 1) if frame[i] == frame[i - 1] != frame[i + 1])
+        played.frames["digest"][k] = played.frames["digest"][k + 1]
     path = saved(tmp_path, played)
     with pytest.raises(L.LockError, match=match):
         L.attribute_take(path, config=CONFIG, codes=played.codes)

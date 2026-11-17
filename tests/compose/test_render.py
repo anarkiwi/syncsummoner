@@ -137,8 +137,10 @@ def test_the_rig_session_is_a_named_format():
     assert (rig.width, rig.height, rig.fps) == (1920, 1080, 30.0)
 
 
-@pytest.mark.parametrize("lead", [0, 3])
-def test_write_timecoded_stamps_every_frame_after_a_wrapped_lead_in(monkeypatch, tmp_path, lead):
+@pytest.mark.parametrize("lead, tail", [(0, 0), (3, 0), (3, 2)])
+def test_write_timecoded_stamps_every_frame_between_a_wrapped_lead_in_and_a_lead_out(
+    monkeypatch, tmp_path, lead, tail
+):
     clip = [np.full((4, 4, 3), 0.1 * (i + 1), np.float32) for i in range(6)]
     monkeypatch.setattr(
         "syncsummoner.compose.features.read_frames",
@@ -163,13 +165,14 @@ def test_write_timecoded_stamps_every_frame_after_a_wrapped_lead_in(monkeypatch,
             stdin=Pipe(), stderr=io.BytesIO(b""), wait=lambda: 0, returncode=0
         ),
     )
-    total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG, lead=lead)
-    assert total == 6 and len(written) == 6 + lead
+    total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG, lead=lead, tail=tail)
+    assert total == 6 and len(written) == 6 + lead + tail
     shaped = [f.reshape(CONFIG.height, CONFIG.width, 3).astype(np.float32) / 255.0 for f in written]
     codes = [read_timecode(f, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in shaped]
-    assert codes == [65536 - lead + i for i in range(lead)] + list(range(6))
+    assert codes == [65536 - lead + i for i in range(lead)] + list(range(6 + tail))
     body = [f[: -CONFIG.strip_px].mean() for f in shaped]
     assert body[: lead + 1] == [body[lead]] * (lead + 1) and body[lead] < body[lead + 1]
+    assert body[lead + 5 :] == [body[lead + 5]] * (tail + 1) and body[lead + 4] < body[lead + 5]
 
 
 def test_reading_a_timecode_only_touches_the_strip():
@@ -292,10 +295,9 @@ def test_a_locked_take_is_proven_and_judged_once_its_cc_map_holds(monkeypatch, t
     assert (int(record["hold"]), int(record["lead"]), int(record["count"])) == (2, 8, 6)
     assert np.array_equal(record["flips"], rig.take.flips)
     if not corrupted:
-        picked = rig.take.picked()
-        assert np.load(L.picked_path(out)).tolist() == picked.tolist()
+        assert rig.take.shows(np.load(L.picked_path(out)))
         assert rig.log[-2] == ("evidence", "Teletext", "tc.mkv", "take.mkv"), "proven against the clip played"
-        assert rig.log[-1] == ("inspect", picked[0] - 1)
+        assert rig.log[-1] == ("inspect", int(np.flatnonzero(rig.take.shown() == 0)[0]))
         assert json.loads(locktake.evidence_path(out).read_text(encoding="utf-8")) == {"ok": True}
 
 
@@ -366,9 +368,18 @@ def test_a_lockcheck_take_loads_its_program_inside_the_lead_in(monkeypatch, tmp_
     rig = locked_pass(monkeypatch, load_s={"Teletext": 0.1})
     out = tmp_path / "take.mkv"
     loaded = R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED)
-    assert [step[1] for step in rig.log if step[0] == "load"] == ["Passthru", "Teletext"]
+    assert [step[1] for step in rig.log if step[0] == "load"] == ["Passthru", "Teletext", "Passthru"]
     assert rig.steps[:5] == ["load", "record", "play", "load", "params"] and loaded == pytest.approx(0.1)
-    assert rig.clock.now == pytest.approx(8 / 30 + 0.2 + LOCKED.tail_s)
+    assert rig.clock.now == pytest.approx((8 + 6 + 8) / 30 + LOCKED.tail_s)
+    record = np.load(L.lock_path(out))
+    assert (int(record["lead"]), int(record["count"]), int(record["tail"])) == (8, 6, 8)
+
+
+def test_passthru_loading_past_the_lead_out_is_a_lead_in_error(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch, load_s={"Passthru": 0.3})
+    with pytest.raises(R.LeadInError, match="Teletext: Passthru loaded past the lead-out"):
+        R.play_take(rig.rig, rig, tmp_path / "take.mkv", program="Teletext", seconds=0.2, config=LOCKED)
+    assert not L.lock_path(tmp_path / "take.mkv").exists()
 
 
 def test_a_load_that_overruns_the_lead_in_is_a_lead_in_error(monkeypatch, tmp_path):

@@ -60,7 +60,7 @@ def plan_states():
 def test_sweep_plan_cuts_the_cover_into_takes(tmp_path, monkeypatch, capsys):
     hold = tmp_path / "hold.json"
     hold.write_text(json.dumps({"program": "p", "settle": 1, "hold": 3}))
-    monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(1200 + 12))
+    monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(1200 + 12 + 1200))
     monkeypatch.setattr("syncsummoner.program.model", lambda name: SimpleNamespace(name=name))
     monkeypatch.setattr(gates, "cover", lambda m, gating=None: "cover")
     monkeypatch.setattr(L, "levels", lambda found: plan_states())
