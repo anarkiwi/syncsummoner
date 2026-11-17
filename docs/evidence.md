@@ -30,7 +30,9 @@ frame or more stop the take. Every frame's start less the band gives the instant
 write must precede to land on it (`evidence.grid`). Where the take's captures admit
 lines other than the one fitted, frame starts lie within `line_lo..line_hi` of it, so
 the device's own latency lies in `Latency.bounds`, the band widened by them; each record
-says its basis (`"basis": "start"`).
+says its basis (`"basis": "start"`). A dry take whose start setting looks like its dry picture shows no
+calibration write; it lands by the band the take directory's dry takes measured, as a take
+with no dry control does, and keeps no latency of its own.
 
 A landing is a window, not a frame (`evidence.window`). The device took a write somewhere
 in its echo bracket and applies it on the first tick after; a tick lies in its band

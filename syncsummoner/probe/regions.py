@@ -24,6 +24,7 @@ __all__ = [
     "allot",
     "chunks_of",
     "design",
+    "region_dims",
     "effect_sizes",
     "guard_frames",
     "hold_at",
@@ -148,6 +149,16 @@ def allot(total: int, dims: Sequence[int]) -> list[int]:
     weight = np.asarray(dims, dtype=np.float64)
     share = total * weight / weight.sum() if weight.sum() else np.zeros_like(weight)
     return [int(2 ** math.floor(math.log2(s))) if s >= 1 else 0 for s in share]
+
+
+def region_dims(record: Mapping, values: Mapping[int, np.ndarray], bypass: int | None) -> list[list[int]]:
+    """Per chosen regime of a cover record, the parameters a design samples: those stepped there that
+    the program reads, its bypass switch aside, since turning it on leaves every other control dead.
+    """
+    return [
+        [int(p) for p in record["stepped"].get(str(i), []) if p in values and p != bypass]
+        for i in record["chosen"]
+    ]
 
 
 def design(

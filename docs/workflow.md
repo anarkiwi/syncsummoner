@@ -258,7 +258,9 @@ parameters it steps there are sampled together by a scrambled Sobol design
 (`scipy.stats.qmc.Sobol`, `--seed`), each coordinate picking among the settings the
 program's read bits tell apart by the stratum it falls in, so interactions are seen, a
 switch or a few-setting control comes up in equal shares, and no unread bit is spent;
-other parameters keep the regime's base. Each setting is held long enough for the
+other parameters keep the regime's base. The program's bypass switch (`ProgramModel.bypass`)
+is never sampled: turned on, it leaves every other control dead, so it would spend half the
+settings on the input, and the take's calibration toggles it against the start setting. Each setting is held long enough for the
 follow test (`survival.follow_z`) to see the least follow the planner's dead-bar test
 resolves over the bar it plays in (`regions.effect_sizes`, bars from the track's
 downbeats, the clip played from the track's start), with a miss as rare as a false call:

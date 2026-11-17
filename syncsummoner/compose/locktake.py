@@ -574,9 +574,14 @@ def _run(
     if dry is not None:
         cc_map = rig.transport.device.midi.cc_map
         echo = W.echoed(sends, wire["receipts"], wire["reads"], cc_map)
-        lat = measure_latency(images, frames, found, sends[toggled], times, taken=echo[toggled])
-        write_latency(Path(out).parent, lat, program)
-        LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
+        try:
+            lat = measure_latency(images, frames, found, sends[toggled], times, taken=echo[toggled])
+        except ev.EvidenceError as err:
+            LOG.warning("%s: %s; landing by the band dry takes measured", program, err)
+            lat = read_latency(Path(out).parent)
+        else:
+            write_latency(Path(out).parent, lat, program)
+            LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
     else:
         lat = read_latency(Path(out).parent)
     held["delta"], held["latency"] = lat.delta, lat.as_dict()
