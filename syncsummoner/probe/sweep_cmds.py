@@ -130,7 +130,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
     states = np.asarray(record["states"], dtype=np.int64)
     chosen = [int(i) for i in record["chosen"]]
-    dims = region_dims(record, values, m.bypass(states[chosen[0]]) if chosen else None)
+    dims = region_dims(record, values, m.bypass())
     extra = np.zeros((0, PARAM_COUNT), dtype=np.int64)
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
