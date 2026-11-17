@@ -118,7 +118,7 @@ def recorded(record: dict, values: dict[int, np.ndarray]) -> np.ndarray:
 
 
 def joint(states: np.ndarray, selector: int, mover: int, values: dict[int, np.ndarray]) -> np.ndarray:
-    """``states`` then, from its last, ``selector`` held at each of its settings with a ``mover`` move under each.
+    """``states`` then ``selector`` held at each of its settings, a ``mover`` move under each.
 
     For a control that acts only on what another's moves write, such as a page select: the move
     goes to the mover's setting farthest from its base and back, and the selector returns last.
