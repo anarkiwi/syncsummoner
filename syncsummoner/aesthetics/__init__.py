@@ -36,6 +36,7 @@ from syncsummoner.aesthetics.score import (
 from syncsummoner.aesthetics.spectrum import SpectralStats, spectral_stats
 from syncsummoner.aesthetics.structure import PointwiseFit, pointwise_fit, pointwise_r2
 from syncsummoner.aesthetics.survival import (
+    LEADS,
     Survival,
     critical_z,
     effective_samples,
@@ -77,6 +78,7 @@ __all__ = [
     "analyze_dynamics",
     "av_correlation",
     "critical_z",
+    "LEADS",
     "dead_output",
     "describe_clip",
     "effective_samples",

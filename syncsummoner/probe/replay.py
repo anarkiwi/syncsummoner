@@ -172,11 +172,16 @@ def _clock(
     return (model, "motion") if model is not None else (None, "none")
 
 
-def _kept(frames: list, captures: np.ndarray, index: np.ndarray, series: tuple, period: int) -> dict:
+def _kept(
+    frames: list, captures: np.ndarray, index: np.ndarray, series: tuple, period: int, ambiguity: int = 0
+) -> dict:
     """Survival of the clip frames ``captures`` show at unwrapped ``index``, against those same source frames.
 
     As in a take check, SI is read at each capture and TI against the capture of the clip frame
-    before; the follow is left out where too few frames moved to correlate.
+    before; the follow is left out where too few frames moved to correlate. ``index`` may be up to
+    ``ambiguity`` frames late, so the leads tried are each candidate's, one search at the bound for them all;
+    where the candidates' own searches disagree on following, the group is attribution-ambiguous and kept
+    out. The best lead, a program-delay measurement, is the interval its candidates allow, in source frames.
     """
     if captures.size == 0:
         return {}
@@ -188,9 +193,26 @@ def _kept(frames: list, captures: np.ndarray, index: np.ndarray, series: tuple, 
     for k in np.flatnonzero(np.diff(span) == 1) + 1:
         out_ti[span[k]] = aesthetics.temporal_information(unit[k - 1], unit[k])
     clip = (index[order[0]] + np.arange(span[-1] + 1)) % period
-    kept = aesthetics.survival_stats(series[0][clip], series[1][clip], out_si, out_ti)
+    shifts = range(int(ambiguity) + 1)
+    union = sorted({lead + a for lead in aesthetics.LEADS for a in shifts})
+    bound = aesthetics.critical_z(len(union))
+    measured = (series[0][clip], series[1][clip], out_si, out_ti)
+    kept = aesthetics.survival_stats(*measured, leads=union)
+    verdicts = {
+        aesthetics.survival_stats(*measured, leads=[lead + a for lead in aesthetics.LEADS]).z > bound
+        for a in shifts
+    }
+    if kept.frames > 2 and len(verdicts) > 1:
+        return {"attribution_ambiguous": 1.0}
     found = {"si_ratio": kept.si_ratio, "ti_ratio": kept.ti_ratio}
-    found.update({"motion_follow": kept.follow} if kept.frames > 2 else {})
+    if kept.frames > 2:
+        found.update(
+            {
+                "motion_follow": kept.follow,
+                "motion_lead_lo": kept.lead - int(ambiguity),
+                "motion_lead_hi": kept.lead,
+            }
+        )
     return {name: float(value) for name, value in found.items() if np.isfinite(value)}
 
 
@@ -210,7 +232,11 @@ def survival_metrics(
     named = np.array([row.shown for row in rows], dtype=np.int64)
     period = int(stimulus["frames"])
     if live.size and np.all(named[live] >= 0):
-        return [_kept(frames, members, named[members], series, period) for members in groups], "take"
+        late = np.array([getattr(row, "ambiguity", 0) for row in rows], dtype=np.int64)
+        return [
+            _kept(frames, members, named[members], series, period, int(late[members].max()))
+            for members in groups
+        ], "take"
     times = np.array([row.captured for row in rows], dtype=np.float64)
     bits, strip_px = int(stimulus["bits"]), int(stimulus["strip_px"])
     codes = np.array(

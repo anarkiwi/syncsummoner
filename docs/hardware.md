@@ -428,6 +428,18 @@ shows as measured latency, not inside the line. A strip-less run the flips canno
 second of the card relocking during a load, is left unattributed; the take stays exact only if
 every clip frame has a capture elsewhere.
 
+A processed run between two Passthru runs, a no-dry take's clip, is numbered by the capture
+clock alone (`compose.relock`): frame `n` of run `r` starts at `t0 + n * T + latency_r`, one `T` a
+take and one latency a run, changing only where the card relocks. `T` is the range every run's
+frame line admits; each Passthru run's latency is the range its strip-named brackets admit at it,
+and the processed run's, numbered from its first change event, is the range its own change events
+admit. A numbering is a candidate when some period in range puts the processed run's latency within
+half a frame of both Passthru runs' (a linear feasibility problem, `scipy.optimize.linprog`). No
+candidate fails the take; the run is numbered by the highest, and its captures carry `ambiguity`,
+how many frames earlier the others put them. The lock record's `clock` keeps, per such run, the
+candidates, the period range, the three latencies and the frame a gap's rounding would name, a
+cross-check only. The Pi's flip log disagreeing with the strips is then reported, never acted on.
+
 ## The analog input decodes luma and sync only
 
 Composite fed straight in yields zero chroma under both NTSC and PAL while luma

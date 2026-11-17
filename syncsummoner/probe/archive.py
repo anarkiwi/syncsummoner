@@ -119,7 +119,8 @@ class FrameRow:
 
     ``setpoint`` is :data:`GAP` for a frame captured while the sweep was moving
     between setpoints; ``captured`` is the card's monotonic capture time, ``shown`` the frame of
-    the stimulus clip it shows when a locked take attributed it, else :data:`GAP`.
+    the stimulus clip it shows when a locked take attributed it, else :data:`GAP`; ``ambiguity`` how many
+    frames earlier the take's capture clock also admits it shows.
     """
 
     frame: int
@@ -128,6 +129,7 @@ class FrameRow:
     setpoint: int
     captured: float = 0.0
     shown: int = GAP
+    ambiguity: int = 0
 
     def as_row(self) -> dict[str, Any]:
         """Flatten to a Parquet-friendly row, sharing ``MeasurementRecord`` param naming."""
@@ -137,6 +139,7 @@ class FrameRow:
             "setpoint": self.setpoint,
             "captured": self.captured,
             "shown": self.shown,
+            "ambiguity": self.ambiguity,
         }
         row.update(dict(zip(_PARAM_COLUMNS, self.params)))
         return row
@@ -151,6 +154,7 @@ class FrameRow:
             setpoint=int(row["setpoint"]),
             captured=float(row.get("captured") or 0.0),
             shown=GAP if row.get("shown") is None else int(row["shown"]),
+            ambiguity=int(row.get("ambiguity") or 0),
         )
 
 

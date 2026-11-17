@@ -287,12 +287,14 @@ def settled_rows(
     lead: int,
     program: str,
     bad_frames: Sequence[int] = (),
+    ambiguity: np.ndarray | None = None,
 ) -> list[FrameRow]:
     """One archive row per capture, under the state the take realized: its settled setpoint, else :data:`GAP`.
 
     A frame belongs to the setpoint whose writes may have started landing last by then, once
     ``chunk.settle`` frames have passed since the end of its writes' latest landing window, and only
-    where the realized state is that setpoint's (:func:`windows`). Frames in ``bad_frames`` keep no setpoint.
+    where the realized state is that setpoint's (:func:`windows`). Frames in ``bad_frames`` keep no setpoint;
+    ``ambiguity`` is, per capture, how many frames earlier the take's clock also admits it shows.
     """
     count, n = picked.size, len(chunk.states)
     rows, first, opens = windows(chunk, landed, count)
@@ -316,6 +318,7 @@ def settled_rows(
             setpoint=int(held[c]),
             captured=float(captured[c]),
             shown=int(shown[c]) + lead if shown[c] >= 0 else GAP,
+            ambiguity=0 if ambiguity is None else int(ambiguity[c]),
         )
         for c in range(shown.size)
     ]
@@ -505,6 +508,7 @@ def collect(
         lead=seen.found.lead,
         program=program,
         bad_frames=disagreeing(seen.proof.applied),
+        ambiguity=getattr(seen.found, "ambiguity", None),
     )
     save_rows(take, rows)
     kept = {r.setpoint for r in rows if r.setpoint != GAP}

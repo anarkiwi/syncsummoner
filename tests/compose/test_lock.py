@@ -267,8 +267,8 @@ def test_strips_a_program_processed_neither_anchor_nor_contradict_the_line():
 
 
 def test_a_run_the_flips_cannot_number_is_left_out_and_the_take_kept_when_the_clip_needs_none(monkeypatch):
-    runs = ((0, 29, 0.0), (31, 33, 0.3), (35, 43, 0.3))
-    played = take(runs, lead=8, count=6, tail=8, strips=(0, 2))
+    runs = ((0, 29, 0.0), (35, 43, 0.3), (45, 47, 0.3))
+    played = take(runs, lead=8, count=6, tail=8, strips=(0, 1))
 
     def refused(*_a, **_k):
         raise L.LockError("numbered 0 ways")
@@ -279,7 +279,7 @@ def test_a_run_the_flips_cannot_number_is_left_out_and_the_take_kept_when_the_cl
         found.complete
         and found.picked.tolist() == attribute(take(runs, lead=8, count=6, tail=8)).picked.tolist()
     )
-    assert (found.shown[30:33] == -1 - played.lead).all()
+    assert (found.shown[-3:] == -1 - played.lead).all()
 
 
 def wire_for(path, **arrays):
@@ -311,3 +311,27 @@ def test_a_program_processed_the_picture_from_its_first_wet_write_to_its_dry_wri
     assert L.processed(path, record, played.frames) == (7.0, 165.0)
     wire_for(path, dry=np.array("null"), **common)
     assert L.processed(path, record, played.frames)[0] == float(t[seg == 0][-1])
+
+
+#: Passthru lead-in, a processed run with no legible strip, Passthru lead-out, each after a load's outage.
+PROCESSED = ((0, 29, 0.0), (35, 69, 0.3), (75, 99, 0.3))
+
+
+def test_a_processed_run_between_passthru_runs_is_numbered_by_the_capture_clock():
+    played = take(PROCESSED, lead=18, count=17, tail=15, strips=(0, 2))
+    found = attribute(played)
+    (said,) = found.clock
+    assert said["run"] == 1 and said["candidates"] and found.complete
+    middle = np.arange(30, 65)
+    assert (found.ambiguity[middle] == len(said["candidates"]) - 1).all()
+    assert not np.delete(found.ambiguity, middle).any()
+    truth, shown = played.shown(), found.shown
+    assert ((truth >= shown - found.ambiguity) & (truth <= shown)).all()
+    assert found.record()["clock"] == [said]
+
+
+def test_a_processed_run_the_clock_numbers_no_way_fails_the_take(monkeypatch):
+    played = take(PROCESSED, lead=18, count=17, tail=15, strips=(0, 2))
+    monkeypatch.setattr(L.relock, "candidates", lambda *a, **k: [])
+    with pytest.raises(L.LockError, match="numbers run 1 no way"):
+        attribute(played)
