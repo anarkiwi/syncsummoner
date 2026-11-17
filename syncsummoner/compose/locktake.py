@@ -12,14 +12,15 @@ import json
 import sys
 from contextlib import contextmanager
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 import numpy as np
 
 from syncsummoner.compose import evidence as ev
-from syncsummoner.compose.lock import live_attribution, read_live, save_lock
+from syncsummoner.compose import frameline
+from syncsummoner.compose.lock import capture_times, changes, live_attribution, read_live, save_lock
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
 from syncsummoner.device import wire as W
 from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
@@ -180,23 +181,34 @@ def boot_count(shell: Any) -> int:
     return int(json.loads(shell.get_setting(BOOT_COUNT_KEY))["value"])
 
 
-def frame_starts(size: int, runs: Any, per_frame: int) -> np.ndarray:
-    """Whether each capture is the first of its frame, by its run's cadence."""
-    out = np.zeros(size, dtype=bool)
-    for run in runs:
-        k = np.arange(run.first, min(run.last + 1, size))
-        out[k] = (run.slot + k - run.first) % per_frame == 0
-    return out
-
-
 @dataclass
 class Clock:
-    """The take's clock as measured so far: frame times and the send-to-capture latency."""
+    """The take's clock as measured so far: the frame line, and the send-to-frame-start latency.
+
+    ``first`` is the first capture of the run the clip plays in and ``seen`` the captures its line
+    has looked at; the line is carried on as the card's log grows (:meth:`extend`).
+    """
 
     times: ev.FrameTimes
     lat: ev.Latency
-    run: Any = None
-    per_frame: int = 2
+    line: Any = None
+    first: int = 0
+    seen: int = 0
+    jitter: float = 0.0
+    resolution: float = 0.0
+
+    @classmethod
+    def of(cls, found: Any, lat: ev.Latency) -> "Clock":
+        """The clock an attribution of the take so far gives."""
+        return cls(
+            times=ev.frame_times(found),
+            lat=lat,
+            line=found.line,
+            first=int(found.span[0]),
+            seen=int(found.span[1]) + 1,
+            jitter=float(found.jitter_ns),
+            resolution=float(found.resolution),
+        )
 
     @property
     def ticks(self) -> ev.Ticks:
@@ -207,19 +219,27 @@ class Clock:
         """Host time to send a write that should land on ``target``."""
         return int(ev.send_time(np.array([target]), self.ticks, self.times, self.lat.delta)[0])
 
-    def extend(self, t_ns: np.ndarray, sequence: np.ndarray) -> None:
-        """Carry the frame line on over every frame start the anchored run has gained."""
-        run = self.run
-        if run is None:
+    def extend(self, log: np.ndarray) -> None:
+        """Carry the frame line on over the frame starts the clip's run has gained, by its bytes.
+
+        A capture's bytes are only known to start a frame once the two after it are logged.
+        """
+        if self.line is None:
             return
-        tail = np.flatnonzero(np.diff(sequence[run.last :]) != 1)
-        last = run.last + (int(tail[0]) if tail.size else t_ns.size - 1 - run.last)
-        k = np.arange(run.first, last + 1)
-        start = k[(run.slot + k - run.first) % self.per_frame == 0]
-        frame = (run.slot + start - run.first) // self.per_frame - self.times.lead
-        if start.size > 2:
-            slope, icept = np.polyfit(frame, t_ns[start].astype(np.float64), 1)
-            self.times = ev.FrameTimes(self.times.ns, self.times.lead, float(icept), float(slope))
+        part = log[self.first :]
+        run = part[frameline.segments(part["t_ns"], part["sequence"]) == 0]
+        done = self.first + run.size - 2
+        if done <= self.seen:
+            return
+        seg = np.zeros(run.size, dtype=np.int64)
+        capture, _ = frameline.capture_line(run["t_ns"], run["sequence"], seg)
+        tau = capture_times(run["t_ns"], run["sequence"], seg, capture)
+        k = np.flatnonzero(changes(run["digest"]))
+        k = k[(k + self.first >= self.seen) & (k + self.first < done)]
+        self.line = frameline.extend(self.line, tau[k - 1], tau[k], self.jitter, self.resolution)
+        self.seen = done
+        lead = self.times.lead
+        self.times = ev.FrameTimes(lead, self.line.origin + lead * self.line.period, self.line.period)
 
 
 @dataclass
@@ -251,45 +271,49 @@ def measure_latency(
     ``taken`` brackets each toggle's taking (:func:`wire.echoed`), else its send interval does.
     """
     size = min(images.shape[0], frames.size, found.shown.size)
-    starts = frame_starts(size, found.runs, found.per_frame)
     landed = ev.toggle_landings(
-        images[:size], frames["t_ns"][:size], starts, found.shown[:size], toggles, until
+        images[:size], frames["t_ns"][:size], found.starts[:size], found.shown[:size], toggles, until
     )
-    return ev.latency(ev.taken(toggles, taken), landed, times)
+    lat = ev.latency(ev.taken(toggles, taken), landed, times)
+    shown = np.unique(np.r_[landed, landed - 1][np.r_[landed, landed] >= -times.lead])
+    least, most = found.line.polygon.at(shown + times.lead)
+    line = times.at(shown)
+    return replace(lat, line_lo=float(np.min(least - line)), line_hi=float(np.max(most - line)))
 
 
 def write_latency(directory: str | Path, measured: ev.Latency, program: str) -> None:
-    """Add a dry take's measured latency to the ones a take without a dry control draws on."""
+    """Keep a dry take's measured latency for the takes without a dry control, one a program and basis."""
     path = Path(directory, LATENCY_FILE)
     takes = json.loads(path.read_text(encoding="utf-8")).get("takes", []) if path.is_file() else []
-    takes.append({"program": program, **measured.as_dict()})
+    entry = {"program": program, **measured.as_dict()}
+    takes = [t for t in takes if (t.get("program"), t.get("basis")) != (program, entry["basis"])] + [entry]
     path.write_text(json.dumps({"takes": takes}, indent=1), encoding="utf-8")
 
 
 def read_latency(directory: str | Path) -> ev.Latency:
-    """The send-to-capture latency for a take whose card phase no picture measured.
+    """The send-to-frame-start latency for a take with no dry control: the band every dry take admits.
 
-    It is a constant plus the card's capture phase, which two captures a frame keep within half a
-    frame; the band runs from the dry takes' least bound less the unseen part of that half frame
-    to their greatest plus it. A band of half a frame or more cannot name a landing frame.
+    Each dry take bounds the device's latency whichever line its captures admit
+    (:attr:`~syncsummoner.compose.evidence.Latency.bounds`), so it lies where they all meet. Only takes
+    measured to the frame line count; a band of half a frame or more cannot name a landing frame.
     """
     path = Path(directory, LATENCY_FILE)
-    if not path.is_file():
+    held = json.loads(path.read_text(encoding="utf-8"))["takes"] if path.is_file() else []
+    takes = [t for t in held if t.get("basis") == ev.BASIS]
+    if not takes:
         raise NoLatencyError(
-            f"no {LATENCY_FILE} in {directory}: a program without a dry control needs a dry take's "
+            f"no {ev.BASIS}-basis latency in {path}: a program without a dry control needs a dry take's "
             "measured CC-to-picture latency; render a program with a bypass first"
         )
-    takes = json.loads(path.read_text(encoding="utf-8"))["takes"]
-    lo = min(t["lo"] for t in takes)
-    hi = max(t["hi"] for t in takes)
+    lo = max(t["lo"] + t.get("line_lo", 0.0) for t in takes)
+    hi = min(t["hi"] + t.get("line_hi", 0.0) for t in takes)
     period = float(np.median([t["period"] for t in takes]))
-    if hi - lo >= period / 2:
+    if hi < lo or hi - lo >= period / 2:
         raise LeadInTimeError(
             f"dry takes in {path} put the CC-to-picture latency over {lo / 1e6:.2f}..{hi / 1e6:.2f} ms, "
-            "half a frame or more, too wide to say which frame a write lands on"
+            "empty or half a frame or more, so it cannot say which frame a write lands on"
         )
-    unseen = 0.5 * (period / 2 - (hi - lo))
-    found = ev.Latency(lo=lo - unseen, hi=hi + unseen, samples=0, period=period)
+    found = ev.Latency(lo=lo, hi=hi, samples=0, period=period)
     LOG.info(
         "CC-to-picture %.2f ms from %d dry takes, within %.2f ms",
         found.delta / 1e6,
@@ -333,8 +357,9 @@ def locked_take(
     """Record ``program`` playing the clip with every planned write sent for its frame.
 
     ``load(name)`` loads a program and checks the rig, returning its program info, and
-    ``working(info)`` gives its working point; ``bypass(info)`` names its dry switch. A rise in the
-    boot count is a :class:`RebootError`.
+    ``working(info)`` gives its working point; ``bypass(info)`` names its dry switch, turned back on
+    for the strip-coded lead-out, as long as the lead-in, or Passthru reloaded for it with no switch.
+    A rise in the boot count is a :class:`RebootError`.
     """
     shell = rig.transport.device.shell
     midi = rig.transport.device.midi
@@ -358,7 +383,7 @@ def locked_take(
     start_state = {**initial, **(dry or {})}
     start_vector = np.array([start_state.get(i, int(park[i - 1])) for i in range(1, PARAM_COUNT + 1)])
     wet = wet_at(lead_in, fps)
-    rows = schedule(plan_rows(plan, dry, initial, wet_frame=wet), start_vector)
+    rows = schedule(plan_rows(plan, dry, initial, wet_frame=wet, dry_frame=count), start_vector)
     echoes = Echoes()
     sender = Sender(write, echoes=echoes, encode=encode)
     poller = Poller(shell, interval_s=lead_in.poll_s, echoes=echoes)
@@ -388,9 +413,10 @@ def locked_take(
                 start=start_vector,
                 park=park,
                 lead_in=lead_in,
+                reload=load if dry is None else None,
             )
             hold = int(player.status().get("hold", 1))
-        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count)
+        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=lead)
     finally:
         asked = held["loaded"]
         save_wire(
@@ -456,8 +482,9 @@ def _play(
     start: np.ndarray,
     park: np.ndarray,
     lead_in: LeadIn,
+    reload: Callable[[str], Any] | None = None,
 ) -> None:
-    """The take from playout start: lead-in writes, calibration, the live clock, then every planned write.
+    """The take from playout start: lead-in writes, calibration, the live clock, every planned write, the lead-out.
 
     The cyclic collector is off meanwhile: a full collection holds the interpreter lock for longer
     than the half frame a send has to make its tick, stalling the sender and the poller together.
@@ -486,6 +513,7 @@ def _play(
             park=park,
             lead_in=lead_in,
             began=began,
+            reload=reload,
         )
     finally:
         sys.setswitchinterval(switch)
@@ -512,11 +540,13 @@ def _run(
     park: np.ndarray,
     lead_in: LeadIn,
     began: int,
+    reload: Callable[[str], Any] | None = None,
 ) -> None:
     """The take's body, run with the interpreter switching threads often enough for the sender.
 
     Every write is acknowledged before the next goes: the start state, each slot not already parked
-    at its value, then the calibration toggles and the plan.
+    at its value, then the calibration toggles and the plan. With ``reload``, Passthru is loaded for the
+    lead-out once the clip has played; either way the lead-out is held as long as the lead-in's wet stretch.
     """
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
@@ -534,7 +564,7 @@ def _run(
     found, frames = live_attribution(
         out, rig.playout.flips(), codes, config=config, hold=hold, lead=lead, count=count
     )
-    times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, lead)
+    times = ev.frame_times(found)
     sends, wire = sender.array(), poller.arrays()
     toggled = sends["target"] == ev.CALIBRATION
     if dry is not None:
@@ -546,7 +576,7 @@ def _run(
     else:
         lat = read_latency(Path(out).parent)
     held["delta"], held["latency"] = lat.delta, lat.as_dict()
-    clock = Clock(times=times, lat=lat, run=found.runs[-1], per_frame=found.per_frame)
+    clock = Clock.of(found, lat)
     rows = held["rows"]
     first_due = clock.when(int(rows["target"][0])) if rows.size else clock.when(0)
     if time.monotonic_ns() >= first_due:
@@ -554,31 +584,41 @@ def _run(
             f"{program}: the clock was measured {(time.monotonic_ns() - first_due) / 1e9:.2f}s after the "
             "first write was due; lengthen the lead-in"
         )
-    log = _read_sidecar(out)
-    clock.extend(log["t_ns"], log["sequence"])
+    clock.extend(_read_sidecar(out))
     sender.when = clock.when
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
     _sleep_until(clock.when(-1) - int(clock.ticks.period))
     held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
-    end = int(clock.times.at(count)) + int(config.tail_s * 1e9)
+    settle = -wet_at(lead_in, float(config.fps))
+    end = int(clock.times.at(count + (0 if reload else settle))) + int(config.tail_s * 1e9)
     with meter((end - began) / 1e9, desc="take") as progress:
         while (now := time.monotonic_ns()) < end:
             time.sleep(min(1.0, (end - now) / 1e9))
-            log = _read_sidecar(out)
-            clock.extend(log["t_ns"], log["sequence"])
+            clock.extend(_read_sidecar(out))
             progress.to((time.monotonic_ns() - began) / 1e9)
     sender.drain(timeout_s=1.0)
+    if reload is not None:
+        reload("Passthru")
+        _sleep_until(time.monotonic_ns() + int(clock.times.period * settle))
 
 
 def plan_rows(
-    plan: np.ndarray, dry: Mapping[int, int] | None, initial: Mapping[int, int], *, wet_frame: int
+    plan: np.ndarray,
+    dry: Mapping[int, int] | None,
+    initial: Mapping[int, int],
+    *,
+    wet_frame: int,
+    dry_frame: int | None = None,
 ) -> np.ndarray:
-    """The take's writes: the dry control back to its take value at ``wet_frame``, then the plan."""
+    """The take's writes: the dry control to its take value at ``wet_frame``, the plan, and dry again at ``dry_frame``."""
     if dry is None:
         return plan
-    ((slot, _),) = dry.items()
-    return np.r_[np.array([(wet_frame, slot, initial.get(slot, 0))], dtype=PLAN), plan]
+    ((slot, value),) = dry.items()
+    rows = [np.array([(wet_frame, slot, initial.get(slot, 0))], dtype=PLAN), plan]
+    if dry_frame is not None:
+        rows.append(np.array([(dry_frame, slot, value)], dtype=PLAN))
+    return np.concatenate(rows)
 
 
 @contextmanager
@@ -680,20 +720,25 @@ def take_latency(
     toggled = sends["target"] == ev.CALIBRATION
     calibration = sends[toggled]
     used = json.loads(str(wire["latency"])) if "latency" in wire else {}
-    if "lo" in used:
+    lat = None
+    if used.get("basis") == ev.BASIS:
         lat = ev.Latency(lo=used["lo"], hi=used["hi"], samples=used.get("samples", 0), period=times.period)
-    else:
-        lat = read_latency(Path(take).parent) if Path(take).parent.joinpath(LATENCY_FILE).is_file() else None
     if json.loads(str(wire["dry"])) is not None and calibration.size:
         later = sends["t0_ns"][(sends["target"] > ev.START) & (sends["t0_ns"] > calibration["t1_ns"].max())]
         until = float(later.min()) if later.size else None
         try:
             taken = None if echo is None else echo[toggled]
             lat = measure_latency(images, frames, found, calibration, times, until, taken)
+            write_latency(Path(take).parent, lat, str(wire.get("program", Path(take).stem)))
         except ev.EvidenceError as err:
             if lat is None:
                 raise
             LOG.warning("%s: %s; using the band measured live in the lead-in", take, err)
+    if lat is None:
+        try:
+            lat = read_latency(Path(take).parent)
+        except NoLatencyError:
+            lat = None
     if lat is None:
         raise ev.EvidenceError(
             f"{take}: no CC-to-picture latency, measured or on file, to land its writes by"
@@ -732,7 +777,7 @@ def take_evidence(
         names = {int(k): v for k, v in json.loads(str(wire["names"])).items()} if "names" in wire else {}
     found = attribute_take(take, config=config, features=features) if found is None else found
     frames = read_log(take)
-    times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, found.lead)
+    times = ev.frame_times(found)
     sends = wire["sends"]
     echo = take_echo(wire)
     resent = wire.get("resent")

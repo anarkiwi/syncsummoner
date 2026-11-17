@@ -157,13 +157,20 @@ class Latency:
     Each calibration write that showed in the picture bounds it: after the start of the frame
     before the one it landed on, at or before its own. ``lo`` and ``hi`` are those bounds
     intersected; where writes disagree by a little, they are the band they disagree over.
-    ``delta`` is the band's middle, in ns.
+    ``delta`` is the band's middle, in ns. Frame starts lie ``line_lo..line_hi`` off the take's line.
     """
 
     lo: float
     hi: float
     samples: int
     period: float
+    line_lo: float = 0.0
+    line_hi: float = 0.0
+
+    @property
+    def bounds(self) -> tuple[float, float]:
+        """The band the device's own latency lies in, whichever line the take's captures admit."""
+        return self.lo + self.line_lo, self.hi + self.line_hi
 
     @property
     def delta(self) -> float:
@@ -190,6 +197,8 @@ class Latency:
             "delta": self.delta,
             "spread": self.spread,
             "frames": self.frames,
+            "line_lo": self.line_lo,
+            "line_hi": self.line_hi,
             "basis": BASIS,
         }
 

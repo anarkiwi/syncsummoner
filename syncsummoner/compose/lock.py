@@ -35,6 +35,7 @@ class Attribution:
     ``picked[j]`` is the capture nearest clip frame ``j``'s centre on the line (the later on a tie),
     -1 where none shows it; ``shown[k]`` is the clip frame capture ``k`` shows, negative in the lead-in.
     ``faults`` are legible strips a frame off at a capture a boundary may cross: what attribution can get wrong.
+    ``span`` is the first and last capture of the run ``line`` is fitted to.
     """
 
     picked: np.ndarray
@@ -57,6 +58,8 @@ class Attribution:
     faults: int
     strays: int
     rejected: int = 0
+    span: tuple[int, int] = (0, -1)
+    resolution: float = 0.0
 
     @property
     def period_ns(self) -> float:
@@ -235,7 +238,8 @@ def attribute(
     k = np.flatnonzero(np.r_[False, seg[1:] == seg[:-1]] & (changes(digest) | (named >= 0)))
     runs = np.unique(seg)
     lines = _lines(tau, k, seg, (named, group), (jitter, resolution), shown_at)
-    main = lines[max(lines, key=lambda s: int(np.count_nonzero(seg == s)))]
+    main_run = max(lines, key=lambda s: int(np.count_nonzero(seg == s)))
+    main, mine = lines[main_run], np.flatnonzero(seg == main_run)
     shown = np.full(tau.size, -1 - lead, dtype=np.int64)
     uncertain = np.zeros(tau.size, dtype=bool)
     tied = 0
@@ -270,6 +274,8 @@ def attribute(
         faults=int(np.count_nonzero(uncertain & (np.abs(diff) == 1))),
         strays=int(np.count_nonzero((shown[stray] >= 0) & (shown[stray] < count))),
         rejected=int(sum(line.rejected for line in lines.values())),
+        span=(int(mine[0]), int(mine[-1])),
+        resolution=resolution,
     )
 
 
