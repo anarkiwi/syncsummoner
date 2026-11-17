@@ -17,6 +17,7 @@ __all__ = [
     "crop_strip",
     "state_index_capacity",
     "burn_timecode",
+    "timecode_row",
     "read_timecode",
 ]
 
@@ -296,13 +297,18 @@ def crop_strip(frame, *, strip_px=8):
     return frame[: frame.shape[0] - int(strip_px)]
 
 
+def timecode_row(index: int, width: int, *, bits: int = 16) -> np.ndarray:
+    """One strip row of ``width`` columns in ``{0, 1}``: a marker cell, then the gray-coded index."""
+    code = int(index) ^ (int(index) >> 1)
+    cells = np.concatenate(([1.0], ((code >> np.arange(bits - 1, -1, -1)) & 1).astype(np.float32)))
+    edges = np.round(np.linspace(0, width, cells.size + 1)).astype(int)
+    return np.repeat(cells.astype(np.float32), np.diff(edges))
+
+
 def burn_timecode(frame: np.ndarray, index: int, *, bits: int = 16, strip_px: int = 8) -> np.ndarray:
     """Write a gray-coded frame index into a croppable bottom edge strip, behind a marker cell."""
     out = np.array(frame, dtype=np.float32, copy=True)
-    code = int(index) ^ (int(index) >> 1)
-    cells = np.concatenate(([1.0], ((code >> np.arange(bits - 1, -1, -1)) & 1).astype(np.float32)))
-    edges = np.round(np.linspace(0, out.shape[1], cells.size + 1)).astype(int)
-    out[out.shape[0] - strip_px :] = np.repeat(cells, np.diff(edges))[None, :, None]
+    out[out.shape[0] - strip_px :] = timecode_row(index, out.shape[1], bits=bits)[None, :, None]
     return out
 
 

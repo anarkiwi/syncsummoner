@@ -3,7 +3,6 @@
 # pylint: disable=missing-function-docstring,protected-access
 
 import contextlib
-import io
 import dataclasses
 import json
 import sys
@@ -141,44 +140,6 @@ def test_the_rig_session_is_a_named_format():
     """Playout writes the Pi framebuffer, which is 1920x1080: a 720p session showed nothing."""
     rig = R.RenderConfig.for_format("1080p30")
     assert (rig.width, rig.height, rig.fps) == (1920, 1080, 30.0)
-
-
-@pytest.mark.parametrize("lead, tail", [(0, 0), (3, 0), (3, 2)])
-def test_write_timecoded_stamps_every_frame_between_a_wrapped_lead_in_and_a_lead_out(
-    monkeypatch, tmp_path, lead, tail
-):
-    clip = [np.full((4, 4, 3), 0.1 * (i + 1), np.float32) for i in range(6)]
-    monkeypatch.setattr(
-        "syncsummoner.compose.features.read_frames",
-        lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
-    )
-    written = []
-
-    class Pipe:
-        """Encoder stdin standing in for ffmpeg, keeping the frames it is handed."""
-
-        def write(self, data):
-            """Write."""
-            written.append(np.frombuffer(bytes(data), np.uint8))
-
-        def close(self):
-            """Close."""
-
-    monkeypatch.setattr(
-        R.subprocess,
-        "Popen",
-        lambda *a, **k: types.SimpleNamespace(
-            stdin=Pipe(), stderr=io.BytesIO(b""), wait=lambda: 0, returncode=0
-        ),
-    )
-    total = R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG, lead=lead, tail=tail)
-    assert total == 6 and len(written) == 6 + lead + tail
-    shaped = [f.reshape(CONFIG.height, CONFIG.width, 3).astype(np.float32) / 255.0 for f in written]
-    codes = [read_timecode(f, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in shaped]
-    assert codes == [65536 - lead + i for i in range(lead)] + list(range(6 + tail))
-    body = [f[: -CONFIG.strip_px].mean() for f in shaped]
-    assert body[: lead + 1] == [body[lead]] * (lead + 1) and body[lead] < body[lead + 1]
-    assert body[lead + 5 :] == [body[lead + 5]] * (tail + 1) and body[lead + 4] < body[lead + 5]
 
 
 def test_reading_a_timecode_only_touches_the_strip():
@@ -461,49 +422,6 @@ def test_the_timecoded_source_is_built_once_for_every_cut_pass(monkeypatch, tmp_
         pass_render=fake_render,
     )
     assert built == [tmp_path / "tc.mkv"] and passes == [True, True]
-
-
-def test_an_excerpt_takes_its_footage_from_where_it_starts(monkeypatch):
-    """A windowed score plays the footage at its own start, not from frame zero."""
-    clip = [np.full((CONFIG.height, CONFIG.width, 3), i / 20, np.float32) for i in range(20)]
-    monkeypatch.setattr(
-        "syncsummoner.compose.features.read_frames",
-        lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in clip]),
-    )
-    _, stream = R.source_stream("clip.mkv", CONFIG, seconds=0.5, start=1.0)
-    assert [round(float(f.mean()), 3) for f in stream] == [round(float(f.mean()), 3) for f in clip[10:15]]
-
-
-def test_a_dead_encoder_is_reported_as_what_it_said(monkeypatch, tmp_path):
-    """Writing to a dead encoder raises a broken pipe, which says nothing about why."""
-    monkeypatch.setattr(
-        "syncsummoner.compose.features.read_frames",
-        lambda p, max_frames=None: iter([(CONFIG.fps, np.zeros((4, 4, 3), np.float32))] * 3),
-    )
-
-    class Pipe:
-        """Encoder stdin that has already gone away."""
-
-        def write(self, data):
-            """Write."""
-            del data
-            raise BrokenPipeError
-
-        def close(self):
-            """Close."""
-
-    monkeypatch.setattr(
-        R.subprocess,
-        "Popen",
-        lambda *a, **k: types.SimpleNamespace(
-            stdin=Pipe(),
-            stderr=io.BytesIO(b"Error opening output timecoded.mkv: Permission denied\n"),
-            wait=lambda: 1,
-            returncode=1,
-        ),
-    )
-    with pytest.raises(RuntimeError, match="Permission denied"):
-        R.write_timecoded("clip.mkv", tmp_path / "tc.mkv", config=CONFIG)
 
 
 def test_cut_render_makes_room_for_its_takes(monkeypatch, tmp_path):

@@ -24,5 +24,6 @@ robotsofdeath/
 *.wav
 *.flac
 .program-cache/
+.timecode-cache/
 .bench/
 *.features.npz
