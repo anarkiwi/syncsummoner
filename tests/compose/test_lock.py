@@ -2,14 +2,17 @@
 
 # pylint: disable=missing-function-docstring
 
+import json
 import subprocess
 import types
 
 import numpy as np
 import pytest
 
+from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import lock as L
 from syncsummoner.device.v4l2rec import sidecar
+from syncsummoner.device.wire import READ, RECEIPT, SEND
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import burn_timecode, read_timecode
 from tests.compose.locked import CARD_NS, CLEAN, PI_T0, STANDARD, VBLANK_NS, WRAP, take
@@ -249,3 +252,62 @@ def test_the_anchor_rests_on_the_lead_in_when_the_clip_misreads_its_strips():
     codes[clip] = (played.frame[clip] + 1 - 8) & WRAP
     found = attribute(played, codes)
     assert found.shown.tolist() == played.shown().tolist() and found.ahead > 0
+
+
+def test_strips_a_program_processed_neither_anchor_nor_contradict_the_line():
+    """A clip strip a frame behind on a boundary capture faults when trusted, and is no evidence otherwise."""
+    clean = take(STANDARD)
+    played = take(STANDARD, misread=(14, (clean.frame[14] - 1 - clean.lead) & WRAP))
+    trusted = np.ones(played.frame.size, dtype=bool)
+    trusted[12:20] = False
+    seen = L.attribute(played.codes, played.frames, played.flips, **played.kw, trusted=trusted)
+    assert attribute(played).faults == 1 and seen.faults == 0
+    assert seen.read == attribute(played).read - int(np.count_nonzero(played.codes[12:20] >= 0))
+    assert seen.shown.tolist() == attribute(clean).shown.tolist()
+
+
+def test_a_run_the_flips_cannot_number_is_left_out_and_the_take_kept_when_the_clip_needs_none(monkeypatch):
+    runs = ((0, 29, 0.0), (31, 33, 0.3), (35, 43, 0.3))
+    played = take(runs, lead=8, count=6, tail=8, strips=(0, 2))
+
+    def refused(*_a, **_k):
+        raise L.LockError("numbered 0 ways")
+
+    monkeypatch.setattr(L, "_bridge", refused)
+    found = attribute(played)
+    assert (
+        found.complete
+        and found.picked.tolist() == attribute(take(runs, lead=8, count=6, tail=8)).picked.tolist()
+    )
+    assert (found.shown[30:33] == -1 - played.lead).all()
+
+
+def wire_for(path, **arrays):
+    np.savez(f"{path}.wire.npz", **arrays)
+
+
+def test_a_program_processed_the_picture_from_its_first_wet_write_to_its_dry_writes_landing(tmp_path):
+    played = take(STANDARD)
+    path = tmp_path / "take.mkv"
+    L.save_lock(path, played.flips, **played.kw)
+    assert L.processed(path, np.load(L.lock_path(path)), played.frames) is None
+    L.save_lock(path, played.flips, **played.kw, wet=True)
+    record, t = np.load(L.lock_path(path)), played.frames["t_ns"]
+    seg = L.frameline.segments(t, played.frames["sequence"])
+    assert L.processed(path, record, played.frames) == (float(t[seg == 0][-1]), np.inf)
+    L.save_lock(path, played.flips, **{**played.kw, "tail": 2}, wet=True)
+    record = np.load(L.lock_path(path))
+    assert L.processed(path, record, played.frames) == (float(t[seg == 0][-1]), float(t[seg == seg[-1]][0]))
+    sends = np.zeros(4, dtype=SEND)
+    sends["target"] = [ev.START, ev.CALIBRATION, 2, played.count]
+    sends["t0_ns"], sends["t1_ns"] = [10, 20, 30, 40], [11, 21, 31, 41]
+    latency = json.dumps({"hi": 5.0, "period": 100.0})
+    common = {"sends": sends, "latency": np.array(latency), "cc_map": np.arange(1, 13)}
+    common |= {"receipts": np.zeros(0, RECEIPT), "reads": np.zeros(0, READ)}
+    wire_for(path, dry=np.array(json.dumps({"1": 1023})), **common)
+    assert L.processed(path, record, played.frames) == (20.0, 41.0 + 105.0)
+    loads = [{"program": "p", "t0_ns": 7, "t1_ns": 8}, {"program": "Passthru", "t0_ns": 50, "t1_ns": 60}]
+    wire_for(path, dry=np.array("null"), loads=np.array(json.dumps(loads)), **common)
+    assert L.processed(path, record, played.frames) == (7.0, 165.0)
+    wire_for(path, dry=np.array("null"), **common)
+    assert L.processed(path, record, played.frames)[0] == float(t[seg == 0][-1])

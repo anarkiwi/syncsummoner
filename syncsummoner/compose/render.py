@@ -314,7 +314,7 @@ def play_take(
                 end += tail / config.fps + config.tail_s
                 _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
                 hold = int(player.status().get("hold", 1))
-        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=tail)
+        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=tail, wet=bool(program))
     return loaded
 
 

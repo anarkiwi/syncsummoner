@@ -415,6 +415,19 @@ one capture period. `compose.lock.attribute` therefore fits each run's line apar
 bounded by the run with most strips; a run with no legible strip is numbered by the one whole-frame
 shift that puts its Pi lag where the strip-numbered runs' lies.
 
+Only strips on unprocessed frames are evidence about the source frame: Passthru before a
+program's load and after the lead-out's reload, and a program's model-proven bypass. While a
+program processes its input, its strips are its own picture (czartroniks/Quilt tiles past frames:
+on region takes most of its in-clip strips read a frame ahead or behind), so they neither anchor
+the frame line nor count against it (`lock.processed`): from the first write off the dry state, or
+the program's load command, to the close of the landing window of the write or reload returning
+it, its echo or return plus the latency band and the frame it lands on. A locked take records its
+loads' times for this (`loads` in the wire record); a take without them is processed from the end
+of its first run to the start of its last, the loads' outages. A program delaying its picture so
+shows as measured latency, not inside the line. A strip-less run the flips cannot number, such as a
+second of the card relocking during a load, is left unattributed; the take stays exact only if
+every clip frame has a capture elsewhere.
+
 ## The analog input decodes luma and sync only
 
 Composite fed straight in yields zero chroma under both NTSC and PAL while luma

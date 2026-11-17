@@ -378,6 +378,14 @@ def locked_take(
         rig.transport.set_param(param, offset)
         return int(midi.get_param(param)) + int(park[param - 1])
 
+    loads: list[dict] = []
+
+    def timed(name: str) -> Any:
+        began = time.monotonic_ns()
+        said = load(name)
+        loads.append({"program": name, "t0_ns": began, "t1_ns": time.monotonic_ns()})
+        return said
+
     if dry is None:
         read_latency(Path(out).parent)
         load("Passthru")
@@ -399,7 +407,7 @@ def locked_take(
             _monitored(shell, poller, sender),
         ):
             if dry is None:
-                load(program)
+                timed(program)
             _play(
                 rig,
                 out,
@@ -417,10 +425,10 @@ def locked_take(
                 start=start_vector,
                 park=park,
                 lead_in=lead_in,
-                reload=load if dry is None else None,
+                reload=timed if dry is None else None,
             )
             hold = int(player.status().get("hold", 1))
-        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=lead)
+        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=lead, wet=True)
     finally:
         asked = held["loaded"]
         save_wire(
@@ -446,6 +454,7 @@ def locked_take(
                 )
             ),
             dry=np.array(json.dumps(dry)),
+            loads=np.array(json.dumps(loads)),
             program=np.array(program),
             names=np.array(json.dumps({int(spec.index): spec.name for spec in info.params})),
             **poller.arrays(),
