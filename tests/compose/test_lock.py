@@ -188,3 +188,13 @@ def test_an_inexact_take_is_refused_and_nothing_kept(tmp_path, runs, count, matc
     with pytest.raises(L.LockError, match=match):
         L.attribute_take(path, config=CONFIG, codes=played.codes)
     assert not L.picked_path(path).exists()
+
+
+def test_the_anchor_rests_on_the_lead_in_when_the_clip_misreads_its_strips():
+    """Legible wrong clip codes, a program's doing, outnumber the lead-in's yet must not move the anchor."""
+    played = take(((0, 59, 0.0),), lead=8, count=22)
+    codes = played.codes.copy()
+    clip = played.slots // 2 >= 8
+    codes[clip] = ((played.slots[clip] + 1) // 2 - 8) & WRAP
+    found = L.attribute(codes, played.frames, played.flips, bits=16, **played.kw)
+    assert found.shown.tolist() == played.shown().tolist()

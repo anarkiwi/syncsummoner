@@ -293,7 +293,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.device.recorder import FFV1, Recorder, require_ffmpeg
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
-    from syncsummoner.probe.harvest import HarvestConfig, harvest, prepare_footage
+    from syncsummoner.probe.harvest import HarvestConfig, harvest, prepare_footage, read_focus
 
     if args.format not in SESSION_FORMATS:
         raise ValueError(f"unknown format {args.format!r}; known: {', '.join(SESSION_FORMATS)}")
@@ -308,6 +308,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         dwell_s=args.dwell,
         seed=args.seed,
         route=args.route,
+        focus=read_focus(args.schedule) if args.schedule else (),
     )
     host = {} if args.source_host is None else {"host": args.source_host}
     player: Any = LoopPlayer(width=config.width, height=config.height, **host)
@@ -529,8 +530,6 @@ def _render_cmd(args: argparse.Namespace) -> int:
     profiles = _profiles_in(Path(args.profiles))
     timing = {
         "source_host": args.source_host,
-        "latency_s": None if args.latency_ms is None else args.latency_ms / 1e3,
-        "measure_latency": args.measure_latency,
         "cc_budget_hz": args.cc_budget,
         "stall_s": args.stall,
         "route": args.route,
@@ -595,6 +594,23 @@ def _render_cmd(args: argparse.Namespace) -> int:
     LOG.info("%s: %.1fs mastered from %s", args.output, seconds, take)
     print(args.output)
     return 0
+
+
+def _evidence_cmd(args: argparse.Namespace) -> int:
+    """Prove each take's parameters were sent on their frames, read back, and moved the picture."""
+    from syncsummoner.compose import locktake
+    from syncsummoner.compose import render as render_mod
+    from syncsummoner.device.wire import load_wire
+
+    config = render_mod.RenderConfig.for_format(args.format, strip_px=args.strip_px)
+    failed = 0
+    for take in args.takes:
+        program = args.program or str(load_wire(take).get("program", Path(take).stem))
+        proof = locktake.take_evidence(take, program=program, clip=args.source, config=config)
+        locktake.evidence_path(take).write_text(proof.to_json(), encoding="utf-8")
+        print("\n".join(proof.lines()))
+        failed += not proof.ok
+    return 1 if failed else 0
 
 
 def _check_cmd(args: argparse.Namespace) -> int:
@@ -776,6 +792,10 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--out", default="archive/")
     collect.add_argument("--format", default="1080p30", help="session format the rig runs at")
     collect.add_argument("--setpoints", type=int, default=32)
+    collect.add_argument(
+        "--schedule",
+        help="a render's schedule.json: undetermined parameters, swept with the steps each needs",
+    )
     collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
     collect.add_argument("--seed", type=int, default=11)
     collect.add_argument(
@@ -874,14 +894,6 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         node.add_argument("--fade-out", type=float, help="override the fade out")
         node.add_argument("--no-master", action="store_true", help="stop at the raw take")
         node.add_argument(
-            "--latency-ms", type=float, help="CC write latency to compensate (default: one frame of --format)"
-        )
-        node.add_argument(
-            "--measure-latency",
-            action="store_true",
-            help="measure the write latency on each loaded program, falling back to --latency-ms",
-        )
-        node.add_argument(
             "--cc-budget",
             type=float,
             default=CC_BUDGET_HZ,
@@ -892,6 +904,16 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         if name == "audition":
             node.add_argument("--seconds", type=float, default=30.0, help="excerpt length")
             node.add_argument("--start", type=float, default=0.0, help="where the excerpt begins")
+
+    proof = sub.add_parser(
+        "evidence", help="prove each take's parameters were sent on their frames, read back and acted upon"
+    )
+    proof.add_argument("takes", nargs="+", help="frame-locked takes, each with its .wire.npz and .lock.npz")
+    proof.add_argument("--source", required=True, help="the timecoded clip the takes were played from")
+    proof.add_argument("--program", help="the program the takes ran (default: as each wire record says)")
+    proof.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
+    proof.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
+    proof.set_defaults(func=_evidence_cmd)
 
     check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")
     check.add_argument("score")

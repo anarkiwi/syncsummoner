@@ -2,12 +2,14 @@
 
 import contextlib
 import dataclasses
+import json
 import types
 from pathlib import Path
 
 import numpy as np
 
 from syncsummoner.compose import lock as L
+from syncsummoner.compose import locktake
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import Layer, Score, Section
 from syncsummoner.device.playout import FLIP
@@ -191,18 +193,52 @@ class Played:
 LOCKED = R.RenderConfig(width=160, height=24, fps=30.0, strip_px=8, bits=16, lead_in_s=8 / 30, tail_s=0.05)
 
 
-def locked_pass(monkeypatch, played=None, transport=None, **kwargs):
-    """A :class:`Played` rig on its own clock, the pass's automation and judging logged rather than run."""
+@dataclasses.dataclass
+class Proof:
+    """A stand-in for a take's evidence: whether it holds, and what it says."""
+
+    ok: bool = True
+
+    def lines(self) -> list:
+        """The report as log lines."""
+        return [f"evidence {'holds' if self.ok else 'fails'}"]
+
+    def to_json(self) -> str:
+        """The report as JSON."""
+        return json.dumps({"ok": self.ok})
+
+    def schedule(self) -> list:
+        """Undetermined parameters to sweep; none."""
+        return []
+
+
+def locked_pass(monkeypatch, played=None, transport=None, *, proof=None, **kwargs):
+    """A :class:`Played` rig on its own clock, its frame-locked take and evidence logged rather than run.
+
+    ``proof`` is what each take's evidence says, one per take and the last held; it holds by default.
+    """
     rig = Played(take(STANDARD) if played is None else played, transport, **kwargs)
     monkeypatch.setattr(R, "time", types.SimpleNamespace(monotonic=rig.clock, sleep=rig.clock.sleep))
     monkeypatch.setattr(L, "strip_codes", lambda *a, **k: rig.take.codes)
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
+    proofs = list(proof or [Proof()])
 
-    def drive(_rig, _auto, *, duration, start):
-        rig.log.append(("drive", start, duration))
-        return 0
+    def locked_take(rig_, recorder, out, *, program, seconds, config, plan, working, load):
+        lead, count = R.lead_frames(config), int(round(seconds * config.fps))
+        working(load(program))
+        with recorder.recording(out), rig_.playout.playing(fps=config.fps) as player:
+            rig.log.append(("drive", program, plan.size))
+            rig.clock.sleep(lead / config.fps + seconds + config.tail_s)
+            hold = int(player.status()["hold"])
+        L.save_lock(out, rig_.playout.flips(), hold=hold, lead=lead, count=count)
 
-    monkeypatch.setattr(R, "drive", drive)
+    def take_evidence(take_path, *, program, clip, config):
+        del config
+        rig.log.append(("evidence", program, str(clip), Path(take_path).name))
+        return proofs.pop(0) if len(proofs) > 1 else proofs[0]
+
+    monkeypatch.setattr(locktake, "locked_take", locked_take)
+    monkeypatch.setattr(locktake, "take_evidence", take_evidence)
     monkeypatch.setattr(
         R, "inspect_take", lambda path, **kw: rig.log.append(("inspect", kw["start_s"])) or PROBED
     )

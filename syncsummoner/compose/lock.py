@@ -49,9 +49,18 @@ def read_codes(strips: np.ndarray, *, bits: int, min_contrast: float = MIN_CONTR
 
 
 def strip_codes(
-    path: str | Path, *, width: int, strip_px: int = 8, bits: int = 16, ffmpeg: str = "ffmpeg"
+    path: str | Path,
+    *,
+    width: int,
+    strip_px: int = 8,
+    bits: int = 16,
+    ffmpeg: str = "ffmpeg",
+    growing: bool = False,
 ) -> np.ndarray:
-    """Every stored frame's strip code, in stream order, -1 where unreadable."""
+    """Every stored frame's strip code, in stream order, -1 where unreadable.
+
+    A ``growing`` recording is read as far as it has been written, its unfinished tail ignored.
+    """
     argv = [ffmpeg, "-loglevel", "error", "-i", str(path), "-fps_mode", "passthrough"]
     argv += ["-vf", f"crop=iw:{strip_px}:0:ih-{strip_px}", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
     size = width * strip_px * 3
@@ -63,7 +72,7 @@ def strip_codes(
                 break
             block = np.frombuffer(data[: len(data) - len(data) % size], np.uint8)
             out.append(read_codes(block.reshape(-1, strip_px, width, 3) / np.float32(255.0), bits=bits))
-    if proc.returncode:
+    if proc.returncode and not growing:
         raise LockError(f"decoding the strips of {path} failed with exit {proc.returncode}")
     return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
 
@@ -262,7 +271,8 @@ def attribute(
     per_frame = max(1, int(round(period / capture_ns)))
     clip = signed(np.asarray(codes, dtype=np.int64), bits)
     played = np.where((codes >= 0) & (clip >= -lead) & (clip < count), clip + lead, -1)
-    anchor, slot0 = anchor_run(runs, played, per_frame)
+    led = np.where(clip < 0, played, -1)
+    anchor, slot0 = anchor_run(runs, led if (led >= 0).any() else played, per_frame)
     new = np.r_[False, frames["digest"][1:] != frames["digest"][:-1]]
     first_up = {int(f): s for f, s in zip(up[::-1], starts[::-1])}
     a_first, a_last = runs[anchor]
@@ -272,6 +282,7 @@ def attribute(
     right = np.clip(np.searchsorted(starts, tau), 1, starts.size - 1)
     nearest = np.where(np.abs(tau - starts[right - 1]) <= np.abs(starts[right] - tau), right - 1, right)
     error, guess = tau - starts[nearest], per_frame * up[nearest]
+    error[(tau < starts[0] - period / 2) | (tau > starts[-1] + period / 2)] = np.inf
     out_runs, shown = [], np.empty(t.size, dtype=np.int64)
     for index, (first, last) in enumerate(runs):
         if index == anchor:
@@ -355,6 +366,53 @@ def attribute_take(take: str | Path, *, config: Any, codes: np.ndarray | None = 
         raise LockError(f"{take}: the clip's frame starts disagree on its cadence: {found.run}")
     np.save(picked_path(take), found.picked)
     return found
+
+
+def read_live(
+    path: str | Path, *, strip_px: int, bits: int, size: tuple[int, int], ffmpeg: str = "ffmpeg"
+) -> tuple[np.ndarray, np.ndarray]:
+    """One pass over a recording as far as it is written: strip codes, and the body small in planar YUV.
+
+    The strip is area-scaled to the body's width, which keeps every cell several samples wide.
+    """
+    width, height = size
+    graph = (
+        f"[0:v]split[a][b];[a]crop=iw:ih-{strip_px}:0:0,scale={width}:{height}:flags=area[s];"
+        f"[b]crop=iw:{strip_px}:0:ih-{strip_px},scale={width}:{strip_px}:flags=area[t];"
+        "[s][t]vstack,format=yuv444p[o]"
+    )
+    argv = [ffmpeg, "-loglevel", "quiet", "-i", str(path), "-filter_complex", graph, "-map", "[o]"]
+    argv += ["-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
+    data = subprocess.run(argv, check=False, capture_output=True).stdout
+    rows = height + strip_px
+    count = len(data) // (3 * width * rows)
+    stack = np.frombuffer(data, np.uint8, count * 3 * width * rows).reshape(count, 3, rows, width)
+    strip = np.repeat(stack[:, 0, height:, :, None], 3, axis=3) / np.float32(255.0)
+    return read_codes(strip, bits=bits), stack[:, :, :height]
+
+
+def live_attribution(
+    take: str | Path, flips: np.ndarray, codes: np.ndarray, *, config: Any, hold: int, lead: int, count: int
+) -> tuple:
+    """A take's attribution so far, read while it records: ``(attribution, frame log)``.
+
+    The captures the recording has stored are attributed as a finished take's would be; the
+    frame log is cut to them, since the card's sidecar runs ahead of the encoder's file.
+    """
+    from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
+
+    frames = read_log(take)
+    size = min(codes.size, frames.size)
+    LOG.info(
+        "%s: live attribution over %d captures (%d decoded, %d logged), %d flips",
+        take,
+        size,
+        codes.size,
+        frames.size,
+        flips.size,
+    )
+    found = attribute(codes[:size], frames[:size], flips, hold=hold, lead=lead, count=count, bits=config.bits)
+    return found, frames[:size]
 
 
 def take_start(take: str | Path, *, config: Any) -> float:

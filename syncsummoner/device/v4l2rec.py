@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import queue
 import signal
 import subprocess
 import sys
@@ -27,6 +28,8 @@ SUFFIX = ".v4l2"
 FLAG_ERROR = 0x40
 #: Buffers queued to the driver, so a slow write never leaves it without one.
 BUFFERS = 16
+#: Dequeued frames held in memory while storage catches up: ten seconds at 60 captures a second.
+BACKLOG = 600
 
 
 def sidecar(path: str | Path) -> Path:
@@ -71,20 +74,44 @@ def record(
     *,
     stop: Callable[[], bool],
     limit: int | None = None,
+    backlog: int = BACKLOG,
 ) -> int:
-    """Write frames to ``sink`` and their records to ``log`` until ``stop`` or ``limit``; returns how many."""
+    """Write frames to ``sink`` and their records to ``log`` until ``stop`` or ``limit``; returns how many.
+
+    A writer thread drains up to ``backlog`` dequeued frames, so storage that stalls holds them in
+    memory rather than leaving the driver without a buffer. A write that fails is raised here.
+    """
+    pending: queue.Queue = queue.Queue(maxsize=max(1, int(backlog)))
+    failed: list[BaseException] = []
+
+    def drain() -> None:
+        while (item := pending.get()) is not None:
+            if failed:
+                continue
+            try:
+                sink.write(item[0])
+                log.write(item[1])
+            except BaseException as err:  # pylint: disable=broad-exception-caught
+                failed.append(err)
+
+    writer = threading.Thread(target=drain, name="v4l2rec-writer", daemon=True)
+    writer.start()
     kept = 0
-    for frame in frames:
-        if stop() or (limit is not None and kept >= limit):
-            break
-        buff = frame.buff
-        sink.write(frame.data)
-        t_ns = int(buff.timestamp.secs) * 1_000_000_000 + int(buff.timestamp.usecs) * 1000
-        digest = int.from_bytes(hashlib.blake2b(frame.data, digest_size=8).digest(), "little")
-        log.write(
-            np.array([(buff.sequence, t_ns, buff.bytesused, buff.flags, digest)], dtype=FRAME).tobytes()
-        )
-        kept += 1
+    try:
+        for frame in frames:
+            if stop() or (limit is not None and kept >= limit) or failed:
+                break
+            buff, data = frame.buff, bytes(frame.data)
+            t_ns = int(buff.timestamp.secs) * 1_000_000_000 + int(buff.timestamp.usecs) * 1000
+            digest = int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
+            row = np.array([(buff.sequence, t_ns, buff.bytesused, buff.flags, digest)], dtype=FRAME)
+            pending.put((data, row.tobytes()))
+            kept += 1
+    finally:
+        pending.put(None)
+        writer.join()
+    if failed:
+        raise failed[0]
     return kept
 
 
@@ -139,7 +166,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a ca
         argv_out = encoder_argv(
             args.input_format, args.width, args.height, rate, args.out_args, args.out, ffmpeg=args.ffmpeg
         )
-        with subprocess.Popen(argv_out, stdin=subprocess.PIPE) as enc, open(sidecar(args.out), "wb") as log:
+        with (
+            subprocess.Popen(argv_out, stdin=subprocess.PIPE) as enc,
+            open(sidecar(args.out), "wb", buffering=0) as log,
+        ):
             try:
                 with VideoCapture(cam, size=BUFFERS) as stream:
                     kept = record(

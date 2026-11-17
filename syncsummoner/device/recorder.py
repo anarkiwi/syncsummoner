@@ -51,8 +51,9 @@ __all__ = [
     "settle",
 ]
 
-#: Compressed by the card; the only mode measured above session rate on this hardware.
-MJPEG = ("mjpeg", "-c:v", "copy")
+#: Compressed by the card; the only mode measured above session rate on this hardware. Clusters
+#: are cut short and flushed, so a take can be read while it is still being recorded.
+MJPEG = ("mjpeg", "-c:v", "copy", "-flush_packets", "1", "-cluster_time_limit", "200")
 #: The card's own samples, unencoded, for a scratch pass that is read once.
 RAW_422 = ("yuyv422", "-c:v", "rawvideo")
 #: Lossless intra-only at session rate, with the exchanged chroma pair put back.

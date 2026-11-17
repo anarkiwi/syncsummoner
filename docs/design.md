@@ -305,10 +305,13 @@ Offline, multi-pass, all real-time captures.
 
 1. Burn a Gray-code frame index into a croppable edge strip of the source, after
    a strip-coded lead-in; the Pi's locked player plays it over HDMI (§10).
-2. Per take: load Passthru, start recording, start the clip; the take's program
-   loads inside the lead-in (`LeadInError` if it is not up before clip frame 0),
-   the score's CC automation runs from clip frame 0, and the player's flip log is
-   kept beside the take (`<take>.lock.npz`).
+2. Per take: load the program and hold it dry, start recording, start the clip;
+   toggle the dry control in the lead-in to time the device's frame tick, attribute
+   the growing recording, then send every CC half a frame before the instant it
+   must precede to land on its frame ([evidence.md](evidence.md)). A program with no dry control loads
+   inside the lead-in under Passthru instead. The player's flip log and the wire
+   record are kept beside the take (`<take>.lock.npz`, `<take>.wire.npz`), and the
+   take must prove every write landed on its frame and read back.
 3. Attribute every clip frame to one capture exactly (§10), crop the strip, write
    the pass.
 4. Check every take against the clip it was fed, bar by bar, and cover or fail
@@ -523,9 +526,10 @@ with their driver sequence, timestamp and digest, in a `<take>.v4l2` sidecar by
 `syncsummoner.device.v4l2rec`
 ([hardware.md](hardware.md#capture-is-stored-never-decoded-while-it-runs)).
 
-A take's clip opens on a lead-in (`RenderConfig.lead_in_s`, 20 s) whose strips
-number its frames `-L..-1`, wrapped to the strip's 16 bits, so captures from
-before the program load carry legible strips whatever the program does after it.
+A take's clip opens on a lead-in (`RenderConfig.lead_in_s`, 40 s) whose strips
+number its frames `-L..-1`, wrapped to the strip's 16 bits, so captures under the
+dry program, or before a program load, carry legible strips whatever the program
+does after it.
 
 `compose.lock.attribute_take(take, config=)` reads the take's strips, its sidecar
 and its lock record, and returns an `Attribution`:

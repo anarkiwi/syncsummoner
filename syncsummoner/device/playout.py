@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import time
 from contextlib import contextmanager
@@ -45,6 +46,15 @@ assert FLIP.itemsize == RECORD.size
 RTPRIO_LIMIT = 20
 #: Status states the player settles in once started.
 SETTLED = ("playing", "failed", "stopped")
+
+
+def file_digest(path: str | Path, chunk: int = 1 << 22) -> str:
+    """SHA-256 of a file, read in chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while block := handle.read(chunk):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class PlayoutError(RuntimeError):
@@ -292,10 +302,25 @@ class ClipPlayer(KmsPlayer):
         """Where the clip sits in tmpfs."""
         return self.path("clip.mkv")
 
+    def remote_digest(self) -> str:
+        """SHA-256 of the clip the Pi holds in tmpfs, or empty when it holds none."""
+        out = str(self._runner(f"sha256sum {self.clip_path} 2>/dev/null || true") or "")
+        return out.split()[0] if out.strip() else ""
+
     def upload(self, path: str) -> int:
-        """Send the clip into tmpfs; returns the bytes put on the wire."""
+        """Put the clip in tmpfs unless the Pi's copy hashes the same; returns the bytes put on the wire.
+
+        The copy is hashed on the Pi after sending, and one that differs is a :class:`PlayoutError`.
+        """
+        want = file_digest(path)
+        if self.remote_digest() == want:
+            LOG.info("%s: the Pi already holds this clip (sha256 %s), so nothing is sent", path, want[:12])
+            return 0
         data = Path(path).read_bytes()
         self._runner(f"mkdir -p {self.directory} && cat > {self.clip_path}", data)
+        got = self.remote_digest()
+        if got != want:
+            raise PlayoutError(f"the Pi's copy of {path} hashes {got or 'to nothing'}, not {want}")
         return len(data)
 
     def source_args(self) -> str:

@@ -452,15 +452,20 @@ ss audition score.yaml --source source.mkv --audio track.flac \
      --cut-programs Derez,Lorenz,Scramble,Sfumato --takes takes/ -o audition.mp4
 ```
 
-An excerpt costs a Passthru load, the lead-in and the excerpt. Each take logs its
-`passthru` and `take` stages (`load_s` is how much of the lead-in the program's load
-used), then its attribution summary, then the take's picture report.
+An excerpt costs a program load, the lead-in and the excerpt. The program is
+loaded before playout and held dry through the lead-in while its bypass is toggled
+to time the device ([evidence.md](evidence.md)); each take logs the measured
+CC-to-picture latency, its attribution summary, the evidence report (every write's
+landing frame, readback and receipt counts, and one line per parameter: acted upon
+or not, and why), then the take's picture report. A take whose capture driver lost
+frames is recaptured once (`TakeFaultError`).
 
-The take is longer than the excerpt because it opens on the lead-in the program
-loads inside, and holds more captures than frames because the card runs its own
-cadence ([hardware.md](hardware.md#the-cards-cadence)). What makes the finished
-clip right is the attribution line: every clip frame has a capture, and the
-clip's run agrees on its cadence.
+The take is longer than the excerpt because it opens on the lead-in, and holds
+more captures than frames because the card runs its own cadence
+([hardware.md](hardware.md#the-cards-cadence)). What makes the finished clip right
+is the attribution line: every clip frame has a capture, and the clip's run agrees
+on its cadence. `ss evidence takes/take-Derez.mkv --source timecoded.mkv` prints a
+take's evidence again from its sidecars.
 
 Iterate here, not on the full render. A different `--seed`, `--style` or
 `--density` at step 2 is seconds of CPU; a full render is most of an hour.

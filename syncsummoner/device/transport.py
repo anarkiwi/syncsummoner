@@ -6,6 +6,7 @@ speaks ``ParamSpec`` / ``ProgramInfo`` / numpy, never raw shell JSON.
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Iterable, Iterator, Mapping, Sequence
@@ -148,6 +149,7 @@ class Transport:
 
     def __init__(self, device: Any):
         self._device = device
+        self.cc_faults: list[dict[str, Any]] = []
         self._loaded: str | None = None
         self._held: str | None = None
         self._authored: bool | None = None
@@ -284,27 +286,26 @@ class Transport:
             raise vm.VmancerError(f"expected ok from 'program load {plain}', got {answer.payload!r}")
         shell.wait_loaded(plain, watch=self.watch(f"loading {name}"))
         device.program = name
-        device.consume_midi_assign()
         device.parameters(refresh=True)
-        device.assign_cc_map("load")
+        self.check_cc_map(f"after loading {name}")
         self._loaded = name
 
-    @property
-    def cc_assignment(self) -> Any:
-        """The device's last CC-map assignment, as pyvmancer's ``CcMapAssignment``, or None."""
-        return self._device.cc_assignment
+    def check_cc_map(self, when: str) -> Any:
+        """Read the device's CC map back; a slot off the CCs this host sends is recorded and raised.
 
-    def consume_midi_assign(self) -> None:
-        """Send the sink CC, so an armed MIDI Assign captures it rather than a slot's CC."""
-        self._device.consume_midi_assign()
-
-    def reassert_cc_map(self) -> Any:
-        """Reassign a sink-CC capture and return the assignment, or None; any other change raises."""
-        return self._device.reassert_cc_map()
+        Nothing is sent to sink a MIDI Assign, and the map is never rewritten: on this firmware a
+        CC119 is a MIDI reset, and the map lives in persistent settings.
+        """
+        try:
+            return self._device.verify_cc_map()
+        except vm.CcMapError as err:
+            self.cc_faults.append({"time": time.time(), "when": when, "error": str(err)})
+            LOG.error("CC map fault %s: %s", when, err)
+            raise
 
     def verify_cc_map(self) -> Any:
-        """Read the CC map back, raising ``pyvmancer.CcMapError`` on any difference."""
-        return self._device.verify_cc_map()
+        """Read the CC map back at the end of a take, raising ``pyvmancer.CcMapError`` on any difference."""
+        return self.check_cc_map("at the end of a take")
 
     def program_info(self, name: str | None = None) -> ProgramInfo:
         """Parameter specs of a program, loading it first when it is not current.

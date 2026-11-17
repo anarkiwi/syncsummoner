@@ -234,6 +234,8 @@ render.unknown_programs(programs, available) -> list[str]   # named but not offe
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
-render.schedule(auto, *, latency_s, early_bias_s, cc_budget_hz) -> Automation  # forward by latency + bias, paced, never late
-render.write_latency(config, transport) -> float   # one frame, the override, or measured with that as fallback
+locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias
+locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
+locktake.take_evidence(take, *, program, clip, config, names=None) -> evidence.Evidence   # the three links; .ok is the hard check
+evidence.send_time(frames, ticks, times, delta) -> ns   # half a frame before the instant each frame's write must precede
 ```

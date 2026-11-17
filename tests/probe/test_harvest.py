@@ -19,7 +19,7 @@ from syncsummoner.probe import harvest as H
 from syncsummoner.probe.archive import CODEFRAMES, GAP, same_stimulus
 from syncsummoner.probe.store import KeyKind, ProgramKey, slug
 from tests import transmitter as tx
-from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport
+from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport, Readback
 from tests.device.test_liveness import mjpeg, needs_ffmpeg
 
 FIRMWARE = "1.0.0-rc.37"
@@ -70,10 +70,11 @@ def blind(monkeypatch, *, canary=True, take=DARK, canary_probe=DARK):
     monkeypatch.setattr(H, "settle", probe)
 
 
-class Port:
+class Port(Readback):
     """Transport stub: answers program queries, and can refuse to hold a program."""
 
     def __init__(self, programs=("Alpha", "Beta"), *, holds=True, info=None, video=()):
+        super().__init__()
         self.transmitter = tx.Transmitter(*video)
         self.programs_list = list(programs)
         self.holds = holds
@@ -271,6 +272,7 @@ class Sess:
 
     def set_params(self, values):
         self.vectors.append(dict(values))
+        self.transport.state.update(values)
 
 
 def run(archive, *, port=None, recorder=None, sessions=None, clock=None, **kwargs):
@@ -325,7 +327,7 @@ def test_sweep_of_a_program_reporting_no_parameters_at_all_is_one_empty_vector()
 def test_a_window_opens_only_once_the_parameters_have_settled():
     """A window that opened on the write would claim frames from the previous setpoint."""
     clock = FakeClock()
-    session = Sess(None)
+    session = Sess(Readback())
     windows = H.sweep(session, {}, [{1: 0.0}, {1: 1.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
     assert [w.setpoint for w in windows] == [0, 1]
     assert [(w.start, w.end) for w in windows] == [(0.25, 1.25), (1.5, 2.5)]
@@ -335,8 +337,10 @@ def test_a_window_opens_only_once_the_parameters_have_settled():
 def test_a_window_carries_the_whole_commanded_state_not_only_the_swept_slots():
     """P12 gates the output and is held open off-sweep, so a zero there misreads the state."""
     clock = FakeClock()
-    base = Sess(None).working_point(INFO)
-    windows = H.sweep(Sess(None), base, [{1: 0.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
+    session = Sess(Readback())
+    base = session.working_point(INFO)
+    session.set_params(base)
+    windows = H.sweep(session, base, [{1: 0.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
     parked = H.raw_params(base)[CROSSFADER_INDEX - 1]
     assert parked and len(windows[0].params) == 12
     assert windows[0].params[CROSSFADER_INDEX - 1] == parked

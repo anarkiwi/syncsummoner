@@ -10,6 +10,7 @@ import pytest
 
 from syncsummoner.compose import render as R
 from syncsummoner.compose import takecheck as T
+from syncsummoner.compose.locktake import NoLatencyError
 from syncsummoner.compose.score import Layer, Score, Section
 
 
@@ -166,3 +167,68 @@ def test_a_dead_span_nothing_covers_fails_the_render_and_names_it(monkeypatch, t
     dead = T.DeadSpan("Derez", 67.1, 112.1, T.Fault.FLAT, None)
     with pytest.raises(T.DeadTakeError, match="Derez:   67.10- 112.10s flat"):
         _cut_run(monkeypatch, tmp_path, ["Derez"], check={"spans": [dead]})
+
+
+def _needing_latency(dry, failing=()):
+    """A pass that needs a measured latency unless its program is ``dry`` or one rendered before it."""
+    seen = {"tried": []}
+
+    def fake_render(score, source, out, **kw):
+        del source, kw
+        program = score.layers[0].program
+        seen["tried"].append(program)
+        if program in failing or not (program in dry or set(dry) & set(seen["tried"][:-1])):
+            raise NoLatencyError(f"{program}: no latency")
+        Path(out).write_bytes(b"take")
+        return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
+
+    return seen, fake_render
+
+
+def test_a_program_needing_a_measured_latency_waits_for_a_dry_take(monkeypatch, tmp_path):
+    seen, fake_render = _needing_latency({"Derez"})
+    cut = _cut_run(monkeypatch, tmp_path, ["Lorenz", "Derez", "Pinwheel"], pass_render=fake_render)
+    assert seen["tried"] == ["Lorenz", "Derez", "Pinwheel", "Lorenz"]
+    assert set(cut["picked"]) == {"Lorenz", "Derez", "Pinwheel"}
+
+
+@pytest.mark.parametrize(
+    "names,failing,tried",
+    [(["Lorenz", "Derez"], {"Lorenz"}, ["Lorenz", "Derez", "Lorenz"]), (["Lorenz"], (), ["Lorenz"])],
+    ids=["still-unmeasured", "nothing-else-left"],
+)
+def test_a_program_still_without_a_latency_fails_the_render(monkeypatch, tmp_path, names, failing, tried):
+    seen, fake_render = _needing_latency({"Derez"}, failing)
+    with pytest.raises(NoLatencyError, match="Lorenz: no latency"):
+        _cut_run(monkeypatch, tmp_path, names, pass_render=fake_render)
+    assert seen["tried"] == tried
+
+
+def _faulting(faults):
+    """A pass whose capture loses frames the first ``faults[program]`` times it runs."""
+    seen = {"tried": []}
+
+    def fake_render(score, source, out, **kw):
+        del source, kw
+        program = score.layers[0].program
+        seen["tried"].append(program)
+        if seen["tried"].count(program) <= faults.get(program, 0):
+            raise R.TakeFaultError(f"{program}: the capture driver lost 3 frames")
+        Path(out).write_bytes(b"take")
+        return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
+
+    return seen, fake_render
+
+
+def test_a_take_whose_capture_lost_frames_is_recaptured_at_once(monkeypatch, tmp_path):
+    seen, fake_render = _faulting({"Derez": 1})
+    cut = _cut_run(monkeypatch, tmp_path, ["Lorenz", "Derez", "Pinwheel"], pass_render=fake_render)
+    assert seen["tried"] == ["Lorenz", "Derez", "Derez", "Pinwheel"]
+    assert set(cut["picked"]) == {"Lorenz", "Derez", "Pinwheel"}
+
+
+def test_a_take_losing_frames_twice_fails_the_render(monkeypatch, tmp_path):
+    seen, fake_render = _faulting({"Derez": 2})
+    with pytest.raises(R.TakeFaultError, match="Derez: the capture driver lost"):
+        _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"], pass_render=fake_render)
+    assert seen["tried"] == ["Derez", "Derez"]

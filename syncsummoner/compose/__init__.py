@@ -21,7 +21,7 @@ from syncsummoner.compose.planner import (
     thin,
 )
 from syncsummoner.compose.master import common_duration, master_command, probe_duration
-from syncsummoner.compose.render import RenderConfig, Rig, render_cuts, render_played, schedule
+from syncsummoner.compose.render import RenderConfig, Rig, render_cuts, render_played
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, Gesture, GestureContext
 from syncsummoner.compose import features, master, planner, render, score, vocabulary
@@ -61,7 +61,6 @@ __all__ = [
     "proxy_render",
     "reachable",
     "render",
-    "schedule",
     "score",
     "search",
     "thin",

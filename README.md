@@ -50,6 +50,7 @@ syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
 syncsummoner check score.yaml --source timecoded.mkv --takes takes/ \
                    --cut-programs Derez,Lorenz,Scramble [--splice cut.mp4]   # dead picture per take
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
+syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv   # each write sent, read back, acted upon
 ```
 
 Every command logs each stage and its elapsed time to stderr (`-v` for detail,
@@ -73,6 +74,7 @@ through `docker run`.
 - [docs/workflow.md](docs/workflow.md) — worked example: clip and track in, finished render out
 - [docs/design.md](docs/design.md) — the design being realized
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
+- [docs/evidence.md](docs/evidence.md) — frame-locked parameter writes and the per-take proof they landed
 - [docs/contracts.md](docs/contracts.md) — normative cross-package signatures
 - [docs/rig.md](docs/rig.md) — wiring, permissions, and bring-up
 

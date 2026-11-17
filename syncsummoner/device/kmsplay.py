@@ -545,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         )
         preroll = Prerolled(frames, max(2, round(float(args.preroll_s * args.fps))))
         preroll.wait_full(timeout_s=60.0)
-        with open(args.flips, "wb") as log:
+        with open(args.flips, "wb", buffering=0) as log:
             player = Player(
                 display,
                 preroll,
