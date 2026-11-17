@@ -237,5 +237,5 @@ render.Rig(session, capture, playout, link=None)   # link is dropped across ever
 locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias
 locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
 locktake.take_evidence(take, *, program, clip, config, names=None) -> evidence.Evidence   # the three links; .ok is the hard check
-evidence.send_time(frames, ticks, times, delta) -> ns   # midway between the ticks around each frame's latching tick
+evidence.send_time(frames, ticks, times, delta) -> ns   # just after the latest instant the tick before each frame's latching tick can fall
 ```

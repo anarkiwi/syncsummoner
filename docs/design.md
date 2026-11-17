@@ -307,8 +307,8 @@ Offline, multi-pass, all real-time captures.
    a strip-coded lead-in; the Pi's locked player plays it over HDMI (§10).
 2. Per take: load the program and hold it dry, start recording, start the clip;
    toggle the dry control in the lead-in to time the device's frame tick, attribute
-   the growing recording, then send every CC midway between the ticks around its
-   target frame's ([evidence.md](evidence.md)). A program with no dry control loads
+   the growing recording, then send every CC just after the latest instant the tick before its
+   target frame's own can fall ([evidence.md](evidence.md)). A program with no dry control loads
    inside the lead-in under Passthru instead. The player's flip log and the wire
    record are kept beside the take (`<take>.lock.npz`, `<take>.wire.npz`), and the
    take must prove every write landed on its frame and read back.
