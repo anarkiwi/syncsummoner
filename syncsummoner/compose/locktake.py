@@ -144,7 +144,7 @@ class Clock:
         """Host time to send a write that should land on ``target``."""
         return int(ev.send_time(np.array([target]), self.ticks, self.times, self.delta)[0])
 
-    def extend(self, t_ns: np.ndarray, sequence: np.ndarray, reads: np.ndarray | None = None) -> None:
+    def extend(self, t_ns: np.ndarray, sequence: np.ndarray, moves: np.ndarray | None = None) -> None:
         """Carry the clock on: the frame line over every frame start the anchored run has, the tick grid
         over every readback change so far. A grid the readback cannot hold leaves the last one standing.
         """
@@ -160,8 +160,7 @@ class Clock:
             slope, icept = np.polyfit(frame, t_ns[start].astype(np.float64), 1)
             self.times = ev.FrameTimes(self.times.ns, self.times.lead, float(icept), float(slope))
             self.ticks = ev.Ticks(self.ticks.lo, self.ticks.hi, float(slope), self.ticks.count)
-        if reads is not None and reads.size > 1:
-            moves = ev.transitions(reads)
+        if moves is not None and moves.size:
             try:
                 self.ticks = ev.tick_bracket(moves["a"], moves["b"], self.times.period)
             except ev.EvidenceError as err:
@@ -465,7 +464,8 @@ def _run(
         out, rig.playout.flips(), codes, config=config, hold=hold, lead=lead, count=count
     )
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, lead)
-    moves = ev.transitions(_reads(poller))
+    changes = Changes(poller)
+    moves = changes.update()
     ticks = ev.tick_bracket(moves["a"], moves["b"], times.period)
     calibration = sender.array()
     calibration = calibration[calibration["target"] == ev.CALIBRATION]
@@ -493,7 +493,7 @@ def _run(
             "first write was due; lengthen the lead-in"
         )
     log = _read_sidecar(out)
-    clock.extend(log["t_ns"], log["sequence"], _reads(poller))
+    clock.extend(log["t_ns"], log["sequence"], changes.update())
     sender.when = clock.when
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
@@ -504,7 +504,7 @@ def _run(
         while (now := time.monotonic_ns()) < end:
             time.sleep(min(1.0, (end - now) / 1e9))
             log = _read_sidecar(out)
-            clock.extend(log["t_ns"], log["sequence"], _reads(poller))
+            clock.extend(log["t_ns"], log["sequence"], changes.update())
             progress.to((time.monotonic_ns() - began) / 1e9)
     sender.drain(timeout_s=1.0)
 
@@ -533,9 +533,26 @@ def _monitored(shell: Any, poller: Poller, sender: Sender) -> Iterator[None]:
             LOG.warning("midi monitor left on: %s", err)
 
 
-def _reads(poller: Poller) -> np.ndarray:
-    """The poller's readbacks so far, as :data:`~syncsummoner.device.wire.READ` records."""
-    return np.array([(a, b, tuple(o)) for a, b, o in list(poller.reads)], dtype=READ)
+class Changes:
+    """The poller's readback changes so far, converted a batch of new reads at a time.
+
+    Converting every read on each refresh would hold the interpreter long enough to make a send late.
+    """
+
+    def __init__(self, poller: Poller):
+        self.poller, self.done, self.last = poller, 0, None
+        self.moves = ev.transitions(np.zeros(0, dtype=READ))
+
+    def update(self) -> np.ndarray:
+        """Every change up to the latest read."""
+        fresh = list(self.poller.reads[self.done :])
+        if fresh:
+            self.done += len(fresh)
+            batch = np.array([(a, b, tuple(o)) for a, b, o in fresh], dtype=READ)
+            joined = batch if self.last is None else np.r_[self.last, batch]
+            self.moves = np.r_[self.moves, ev.transitions(joined)]
+            self.last = batch[-1:]
+        return self.moves
 
 
 def _read_sidecar(take: str | Path) -> np.ndarray:

@@ -666,9 +666,24 @@ def test_extending_the_clock_measures_the_tick_grid_from_the_readback_so_far():
     t, sequence = (T0 + k * P / 2).astype(np.int64), k
     true = TAU + 0.004e9 + np.array([3, 40, 90, 150]) * P
     clock = LT.Clock(times=times_for(lead), ticks=ticks_for(), delta=DELTA, run=run_of(0, 99))
-    clock.extend(t, sequence, reads_around(true))
+    clock.extend(t, sequence, ev.transitions(reads_around(true)))
     assert clock.ticks.count == 4 and clock.ticks.lo < true[0] <= clock.ticks.hi
     kept = clock.ticks
     bad = reads_around(np.r_[true[:2], true[2] + P / 2])
-    clock.extend(t, sequence, bad)
+    clock.extend(t, sequence, ev.transitions(bad))
     assert clock.ticks.lo == kept.lo and clock.ticks.hi == kept.hi
+
+
+def test_changes_convert_only_new_reads_and_keep_changes_across_batches():
+    """A change between the last read of one batch and the first of the next is kept."""
+    poller = types.SimpleNamespace(reads=[])
+    changes = LT.Changes(poller)
+    assert changes.update().size == 0
+    poller.reads.extend([(0, 1, [0] * 12), (2, 3, [0] * 12)])
+    assert changes.update().size == 0
+    poller.reads.extend([(4, 5, [7] + [0] * 11), (6, 7, [7] + [0] * 11), (8, 9, [7, 1] + [0] * 10)])
+    moves = changes.update()
+    assert (
+        moves["slot"].tolist() == [1, 2] and moves["a"].tolist() == [2, 6] and moves["b"].tolist() == [5, 9]
+    )
+    assert changes.done == 5 and changes.update() is moves

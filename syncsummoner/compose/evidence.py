@@ -140,11 +140,16 @@ def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
     The grid keeps ``period``, measured from the captures, while every interval admits it; only
     readback that rules it out, which takes a long span, sets the period itself, as the Chebyshev
     centre of ``a_i < phase + n_i period <= b_i`` within :data:`MAX_RATE` of ``period``. No
-    feasible grid is an :class:`EvidenceError`.
+    feasible grid is an :class:`EvidenceError`. An interval half a frame wide or more, from a late
+    poll, cannot be numbered by its midpoint and is left out.
     """
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    narrow = (b - a) < period / 2
+    a, b = a[narrow], b[narrow]
     if not a.size:
-        raise EvidenceError("no readback changed, so the device's frame tick was never seen")
+        raise EvidenceError(
+            "no readback changed within half a frame, so the device's frame tick was never seen"
+        )
     ref = 0.5 * (a[0] + b[0])
     n = np.rint((0.5 * (a + b) - ref) / period)
     lo_s, hi_s = a - ref, b - ref
@@ -174,11 +179,13 @@ def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
 def observed_ticks(sends: np.ndarray, moves: np.ndarray, ticks: Ticks) -> np.ndarray:
     """The tick at which each write first read back: its slot's next change to its value; -1 if none did.
 
-    A write that leaves its slot's value unchanged, or is overtaken before a read sees it, has no
-    observed tick.
+    The tick is the first of the grid after the change's interval opens; a write that leaves its
+    slot unchanged, is overtaken before a read sees it, or reads back over an interval that could
+    hold two ticks has no observed tick.
     """
     out = np.full(len(sends), -1, dtype=np.int64)
-    mid = 0.5 * (moves["a"] + moves["b"])
+    first = np.ceil((moves["a"] - ticks.hi) / ticks.period)
+    single = ticks.lo + (first + 1) * ticks.period >= moves["b"]
     for slot in np.unique(sends["param"]):
         mine = np.flatnonzero(sends["param"] == slot)
         here = np.flatnonzero(moves["slot"] == slot)
@@ -187,9 +194,9 @@ def observed_ticks(sends: np.ndarray, moves: np.ndarray, ticks: Ticks) -> np.nda
         nxt = np.searchsorted(moves["b"][here], sends["t1_ns"][mine].astype(np.float64), side="right")
         ok = nxt < here.size
         at = here[np.clip(nxt, 0, here.size - 1)]
-        ok &= moves["new"][at] == sends["value"][mine]
+        ok &= (moves["new"][at] == sends["value"][mine]) & single[at]
         ok &= np.r_[nxt[1:] > nxt[:-1], True]
-        out[mine[ok]] = np.rint((mid[at[ok]] - ticks.phase) / ticks.period).astype(np.int64)
+        out[mine[ok]] = first[at[ok]].astype(np.int64)
     return out
 
 
