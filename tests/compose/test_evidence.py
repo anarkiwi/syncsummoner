@@ -132,21 +132,17 @@ def test_tick_bracket_rejects_changes_off_one_grid_and_no_changes():
         ev.tick_bracket(np.zeros(0), np.zeros(0), PERIOD)
 
 
-def test_send_time_is_the_latest_the_previous_tick_can_fall_so_late_wakes_still_land():
+def test_send_time_is_midway_between_ticks_so_errors_either_way_still_land():
     frames = np.arange(-LEAD, FRAMES + 10)
     due = ev.send_time(frames, TICKS, TIMES, DELTA)
     true_n = np.ceil((due - TRUE_TICK) / PERIOD)
     assert np.all(true_tick(true_n - 1) < due) and np.all(due < true_tick(true_n))
-    assert np.allclose(due - true_tick(true_n - 1), TICKS.hi - TRUE_TICK + 1.0)
-    margin = TRUE_TICK - TICKS.lo
-    for late in np.linspace(0.0, PERIOD - TICKS.width - margin - 1.0, 7):
-        n, clear = TICKS.after(due + late)
+    assert np.allclose(due - TICKS.at(true_n - 1), PERIOD / 2)
+    for off in np.linspace(-(PERIOD - TICKS.width) / 2 + 1.0, (PERIOD - TICKS.width) / 2 - 1.0, 7):
+        n, clear = TICKS.after(due + off)
         assert ev.frame_of_tick(n, TICKS, TIMES, DELTA).tolist() == frames.tolist()
-        assert np.allclose(clear, PERIOD - TICKS.width - late - 1.0) and np.all(clear >= margin - 2)
-        assert np.all(due + late <= true_tick(true_n))
-    n, clear = TICKS.after(due + PERIOD - TICKS.width + 1.0)
-    assert np.all(clear < 0) and np.all(ev.frame_of_tick(n, TICKS, TIMES, DELTA) == frames)
-    n, _ = TICKS.after(due + PERIOD + 1.0)
+        assert np.allclose(clear, (PERIOD - TICKS.width) / 2 - off) and np.all(clear > 0)
+    n, _ = TICKS.after(due + PERIOD)
     assert np.all(ev.frame_of_tick(n, TICKS, TIMES, DELTA) == frames + 1)
 
 

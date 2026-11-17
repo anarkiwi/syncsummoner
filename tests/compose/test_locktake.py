@@ -140,16 +140,16 @@ def times_for(lead=10, period=P):
 
 
 @pytest.mark.parametrize("target", [-7, 0, 1, 13])
-def test_a_clock_sends_each_write_once_the_previous_tick_is_past_so_late_wakes_still_land(target):
-    """Due as the previous tick's bracket ends; any wake short of a period less the bracket lands it."""
+def test_a_clock_sends_each_write_midway_between_ticks_so_late_wakes_still_land(target):
+    """Due half a frame before the target's tick; a wake short of that, less the bracket, lands it."""
     ticks, times = ticks_for(), times_for()
     clock = LT.Clock(times=times, ticks=ticks, delta=DELTA)
     t = clock.when(target)
     assert t == pytest.approx(ev.send_time(np.array([target]), ticks, times, DELTA)[0], abs=1.0)
-    for late in (1.0, P / 2, P - ticks.width - 1.0):
+    for late in (1.0, P / 4, (P - ticks.width) / 2 - 1.0):
         n, clear = ticks.after(np.array([t + late]))
         assert int(ev.frame_of_tick(n, ticks, times, DELTA)[0]) == target
-        assert clear[0] == pytest.approx(P - ticks.width - late - 1.0, abs=1.0)
+        assert clear[0] == pytest.approx((P - ticks.width) / 2 - late, abs=1.0)
 
 
 def test_extending_the_clock_refits_the_period_from_the_growing_frame_log():

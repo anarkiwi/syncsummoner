@@ -40,9 +40,10 @@ centre of the interval constraints; no feasible grid is an error, not a fit.
    holds and the take stops.
 3. While the recording runs, its stored captures are read (`lock.read_live`) and
    attributed (`lock.live_attribution`), giving each clip frame's capture time.
-4. Each planned write for frame `j` is sent just after the latest instant the tick
-   before the one that latches `j` can fall (`evidence.send_time`). A sending thread
-   can only wake late, so this leaves almost a whole frame for it; each send records
+4. Each planned write for frame `j` is sent midway between the ticks either side of
+   the tick that latches `j` (`evidence.send_time`), half a frame clear of both: the
+   live clock can err either way and a send can wake late. The take runs with a short
+   interpreter switch interval so the sending thread wakes promptly; each send records
    when it was due, and the report gives the worst wake-up. The frame clock is carried
    on from the growing sidecar while the take runs.
 5. Two seconds before clip frame 0 the dry control is set to its take value; the

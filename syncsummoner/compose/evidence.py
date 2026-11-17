@@ -210,12 +210,12 @@ def frame_of_tick(n: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) 
 
 
 def send_time(frames: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) -> np.ndarray:
-    """When to send a CC to land on each frame: just after the latest instant the tick before it can fall.
+    """When to send a CC so it lands on each frame: midway between the ticks either side of its own.
 
-    A sending thread can only wake late, never early, so this leaves almost a whole frame for it.
+    The clock's prediction can err either way and a send can wake late, so half a frame each side.
     """
     tick = np.rint((times.at(frames) - delta - ticks.phase) / ticks.period)
-    return ticks.hi + (tick - 1) * ticks.period + 1.0
+    return ticks.phase + (tick - 0.5) * ticks.period
 
 
 def toggle_landings(

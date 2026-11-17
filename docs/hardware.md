@@ -90,8 +90,8 @@ lead-in, and a bypass or crossfader toggled at random phases on eight programs:
 | Tick to the card's first capture of the latched frame | 0.99 to 1.26 frames, constant within a take to under 0.5 ms; it moves between takes with the card's capture phase |
 | Write lead needed before a tick | under 4.4 ms |
 
-Render therefore sends each write just after the latest instant the tick before its target
-frame's own can fall, and proves where it landed ([evidence.md](evidence.md)). The early bias
+Render therefore sends each write midway between the ticks around its target
+frame's, and proves where it landed ([evidence.md](evidence.md)). The early bias
 of design 4.4 picks the target: the first frame starting at or after the write's
 time less 15 ms.
 
