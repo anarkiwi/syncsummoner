@@ -141,7 +141,9 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     n = chunk.frames
     proof = SimpleNamespace(
         ok=True,
-        landed=SimpleNamespace(rows=rows, summary=lambda: "landed"),
+        landed=SimpleNamespace(
+            rows=rows, summary=lambda: "landed", missing=0, unechoed=0, duplicated=0, out_of_order=0, late=2
+        ),
         applied=SimpleNamespace(disagree=np.zeros(0, dtype=DISAGREE), summary=lambda: "applied"),
         received=None,
     )
@@ -153,6 +155,7 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(wire, "load_wire", lambda take: {"program": np.array("p")})
     said = L.collect(tmp_path / "t.mkv", chunk, clip="c.mkv", config=None)
     assert said["setpoints_kept"] == len(chunk.states) and said["rows_measured"] == n
+    assert said["evidence_ok"] and said["verdict"]["late"] == 2
     assert L.rows_path(tmp_path / "t.mkv").is_file()
 
 

@@ -24,6 +24,7 @@ __all__ = [
     "allot",
     "chunks_of",
     "design",
+    "distinct",
     "region_dims",
     "effect_sizes",
     "guard_frames",
@@ -139,6 +140,15 @@ def _filled(x: np.ndarray) -> np.ndarray:
         return x
     at = np.maximum.accumulate(np.where(ok, np.arange(x.size), -1))
     return x[np.where(at < 0, np.flatnonzero(ok)[0], at)]
+
+
+def distinct(params: Sequence[int], values: Mapping[int, np.ndarray]) -> int:
+    """The largest power of two no more than the distinct settings ``params`` have together.
+
+    A design asking for more repeats settings, and a repeat that follows itself writes nothing.
+    """
+    total = math.prod(len(values[p]) for p in params) if params else 1
+    return int(2 ** math.floor(math.log2(total)))
 
 
 def allot(total: int, dims: Sequence[int]) -> list[int]:

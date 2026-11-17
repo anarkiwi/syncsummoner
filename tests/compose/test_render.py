@@ -66,7 +66,11 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
 
         return make
 
-    module("syncsummoner.device.transport", Transport=types.SimpleNamespace(open=lambda stall: "transport"))
+    stalls = []
+    module(
+        "syncsummoner.device.transport",
+        Transport=types.SimpleNamespace(open=lambda stall: stalls.append(stall) or "transport"),
+    )
     module("syncsummoner.device.session", Session=record("session"))
 
     def capture(*args, **kwargs):
@@ -83,6 +87,8 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
     R.open_rig(dataclasses.replace(CONFIG, source_host="pi@rig"))
     assert built["link"][0] == ("pi@rig",) and built["playout"][0] == ("pi@rig",)
+    R.open_rig(dataclasses.replace(CONFIG, stall_s=5.0))
+    assert stalls == [CONFIG.lead_in_s, CONFIG.lead_in_s, 5.0], "a wait seeing nothing past a load fails"
 
 
 def test_enforce_safety_passes_safe_output_through():
