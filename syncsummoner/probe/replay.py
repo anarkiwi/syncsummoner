@@ -271,7 +271,8 @@ def survival_metrics(
 ) -> tuple[list[dict[str, float]], str]:
     """Per setpoint group, in :func:`group` order, what it kept of the clip, and how the clock was found.
 
-    A locked take names the clip frame of every capture it keeps; otherwise captures are attributed
+    A locked take names the frame it played of every capture it keeps, lead-in included, and the
+    series starts at clip frame 0 (:func:`footage.source_series`); otherwise captures are attributed
     by the fitted clock and ordered unwrapped, so a dwell across the loop's wrap stays consecutive.
     With neither, every group comes back empty.
     """
@@ -283,8 +284,9 @@ def survival_metrics(
     period = int(stimulus["frames"])
     if live.size and np.all(named[live] >= 0):
         late = np.array([getattr(row, "ambiguity", 0) for row in rows], dtype=np.int64)
+        clip = named - int(stimulus.get("lead", 0))
         return [
-            _kept(frames, members, named[members], series, period, int(late[members].max()))
+            _kept(frames, members, clip[members], series, period, int(late[members].max()))
             for members in groups
         ], "take"
     times = np.array([row.captured for row in rows], dtype=np.float64)
