@@ -348,17 +348,6 @@ def test_working_point_holds_a_bypass_off_whatever_its_range():
     assert session.working_point(_info([bypass]))[11] is False
 
 
-def test_arm_modulation_binds_operators_and_disarm_clears_them():
-    info = _info([_spec(i, f"P{i}", ParamKind.CONTINUOUS) for i in range(1, 6)])
-    port = FakeTransport()
-    session, _, _ = make_session(port)
-    armed = session.arm_modulation(info, ["Sync LFO"], np.random.default_rng(0), exclude=[1, 2], count=2)
-    assert armed == ["P3<-Sync LFO", "P4<-Sync LFO"]
-    assert port.sources[3] == "Sync LFO"
-    session.disarm_modulation()
-    assert set(port.sources.values()) == {sess_mod.DISABLED_OPERATOR}
-
-
 def test_ensure_live_resyncs_once_then_raises():
     port = FakeTransport()
     session, _, _ = make_session(port)

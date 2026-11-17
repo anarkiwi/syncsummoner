@@ -21,8 +21,6 @@ DEFAULT_TOLERANCE = 8
 #: Parameter writes per second the host sends; each is ``msgs_per_param`` CC
 #: messages on the wire. docs/hardware.md records the measured backlog limit.
 CC_BUDGET_HZ = 200.0
-#: The operator name that means no modulation.
-DISABLED_OPERATOR = "Disabled"
 
 #: A freshly loaded program keeps applying its defaults after the source returns.
 LOCK_POLLS = 40
@@ -210,41 +208,6 @@ class Session:
             else:
                 values[spec.index] = 0.5
         return values
-
-    def arm_modulation(
-        self,
-        info: Any,
-        operators: Sequence[str],
-        rng: np.random.Generator,
-        *,
-        exclude: Iterable[int] = (),
-        count: int = 5,
-        depth: tuple[int, int] = (500, 900),
-    ) -> list[str]:
-        """Bind on-board operators to unused continuous slots; returns what was bound.
-
-        Operators run on the FPGA at field rate, which no CC stream can match;
-        without them a program only moves when a parameter write arrives.
-        """
-        skip = set(exclude)
-        armed = []
-        for spec in info.params:
-            if len(armed) >= count:
-                break
-            if spec.kind is not ParamKind.CONTINUOUS or spec.index in skip:
-                continue
-            operator = operators[int(rng.integers(len(operators)))]
-            self.transport.set_modulation_source(spec.index, operator)
-            self.transport.set_manual(
-                spec.index, PARAM_MAX // 2, time_=int(rng.integers(*depth)), space=512, slope=512
-            )
-            armed.append(f"{spec.name}<-{operator}")
-        return armed
-
-    def disarm_modulation(self) -> None:
-        """Return every slot to Disabled so the next program starts clean."""
-        for index in range(1, PARAM_COUNT + 1):
-            self.transport.set_modulation_source(index, DISABLED_OPERATOR)
 
     def _note(self, kind: str, **detail: Any) -> None:
         """Record an action, when a journal is attached."""

@@ -325,30 +325,9 @@ class Transport:
         """Send a MIDI CC for one parameter; the device adds it to the manual value."""
         self._device.set_param(_check_index(index), value)
 
-    def set_manual(
-        self,
-        index: int,
-        value: int,
-        *,
-        time_: int | None = None,
-        space: int | None = None,
-        slope: int | None = None,
-    ) -> None:
-        """Set a slot's manual value, and optionally its Time/Space/Slope macros.
-
-        The serial verb is absolute, unlike a CC, which is an offset onto it.
-        """
-        self._shell.set_modulation(
-            _check_index(index) - 1, int(np.clip(value, 0, PARAM_MAX)), time_, space, slope
-        )
-
-    def set_modulation_source(self, index: int, source: str) -> None:
-        """Bind a modulation operator to a slot; operators run at field rate."""
-        self._shell.set_source(_check_index(index) - 1, source)
-
-    def operators(self) -> dict[str, Any]:
-        """Every modulation operator the firmware exposes, keyed by name."""
-        return dict(self._shell.operators())
+    def set_manual(self, index: int, value: int) -> None:
+        """Set a slot's manual value; the serial verb is absolute, unlike a CC, which is an offset onto it."""
+        self._shell.set_modulation(_check_index(index) - 1, int(np.clip(value, 0, PARAM_MAX)))
 
     def program_manifest(self) -> Any:
         """Installed program library, or None when the device carries no manifest.
