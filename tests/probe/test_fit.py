@@ -476,3 +476,17 @@ def test_survival_metrics_are_kept_as_measured_curves():
     spec = fit.fit_profile(rows).params[0]
     assert {"si_ratio", "ti_ratio", "motion_follow"} <= set(spec.measured)
     assert spec.measured["ti_ratio"][0] > spec.measured["ti_ratio"][-1]
+
+
+def test_a_parameter_parked_while_the_others_move_is_fitted_from_the_whole_sweep():
+    """Rows with every other parameter at its mode can hold this one still; that isolates nothing."""
+    rng = np.random.default_rng(11)
+    parked = [record({1: 256, 2: 512, 7: v}, {"concentration": 0.1}) for v in (0, PARAM_MAX, 0)]
+    swept = []
+    for _ in range(64):
+        raw = rng.integers(0, PARAM_MAX, size=12)
+        swept.append(
+            a_record(params=tuple(int(v) for v in raw), metrics={"concentration": raw[0] / PARAM_MAX})
+        )
+    spec = param(fit.fit_profile(parked + swept), 1)
+    assert len(spec.values) > 2 and spec.sensitivity > 0

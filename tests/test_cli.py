@@ -810,3 +810,24 @@ def test_score_plan_prints_the_messages_each_frame_carries(monkeypatch, tmp_path
     said = capsys.readouterr().out
     assert said.startswith("g: 468 automation writes, 468 frame-plan rows, 468 sent; 39 frames carry writes")
     assert "busiest frame 2 with 24, median 24 a frame" in said
+
+
+def test_a_score_carrying_its_cuts_is_cut_by_them_with_no_programs_named(monkeypatch, tmp_path):
+    from syncsummoner.compose.cut import Cut
+    from syncsummoner.compose.score import Score
+
+    seen = {}
+    _render_stubs(monkeypatch, seen)
+    path = _score_file(tmp_path, 2)
+    score = Score.load(path)
+    score.cuts = [Cut(0.0, 60.0, "g"), Cut(60.0, 120.0, "g")]
+    score.save(path)
+
+    def fake_cuts(*_args, **kwargs):
+        seen["cuts"] = kwargs
+        return []
+
+    monkeypatch.setattr("syncsummoner.compose.render.render_cuts", fake_cuts)
+    argv = ["render", path, "--source", "clip.mkv", "--no-master", "-o", str(tmp_path / "final.mp4")]
+    assert cli.main(argv) == 0
+    assert seen["cuts"]["programs"] == [] and "render" not in seen

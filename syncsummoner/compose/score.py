@@ -15,10 +15,11 @@ import numpy as np
 import yaml
 
 from syncsummoner.device.profile import Axis, ProgramProfile
+from syncsummoner.compose.cut import Cut
 from syncsummoner.compose.features import Section
 from syncsummoner.compose.vocabulary import GESTURES, Automation, GestureContext
 
-__all__ = ["Section", "GestureInstance", "Layer", "Score", "control_rate"]
+__all__ = ["Cut", "Section", "GestureInstance", "Layer", "Score", "control_rate"]
 
 
 def control_rate(fps: float) -> float:
@@ -97,7 +98,11 @@ class Layer:
 
 @dataclass
 class Score:
-    """The composed timeline: seed, tempo grid, sections, and one layer per program pass."""
+    """The composed timeline: seed, tempo grid, sections, one layer per program pass, and its cuts.
+
+    ``cuts`` is the plan the layers were composed against, which the render splices by; empty
+    for a score composed before cuts were planned, which the render cuts in rotation.
+    """
 
     seed: int = 0
     bpm: float = 120.0
@@ -106,6 +111,7 @@ class Score:
     sections: list[Section] = field(default_factory=list)
     layers: list[Layer] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
+    cuts: list[Cut] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Plain-data form for YAML; the round-trip through this is lossless."""
@@ -119,6 +125,7 @@ class Score:
                 for s in self.sections
             ],
             "layers": [layer.to_dict() for layer in self.layers],
+            "cuts": [{"start": float(c.start), "end": float(c.end), "program": c.program} for c in self.cuts],
             "meta": dict(self.meta),
         }
 
@@ -141,6 +148,7 @@ class Score:
             ],
             layers=[Layer.from_dict(m) for m in data.get("layers", ())],
             meta=dict(data.get("meta", {})),
+            cuts=[Cut(float(c["start"]), float(c["end"]), c["program"]) for c in data.get("cuts", ())],
         )
 
     def to_yaml(self) -> str:
@@ -196,24 +204,34 @@ class Score:
             )
             for layer in self.layers
         ]
-        return replace(self, duration=max(0.0, end - start), sections=sections, layers=layers)
+        cuts = [
+            Cut(max(c.start, start) - start, min(c.end, end) - start, c.program)
+            for c in self.cuts
+            if c.start < end and c.end > start
+        ]
+        return replace(self, duration=max(0.0, end - start), sections=sections, layers=layers, cuts=cuts)
 
     def with_layers(self, layers: list[Layer]) -> "Score":
         """Copy with a different set of layers."""
         return replace(self, layers=layers)
 
-    def render_layer(self, layer: Layer, profile: ProgramProfile, *, rate: float | None = None) -> Automation:
+    def render_layer(
+        self, layer: Layer, profile: ProgramProfile, *, rate: float | None = None, offset: int = 0
+    ) -> Automation:
         """Expand one layer's gesture instances into merged parameter automation."""
-        parts = [auto for _, auto in self.gesture_automations(layer, profile, rate=rate)]
+        parts = [auto for _, auto in self.gesture_automations(layer, profile, rate=rate, offset=offset)]
         return Automation.concat(parts)
 
     def gesture_automations(
-        self, layer: Layer, profile: ProgramProfile, *, rate: float | None = None
+        self, layer: Layer, profile: ProgramProfile, *, rate: float | None = None, offset: int = 0
     ) -> list[tuple[GestureInstance, Automation]]:
-        """Each known gesture instance of a layer with the automation it renders on its own."""
+        """Each known gesture instance of a layer with the automation it renders on its own.
+
+        ``offset`` is the position of the layer's first gesture in a longer layer it is the tail of.
+        """
         rate = control_rate(self.fps) if rate is None else rate
         parts = []
-        for i, inst in enumerate(layer.gestures):
+        for i, inst in enumerate(layer.gestures, start=offset):
             gesture = GESTURES.get(inst.gesture)
             if gesture is None:
                 continue

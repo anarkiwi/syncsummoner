@@ -113,12 +113,17 @@ Renderer = Callable[[ProgramProfile, GestureContext], Automation]
 
 @dataclass(frozen=True)
 class Gesture:
-    """One vocabulary primitive: an anchor, the profile field it consumes, and its renderer."""
+    """One vocabulary primitive: an anchor, the profile field it consumes, and its renderer.
+
+    ``kinds`` are the parameter kinds it writes through ``ctx.targets``; ``None`` for a gesture
+    whose parameter its profile field chooses.
+    """
 
     name: str
     anchor: Anchor
     profile_field: str
     fn: Renderer
+    kinds: tuple[ParamKind, ...] | None = None
 
     def __call__(self, profile: ProgramProfile, ctx: GestureContext) -> Automation:
         return self.fn(profile, ctx)
@@ -127,12 +132,27 @@ class Gesture:
 GESTURES: dict[str, Gesture] = {}
 
 
-def _register(name: str, anchor: Anchor, profile_field: str) -> Callable[[Renderer], Renderer]:
+def _register(
+    name: str, anchor: Anchor, profile_field: str, kinds: tuple[ParamKind, ...] | None = None
+) -> Callable[[Renderer], Renderer]:
     def deco(fn: Renderer) -> Renderer:
-        GESTURES[name] = Gesture(name, anchor, profile_field, fn)
+        GESTURES[name] = Gesture(name, anchor, profile_field, fn, kinds)
         return fn
 
     return deco
+
+
+def candidates(profile: ProgramProfile, name: str) -> list[ParamSpec]:
+    """Parameters a gesture may be aimed at: drivable by it and measured to move something.
+
+    A gesture that reads a field such as ``hysteresis`` is aimed among the parameters carrying it
+    when there are any.
+    """
+    gesture = GESTURES[name]
+    if gesture.kinds is None:
+        return []
+    pool = [p for p in profile.params if drivable(p, kinds=gesture.kinds) and p.sensitivity > 0]
+    return [p for p in pool if getattr(p, gesture.profile_field, False)] or pool
 
 
 def safe_range(spec: ParamSpec) -> tuple[int, int]:
@@ -194,7 +214,7 @@ def _pick(profile: ProgramProfile, ctx: GestureContext, kinds=CONTINUOUS_KINDS) 
     return found[0] if found else None
 
 
-@_register("hold", Anchor.BAR, "safe_range")
+@_register("hold", Anchor.BAR, "safe_range", CONTINUOUS_KINDS)
 def _hold(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     spec = _pick(profile, ctx)
     if spec is None:
@@ -203,7 +223,7 @@ def _hold(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     return Automation.of([ctx.arrival], spec.index, lo + ctx.intensity * (hi - lo))
 
 
-@_register("ramp", Anchor.PHRASE, "monotonic_segments")
+@_register("ramp", Anchor.PHRASE, "monotonic_segments", CONTINUOUS_KINDS)
 def _ramp(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     spec = _pick(profile, ctx)
     if spec is None:
@@ -259,7 +279,7 @@ def _lock_snap(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     return Automation.of([ctx.arrival], lock.b, tongue.center)
 
 
-@_register("punch", Anchor.ONSET, "effect_buttons")
+@_register("punch", Anchor.ONSET, "effect_buttons", (ParamKind.BOOLEAN,))
 def _punch(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     spec = _pick(profile, ctx, kinds=(ParamKind.BOOLEAN,))
     if spec is None:
@@ -273,10 +293,10 @@ def _punch(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     )
 
 
-@_register("hysteresis_loop", Anchor.TWO_BAR, "hysteresis")
+@_register("hysteresis_loop", Anchor.TWO_BAR, "hysteresis", CONTINUOUS_KINDS)
 def _hysteresis_loop(profile: ProgramProfile, ctx: GestureContext) -> Automation:
     pool = [p for p in profile.params if p.hysteresis and drivable(p)]
-    spec = pool[0] if pool else _pick(profile, ctx)
+    spec = pool[0] if pool and not ctx.targets else _pick(profile, ctx)
     if spec is None:
         return Automation.empty()
     lo, hi = safe_range(spec)

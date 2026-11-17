@@ -484,7 +484,7 @@ def fit_profile(
             continue
         others = [k for k in varying if k != j]
         rows = np.flatnonzero((params[:, others] == modes[others]).all(axis=1))
-        isolated = rows.size >= 2
+        isolated = np.unique(params[rows, j]).size >= 2
         if not isolated:
             rows = np.arange(len(records))
         driver = _fit_param(
