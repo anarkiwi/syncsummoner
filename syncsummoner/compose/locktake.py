@@ -550,7 +550,8 @@ def _run(
 
     Every write is acknowledged before the next goes: the start state, each slot not already parked
     at its value, then the calibration toggles and the plan. With ``reload``, Passthru is loaded for the
-    lead-out once the clip has played; either way the lead-out is held as long as the lead-in's wet stretch.
+    lead-out once the clip has played, the sender, poller and monitor stopped first so the load is the shell's
+    only client; either way the lead-out is held as long as the lead-in's wet stretch.
     """
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
@@ -608,8 +609,16 @@ def _run(
             progress.to((time.monotonic_ns() - began) / 1e9)
     sender.drain(timeout_s=1.0)
     if reload is not None:
-        reload("Passthru")
+        _reload_quiet(sender, poller, shell, reload)
         _sleep_until(time.monotonic_ns() + int(clock.times.period * settle))
+
+
+def _reload_quiet(sender: Sender, poller: Poller, shell: Any, reload: Callable[[str], Any]) -> None:
+    """Load Passthru for the lead-out with the sender, poller and monitor stopped: the shell's only client."""
+    sender.stop()
+    poller.stop()
+    shell.command("midi", "monitor", "off")
+    reload("Passthru")
 
 
 def plan_rows(
