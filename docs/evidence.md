@@ -17,17 +17,20 @@ sidecars.
 
 The device latches MIDI CCs once per output frame: the picture changes on a frame
 start, never part way down it (docs/hardware.md). So a write lands on the first frame
-whose first capture reaches the host at least a fixed latency after the write left it.
-That latency is measured from the picture in every dry take's lead-in, and is the
-only thing the landing frame rests on; the serial readback's timing is not used.
+that starts at least a fixed latency after the device took it. Frame starts are the
+take's frame line on the capture clock (`evidence.frame_times`,
+[hardware.md](hardware.md#the-cards-clock)), so they carry no capture phase. The latency
+is measured from the picture in every dry take's lead-in, and is the only thing the
+landing frame rests on; the serial readback's timing is not used.
 
-The latency is the card's capture phase plus constants, and the phase changes with
-every recording, so it is measured per take: each calibration write sent at `t` and
-first shown in frame `F` puts it in `(T(F-1) - t, T(F) - t]`, `T` being the frame's
-first capture time; the bounds of all writes intersect in one band
-(`evidence.latency`). Writes that disagree by half a frame or more stop the take.
-Every frame's capture time less the band gives the instants a write must precede to
-land on it (`evidence.grid`).
+Each calibration write taken at `t` and first shown in frame `F` puts the latency in
+`(T(F-1) - t, T(F) - t]`, `T` being the frame's start on the line; the bounds of all
+writes intersect in one band (`evidence.latency`). Writes that disagree by half a
+frame or more stop the take. Every frame's start less the band gives the instants a
+write must precede to land on it (`evidence.grid`). Where the take's captures admit
+lines other than the one fitted, frame starts lie within `line_lo..line_hi` of it, so
+the device's own latency lies in `Latency.bounds`, the band widened by them; each record
+says its basis (`"basis": "start"`).
 
 ## Frame-locked sends
 
@@ -40,22 +43,26 @@ land on it (`evidence.grid`).
 2. The dry control is toggled at random intervals and each toggle's first frame in
    the lead-in's picture measures the latency band.
 3. While the recording runs, its stored captures are read (`lock.read_live`) and
-   attributed (`lock.live_attribution`), giving each clip frame's capture time.
+   attributed (`lock.live_attribution`), giving the frame line from the lead-in's strips.
 4. Each planned write for frame `j` is sent half a frame before the instant it must
    precede (`evidence.send_time`): the live clock can err either way and a send can
    wake late. The take runs with a short interpreter switch interval so the sending
    thread wakes promptly; each send records when it was due, and the report gives the
-   worst wake-up. The frame line is refitted over the whole run from the growing
-   sidecar while the take runs.
+   worst wake-up. The frame line is carried on while the take runs (`locktake.Clock.extend`):
+   each capture the growing sidecar shows starting a frame, its bytes differing from the
+   capture before's, is named by the line so far and narrows it, as the offline fit does.
 5. Two seconds before clip frame 0 the dry control is set to its take value; the
    last readback before frame 0's latch must equal frame 0's planned parameters,
    and `fpga status` must name the program (`locktake.loaded_before`).
+6. On the frame after the clip's last the dry control is set dry again, and the take
+   runs on as long as the lead-in's wet stretch into the clip's lead-out, whose strips
+   then pin the frame line's far end.
 
 A program with no bypass switch keeps the old lead-in: Passthru
 under the strips, the program loaded inside it, the outage bridged by the Pi's flip
-log. Its latency band is the dry takes' (`ccpicture.json`) widened by the part of the
-capture phase's half-frame range they have not shown; `render --cut-programs` renders
-such programs after a dry one.
+log; Passthru is loaded again for the lead-out. Its latency band is where every dry
+take's `Latency.bounds` meet (`ccpicture.json`, start-basis records only; a judged dry take
+records its own); `render --cut-programs` renders such programs after a dry one.
 
 The boot count (settings key 9) is read before and after every take; any rise is a
 `RebootError`.

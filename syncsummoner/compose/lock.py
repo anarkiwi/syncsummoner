@@ -183,7 +183,7 @@ def anchors(played: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, np.ndarray
     A program showing past frames' strips makes a group of its own, which the frame line then refuses.
     """
     k = np.arange(1, played.size)
-    k = k[(seg[k] == seg[k - 1]) & (played[k] >= 0) & (played[k - 1] == played[k] - 1)]
+    k = k[(seg[k] == seg[k - 1]) & (played[k - 1] >= 0) & (played[k - 1] == played[k] - 1)]
     out, group = np.full(played.size, -1, dtype=np.int64), np.full(played.size, -1, dtype=np.int64)
     out[k] = played[k]
     group[k] = np.cumsum(np.r_[True, (np.diff(played[k]) != 1) | (np.diff(seg[k]) != 0)])
@@ -287,15 +287,23 @@ def _lines(
     ``shown_at[n]`` is when the Pi first showed frame ``n``.
 
     The run with most strip-named frames fixes the period an outage leaves alone and the lag from the
-    Pi showing a frame to its start; another run keeps its strips only if they keep that lag too.
+    Pi showing a frame to its start; another run keeps its strips only if their largest group spans two
+    frames and keeps that lag too, and is otherwise numbered by the lag.
     """
     named, group = anchored
     jitter, resolution = error
     runs = [int(s) for s in np.unique(seg[k])]
     own = {s: named[k[seg[k] == s]] for s in runs}
-    fixed = sorted(
-        (s for s in runs if np.unique(own[s][own[s] >= 0]).size > 1), key=lambda s: -int((own[s] >= 0).sum())
-    )
+    def spans(s: int) -> bool:
+        mine = k[seg[k] == s]
+        ok = named[mine] >= 0
+        if not ok.any():
+            return False
+        ids, sizes = np.unique(group[mine][ok], return_counts=True)
+        largest = ok & (group[mine] == ids[np.argmax(sizes)])
+        return np.unique(named[mine][largest]).size > 1
+
+    fixed = sorted((s for s in runs if spans(s)), key=lambda s: -int((own[s] >= 0).sum()))
     if not fixed:
         raise LockError("no run of captures carries two legible strip-coded frames, so nothing fixes the line")
 
@@ -307,6 +315,7 @@ def _lines(
     period = lines[fixed[0]].polygon.periods
     for s in runs:
         if s not in lines:
+            own[s] = np.full_like(own[s], -1)
             lines[s] = fitted(s, period)
     rate = min(lines.values(), key=lambda line: np.ptp(line.polygon.periods)).period
     rate /= float(np.nanmedian(np.diff(shown_at)))

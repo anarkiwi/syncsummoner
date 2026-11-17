@@ -138,8 +138,8 @@ ss lockcheck source.mkv --seconds 30 --program Pinwheel --source-host pi@videopi
 It timecodes the footage into `--scratch` (`--prepared` plays one already
 timecoded), plays it with the render's lead-in (`--lead-in` overrides it),
 records `--take`, and prints one line, `LOCKED` or `NOT LOCKED`, with the Pi's
-flips and missed vblanks, the card's lost frames, gaps and off-cadence frame
-changes, strip agreement and, through Passthru, torn captures. It exits 1 unless
+flips and missed vblanks, the card's lost frames, gaps and picture changes off
+a frame start, strip agreement and, through Passthru, torn captures. It exits 1 unless
 locked; `--judge` re-judges a recorded `--take` without playing.
 
 A full clip through `Pinwheel`, loaded in the lead-in, with `--prepared`:
@@ -491,10 +491,10 @@ or not, and why), then the take's picture report. A take whose capture driver lo
 frames is recaptured once (`TakeFaultError`).
 
 The take is longer than the excerpt because it opens on the lead-in, and holds
-more captures than frames because the card runs its own cadence
-([hardware.md](hardware.md#the-cards-cadence)). What makes the finished clip right
-is the attribution line: every clip frame has a capture, and the clip's run agrees
-on its cadence. `ss judge takes/take-Derez.mkv --source timecoded.mkv` judges a
+more captures than frames because the card runs its own clock
+([hardware.md](hardware.md#the-cards-clock)). What makes the finished clip right
+is the attribution line: every clip frame has a capture, the frame line meets every
+frame start within the capture jitter, and no strip or byte change contradicts it. `ss judge takes/take-Derez.mkv --source timecoded.mkv` judges a
 take again from its sidecars and one cached decode, with no device, so it can run
 while the rig captures the next ([judging.md](judging.md)). Each step is judged by
 the program model from the state it was taken in, so a parameter is tested only on
@@ -563,7 +563,7 @@ What happens, in order:
    silence over `--fade` seconds, and the same back down at the end.
 
 The capture card returns frames at its own rate
-([hardware.md](hardware.md#the-cards-cadence)), so a take holds more frames than
+([hardware.md](hardware.md#the-cards-clock)), so a take holds more frames than
 the session's rate implies. Attribution picks one capture per clip frame, so the
 splice is at the clip's rate.
 
@@ -684,7 +684,7 @@ doing it twice, which is what the audition is for.
 | `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or not following the clip, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
 | `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `probe sweep` and refit |
 | `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
-| `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, cadence, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |
+| `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, the frame line against the jitter, slips, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |
 | `LeadInError: ...` | the program's load ran past the lead-in, or clip frame 0 reached the card before it ended; raise `RenderConfig.lead_in_s` (`lockcheck --program NAME --lead-in S` tries a value) |
 | `PlayoutError: the Pi player faulted ...` | the player missed a vblank, ran out of decoded frames or met a mode that does not divide the clip rate; read its `status.json` and log in the Pi's `/dev/shm` player directory |
 | `source.drm_free` fails | another DRM master holds `/dev/dri/card1` (a compositor or a stray player); stop the pid it names |

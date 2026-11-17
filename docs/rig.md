@@ -68,7 +68,7 @@ leaves its last frame in `/dev/fb0`.
 `syncsummoner lockcheck` checks the whole frame clock on the rig: it plays a
 timecoded clip through Passthru (or `--program NAME`, loaded in the lead-in),
 records it, and prints `LOCKED` or `NOT LOCKED` with the flips, missed vblanks,
-card drops, gaps, off-cadence frame changes, strip agreement and, under Passthru,
+card drops, gaps, picture changes off a frame start, strip agreement and, under Passthru,
 torn captures; it exits 1 unless locked. `--prepared` plays `--scratch` as an
 already timecoded clip, and `--judge` re-judges `--take` without playing.
 
