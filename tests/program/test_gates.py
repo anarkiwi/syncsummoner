@@ -120,3 +120,75 @@ def test_the_structure_reads_every_reviving_setting_off_the_condition(tiny):
     assert any(line.startswith("P1 in 64..1023 and P2 in 513..527, 529..543") for line in found[8])
     assert found[3] == ["never"] and found[2] == ["P7 in 0..511 and P8 in 0..511"]
     assert "live where P7 in 512..1023 and P8 in 0..511" in cover(tiny).table()
+
+
+def _synthetic():
+    from dd import cudd  # pylint: disable=import-outside-toplevel
+
+    bdd = cudd.BDD()
+    bdd.declare("a0", "a1", "b0", "c0")
+    held = {1: {"a0": False, "a1": False}, 2: {"b0": False}, 3: {"c0": False}}
+    domains = {
+        1: [{"a0": x, "a1": y} for y in (False, True) for x in (False, True)],
+        2: [{"b0": False}, {"b0": True}],
+        3: [{"c0": False}, {"c0": True}],
+    }
+    return bdd, held, domains
+
+
+def test_the_fewest_gates_are_the_smallest_satisfiable_selector_count():
+    from syncsummoner.program.gates import fewest  # pylint: disable=import-outside-toplevel
+
+    bdd, held, domains = _synthetic()
+    a0, a1, b0, c0 = (bdd.var(n) for n in ("a0", "a1", "b0", "c0"))
+    assert fewest(bdd, b0 | c0, held, domains) == [(2,), (3,)]
+    assert fewest(bdd, a1 & b0, held, domains) == [(1, 2)]
+    assert fewest(bdd, (a1 & b0 & c0) | (a0 & ~a1 & c0), held, domains) == [(1, 3)]
+    assert fewest(bdd, a1 & b0 & c0, held, domains) == [(1, 2, 3)]
+    assert not fewest(bdd, bdd.false, held, domains)
+    narrow = {**domains, 1: domains[1][:2]}
+    assert not fewest(bdd, a0 & a1, held, narrow), "no setting in the domain reaches it"
+    assert fewest(bdd, a0 & a1, held, domains) == [(1,)]
+    moved = {**held, 2: {"b0": True}}
+    assert fewest(bdd, a1 & b0, moved, domains) == [(1,)], "a gate already at its setting is not moved"
+
+
+def test_a_witness_takes_the_first_completable_setting_and_spans_the_last_gate():
+    from syncsummoner.program.gates import witness  # pylint: disable=import-outside-toplevel
+
+    bdd, _, domains = _synthetic()
+    a0, a1, b0 = (bdd.var(n) for n in ("a0", "a1", "b0"))
+    picks, ok = witness(bdd, (a1 & b0) | (a0 & a1 & ~b0), (1, 2), domains)
+    assert picks == [2] and ok.tolist() == [False, True]
+    picks, ok = witness(bdd, a0 & a1, (1, 2), domains)
+    assert picks == [3] and ok.tolist() == [True, True]
+    picks, ok = witness(bdd, a1 & ~a1, (1, 2), domains)
+    assert not picks and not ok.any()
+    assert witness(bdd, ~a0, (1,), domains)[1].tolist() == [True, False, True, False]
+
+
+def test_revivals_from_the_condition_match_the_simulated_search(tiny):
+    found = cover(tiny)
+    g = Gating(tiny)
+    for i, state in enumerate(found.states):
+        for p, st in found.status[i].items():
+            if st.state != LIVE:
+                others = [q for q in sorted(g.read) if q != p]
+                expected = g._simulated(state, p, others)  # pylint: disable=protected-access
+                assert found.revivals[i][p] == expected
+    both = tiny.initial()
+    both[[6, 7]] = 0, 1023
+    pair = g.revivals(both, Status(1, ()))
+    assert [r.gate for r in pair] == [(7, 8)] and not pair[0].spans
+    assert pair == g._simulated(both, 1, [2, 7, 8])  # pylint: disable=protected-access
+    assert g.statuses(np.r_[both[:6], pair[0].moves[0][1], pair[0].moves[1][1], both[8:]])[1].state == LIVE
+
+
+def test_a_cover_without_conditions_revives_by_the_ternary_simulator(tiny, tmp_path):
+    from syncsummoner.program.model import ProgramModel  # pylint: disable=import-outside-toplevel
+
+    coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path)
+    coarse.memory = 0
+    found = cover(coarse)
+    assert coarse.method == "ternary" and not found.uncovered
+    assert found.gating()[1] == ["dead at the reference", "live when P7 in 512..1023"]

@@ -1,7 +1,8 @@
 """Which controls make each parameter live, and the fewest base states that step every one where it is.
 
-Live means a written bit is observable at the video (:mod:`.observe`); revivals are found by exact
-refutation with controls freed, then by each remaining control's settings over its resolution classes;
+Live means a written bit is observable at the video (:mod:`.observe`); revivals are read off each
+parameter's observability condition, restricted to the state, as the smallest sets of controls whose
+settings over their resolution classes satisfy it (by the ternary simulator where there is no condition);
 the states they reach are covered by a lexicographic 0-1 programme (fewest states, then steps).
 """
 
@@ -116,6 +117,76 @@ def condition(m: ProgramModel, param: int, timing: int | None = None):
     return bdd, bdd.exist(own | (set(clock) if timing is None else set()), bdd.let(fixed, u))
 
 
+def setting(m: ProgramModel, param: int, manual: int) -> dict[str, bool]:
+    """The condition variables of ``param``'s bits at one manual value."""
+    f = declared.field(param)
+    value = int(register_value(m.decl(param), int(manual)))
+    word = value << f.bits[0] if len(f.bits) == 1 else value
+    return {f"c{k}": bool((word >> b) & 1) for k, b in zip(f.flat, f.bits)}
+
+
+def _anyof(bdd, assignments: Iterable[dict]):
+    out = bdd.false
+    for a in assignments:
+        out |= bdd.cube(a)
+    return out
+
+
+def _exactly(bdd, names: Sequence[str], k: int):
+    """True where exactly ``k`` of the variables ``names`` are."""
+    row = [bdd.true] + [bdd.false] * k
+    for n in reversed(names):
+        x = bdd.var(n)
+        row = [~x & row[0]] + [(~x & row[j]) | (x & row[j - 1]) for j in range(1, k + 1)]
+    return row[k]
+
+
+def fewest(bdd, u, held: dict[int, dict], domains: dict[int, list[dict]]) -> list[tuple[int, ...]]:
+    """Every smallest set of gates whose moves satisfy ``u``, the rest held, in lexicographic order.
+
+    ``u`` is over the gates' variables; each gate holds the assignment ``held[g]`` unless moved to one
+    of ``domains[g]``. A selector per gate picks moved or held, the gates' variables are quantified
+    away, and the smallest satisfiable selector count is read off by intersecting with a cardinality.
+    """
+    gates = sorted(domains)
+    sel = {g: f"s{g}" for g in gates}
+    bdd.declare(*sel.values())
+    moved = bdd.true
+    for g in gates:
+        s = bdd.var(sel[g])
+        moved &= (s & _anyof(bdd, domains[g])) | (~s & bdd.cube(held[g]))
+    names = {n for g in gates for n in held[g]}
+    v = bdd.exist(names, u & moved) if names else u & moved
+    for k in range(1, len(gates) + 1):
+        w = v & _exactly(bdd, [sel[g] for g in gates], k)
+        if w != bdd.false:
+            picks = bdd.pick_iter(w, care_vars=set(sel.values()))
+            return sorted(tuple(g for g in gates if a[sel[g]]) for a in picks)
+    return []
+
+
+def witness(bdd, u, gates: Sequence[int], domains: dict[int, list[dict]]) -> tuple[list[int], np.ndarray]:
+    """The first setting of each gate but the last, in domain order, that some later settings complete,
+    and which settings of the last gate then satisfy ``u``.
+    """
+    picks = []
+    for i, g in enumerate(gates[:-1]):
+        rest = gates[i + 1 :]
+        names = {n for r in rest for n in domains[r][0]}
+        allowed = bdd.true
+        for r in rest:
+            allowed &= _anyof(bdd, domains[r])
+        for j, a in enumerate(domains[g]):
+            f = bdd.let(a, u)
+            if bdd.exist(names, f & allowed) != bdd.false:
+                picks.append(j)
+                u = f
+                break
+        else:
+            return picks, np.zeros(len(domains[gates[-1]]), dtype=bool)
+    return picks, np.array([bdd.let(a, u) != bdd.false for a in domains[gates[-1]]], dtype=bool)
+
+
 def branches(m: ProgramModel, bdd, u, gates: Sequence[int]) -> list[list[tuple[int, list[tuple[int, int]]]]]:
     """``u`` as disjoint branches, each a list of ``(gate, manual-value intervals)`` over ``gates`` in order.
 
@@ -131,13 +202,11 @@ def branches(m: ProgramModel, bdd, u, gates: Sequence[int]) -> list[list[tuple[i
     if not set(names) & bdd.support(u):
         return branches(m, bdd, u, rest)
     values = register_value(m.decl(gate), np.arange(VALUE_MAX + 1))
-    bits = declared.field(gate).bits
     by_value: dict[int, object] = {}
     cofactor = []
-    for v in values.tolist():
+    for manual, v in enumerate(values.tolist()):
         if v not in by_value:
-            word = v << bits[0] if len(bits) == 1 else v
-            by_value[v] = bdd.let({n: bool((word >> b) & 1) for n, b in zip(names, bits)}, u)
+            by_value[v] = bdd.let(setting(m, gate, manual), u)
         cofactor.append(by_value[v])
     out = []
     for f in dict.fromkeys(cofactor):
@@ -172,6 +241,7 @@ class Gating:
     m: ProgramModel
     timing: int | None = None
     _status: dict = field(default_factory=dict, repr=False)
+    _cond: dict = field(default_factory=dict, repr=False)
 
     def key(self, state: np.ndarray) -> tuple:
         """What the program sees of a state: its register words."""
@@ -196,10 +266,53 @@ class Gating:
         """False only when no held values of ``free`` can revive ``param``: an exact refutation."""
         return self.m.revivable(state, param, free, self.timing)
 
+    @cached_property
+    def _classes(self) -> dict[int, tuple[list[np.ndarray], list[int]]]:
+        """Each read control's resolution classes and a representative manual value of each."""
+        out = {}
+        for q, bits in self.read.items():
+            groups = classes(self.m.decl(q), bits)
+            out[q] = (groups, [int(g[len(g) // 2]) for g in groups])
+        return out
+
+    def _condition(self, param: int):
+        if param not in self._cond:
+            self._cond[param] = condition(self.m, param, self.timing)
+        return self._cond[param]
+
     def revivals(self, state: np.ndarray, st: Status) -> list[Revival]:
-        """Every way of making ``st.param`` live by moving the fewest other controls from ``state``."""
+        """Every way of making ``st.param`` live by moving the fewest other controls from ``state``.
+
+        Answered from the parameter's observability condition where the program has one, else by the
+        ternary simulator.
+        """
         p = st.param
         others = [q for q in sorted(self.read) if q != p]
+        if self.m.conditions({p, *([TIMING] if self.timing is None else [])}) is None:
+            return self._simulated(state, p, others)
+        bdd, u = self._condition(p)
+        held = {
+            d.parameter_id: setting(self.m, d.parameter_id, state[d.parameter_id - 1]) for d in self.m.params
+        }
+        u = bdd.let({n: x for q, a in held.items() if q != p and q not in others for n, x in a.items()}, u)
+        domains = {q: [setting(self.m, q, v) for v in self._classes[q][1]] for q in others}
+        found = []
+        for qs in track(
+            fewest(bdd, u, {q: held[q] for q in others}, domains), desc=f"P{p} gates", unit="set"
+        ):
+            f = bdd.let({n: x for q in others if q not in qs for n, x in held[q].items()}, u)
+            picks, ok = witness(bdd, f, qs, domains)
+            groups = self._classes[qs[-1]][0]
+            full = np.zeros(VALUE_MAX + 1, dtype=bool)
+            for g, hit in zip(groups, ok):
+                full[g] = hit
+            spans = intervals(full)
+            lo, hi = max(spans, key=lambda s: s[1] - s[0])
+            moves = (*((g, self._classes[g][1][j]) for g, j in zip(qs, picks)), (qs[-1], (lo + hi) // 2))
+            found.append(Revival(p, moves, tuple(spans) if len(qs) == 1 else ()))
+        return found
+
+    def _simulated(self, state: np.ndarray, p: int, others: list[int]) -> list[Revival]:
         if not self._could(state, p, others):
             return []
         for size in range(1, len(others) + 1):
