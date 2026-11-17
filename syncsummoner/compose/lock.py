@@ -1,8 +1,8 @@
 """Exact attribution of a locked take: which capture shows each clip frame.
 
-Within a run of captures with no gap the card's cadence says which frame each shows; the
-strip-coded lead-in fixes the first run's offset, and capture timestamps against the Pi's
-logged flip times carry it across the outage a program load causes.
+Each gap-free run's frame starts lie on a straight line on the capture clock (:mod:`frameline`),
+named by the strips the dry lead-in and lead-out carry and fitted through every start the strips
+or the captures' bytes show; each capture shows the frame its time falls in on that line.
 """
 
 from __future__ import annotations
@@ -14,12 +14,10 @@ from typing import Any
 
 import numpy as np
 
+from syncsummoner.compose import frameline
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import read_codes
 from syncsummoner.progress import LOG
-
-#: A capture interval past the midpoint between one period and two is a lost frame or an outage.
-GAP_PERIODS = 1.5
 
 
 class LockError(RuntimeError):
@@ -31,85 +29,113 @@ class LostTimecodeError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class Run:
-    """Captures ``first..last`` (inclusive) with no gap between them, so one cadence holds them.
-
-    ``slot`` is the sub-frame slot capture ``first`` shows, ``per_frame * played + copy``.
-    ``repeats`` is the fraction of the card's frame changes on that cadence, ``agree`` the
-    fraction of frame starts whose timestamp gives that slot, ``worst_ms`` their largest error.
-    """
-
-    first: int
-    last: int
-    slot: int
-    repeats: float
-    agree: float
-    worst_ms: float
-
-    def __len__(self) -> int:
-        return self.last - self.first + 1
-
-
-@dataclass(frozen=True)
 class Attribution:
     """Per clip frame, the capture that shows it; per capture, the clip frame it shows.
 
-    ``picked[j]`` is the capture nearest clip frame ``j``'s centre (the later on a tie), -1
-    where none shows it. ``shown[k]`` is the clip frame capture ``k`` shows, negative in the
-    lead-in. ``frame0_ns`` is when clip frame 0 reached the card, on the capture clock.
+    ``picked[j]`` is the capture nearest clip frame ``j``'s centre on the line (the later on a tie),
+    -1 where none shows it; ``shown[k]`` is the clip frame capture ``k`` shows, negative in the lead-in.
+    ``faults`` are legible strips a frame off where a boundary may cross: what attribution can get wrong.
+    ``span`` is the first and last capture of the run ``line`` is fitted to.
     """
 
     picked: np.ndarray
     shown: np.ndarray
+    starts: np.ndarray
     per_frame: int
     lead: int
-    runs: tuple[Run, ...]
-    anchor: int
-    offset_ns: float
-    period_ns: float
+    line: frameline.Line
+    capture_ns: float
+    jitter_ns: float
     frame0_ns: float
+    runs: int
+    slips: int
+    uncertain: int
+    tied: int
     drops: int
     read: int
     agreed: int
+    ahead: int
+    faults: int
+    strays: int
+    rejected: int = 0
+    span: tuple[int, int] = (0, -1)
+    resolution: float = 0.0
 
     @property
-    def run(self) -> Run:
-        """The run clip frame 0 is shown in."""
-        k = int(self.picked[0]) if self.picked.size and self.picked[0] >= 0 else -1
-        return next((r for r in self.runs if r.first <= k <= r.last), self.runs[-1])
+    def period_ns(self) -> float:
+        """The frame period on the capture clock."""
+        return self.line.period
+
+    @property
+    def drift_ppm(self) -> float:
+        """How far the frame period runs from a whole number of capture periods, in parts per million."""
+        return (self.line.period / (self.per_frame * self.capture_ns) - 1.0) * 1e6
+
+    @property
+    def drift_range_ppm(self) -> tuple[float, float]:
+        """The least and greatest drift any line the brackets admit has."""
+        least, most = self.line.polygon.periods
+        unit = self.per_frame * self.capture_ns
+        return (least / unit - 1.0) * 1e6, (most / unit - 1.0) * 1e6
+
+    @property
+    def spread_ms(self) -> float:
+        """How far apart the lines the brackets admit put clip frame 0's start, in ms."""
+        lo, hi = self.line.polygon.at(np.array([self.lead]))
+        return float(hi[0] - lo[0]) / 1e6
+
+    @property
+    def behind(self) -> int:
+        """Legible strips showing an earlier frame than the line: the program showing past frames."""
+        return self.read - self.agreed - self.ahead
+
+    @property
+    def first_capture(self) -> int:
+        """The first capture showing clip frame 0."""
+        return int(np.flatnonzero(self.shown == 0)[0])
+
+    def record(self) -> dict:
+        """The frame line and how the take bears it out, JSON-ready."""
+        least, most = self.drift_range_ppm
+        return {
+            "drift_ppm": self.drift_ppm,
+            "drift_range_ppm": [least, most],
+            "period_ns": self.period_ns,
+            "capture_ns": self.capture_ns,
+            "residual_ms": self.line.residual / 1e6,
+            "jitter_ms": self.jitter_ns / 1e6,
+            "frame0_spread_ms": self.spread_ms,
+            "runs": self.runs,
+            "slips": self.slips,
+            "uncertain": self.uncertain,
+            "tied": self.tied,
+            "strips_read": self.read,
+            "strips_agree": self.agreed,
+            "strips_ahead": self.ahead,
+            "strips_behind": self.behind,
+            "faults": self.faults,
+            "strays": self.strays,
+            "rejected": self.rejected,
+        }
 
     @property
     def complete(self) -> bool:
         """Whether every clip frame has a capture."""
         return bool(self.picked.size) and bool(np.all(self.picked >= 0))
 
-    @property
-    def margin_ms(self) -> float:
-        """How far a frame start's timestamp may stray before it names the wrong frame: half a frame."""
-        return self.period_ns / 2e6
-
     def summary(self) -> str:
-        """One line: frames covered, runs, bridge margin, strip agreement and drops."""
+        """One line: frames covered, the line against the jitter, slips, boundary captures, strips, drops."""
         covered = int(np.count_nonzero(self.picked >= 0))
-        run = self.run
         return (
-            f"{covered}/{self.picked.size} clip frames attributed at {self.per_frame} captures a frame, "
-            f"{len(self.runs)} runs, clip in captures {run.first}..{run.last} (repeats on cadence "
-            f"{run.repeats:.1%}, timestamps agree {run.agree:.1%}, worst {run.worst_ms:.2f} of "
-            f"{self.margin_ms:.2f} ms), strips agree "
-            f"{self.agreed}/{self.read}, {self.drops} frames lost by the driver"
+            f"{covered}/{self.picked.size} clip frames attributed over {self.runs} runs; frame line "
+            f"{self.drift_ppm:+.1f} ppm ({self.drift_range_ppm[0]:+.1f}..{self.drift_range_ppm[1]:+.1f}) "
+            f"off {self.per_frame} captures a frame, residual "
+            f"{self.line.residual / 1e6:.3f} of {self.jitter_ns / 1e6:.3f} ms jitter, frame 0 within "
+            f"{self.spread_ms:.3f} ms; {self.slips} slips; {self.uncertain} captures on a boundary, "
+            f"{self.tied} tied; strips agree {self.agreed}/{self.read}, {self.ahead} ahead, "
+            f"{self.behind} behind, {self.faults} a boundary off, {self.rejected} lead strips off the line; "
+            f"{self.strays} byte changes off the line in the clip; {self.drops} frames lost by the driver"
         )
-
-
-def runs_of(t_ns: np.ndarray, sequence: np.ndarray) -> tuple[list[tuple[int, int]], float]:
-    """Gap-free runs of captures, and the capture period; a sequence gap or a long interval breaks one."""
-    dt = np.diff(t_ns.astype(np.float64))
-    if not dt.size:
-        return ([(0, t_ns.size - 1)] if t_ns.size else []), float("nan")
-    period = float(np.median(dt))
-    breaks = np.flatnonzero((dt > GAP_PERIODS * period) | (np.diff(sequence) != 1)) + 1
-    edges = np.r_[0, breaks, t_ns.size]
-    return [(int(a), int(b) - 1) for a, b in zip(edges[:-1], edges[1:])], period
 
 
 def displays(flips: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
@@ -130,76 +156,54 @@ def signed(codes: np.ndarray, bits: int) -> np.ndarray:
     return np.where(codes >= half, codes - (1 << bits), codes)
 
 
-def anchor_run(runs: list[tuple[int, int]], played: np.ndarray, per_frame: int) -> tuple[int, int]:
-    """The run with most strips on one cadence, and the slot its first capture shows."""
-    best = (-1, 0, 0)
-    for index, (first, last) in enumerate(runs):
-        ok = played[first : last + 1] >= 0
-        if not ok.any():
-            continue
-        q = np.arange(first, last + 1)[ok] - per_frame * played[first : last + 1][ok]
-        values, counts = np.unique(q, return_counts=True)
-        window = np.array([counts[(values >= v) & (values < v + per_frame)].sum() for v in values])
-        at = int(window.argmax())
-        if window[at] > best[2]:
-            best = (index, first - int(values[at]), int(window[at]))
-    if best[0] < 0:
-        raise LockError("no run of captures carries a legible strip, so nothing fixes the take's offset")
-    return best[0], best[1]
+def capture_times(t_ns: np.ndarray, sequence: np.ndarray, seg: np.ndarray, period: float) -> np.ndarray:
+    """Each capture's time on its run's capture line, its timestamp's jitter removed."""
+    t, s = np.asarray(t_ns, dtype=np.float64), np.asarray(sequence, dtype=np.float64)
+    counts = np.maximum(np.bincount(seg), 1)
+    return (np.bincount(seg, t - period * s) / counts)[seg] + period * s
 
 
-def repeat_phase(new: np.ndarray, per_frame: int) -> tuple[int | None, float]:
-    """The copy index a run's frames change at, and the fraction of changes there; None if none change."""
-    at = np.flatnonzero(new)
-    if not at.size:
-        return None, float("nan")
-    counts = np.bincount(at % per_frame, minlength=per_frame)
-    return int(counts.argmax()), float(counts.max()) / at.size
+def changes(digest: np.ndarray) -> np.ndarray:
+    """Captures whose bytes differ from the capture before's, outside any run of three such in a row.
 
-
-def anchor_offset(
-    t: np.ndarray, run: tuple[int, int], slot: int, per_frame: int, first_up: dict, phase: int | None
-) -> float:
-    """Capture time minus Pi flip time, for the frame starts of the anchoring run."""
-    first, last = run
-    if phase is not None and (phase + 1 + slot) % per_frame:
-        raise LockError(
-            f"the strips put frame starts at copy {(-slot) % per_frame} of the anchoring run, "
-            f"the card's repeats at copy {(phase + 1) % per_frame}"
-        )
-    n = np.arange(last - first + 1) + slot
-    starting = n % per_frame == 0
-    t_frame = np.array([first_up.get(int(p), np.nan) for p in n[starting] // per_frame])
-    x = t[first : last + 1][starting] - t_frame
-    if not np.isfinite(x).any():
-        raise LockError("the anchoring run shows no frame the Pi logged a flip for")
-    return float(np.nanmedian(x))
-
-
-def bridge(
-    span: tuple[int, int],
-    guess: np.ndarray,
-    error: np.ndarray,
-    new: np.ndarray,
-    per_frame: int,
-    period: float,
-) -> tuple[int, float, np.ndarray, np.ndarray]:
-    """A run's slot from its frame-starting captures' timestamps, the card's repeats saying which those are.
-
-    Returns the slot, the fraction of repeats on its cadence, and each frame start's slot
-    offset and timing error.
+    A frame lasting over one and a half captures cannot be captured once twice running, so a longer
+    run of changes is the card's picture settling, not frames starting.
     """
-    first, last = span
-    if per_frame < 2:
-        raise LockError("the card takes one capture a frame, so nothing bridges a gap in the captures")
-    phase, repeats = repeat_phase(new[first + 1 : last + 1], per_frame)
-    k = np.arange(first, last + 1)
-    starting = (k - first) % per_frame == ((phase + 1) % per_frame if phase is not None else 0)
-    rel = guess[first : last + 1][starting] - (k - first)[starting]
-    err = error[first : last + 1][starting]
-    live = np.abs(err) < period
-    values, counts = np.unique(rel[live] if live.any() else rel, return_counts=True)
-    return int(values[counts.argmax()]), repeats, rel, err
+    new = np.r_[False, digest[1:] != digest[:-1]]
+    edges = np.flatnonzero(np.diff(np.r_[0, new.astype(np.int8), 0]))
+    length = np.zeros(new.size + 1, dtype=np.int64)
+    np.add.at(length, edges[::2], edges[1::2] - edges[::2])
+    np.subtract.at(length, edges[1::2], edges[1::2] - edges[::2])
+    return new & (np.cumsum(length)[:-1] < 3)
+
+
+def anchors(played: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Strip-named frame starts, and each one's group: the run of starts on consecutive frames it is in.
+
+    A program showing past frames' strips makes a group of its own, which the frame line then refuses.
+    """
+    k = np.arange(1, played.size)
+    k = k[(seg[k] == seg[k - 1]) & (played[k - 1] >= 0) & (played[k - 1] == played[k] - 1)]
+    out, group = np.full(played.size, -1, dtype=np.int64), np.full(played.size, -1, dtype=np.int64)
+    out[k] = played[k]
+    group[k] = np.cumsum(np.r_[True, (np.diff(played[k]) != 1) | (np.diff(seg[k]) != 0)])
+    return out, group
+
+
+def run_line(
+    lo: np.ndarray,
+    hi: np.ndarray,
+    named: np.ndarray,
+    jitter: float,
+    period: tuple[float, float] | None,
+    group: np.ndarray | None = None,
+    resolution: float = 0.0,
+) -> frameline.Line:
+    """A run's frame line; strips missing every line past the capture jitter are a :class:`LockError`."""
+    try:
+        return frameline.fit(lo, hi, named, jitter, period=period, group=group, resolution=resolution)
+    except frameline.LineError as err:
+        raise LockError(str(err)) from err
 
 
 def attribute(
@@ -210,65 +214,225 @@ def attribute(
     hold: int,
     lead: int,
     count: int,
+    tail: int = 0,
     bits: int = 16,
 ) -> Attribution:
     """Attribute every capture of a take to the clip frame it shows.
 
-    ``codes`` are the captures' strip codes, ``frames`` their V4L2 records and ``flips`` the
-    Pi's flip log; the clip played ``lead`` lead-in frames then ``count`` clip frames.
+    ``codes`` are the captures' strip codes, ``frames`` their V4L2 records and ``flips`` the Pi's
+    flip log; the clip played ``lead`` lead-in frames, ``count`` clip frames and ``tail`` lead-out.
     """
-    t = frames["t_ns"].astype(np.float64)
-    runs, capture_ns = runs_of(frames["t_ns"], frames["sequence"])
+    seg = frameline.segments(frames["t_ns"], frames["sequence"])
+    resolution = float(np.gcd.reduce(frames["t_ns"])) if frames.size else 0.0
+    capture, jitter = frameline.capture_line(frames["t_ns"], frames["sequence"], seg)
+    tau = capture_times(frames["t_ns"], frames["sequence"], seg, capture)
     starts, up, _, vblank = displays(flips)
-    period = hold * vblank
-    per_frame = max(1, int(round(period / capture_ns)))
+    shown_at = np.full(int(up.max()) + 1 if up.size else 0, np.nan)
+    shown_at[up[::-1]] = starts[::-1]
     clip = signed(np.asarray(codes, dtype=np.int64), bits)
-    played = np.where((codes >= 0) & (clip >= -lead) & (clip < count), clip + lead, -1)
-    led = np.where(clip < 0, played, -1)
-    anchor, slot0 = anchor_run(runs, led if (led >= 0).any() else played, per_frame)
-    new = np.r_[False, frames["digest"][1:] != frames["digest"][:-1]]
-    first_up = {int(f): s for f, s in zip(up[::-1], starts[::-1])}
-    a_first, a_last = runs[anchor]
-    phase, a_repeats = repeat_phase(new[a_first + 1 : a_last + 1], per_frame)
-    offset = anchor_offset(t, runs[anchor], slot0, per_frame, first_up, phase)
-    tau = t - offset
-    right = np.clip(np.searchsorted(starts, tau), 1, starts.size - 1)
-    nearest = np.where(np.abs(tau - starts[right - 1]) <= np.abs(starts[right] - tau), right - 1, right)
-    error, guess = tau - starts[nearest], per_frame * up[nearest]
-    error[(tau < starts[0] - period / 2) | (tau > starts[-1] + period / 2)] = np.inf
-    out_runs, shown = [], np.empty(t.size, dtype=np.int64)
-    for index, (first, last) in enumerate(runs):
-        if index == anchor:
-            slot, repeats, agree, worst = slot0, a_repeats, 1.0, 0.0
-        else:
-            slot, repeats, rel, err = bridge((first, last), guess, error, new, per_frame, period)
-            live = np.abs(err) < period
-            same = live & (rel == slot)
-            agree = float(same.sum()) / max(1, int(live.sum()))
-            worst = float(np.abs(err[same]).max()) / 1e6 if same.any() else 0.0
-        out_runs.append(Run(first, last, slot, repeats, agree, worst))
-        shown[first : last + 1] = (slot + np.arange(last - first + 1)) // per_frame - lead
-    picked = np.full(count, -1, dtype=np.int64)
-    j = np.arange(count)
-    for run in out_runs:
-        k = run.first + per_frame * (j + lead) + per_frame // 2 - run.slot
-        inside = (k >= run.first) & (k <= run.last)
-        picked[inside] = k[inside]
-    readable = played >= 0
+    legible = (codes >= 0) & (clip >= -lead) & (clip < count + tail)
+    played = np.where(legible, clip + lead, -1)
+    dry = np.where((clip < 0) | (clip >= count), played, -1)
+    named, group = anchors(dry, seg)
+    digest = frames["digest"]
+    k = np.flatnonzero(np.r_[False, seg[1:] == seg[:-1]] & (changes(digest) | (named >= 0)))
+    runs = np.unique(seg)
+    lines = _lines(tau, k, seg, (named, group), (jitter, resolution), (shown_at, hold * vblank))
+    main_run = max(lines, key=lambda s: int(np.count_nonzero(seg == s)))
+    main, mine = lines[main_run], np.flatnonzero(seg == main_run)
+    shown = np.full(tau.size, -1 - lead, dtype=np.int64)
+    uncertain = np.zeros(tau.size, dtype=bool)
+    tied = 0
+    for s, line in lines.items():
+        at = np.flatnonzero(seg == s)
+        n, on, ties = _frames(line, tau[at], digest[at], resolution)
+        shown[at], uncertain[at] = n - lead, on
+        tied += ties
+    starts = np.r_[True, (shown[1:] != shown[:-1]) | (seg[1:] != seg[:-1])]
+    per_frame = max(1, int(round(main.period / capture)))
+    picked = _pick(shown, tau, seg, lines, lead, count, resolution)
+    diff = np.where(legible, clip - shown, 0)
+    stray = np.concatenate([k[seg[k] == s][line.strays] for s, line in lines.items()]).astype(np.int64)
     return Attribution(
         picked=picked,
         shown=shown,
+        starts=starts,
         per_frame=per_frame,
         lead=lead,
-        runs=tuple(out_runs),
-        anchor=anchor,
-        offset_ns=offset,
-        period_ns=period,
-        frame0_ns=float(first_up.get(lead, np.nan) + offset),
+        line=main,
+        capture_ns=capture,
+        jitter_ns=jitter,
+        frame0_ns=float(main.origin + lead * main.period),
+        runs=int(runs.size),
+        slips=_slips(lines, tau, seg, per_frame),
+        uncertain=int(uncertain.sum()),
+        tied=int(tied),
         drops=int(np.clip(np.diff(frames["sequence"]) - 1, 0, None).sum()),
-        read=int(readable.sum()),
-        agreed=int(np.count_nonzero(readable & (shown == clip))),
+        read=int(legible.sum()),
+        agreed=int(np.count_nonzero(legible & (diff == 0))),
+        ahead=int(np.count_nonzero(diff > 0)),
+        faults=int(np.count_nonzero(uncertain & (np.abs(diff) == 1))),
+        strays=int(np.count_nonzero((shown[stray] >= 0) & (shown[stray] < count))),
+        rejected=int(sum(line.rejected for line in lines.values())),
+        span=(int(mine[0]), int(mine[-1])),
+        resolution=resolution,
     )
+
+
+def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, error: tuple, pi: tuple) -> dict:
+    """Each run's frame line through its starts ``k``, within ``error``: the capture jitter and resolution.
+
+    ``pi`` is ``(shown_at, period)``: when the Pi first showed each frame, and its frame period.
+
+    The run with most strip-named frames fixes the period an outage leaves alone and the lag from the
+    Pi showing a frame to its start; another run keeps its strips only if their largest group spans two
+    frames and keeps that lag too, and is otherwise numbered by the lag.
+    """
+    named, group = anchored
+    jitter, resolution = error
+    shown_at, pi_period = pi
+    runs = [int(s) for s in np.unique(seg[k])]
+    own = {s: named[k[seg[k] == s]] for s in runs}
+
+    def spans(s: int) -> bool:
+        mine = k[seg[k] == s]
+        ok = named[mine] >= 0
+        if not ok.any():
+            return False
+        ids, sizes = np.unique(group[mine][ok], return_counts=True)
+        largest = ok & (group[mine] == ids[np.argmax(sizes)])
+        return np.unique(named[mine][largest]).size > 1
+
+    fixed = sorted((s for s in runs if spans(s)), key=lambda s: -int((own[s] >= 0).sum()))
+    if not fixed:
+        raise LockError(
+            "no run of captures carries two legible strip-coded frames, so nothing fixes the line"
+        )
+
+    def fitted(s: int, period: tuple[float, float] | None) -> frameline.Line:
+        mine = k[seg[k] == s]
+        return run_line(tau[mine - 1], tau[mine], own[s], jitter, period, group[mine], resolution)
+
+    lines = {s: fitted(s, None) for s in fixed}
+    period = lines[fixed[0]].polygon.periods
+    for s in runs:
+        if s not in lines:
+            own[s] = np.full_like(own[s], -1)
+            lines[s] = fitted(s, period)
+    rate = min(lines.values(), key=lambda line: np.ptp(line.polygon.periods)).period / pi_period
+    lag = _lag(lines[fixed[0]], shown_at, rate)
+    for s in fixed[1:]:
+        mine = _lag(lines[s], shown_at, rate)
+        if max(lag[0], mine[0]) <= min(lag[1], mine[1]):
+            lag = (max(lag[0], mine[0]), min(lag[1], mine[1]))
+            continue
+        LOG.warning(
+            "captures in run %d carry strips off the Pi lag of the rest; counting its frames instead", s
+        )
+        own[s] = np.full_like(own[s], -1)
+        lines[s] = fitted(s, period)
+    for s in runs:
+        if not (own[s] >= 0).any():
+            lines[s] = _bridge(lines[s], lag, rate, shown_at)
+    return lines
+
+
+def _lag(line: frameline.Line, shown_at: np.ndarray, rate: float) -> tuple[float, float]:
+    """The lag from the Pi showing a frame to its start that a line admits over its frames.
+
+    ``rate`` turns the Pi's clock into the capture clock.
+    """
+    up = np.flatnonzero(np.isfinite(shown_at))
+    n = up[(up >= line.frame[line.frame >= 0].min()) & (up <= line.frame.max())]
+    least, most = line.polygon.at(n)
+    return float(np.max(least - rate * shown_at[n], initial=-np.inf)), float(
+        np.min(most - rate * shown_at[n], initial=np.inf)
+    )
+
+
+def _bridge(
+    line: frameline.Line, lag: tuple[float, float], rate: float, shown_at: np.ndarray
+) -> frameline.Line:
+    """A run with no strip, counted from 0, renumbered by the one shift whose Pi lag meets ``lag``."""
+    lo, hi = lag
+    ok = line.frame >= 0
+    span = np.arange(line.frame[ok].min(), line.frame[ok].max() + 1)
+    least, most = line.polygon.at(span)
+    up = np.flatnonzero(np.isfinite(shown_at))
+    centre = int(up[np.argmin(np.abs(rate * shown_at[up] + 0.5 * (lo + hi) - 0.5 * (least[0] + most[0])))])
+    shifts = []
+    for shift in range(centre - int(span[0]) - 1, centre - int(span[0]) + 2):
+        n = span + shift
+        inside = (n >= 0) & (n < shown_at.size)
+        inside[inside] = np.isfinite(shown_at[n[inside]])
+        p = rate * shown_at[n[inside]]
+        if inside.any() and np.max(least[inside] - p) <= hi and np.min(most[inside] - p) > lo:
+            shifts.append(shift)
+    if len(shifts) != 1:
+        raise LockError(f"the Pi's flip log numbers a run with no strip {len(shifts)} ways across its outage")
+    shift = shifts[0]
+    return frameline.Line(
+        origin=line.origin - shift * line.period,
+        period=line.period,
+        slack=line.slack,
+        residual=line.residual,
+        frame=np.where(ok, line.frame + shift, line.frame),
+        polygon=frameline.Polygon(line.polygon.ref + shift, line.polygon.vertices),
+        tied=line.tied,
+    )
+
+
+def _frames(
+    line: frameline.Line, tau: np.ndarray, digest: np.ndarray, resolution: float
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Each capture's frame: the side of its nearest boundary every admitted line puts it, else its bytes'.
+
+    The admitted range is widened by the line's slack, and a capture within the timestamps' ``resolution``
+    of it is on its side. Bytes equal to the capture before's are its frame, to the next's the next;
+    equal to both or neither, any choice measures alike and the line's stands, counted in the count returned.
+    """
+    b = np.rint((tau - line.origin) / line.period).astype(np.int64)
+    lo, hi = line.polygon.at(b)
+    new = hi + line.slack <= tau + resolution
+    old = lo - line.slack >= tau - resolution
+    on = ~(new | old)
+    same_before = np.r_[False, digest[1:] == digest[:-1]]
+    same_after = np.r_[digest[:-1] == digest[1:], False]
+    sure = on & (same_before != same_after)
+    n = np.where(
+        new | (sure & same_after), b, np.where(old | (sure & same_before), b - 1, line.frame_of(tau))
+    )
+    return n, on, int(np.count_nonzero(on & ~sure))
+
+
+def _pick(
+    shown: np.ndarray, tau: np.ndarray, seg: np.ndarray, lines: dict, lead: int, count: int, resolution: float
+) -> np.ndarray:
+    """Per clip frame, the capture showing it nearest its centre on its run's line.
+
+    The later wins a tie within the timestamps' ``resolution``.
+    """
+    picked = np.full(count, -1, dtype=np.int64)
+    k = np.flatnonzero((shown >= 0) & (shown < count) & np.isin(seg, list(lines)))
+    if not k.size:
+        return picked
+    origin = np.array([lines[int(s)].origin for s in seg[k]])
+    period = np.array([lines[int(s)].period for s in seg[k]])
+    away = np.abs(tau[k] - (origin + (shown[k] + lead + 0.5) * period))
+    away = np.floor(away / resolution) if resolution > 0 else away
+    best = k[np.lexsort((-k, away, shown[k]))]
+    first = np.r_[True, shown[best][1:] != shown[best][:-1]]
+    picked[shown[best][first]] = best[first]
+    return picked
+
+
+def _slips(lines: dict, tau: np.ndarray, seg: np.ndarray, per_frame: int) -> int:
+    """Frames a run's line captures other than ``per_frame`` times, its end frames aside: the card's slips."""
+    total = 0
+    for s, line in lines.items():
+        _, counts = np.unique(line.frame_of(tau[seg == s]), return_counts=True)
+        total += int(np.count_nonzero(counts[1:-1] != per_frame))
+    return total
 
 
 def lock_path(take: str | Path) -> Path:
@@ -281,9 +445,11 @@ def picked_path(take: str | Path) -> Path:
     return Path(f"{take}.picked.npy")
 
 
-def save_lock(take: str | Path, flips: np.ndarray, *, hold: int, lead: int, count: int) -> None:
+def save_lock(
+    take: str | Path, flips: np.ndarray, *, hold: int, lead: int, count: int, tail: int = 0
+) -> None:
     """Keep what attribution needs from the Pi next to the take."""
-    np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count)
+    np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count, tail=tail)
 
 
 def attribute_take(
@@ -296,8 +462,8 @@ def attribute_take(
     """The take's :class:`~syncsummoner.compose.lock.Attribution`, checked exact; ``picked`` saved beside it.
 
     Strips read as ``codes``, else as the take's :class:`~syncsummoner.probe.decoded.Features` hold them.
-    Every clip frame must have a capture, inside one gap-free run whose frame starts all agree on
-    its cadence; anything less is a :class:`~syncsummoner.compose.lock.LockError`.
+    Every clip frame must have a capture, and no strip at a boundary capture nor byte change in the
+    clip may contradict the line; anything less is a :class:`~syncsummoner.compose.lock.LockError`.
     """
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
@@ -318,13 +484,14 @@ def attribute_take(
         hold=int(record["hold"]),
         lead=int(record["lead"]),
         count=int(record["count"]),
+        tail=int(record["tail"]) if "tail" in record else 0,
         bits=config.bits,
     )
     LOG.info("%s: %s", take, found.summary())
     if not found.complete:
         raise LockError(f"{take}: {found.summary()}")
-    if found.run.agree < 1.0:
-        raise LockError(f"{take}: the clip's frame starts disagree on its cadence: {found.run}")
+    if found.faults or found.strays:
+        raise LockError(f"{take}: the strips or bytes contradict the frame line: {found.summary()}")
     np.save(picked_path(take), found.picked)
     return found
 
@@ -379,5 +546,4 @@ def live_attribution(
 def take_start(take: str | Path, *, config: Any) -> float:
     """Seconds into a take at which clip frame 0's first capture lands, from its attribution."""
     found = attribute_take(take, config=config)
-    rate = found.per_frame * config.fps
-    return float(found.picked[0] - found.per_frame // 2) / rate
+    return float(found.first_capture) / (found.per_frame * config.fps)

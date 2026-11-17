@@ -18,6 +18,7 @@ from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device import wire as W
 from syncsummoner.device.wire import SEND, Echoes, Poller, Sender
 from syncsummoner.probe import decoded
+from tests.compose import locked
 
 FPS = 30.0
 P = 1e9 / FPS
@@ -150,17 +151,6 @@ def test_the_boot_count_is_read_from_its_setting():
     assert LT.boot_count(shell) == 7 and asked == [LT.BOOT_COUNT_KEY]
 
 
-def run_of(first, last, slot=0):
-    """A gap-free run."""
-    return L.Run(first=first, last=last, slot=slot, repeats=1.0, agree=1.0, worst_ms=0.0)
-
-
-def test_frame_starts_follow_each_runs_cadence():
-    """Each run's captures counted from its own slot; captures past the size are ignored."""
-    starts = LT.frame_starts(9, [run_of(0, 3, slot=1), run_of(5, 12, slot=0)], 2)
-    assert starts.tolist() == [False, True, False, True, False, True, False, True, False]
-
-
 def ticks_for(width=2e6):
     """A tick bracket around the simulated device's true phase."""
     return ev.Ticks(lo=TAU - width / 2, hi=TAU + width / 2, period=P, count=4)
@@ -172,8 +162,8 @@ def lat_for(width=2e6, samples=4):
 
 
 def times_for(lead=10, period=P):
-    """Frame times with no measured starts: the line through ``T0 + lead * P``."""
-    return ev.FrameTimes(ns=np.full(1, np.nan), lead=lead, origin=T0 + lead * P, period=period)
+    """Frame times on the line through ``T0 + lead * P``."""
+    return ev.FrameTimes(lead=lead, origin=T0 + lead * P, period=period)
 
 
 @pytest.mark.parametrize("target", [-7, 0, 1, 13])
@@ -191,59 +181,122 @@ def test_a_clock_sends_each_write_midway_between_ticks_so_late_wakes_still_land(
         assert clear[0] == pytest.approx((P - ticks.width) / 2 - late, abs=1.0)
 
 
-def test_extending_the_clock_refits_the_period_from_the_growing_frame_log():
-    """Captures past the run's end refit the line; a sequence break cuts what is used."""
-    lead, size = 10, 400
-    k = np.arange(size)
-    t = (T0 + k * P / 2).astype(np.int64)
-    t[300:] += 10**12
-    sequence = np.r_[k[:300], k[300:] + 5]
-    clock = LT.Clock(times=times_for(lead, period=1.01 * P), lat=lat_for(), run=run_of(0, 99))
-    clock.extend(t, sequence)
-    assert clock.times.period == pytest.approx(P, rel=1e-9)
-    assert clock.ticks.period == clock.times.period
-    assert clock.times.origin == pytest.approx(T0 + lead * P, abs=1.0)
-    assert clock.ticks == ev.grid(clock.times, lat_for())
-
-
-def test_extending_a_clock_with_no_run_changes_nothing():
-    """No anchored run, no refit."""
+def test_a_clock_with_no_line_is_not_extended():
+    """Frame times given outright stay as given."""
     clock = LT.Clock(times=times_for(period=1.01 * P), lat=lat_for())
-    clock.extend(np.arange(10), np.arange(10))
-    assert clock.times.period == 1.01 * P
+    clock.extend(np.zeros(10, FRAME))
+    assert clock.times == times_for(period=1.01 * P)
 
 
-def latency_of(delta):
-    """A dry take's measured latency band."""
-    return ev.Latency(lo=delta - 1e5, hi=delta + 1e5, samples=3, period=P)
+@pytest.mark.parametrize("ppm", [-70.0, 60.0])
+def test_the_live_clock_keeps_sends_mid_tick_through_a_drift_and_a_slip(ppm):
+    """Attributed on the lead-in, carried on as the log grows; every logged frame's send lands on it.
+
+    Rate-locked cadence counting, extrapolated from the lead-in, lands writes on the wrong frame.
+    """
+    lead, count = 1200, 10500
+    played = locked.take(
+        ((0, 2 * (lead + count) + 99, 0.0),), ppm=ppm, jitter_ns=500_000, lead=lead, count=count, hold=1
+    )
+    capture = locked.VBLANK_NS / 2
+    period = 2 * capture * (1 + ppm * 1e-6)
+    origin = locked.PI_T0 + locked.CARD_NS - 0.5 * capture
+
+    def true(j):
+        return origin + (j + lead) * period
+
+    m = int(np.flatnonzero(played.frame == lead)[0])
+    starts = np.flatnonzero(np.diff(played.frame[m:]) > 0) + 1
+    assert np.unique((starts - 2 * played.frame[m:][starts]) % 2).size == 2
+    found = L.attribute(played.codes[:m], played.frames[:m], played.flips, hold=1, lead=lead, count=count)
+    delta = 2.3 * period
+    lat = ev.Latency(lo=delta - 1e5, hi=delta + 1e5, samples=3, period=period)
+    clock = LT.Clock.of(found, lat)
+    assert (clock.first, clock.seen) == (0, m)
+    cadence = true(0) + np.arange(-lead, count) * 2 * found.capture_ns
+    for size in np.linspace(m, played.frames.size, 7).astype(np.int64):
+        clock.extend(played.frames[:size])
+        j = np.arange(-lead, count)
+        j = j[true(j) < played.frames["t_ns"][size - 1]]
+        when = ev.send_time(j, clock.ticks, clock.times, lat.delta)
+        assert clock.when(int(j[-1])) == int(when[-1])
+        gap = true(j) - delta - when
+        assert np.array_equal(np.ceil((when + delta - true(0)) / period), j)
+        assert np.minimum(gap, period - gap).min() > (lat.hi - lat.lo) / 2 + 500_000
+    assert clock.seen == played.frames.size - 2
+    old = cadence - delta - period / 2
+    assert not np.array_equal(np.ceil((old + delta - true(0)) / period), np.arange(-lead, count))
 
 
-def test_measured_latencies_accumulate_and_widen_to_half_a_frame_around_their_extremes(tmp_path):
-    """Each dry take adds one; the band spans them all, padded evenly to half a frame; none is an error."""
+def latency_of(delta, line=(0.0, 0.0)):
+    """A dry take's measured latency band, its frame starts ``line`` off its line."""
+    return ev.Latency(lo=delta - 1e5, hi=delta + 1e5, samples=3, period=P, line_lo=line[0], line_hi=line[1])
+
+
+def test_dry_takes_bound_the_latency_where_every_one_admits_it(tmp_path):
+    """Each take's band widened by its line's error; the band read is where they all meet."""
     with pytest.raises(LT.NoLatencyError, match="bypass"):
         LT.read_latency(tmp_path)
-    LT.write_latency(tmp_path, latency_of(DELTA), "Teletext")
+    LT.write_latency(tmp_path, latency_of(DELTA, (-2e6, 1e6)), "Teletext")
     one = LT.read_latency(tmp_path)
-    assert one.delta == pytest.approx(DELTA) and one.hi - one.lo == pytest.approx(P / 2)
-    assert one.samples == 0 and one.period == P
-    LT.write_latency(tmp_path, latency_of(DELTA + 0.2 * P), "Other")
-    LT.write_latency(tmp_path, latency_of(DELTA + 0.1 * P), "Third")
-    three = LT.read_latency(tmp_path)
-    assert three.delta == pytest.approx(DELTA + 0.1 * P) and three.hi - three.lo == pytest.approx(P / 2)
-    assert three.lo < DELTA - 1e5 and three.hi > DELTA + 0.2 * P + 1e5
+    assert (one.lo, one.hi, one.samples, one.period) == (DELTA - 2.1e6, DELTA + 1.1e6, 0, P)
+    LT.write_latency(tmp_path, latency_of(DELTA + 5e5, (-1e6, 3e6)), "Other")
+    both = LT.read_latency(tmp_path)
+    assert (both.lo, both.hi) == (DELTA - 6e5, DELTA + 1.1e6)
     said = json.loads((tmp_path / LT.LATENCY_FILE).read_text())["takes"]
-    assert [t["program"] for t in said] == ["Teletext", "Other", "Third"]
-    assert said[0]["frames"] == pytest.approx(1.7) and said[0]["lo"] == DELTA - 1e5
+    assert [(t["program"], t["basis"]) for t in said] == [("Teletext", ev.BASIS), ("Other", ev.BASIS)]
+    assert said[0]["frames"] == pytest.approx(1.7) and said[0]["line_lo"] == -2e6
 
 
-def test_dry_takes_half_a_frame_apart_contradict_one_card_phase(tmp_path):
-    """No single delay is within half a frame of both."""
-    LT.write_latency(tmp_path, latency_of(DELTA), "Teletext")
-    LT.write_latency(tmp_path, latency_of(DELTA + 0.5 * P - 3e5), "Other")
-    assert LT.read_latency(tmp_path).hi - LT.read_latency(tmp_path).lo == pytest.approx(P / 2)
-    LT.write_latency(tmp_path, latency_of(DELTA + 0.5 * P - 1e5), "Third")
-    with pytest.raises(LT.LeadInTimeError, match="half a frame"):
+def test_a_programs_latency_is_replaced_and_takes_measured_otherwise_ignored(tmp_path):
+    """One entry a program and basis, the latest; entries with no start basis bound nothing."""
+    old = {"program": "Teletext", "lo": 0.0, "hi": 1.0, "period": P}
+    (tmp_path / LT.LATENCY_FILE).write_text(json.dumps({"takes": [old]}))
+    with pytest.raises(LT.NoLatencyError, match="start-basis"):
         LT.read_latency(tmp_path)
+    LT.write_latency(tmp_path, latency_of(DELTA), "Teletext")
+    LT.write_latency(tmp_path, latency_of(DELTA + 3e5), "Teletext")
+    said = json.loads((tmp_path / LT.LATENCY_FILE).read_text())["takes"]
+    assert said[0] == old and len(said) == 2 and said[1]["lo"] == DELTA + 2e5
+    assert LT.read_latency(tmp_path).delta == pytest.approx(DELTA + 3e5)
+
+
+@pytest.mark.parametrize(
+    "second, said",
+    [((DELTA + 3e5,), "empty"), ((DELTA, (-0.3 * P, 0.3 * P)), "half a frame")],
+    ids=["disjoint", "wide"],
+)
+def test_dry_takes_that_cannot_name_a_landing_frame_are_refused(tmp_path, second, said):
+    """Bands that do not meet, or one half a frame wide, say nothing of which frame a write lands on."""
+    LT.write_latency(tmp_path, latency_of(*second), "Other")
+    if said == "empty":
+        LT.write_latency(tmp_path, latency_of(DELTA), "Teletext")
+    with pytest.raises(LT.LeadInTimeError, match=said):
+        LT.read_latency(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "live, kept, want",
+    [
+        ({"lo": 1.0, "hi": 3.0, "basis": ev.BASIS}, None, (1.0, 3.0)),
+        ({"lo": 1.0, "hi": 3.0}, None, "no CC-to-picture latency"),
+        ({"lo": 1.0, "hi": 3.0}, latency_of(DELTA, (-1e5, 1e5)), (DELTA - 2e5, DELTA + 2e5)),
+        ({}, latency_of(DELTA, (-0.3 * P, 0.3 * P)), "half a frame"),
+    ],
+    ids=["live", "unmeasured", "on-file", "too-wide"],
+)
+def test_a_take_without_a_dry_control_lands_its_writes_by_a_start_basis_band(tmp_path, live, kept, want):
+    """The band it was sent by when measured to frame starts, else what the dry takes on file admit."""
+    if kept is not None:
+        LT.write_latency(tmp_path, kept, "Other")
+    wire = {"sends": np.zeros(0, SEND), "latency": np.array(json.dumps(live)), "dry": np.array("null")}
+    seen = (None, None, None, times_for())
+    if isinstance(want, str):
+        with pytest.raises(ev.EvidenceError, match=want):
+            LT.take_latency(tmp_path / "t.mkv", wire, seen, None)
+    else:
+        lat = LT.take_latency(tmp_path / "t.mkv", wire, seen, None)
+        assert (lat.lo, lat.hi, lat.period) == (*want, P)
 
 
 class Recorded:
@@ -267,11 +320,13 @@ def test_calibration_toggles_the_dry_control_at_random_intervals_ending_dry(monk
     assert len(slept) == 6 and all(0.2 <= s <= 0.3 for s in slept) and len(set(slept)) == 6
 
 
-def test_a_takes_rows_return_the_dry_control_to_its_take_value_before_the_plan():
-    """Dry takes lead with the wet write at ``wet_frame``; others are the plan alone."""
+def test_a_takes_rows_wet_the_dry_control_for_the_plan_and_dry_it_for_the_lead_out():
+    """Dry takes go wet at ``wet_frame`` and back dry at ``dry_frame``; others are the plan alone."""
     plan = np.array([(0, 3, 5), (4, 1, 9)], dtype=LT.PLAN)
     rows = LT.plan_rows(plan, {1: PARAM_MAX}, {1: 40, 3: 5}, wet_frame=-15)
     assert rows.tolist() == [(-15, 1, 40), (0, 3, 5), (4, 1, 9)]
+    rows = LT.plan_rows(plan, {1: PARAM_MAX}, {1: 40}, wet_frame=-15, dry_frame=30)
+    assert rows.tolist() == [(-15, 1, 40), (0, 3, 5), (4, 1, 9), (30, 1, PARAM_MAX)]
     assert LT.plan_rows(plan, {12: 0}, {}, wet_frame=-3)[0].tolist() == (-3, 12, 0)
     assert LT.plan_rows(plan, None, {1: 40}, wet_frame=-15) is plan
 
@@ -331,11 +386,12 @@ def test_a_takes_evidence_sits_beside_it():
 class Sim:
     """A device latching CCs on its own frame tick, a card capturing it, and a clock only sleeps advance.
 
-    Played frame ``f`` reaches the card at ``T0 + f * P`` in two captures and shows the state
-    latched at tick ``f - 2``; a write latches on the first tick at or after it is sent.
+    Played frame ``f`` starts at ``T0 + f * P``, is captured a quarter frame either side of
+    ``T0 + (f + 0.5) * P`` and shows the state latched at tick ``f - 2``; a write latches on the
+    first tick at or after it is sent.
     """
 
-    def __init__(self, *, lead, count, tail=10, drop=None):
+    def __init__(self, *, lead, count, tail=20, drop=None):
         self.now, self.lead, self.count = S0, lead, count
         self.size = 2 * (lead + count + tail)
         self.writes = []
@@ -347,7 +403,10 @@ class Sim:
         self.base[:lead] = 30 + rng.uniform(0, 2, (lead, 3, SIDE, SIDE))
         self.frames = np.zeros(self.size, FRAME)
         self.frames["sequence"] = np.arange(self.size)
-        self.frames["t_ns"] = np.rint(T0 + np.arange(self.size) * P / 2)
+        self.frames["t_ns"] = np.rint(T0 + (np.arange(self.size) + 0.5) * P / 2)
+        self.frames["digest"] = np.arange(self.size) // 2 + 1
+        self.codes = (np.arange(self.size) // 2 - lead) & locked.WRAP
+        self.flips = locked.flip_log(lead + count + tail, 2)
 
     def clock(self):
         """Simulated ``CLOCK_MONOTONIC``."""
@@ -385,23 +444,10 @@ class Sim:
         return np.rint([self.picture(k) for k in range(size)]).astype(np.uint8)
 
     def attribution(self, size=None):
-        """The exact attribution of the first ``size`` captures."""
+        """The attribution of the first ``size`` captures from their strips and bytes."""
         size = self.stored() if size is None else size
-        picked = 2 * (np.arange(self.count) + self.lead) + 1
-        return L.Attribution(
-            picked=np.where(picked < size, picked, -1),
-            shown=np.arange(size) // 2 - self.lead,
-            per_frame=2,
-            lead=self.lead,
-            runs=(run_of(0, size - 1),),
-            anchor=0,
-            offset_ns=0.0,
-            period_ns=P,
-            frame0_ns=T0 + self.lead * P,
-            drops=0,
-            read=size,
-            agreed=size,
-        )
+        frames = self.frames[:size]
+        return L.attribute(self.codes[:size], frames, self.flips, hold=2, lead=self.lead, count=self.count)
 
     def poll_next(self):
         """Advance to the next poll and run it: what a sender waiting on its echo sees."""
@@ -603,8 +649,16 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert [name for name, _ in loads] == ["Teletext"]
     band = json.loads(str(np.load(tmp_path / "take.mkv.wire.npz")["latency"]))
     assert band["lo"] <= DELTA <= band["hi"]
-    assert LT.read_latency(tmp_path).delta == pytest.approx(record.delta)
-    assert record.plan[0].tolist() == (-15, 1, 0)
+    (kept,) = json.loads((tmp_path / LT.LATENCY_FILE).read_text())["takes"]
+    assert kept["program"] == "Teletext" and kept["lo"] <= DELTA <= kept["hi"]
+    assert kept["line_lo"] == pytest.approx(-P / 4, abs=2.0) and kept["line_hi"] == pytest.approx(
+        P / 4, abs=2.0
+    )
+    with pytest.raises(LT.LeadInTimeError, match="half a frame"):
+        LT.read_latency(tmp_path)
+    assert record.plan[0].tolist() == (-15, 1, 0) and record.plan[-1].tolist() == (30, 1, PARAM_MAX)
+    lock = np.load(tmp_path / "take.mkv.lock.npz")
+    assert (int(lock["lead"]), int(lock["count"]), int(lock["tail"])) == (120, 30, 120)
     calibration = record.sends[record.sends["target"] == ev.CALIBRATION]
     assert calibration["value"].tolist() == [0, PARAM_MAX] * 3
     assert (tmp_path / "take.mkv.wire.npz").is_file() and (tmp_path / "take.mkv.lock.npz").is_file()
@@ -614,7 +668,7 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert proof.ok, proof.lines()
     assert proof.landed.ok and proof.applied.ok and proof.received.ok and proof.loaded["ok"]
     assert proof.latency["lo"] <= DELTA <= proof.latency["hi"]
-    assert len(proof.landed.rows) == np.count_nonzero(PLAN_ROWS["target"] > 0) + 1
+    assert len(proof.landed.rows) == np.count_nonzero(PLAN_ROWS["target"] > 0) + 2
     assert 0 not in record.plan["target"].tolist()
     assert proof.received.sent == 2 * record.sends.size
     assert {m.param for m in proof.moved} == {3, 4, 5}
@@ -686,11 +740,12 @@ def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch
     _, _, record, proof, loads = take_and_prove(
         monkeypatch, simulate, tmp_path, dry=None, working={3: 1.0, 4: 100}
     )
-    assert [name for name, _ in loads] == ["Teletext", "Passthru", "Teletext"]
+    assert [name for name, _ in loads] == ["Teletext", "Passthru", "Teletext", "Passthru"]
+    assert loads[-1][1] >= T0 + (120 + 30) * P
     assert record.dry is None and record.delta == pytest.approx(DELTA)
     assert not (record.sends["target"] == ev.CALIBRATION).any()
     assert proof.ok, proof.lines()
-    assert proof.latency["samples"] == 0 and proof.latency["hi"] - proof.latency["lo"] == pytest.approx(P / 2)
+    assert proof.latency["samples"] == 0 and (proof.latency["lo"], proof.latency["hi"]) == (DELTA, DELTA)
 
 
 def test_a_reboot_during_the_take_is_an_error_after_its_record_is_kept(monkeypatch, simulate, tmp_path):
@@ -737,6 +792,8 @@ def test_measured_latency_comes_from_where_each_toggle_showed(simulate):
     sim.now = int(T0 + 1.9e9)
     found, images = sim.attribution(), sim.images()
     frames = sim.frames[: sim.stored()]
-    times = ev.frame_times(frames["t_ns"], found.shown, found.runs, 2, sim.lead)
+    times = ev.frame_times(found)
     got = LT.measure_latency(images, frames, found, toggles, times)
     assert got.samples == 4 and got.lo < DELTA <= got.hi and got.hi - got.lo <= P / 2 + 1
+    assert got.line_lo == pytest.approx(-P / 4, abs=2.0) and got.line_hi == pytest.approx(P / 4, abs=2.0)
+    assert got.bounds == (got.lo + got.line_lo, got.hi + got.line_hi)

@@ -28,7 +28,7 @@ def _hold_cmd(args: argparse.Namespace) -> int:
 
 def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     """Cut a program's covering sweep into locked takes one hold a level, from its measured hold."""
-    from syncsummoner.compose.render import RenderConfig, lead_frames
+    from syncsummoner.compose.render import RenderConfig, lead_frames, tail_frames
     from syncsummoner.probe import decoded
     from pyvmancer.midi import ParamKind, param_kind
 
@@ -43,7 +43,7 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     if held["program"] != args.program:
         raise ValueError(f"{args.hold} measured {held['program']}, not {args.program}")
     clip = decoded.features(args.source, decoded.Spec.of(config), workers=args.workers)
-    frames = int(clip.small.shape[0]) - lead_frames(config)
+    frames = int(clip.small.shape[0]) - lead_frames(config) - tail_frames(config)
     m = model(args.program)
     toggles = [p for p in range(1, PARAM_COUNT + 1) if param_kind(p) is ParamKind.TOGGLE]
     values = (

@@ -531,41 +531,46 @@ with their driver sequence, timestamp and digest, in a `<take>.v4l2` sidecar by
 ([hardware.md](hardware.md#capture-is-stored-never-decoded-while-it-runs)).
 
 A take's clip opens on a lead-in (`RenderConfig.lead_in_s`, 40 s) whose strips
-number its frames `-L..-1`, wrapped to the strip's 16 bits, so captures under the
-dry program, or before a program load, carry legible strips whatever the program
-does after it.
+number its frames `-L..-1`, wrapped to the strip's 16 bits, and closes on a lead-out
+as long, its last frame held with the numbering carried on (`render.tail_frames`), so
+captures under the dry program, or before a program load and after Passthru is reloaded,
+carry legible strips at both ends whatever the program does between.
 
 `compose.lock.attribute_take(take, config=)` reads the take's strips from its decode, its sidecar
 and its lock record, and returns an `Attribution`:
 
 | Field | Meaning |
 | --- | --- |
-| `picked[j]` | per clip frame `j`, the capture index (into the take's stored frames, in order) nearest the frame's centre, the later on a tie; -1 where none shows it |
-| `shown[k]` | per capture, the clip frame it shows; negative in the lead-in |
-| `per_frame`, `lead` | captures per clip frame; lead-in frames played |
-| `runs` | gap-free runs of captures, each a `Run(first, last, slot, repeats, agree, worst_ms)`: its sub-frame slot, the share of frame changes on its cadence, the share of frame starts whose timestamp names that slot, and their worst timing error |
-| `frame0_ns` | when clip frame 0 reached the card, on the capture clock |
-| `drops`, `read`, `agreed` | frames the driver lost; legible strips, and those that read the frame `shown` says |
+| `picked[j]` | per clip frame `j`, the capture index (into the take's stored frames, in order) nearest the frame's centre on its frame line, the later on a tie; -1 where none shows it |
+| `shown[k]`, `starts[k]` | per capture, the clip frame it shows, negative in the lead-in, and whether it is its frame's first |
+| `per_frame`, `lead` | captures per clip frame, rounded; lead-in frames played |
+| `line` | the frame line of the run the clip plays in (`compose.frameline.Line`): `origin + n * period` on the capture clock, the polygon of lines the take's frame starts admit, its slack and residual |
+| `drift_ppm`, `drift_range_ppm`, `slips` | the period against `per_frame` capture periods, the range the polygon admits, and the frames captured other than `per_frame` times |
+| `jitter_ns`, `uncertain`, `tied` | the timestamps' largest residual off the capture line; captures a boundary the polygon admits may cross, and those whose bytes match both neighbours or neither, which keep the line's frame |
+| `frame0_ns` | when clip frame 0 started, on the capture clock |
+| `read`, `agreed`, `ahead`, `faults`, `strays`, `rejected` | legible strips, those reading the frame `shown` says and those a later one; strips a frame off at an uncertain capture; byte changes in the clip no line meets; lead strips whose group no line through the largest meets |
 
-`summary()` is one line of all of it. `picked` is saved as `<take>.picked.npy`.
-The call raises `LockError` unless every clip frame is attributed and the clip's
-run has unanimous frame starts, and `LostTimecodeError` for a take with no lock
-record, which is then unusable for a render.
+`summary()` is one line of all of it, `record()` the same as JSON. `picked` is saved as
+`<take>.picked.npy`. The call raises `LockError` unless every clip frame is attributed and no
+fault or stray contradicts the line, and `LostTimecodeError` for a take with no lock record, which
+is then unusable for a render.
 
-Within a gap-free run the card's cadence fixes which frame each capture shows up
-to one offset. The strips fix that offset for the anchoring run, in the lead-in,
-which also gives the fixed latency from a Pi flip to its capture. A program load
-breaks the capture, and the card relocks at a new phase
-([hardware.md](hardware.md#a-program-load-breaks-the-capture)); across it, the
-card's byte-identical repeats say which captures start a frame and the nearest
-Pi flip time, less that latency, names the frame. That is exact because, at two
-captures a frame, the relock moves the offset by less than half a frame, so
-attribution needs no strip after the load and survives a program that destroys
-it.
+Each gap-free run's frame starts lie on a straight line on the capture clock
+([hardware.md](hardware.md#the-cards-clock)). A capture starts a frame where its strip reads the
+next frame or its bytes differ from the capture before's; each puts the start between the capture
+before and itself. The strips of the dry lead-in, and of the dry lead-out after the clip, name their
+frames; every other start is named, outward from them, by the one frame the polygon of lines through
+the named starts admits, and clips it in turn. A miss within the capture jitter widens its bracket;
+a lead strip group missing by more is refused, the largest one's a `LockError`. Each capture then
+shows the frame its time falls in on the line, and one a boundary may cross goes by its bytes.
+A program load breaks the capture and the card relocks at a new phase
+([hardware.md](hardware.md#a-program-load-breaks-the-capture)); each run has its own line, and one
+with no legible strip, as under a program that destroys it, is numbered by the lag from the Pi's
+flips, which the load leaves alone.
 
 `syncsummoner lockcheck` is the acceptance test of all of this on the rig: it
 plays a timecoded clip through Passthru, or a program loaded in the lead-in, and
-reports missed vblanks, driver drops, gaps, off-cadence frame changes, strip
+reports missed vblanks, driver drops, gaps, picture changes off a frame start, strip
 agreement and, under Passthru, tears (`compose.lockcheck`).
 
 ---

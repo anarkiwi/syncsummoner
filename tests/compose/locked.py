@@ -27,9 +27,9 @@ WRAP = 0xFFFF
 
 @dataclasses.dataclass
 class Take:
-    """A take's logs, and the sub-frame slot ``per_frame * played + copy`` each capture truly shows."""
+    """A take's logs, and the played frame each capture truly shows."""
 
-    slots: np.ndarray
+    frame: np.ndarray
     frames: np.ndarray
     flips: np.ndarray
     codes: np.ndarray
@@ -37,25 +37,25 @@ class Take:
     count: int
     per_frame: int
     hold: int
+    tail: int = 0
 
     @property
     def kw(self) -> dict:
         """What the lock record says was played."""
-        return {"hold": self.hold, "lead": self.lead, "count": self.count}
-
-    def picked(self) -> np.ndarray:
-        """The capture of each clip frame's middle copy, -1 where none was captured."""
-        want = self.per_frame * (np.arange(self.count) + self.lead) + self.per_frame // 2
-        at = {int(s): k for k, s in enumerate(self.slots)}
-        return np.array([at.get(int(w), -1) for w in want])
+        return {"hold": self.hold, "lead": self.lead, "count": self.count, "tail": self.tail}
 
     def shown(self) -> np.ndarray:
         """The clip frame each capture shows, negative in the lead-in."""
-        return self.slots // self.per_frame - self.lead
+        return self.frame - self.lead
+
+    def shows(self, picked: np.ndarray) -> bool:
+        """Whether every pick is a capture of its own clip frame."""
+        picked = np.asarray(picked)
+        return bool((picked >= 0).all()) and bool((self.shown()[picked] == np.arange(picked.size)).all())
 
 
 def flip_log(frames: int, hold: int) -> np.ndarray:
-    """A flip every vblank, each frame held ``hold`` vblanks, one segment."""
+    """A flip every vblank, each frame held ``hold`` vblanks, one segment, on the Pi's clock."""
     v = np.arange(frames * hold)
     out = np.zeros(v.size, FLIP)
     out["v"] = out["seq"] = v
@@ -72,37 +72,56 @@ def take(
     count=6,
     per_frame=2,
     hold=2,
-    strips=(0,),
+    strips=None,
     misread=None,
-    shift=0,
+    ppm=0.0,
+    jitter_ns=0,
+    static=None,
+    wet=None,
+    tail=0,
+    kink=None,
+    seed=0,
 ):
-    """Captures of slots ``first..last`` per run ``(first, last, late, lost)``, ``late`` in captures.
+    """Captures ``first..last`` of the card's clock per run ``(first, last, late, lost)``, late in captures.
 
-    ``lost`` is the driver sequence numbers skipped before the run; runs in ``strips`` carry
-    legible strips, ``misread`` is ``(capture, code)``, and ``shift`` moves the card's repeats.
+    The device's frames, locked to the Pi, run ``ppm`` off ``per_frame`` captures from midway between
+    the first run's; ``lost`` sequence numbers go before a run and timestamps up to ``jitter_ns`` late.
+    Runs in ``strips`` (all by default) read their frame outside the played frames ``wet``, frames in
+    ``static`` show one picture, ``misread`` is ``(capture, code)``, ``kink`` ``(frame, ns)`` bends the line.
     """
-    slots, late, sequence, legible = [], [], [], []
+    capture = hold * VBLANK_NS / per_frame
+    period = per_frame * capture * (1 + ppm * 1e-6)
+    origin = PI_T0 + CARD_NS + (runs[0][2] - 0.5) * capture
+    times, sequence, legible = [], [], []
     seq = 0
     for index, (first, last, delay, *lost) in enumerate(runs):
         span = np.arange(first, last + 1)
         seq += lost[0] if lost else 0
-        slots.append(span)
-        late.append(np.broadcast_to(np.asarray(delay, float), span.shape))
+        times.append(PI_T0 + CARD_NS + (span + delay) * capture)
         sequence.append(seq + np.arange(span.size))
         seq += span.size
-        legible.append(np.full(span.size, index in strips))
-    slots, late = np.concatenate(slots), np.concatenate(late)
-    capture = hold * VBLANK_NS / per_frame
-    frames = np.zeros(slots.size, FRAME)
+        legible.append(np.full(span.size, strips is None or index in strips))
+    tau = np.concatenate(times)
+    frame = np.floor((tau - origin) / period).astype(np.int64)
+    if kink is not None:
+        frame = np.floor((tau - origin - np.where(frame >= kink[0], kink[1], 0)) / period).astype(np.int64)
+    rng = np.random.default_rng(seed)
+    frames = np.zeros(tau.size, FRAME)
     frames["sequence"] = np.concatenate(sequence)
-    frames["t_ns"] = np.round(PI_T0 + CARD_NS + (slots + late) * capture).astype(np.int64)
+    frames["t_ns"] = np.round(tau + jitter_ns * rng.random(tau.size)).astype(np.int64)
     frames["bytes"] = 1
-    frames["digest"] = (slots + shift) // per_frame
-    codes = np.where(np.concatenate(legible), (slots // per_frame - lead) & WRAP, -1)
+    picture = (
+        frame if static is None else np.where((frame >= static[0]) & (frame < static[1]), static[0], frame)
+    )
+    frames["digest"] = picture + 1
+    readable = np.concatenate(legible) & (frame >= 0)
+    if wet is not None:
+        readable &= (frame < wet[0]) | (frame >= wet[1])
+    codes = np.where(readable, (frame - lead) & WRAP, -1)
     if misread is not None:
         codes[misread[0]] = misread[1]
-    flips = flip_log(lead + count + 1, hold)
-    return Take(slots, frames, flips, codes, lead, count, per_frame, hold)
+    flips = flip_log(lead + count + tail + 1, hold)
+    return Take(frame, frames, flips, codes, lead, count, per_frame, hold, tail)
 
 
 #: Lead-in with strips, a load's outage, a run on another card phase, a lost frame, the rest of the clip.

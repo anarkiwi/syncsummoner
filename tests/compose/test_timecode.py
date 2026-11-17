@@ -1,4 +1,4 @@
-"""A timecoded clip as encoded: its lead-in and clip frames read back from the stored strips."""
+"""A timecoded clip as encoded: its lead-in, clip and lead-out frames read back from the stored strips."""
 
 # pylint: disable=missing-function-docstring
 
@@ -23,13 +23,13 @@ def clip_fixture(monkeypatch, tmp_path):
         lambda p, max_frames=None: iter([(CONFIG.fps, f) for f in source]),
     )
     out = tmp_path / "tc.mkv"
-    assert R.write_timecoded("source.mkv", out, config=CONFIG, lead=4) == 5
+    assert R.write_timecoded("source.mkv", out, config=CONFIG, lead=4, tail=2) == 5
     return out
 
 
-def test_an_encoded_clip_reads_back_its_wrapped_lead_in_then_every_frame(clip):
+def test_an_encoded_clip_reads_back_its_wrapped_lead_in_every_frame_and_its_lead_out(clip):
     codes = decoded.features(clip, decoded.Spec.of(CONFIG)).codes
-    assert L.signed(codes, CONFIG.bits).tolist() == [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+    assert L.signed(codes, CONFIG.bits).tolist() == [-4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6]
 
 
 def test_a_program_that_turns_the_picture_over_leaves_no_legible_strip(clip, tmp_path):

@@ -147,6 +147,11 @@ def lead_frames(config: RenderConfig) -> int:
     return int(round(config.lead_in_s * config.fps))
 
 
+def tail_frames(config: RenderConfig) -> int:
+    """Strip-coded lead-out frames after the clip's last: as many as the lead-in, which a load fits."""
+    return lead_frames(config)
+
+
 def crop_strip(frame: np.ndarray, *, strip_px: int = 8) -> np.ndarray:
     """Remove the timecode strip before anything else looks at the frame."""
     return frame[: frame.shape[0] - strip_px]
@@ -159,12 +164,14 @@ def write_timecoded(
     config: RenderConfig,
     seconds: float | None = None,
     start: float = 0.0,
-    lead: int = 0,
+    lead: int | None = None,
+    tail: int | None = None,
 ) -> int:
-    """Write the source at session geometry with each frame's index burnt in, after a lead-in.
+    """Write the source at session geometry, each frame's index burnt in, between a lead-in and a lead-out.
 
-    The lead-in is ``lead`` copies of the first frame (a locked take's is :func:`lead_frames`) numbered
-    ``-lead..-1``, wrapped to the strip's width. Returns the clip frames written, lead-in excluded.
+    The lead-in is ``lead`` copies of the first frame numbered ``-lead..-1``, wrapped to the strip's
+    width, and the lead-out ``tail`` copies of the last numbered on from it, a locked take's
+    (:func:`lead_frames`, :func:`tail_frames`) unless given. Returns the clip frames, neither included.
 
     A clip the playout can identify frame by frame is what lets the source be
     played from the other end, where it can run at rate. ``start`` skips into it,
@@ -173,7 +180,8 @@ def write_timecoded(
     than the broken pipe writing to it produces.
     """
     total, frames = source_stream(source, config, seconds=seconds, start=start)
-    lead = int(lead)
+    lead = lead_frames(config) if lead is None else int(lead)
+    tail = tail_frames(config) if tail is None else int(tail)
     argv = [
         getattr(config, "ffmpeg", "ffmpeg"),
         "-loglevel",
@@ -209,6 +217,7 @@ def write_timecoded(
         stamped = burn_timecode(frame, index & wrap, bits=config.bits, strip_px=config.strip_px)
         return np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data
 
+    last = None
     try:
         for index, frame in enumerate(track(frames, desc="timecoding", total=total or None, unit="frame")):
             try:
@@ -217,7 +226,9 @@ def write_timecoded(
                 proc.stdin.write(stamp(frame, index))
             except BrokenPipeError:
                 break
-            written = index + 1
+            written, last = index + 1, frame
+        for after in range(written, written + tail) if last is not None else ():
+            proc.stdin.write(stamp(last, after))
     finally:
         proc.stdin.close()
         said = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
@@ -225,13 +236,14 @@ def write_timecoded(
         proc.wait()
     if proc.returncode:
         raise RuntimeError(f"timecoding {out} failed: {said.splitlines()[-1] if said else 'no output'}")
+    size = f"{config.width}x{config.height}"
     LOG.info(
-        "timecoded %d frames after a %d frame lead-in into %s at %dx%d",
+        "timecoded %d frames between a %d and a %d frame lead-in and -out into %s at %s",
         written or total,
         lead,
+        tail,
         out,
-        config.width,
-        config.height,
+        size,
     )
     return written or total
 
@@ -266,10 +278,10 @@ def play_take(
 ) -> float:
     """Record one locked take with no automation: the lead-in under Passthru, ``program`` loaded inside it.
 
-    The lock record is saved beside the take. Returns when the load ended, on the capture
-    clock; a load that overran the lead-in is a :class:`LeadInError`.
+    Passthru comes back for the lead-out. The lock record is saved beside the take. Returns when the
+    load ended, on the capture clock; a load that overran the lead-in or lead-out is a :class:`LeadInError`.
     """
-    lead, count = lead_frames(config), int(round(seconds * config.fps))
+    lead, count, tail = lead_frames(config), int(round(seconds * config.fps)), tail_frames(config)
     lead_s = lead / config.fps
     with stage("passthru", program=PASSTHRU):
         rig.session.load_program(PASSTHRU, link=rig.link)
@@ -292,10 +304,17 @@ def play_take(
                         f"{program}: loading took {loaded - began:.1f}s, past the {lead_s:.1f}s lead-in; "
                         "raise lead_in_s"
                     )
-                end = began + lead_s + seconds + config.tail_s
+                end = began + lead_s + seconds
+                _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
+                if program is not None:
+                    rig.session.load_program(PASSTHRU, link=rig.link)
+                    await_transmitting(rig.transport, program=PASSTHRU, timing=config.timing)
+                    if time.monotonic() - end >= tail / config.fps:
+                        raise LeadInError(f"{program}: Passthru loaded past the lead-out; raise lead_in_s")
+                end += tail / config.fps + config.tail_s
                 _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
                 hold = int(player.status().get("hold", 1))
-        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count)
+        save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=tail)
     return loaded
 
 
@@ -414,9 +433,7 @@ def render_played(
     owned = rig is None
     rig = open_rig(config, capture=False) if owned else rig
     if not prepared:
-        write_timecoded(
-            source, scratch, config=config, seconds=score.duration, start=start, lead=lead_frames(config)
-        )
+        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
     if recorder is None:
         from syncsummoner.device.recorder import Recorder
 
@@ -758,9 +775,7 @@ def render_cuts(
         human(len(fresh) * score.duration),
     )
     if (fresh or not Path(scratch).is_file()) and not prepared:
-        write_timecoded(
-            source, scratch, config=config, seconds=score.duration, start=start, lead=lead_frames(config)
-        )
+        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
         prepared = True
     _passes(
         ordered,

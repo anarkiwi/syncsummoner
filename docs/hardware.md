@@ -121,7 +121,7 @@ lead-in, and a bypass or crossfader toggled at random phases on eight programs:
 | Readback (`modulation status` combined value) | changes once per output frame; its serial timing is too coarse to time the latch, so landings rest on the picture |
 | CC to readback value | exact for all 1024 values, high-resolution CC with manual parked at 0 |
 | Serial `modulation status` round trip | about 1.4 to 2.2 ms, 279-byte reply |
-| Send to the card's first capture of the frame a write lands on | 1.0 to 1.5 frames, known per take to about 2 ms from 16 calibration writes; it moves between takes with the card's capture phase, over less than half a frame |
+| Send to the start of the frame a write lands on | 1.0 to 1.5 frames, from 16 calibration writes; the frame start is the take's frame line, known to the width of the lines its captures admit ([the card's clock](#the-cards-clock)) |
 
 Render therefore sends each write half a frame before the instant it must precede
 to land on its target frame, and proves where it landed ([evidence.md](evidence.md)). The early bias
@@ -185,7 +185,7 @@ pipeline and never vary it.
 
 The card returns frames at its own rate, not the session's: a 10 s pass at
 `1080p30` comes back as ~600 frames, two per session frame
-([the card's cadence](#the-cards-cadence)).
+([the card's clock](#the-cards-clock)).
 
 ## Signal comes from the Videomancer's transmitter; the card exposes none
 
@@ -323,22 +323,65 @@ signals the player instead: `SIGUSR1` turns the CRTC off (the link drops and `dp
 meanwhile, and the frame due when the link returns is shown. The returning CRTC's vblanks
 sit at an arbitrary phase to the old ones, which the flip log records.
 
-## The card's cadence
+## The card's clock
 
-At 1920x1080 the card delivers about 60 fps whatever rate is asked for. From the locked
-30 Hz signal it delivers exactly two captures per frame, and the two are byte-identical MJPEG
-packets: over a minute, 898 pairs and the two partial ones at the ends, every strip on one
-cadence. uvcvideo's buffer sequence numbers have no gaps there; the recorder keeps each
-capture's sequence, timestamp and a digest of its bytes in a `.v4l2` sidecar, so a frame the
-driver loses shows as a sequence gap and the card's own repeats show which captures start a
-frame.
+At 1920x1080 the card delivers about 60 fps whatever rate is asked for, on its own crystal: it
+is not locked to the signal. From the 30 Hz signal it delivers about two captures a frame, and
+two captures of one frame are byte-identical MJPEG packets, so a change in a capture's bytes
+marks a new frame. The frame period on the host's clock is not two capture periods: it runs some
+tens of parts per million off them (measured per take below), so the capture a frame starts on
+moves by one capture, a slip, once or twice in a full take. At a slip a frame is captured once
+(frames shorter than two captures) or three times (longer).
+
+uvcvideo's buffer sequence numbers have no gaps there; the recorder keeps each capture's
+sequence, timestamp and a digest of its bytes in a `.v4l2` sidecar, so a frame the driver loses
+shows as a sequence gap. The timestamps carry 1 µs resolution and arrive late by a varying amount:
+against the straight line through them, the card's capture clock, the earliest sit a few hundred
+microseconds early and the latest up to the take's jitter, its largest residual (0.8 to 2.6 ms
+over the takes below). The capture line removes that jitter, so a capture's time is its place on
+the line.
+
+The device's frames start on a straight line of their own, `origin + n * period`: two crystals at a
+constant ratio. Each capture that starts a frame puts that frame's start after the capture before
+it and at or before itself; `compose.frameline` keeps the polygon of lines meeting every such
+bracket and fits the least-squares line inside it. Between slips the brackets leave the line one
+capture period (16.7 ms) wide; a slip pins it to the capture where it happens, and two slips pin
+its period. A take with no slip bounds its drift to about one capture period over its length
+(about 43 ppm over 400 s) and no closer.
+
+| Take | Frame line drift, ppm (range the captures admit) | Slips | Frame 0's start known to |
+| --- | --- | --- | --- |
+| param-evidence full Pinwheel | -0.0 (-42.5 to +42.5) | 0 | 16.67 ms |
+| param-evidence full boneoh_YUV_Bit_Rotator-1473b2c4 | +0.0 (-42.0 to +42.0) | 0 | 16.67 ms |
+| param-evidence full czartroniks_Quilt-803bc8ea | -42.7 (-54.2 to -30.0) | 1 | 1.11 ms |
+| param-evidence rc4 Pinwheel | -78.5 (-78.5 to -30.0) | 2 | 8.40 ms |
+| param-evidence rc4 YUV_Amplifier-6b88e9be | +0.0 (-43.0 to +43.0) | 0 | 16.67 ms |
+| param-evidence rc4 boneoh_YUV_Bit_Rotator-1473b2c4 | -0.0 (-41.9 to +41.9) | 0 | 16.67 ms |
+| param-evidence rc4 homegrownvhs_Pigment-fde77c40 | +0.0 (-42.5 to +42.5) | 0 | 16.67 ms |
+| param-evidence rc4 czartroniks_Fray-fad121db | +0.0 (-44.1 to +44.1) | 0 | 16.67 ms |
+| param-evidence rc4 czartroniks_Porthole-9444a020 | +0.0 (-44.1 to +44.1) | 0 | 16.67 ms |
+| param-evidence rc4 czartroniks_Quilt-803bc8ea | -0.0 (-44.6 to +44.6) | 0 | 16.67 ms |
+| param-evidence rc4 teletect_Teletect_RamBend-3c9af621 | +0.0 (-43.2 to +43.2) | 0 | 16.67 ms |
+| param-evidence short YUV_Amplifier-6b88e9be | +0.0 (-316.8 to +316.8) | 0 | 16.67 ms |
+| param-evidence short boneoh_YUV_Bit_Rotator-1473b2c4 | +0.0 (-239.0 to +239.0) | 0 | 16.67 ms |
+| param-evidence short homegrownvhs_Pigment-fde77c40 | -0.0 (-257.5 to +257.5) | 0 | 16.67 ms |
+| param-evidence short teletect_Teletect_RamBend-3c9af621 | -0.0 (-235.7 to +235.7) | 0 | 16.67 ms |
+| param-evidence short czartroniks_Fray-fad121db | not attributed: the driver lost frames in the clip | | |
+| param-evidence short czartroniks_Porthole-9444a020 | +0.0 (-283.6 to +283.6) | 0 | 16.67 ms |
+| param-evidence short czartroniks_Quilt-803bc8ea | -0.0 (-285.7 to +285.7) | 0 | 16.67 ms |
+| param-evidence Pinwheel | -0.0 (-320.3 to +320.3) | 0 | 16.67 ms |
+| archive-rc4 failed YUV_Amplifier-6b88e9be-00 | -59.9 (-71.8 to -30.0) | 1 | 5.06 ms |
+| fw-upgrade lock-passthru (lockcheck) | +0.0 (-153.5 to +153.5) | 0 | 16.67 ms |
+| fw-upgrade lock-passthru-2 (lockcheck) | +0.0 (-150.2 to +150.2) | 0 | 16.67 ms |
 
 ## A program load breaks the capture
 
 A load stops the Videomancer's transmitter. The card then delivers nothing for a few
 hundred milliseconds at a time, with no gap in its sequence numbers, and relocks with its
 60 Hz grid at a new phase to the frames. Counting captures cannot carry a frame index across
-a load.
+a load. The device's own frames keep their lag behind the Pi's flips across it: in the two
+rc4 takes with legible strips on both sides of their load (czartroniks/Porthole and
+teletect/RamBend), the lag every line admits on one side meets the other's.
 
 | Load | Load call | Captures missing |
 | --- | --- | --- |
@@ -351,12 +394,10 @@ A load that changes author is the slow one. A program loaded inside a locked tak
 
 Across eleven link-dropped Passthru loads in one recording, the capture time of each frame's
 first capture, against the Pi's flip time for that frame, moved by between -4.5 and +10.0 ms
-from one relock to the next, a spread of 14.4 ms. Two captures a frame put a frame's first
-capture within one capture period (16.7 ms) of the frame's flip plus a fixed latency, so that
-offset cannot move by half a frame. `compose.lock.attribute` therefore takes the captures
-that start a frame from the card's repeats, and names the frame each shows by the nearest
-flip time; every run of the eleven matched its strips. A run whose frame starts disagree is a
-`LockError`.
+from one relock to the next, a spread of 14.4 ms: the card's capture phase, which moves within
+one capture period. `compose.lock.attribute` therefore fits each run's line apart, the period
+bounded by the run with most strips; a run with no legible strip is numbered by the one whole-frame
+shift that puts its Pi lag where the strip-numbered runs' lies.
 
 ## The analog input decodes luma and sync only
 

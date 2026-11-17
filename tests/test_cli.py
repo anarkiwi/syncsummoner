@@ -720,7 +720,7 @@ def _judge_stub(monkeypatch, seen):
         if "unlocked" in str(take):
             raise LockError("4/6 clip frames attributed")
         proof = SimpleNamespace(ok="unproven" not in str(take), schedule=lambda: [{"param": 3}])
-        found = SimpleNamespace(per_frame=2, picked=np.arange(6))
+        found = SimpleNamespace(per_frame=2, picked=np.arange(6), record=lambda: {"drift_ppm": -70.0})
         return SimpleNamespace(
             proof=proof,
             found=found,
@@ -754,6 +754,7 @@ def test_takes_are_judged_offline_and_their_outcome_kept_beside_them(monkeypatch
     meta = json.loads(Path(f"{takes[0]}.meta.json").read_text(encoding="utf-8"))
     assert meta["attempt-1"] == {"program": "a"} and meta["judged"]["lock"] == "ok"
     assert meta["judged"]["evidence_ok"] and meta["judged"]["clip_frames"] == 6
+    assert meta["judged"]["frame_line"] == {"drift_ppm": -70.0}
     assert json.loads(Path(f"{takes[1]}.schedule.json").read_text(encoding="utf-8")) == [{"param": 3}]
     assert len(capsys.readouterr().out.splitlines()) == 2
     assert cli.main(["judge", str(takes[0]), "--source", "tc.mkv"]) == 0

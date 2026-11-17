@@ -484,6 +484,7 @@ def _lockcheck_cmd(args: argparse.Namespace) -> int:
                 seconds=args.seconds,
                 start=args.start,
                 lead=render_mod.lead_frames(config),
+                tail=render_mod.tail_frames(config),
             )
             seconds = frames / config.fps
         report = lockcheck_mod.lockcheck(

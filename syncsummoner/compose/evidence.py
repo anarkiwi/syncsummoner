@@ -34,57 +34,27 @@ class EvidenceError(RuntimeError):
 
 @dataclass(frozen=True)
 class FrameTimes:
-    """When each played frame's first capture reached the host, ``ns[j + lead]`` for frame ``j``.
+    """When each played frame started on the capture clock: ``origin + j * period`` for clip frame ``j``.
 
-    NaN where no capture starts the frame; ``origin`` and ``period`` are the least-squares line.
+    The take's frame line (:mod:`~syncsummoner.compose.frameline`), so it carries no capture phase.
     """
 
-    ns: np.ndarray
     lead: int
     origin: float
     period: float
 
     def at(self, frame: int | np.ndarray) -> np.ndarray:
-        """Measured time of ``frame``'s first capture, or the line's where none was measured."""
-        frame = np.asarray(frame, dtype=np.int64)
-        index = frame + self.lead
-        inside = (index >= 0) & (index < self.ns.size)
-        measured = np.where(inside, self.ns[np.clip(index, 0, self.ns.size - 1)], np.nan)
-        return np.where(np.isfinite(measured), measured, self.origin + frame * self.period)
+        """When ``frame`` started."""
+        return self.origin + np.asarray(frame, dtype=np.float64) * self.period
 
     def frame_of(self, t_ns: float | np.ndarray) -> np.ndarray:
-        """The frame whose first capture lies nearest ``t_ns`` on the line."""
+        """The frame whose start lies nearest ``t_ns``."""
         return np.rint((np.asarray(t_ns, dtype=np.float64) - self.origin) / self.period).astype(np.int64)
 
 
-def frame_times(
-    t_ns: np.ndarray, shown: np.ndarray, runs: Sequence[Any], per_frame: int, lead: int
-) -> FrameTimes:
-    """Frame start times from an attribution: each run's captures on its cadence's first copy.
-
-    The card relocks at a new phase after a gap, so the period is the slope common to every run,
-    and the line runs through the last run, the one the clip plays in.
-    """
-    t = np.asarray(t_ns, dtype=np.float64)
-    last = int(shown.max()) if shown.size else -lead
-    ns = np.full(last + lead + 1, np.nan)
-    dx, dt, line = [], [], None
-    for run in runs:
-        k = np.arange(run.first, run.last + 1)
-        start = k[(run.slot + k - run.first) % per_frame == 0]
-        frame = shown[start] + lead
-        ok = (frame >= 0) & (frame < ns.size)
-        ns[frame[ok]] = t[start[ok]]
-        if ok.sum() > 1:
-            f, s = frame[ok].astype(np.float64) - lead, t[start[ok]]
-            dx.append(f - f.mean())
-            dt.append(s - s.mean())
-            line = (f.mean(), s.mean())
-    if line is None:
-        raise EvidenceError("no run captured two frame starts, so the frame period is unknown")
-    x, y = np.concatenate(dx), np.concatenate(dt)
-    slope = float(x @ y / (x @ x))
-    return FrameTimes(ns=ns, lead=lead, origin=float(line[1] - slope * line[0]), period=slope)
+def frame_times(found: Any) -> FrameTimes:
+    """Frame start times from an attribution: its frame line, clip frame 0 at ``frame0_ns``."""
+    return FrameTimes(lead=int(found.lead), origin=float(found.frame0_ns), period=float(found.period_ns))
 
 
 @dataclass(frozen=True)
@@ -176,20 +146,31 @@ def toggle_landings(
     return out
 
 
+#: What a latency is measured to: the start of the frame a write lands on, on the frame line.
+BASIS = "start"
+
+
 @dataclass(frozen=True)
 class Latency:
-    """From a write leaving the host to the card's first capture of the frame it lands on, per take.
+    """From a write leaving the host to the start of the frame it lands on, per take.
 
     Each calibration write that showed in the picture bounds it: after the start of the frame
     before the one it landed on, at or before its own. ``lo`` and ``hi`` are those bounds
     intersected; where writes disagree by a little, they are the band they disagree over.
-    ``delta`` is the band's middle, in ns.
+    ``delta`` is the band's middle, in ns. Frame starts lie ``line_lo..line_hi`` off the take's line.
     """
 
     lo: float
     hi: float
     samples: int
     period: float
+    line_lo: float = 0.0
+    line_hi: float = 0.0
+
+    @property
+    def bounds(self) -> tuple[float, float]:
+        """The band the device's own latency lies in, whichever line the take's captures admit."""
+        return self.lo + self.line_lo, self.hi + self.line_hi
 
     @property
     def delta(self) -> float:
@@ -216,6 +197,9 @@ class Latency:
             "delta": self.delta,
             "spread": self.spread,
             "frames": self.frames,
+            "line_lo": self.line_lo,
+            "line_hi": self.line_hi,
+            "basis": BASIS,
         }
 
 

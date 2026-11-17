@@ -18,7 +18,7 @@ import numpy as np
 
 from syncsummoner.compose import locktake
 from syncsummoner.compose.cut import Cut
-from syncsummoner.compose.evidence import Evidence
+from syncsummoner.compose.evidence import Evidence, EvidenceError
 from syncsummoner.compose.lock import Attribution, attribute_take
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.takecheck import CheckReport, check_takes
@@ -124,7 +124,7 @@ def judge_take(
         source=source,
     )
     locktake.evidence_path(take).write_text(proof.to_json(), encoding="utf-8")
-    report = inspect_luma(features.luma, start=int(found.picked[0]) - found.per_frame // 2)
+    report = inspect_luma(features.luma, start=found.first_capture)
     check = None
     if score is not None:
         played, cuts = one_program(score, program)
@@ -176,6 +176,9 @@ def recorded(take: str | Path, options: dict) -> dict:
     except LockError as err:
         LOG.error("%s: %s", take, err)
         meta["judged"] = {"lock": f"{type(err).__name__}: {err}"}
+    except EvidenceError as err:
+        LOG.error("%s: %s", take, err)
+        meta["judged"] = {"lock": "ok", "evidence": f"{type(err).__name__}: {err}"}
     else:
         Path(f"{take}.schedule.json").write_text(
             json.dumps(judged.proof.schedule(), indent=1), encoding="utf-8"
@@ -185,6 +188,7 @@ def recorded(take: str | Path, options: dict) -> dict:
         meta["judged"] = {
             "lock": "ok",
             "per_frame": int(judged.found.per_frame),
+            "frame_line": judged.found.record(),
             "clip_frames": int(judged.found.picked.size),
             "evidence_ok": bool(judged.proof.ok),
             "picture": str(judged.report),
