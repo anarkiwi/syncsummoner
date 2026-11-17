@@ -292,10 +292,10 @@ def attribute(
 
 
 def _ambiguity(seg: np.ndarray, clocks: dict) -> np.ndarray:
-    """Per capture, how many more frames back its run's clock numbering admits."""
+    """Per capture, how far below its run's numbering, the highest candidate, the lowest one lies."""
     out = np.zeros(seg.size, dtype=np.int64)
     for s, said in clocks.items():
-        out[seg == s] = len(said["candidates"]) - 1
+        out[seg == s] = max(said["candidates"]) - min(said["candidates"])
     return out
 
 

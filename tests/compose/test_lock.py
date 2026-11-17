@@ -323,7 +323,7 @@ def test_a_processed_run_between_passthru_runs_is_numbered_by_the_capture_clock(
     (said,) = found.clock
     assert said["run"] == 1 and said["candidates"] and found.complete
     middle = np.arange(30, 65)
-    assert (found.ambiguity[middle] == len(said["candidates"]) - 1).all()
+    assert (found.ambiguity[middle] == max(said["candidates"]) - min(said["candidates"])).all()
     assert not np.delete(found.ambiguity, middle).any()
     truth, shown = played.shown(), found.shown
     assert ((truth >= shown - found.ambiguity) & (truth <= shown)).all()
@@ -335,3 +335,14 @@ def test_a_processed_run_the_clock_numbers_no_way_fails_the_take(monkeypatch):
     monkeypatch.setattr(L.relock, "candidates", lambda *a, **k: [])
     with pytest.raises(L.LockError, match="numbers run 1 no way"):
         attribute(played)
+
+
+def test_a_processed_run_is_numbered_by_its_highest_candidate_and_spans_to_its_lowest(monkeypatch):
+    played = take(PROCESSED, lead=18, count=17, tail=15, strips=(0, 2))
+    middle = np.arange(30, 65)
+    monkeypatch.setattr(L.relock, "candidates", lambda *a, **k: [19])
+    highest = attribute(played)
+    monkeypatch.setattr(L.relock, "candidates", lambda *a, **k: [17, 19])
+    found = attribute(played)
+    assert found.shown[middle].tolist() == highest.shown[middle].tolist()
+    assert (found.ambiguity[middle] == 2).all() and not highest.ambiguity.any()
