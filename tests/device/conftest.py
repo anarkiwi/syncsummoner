@@ -25,6 +25,7 @@ from pyvmancer.transports.base import MidiTransport
 from pyvmancer.video import VideoStatus
 
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
+from syncsummoner.probe.runner import raw_params
 from tests.transmitter import LIVE, Live
 
 COLORBARS_INFO = {
@@ -428,3 +429,17 @@ def device_fixture():
 @pytest.fixture(name="clock")
 def clock_fixture():
     return FakeClock()
+
+
+class Readback:
+    """The device's combined parameter state: what was commanded, unless ``wrong`` overrides a slot."""
+
+    def __init__(self):
+        self.state = {}
+        self.wrong = {}
+
+    def program_state(self):
+        raw = list(raw_params(self.state))
+        for slot, value in self.wrong.items():
+            raw[slot - 1] = value
+        return np.array(raw)

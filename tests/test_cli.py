@@ -576,11 +576,42 @@ def test_render_timing_flags_reach_the_config(monkeypatch, tmp_path):
     ]
     assert cli.main(argv + ["--format", "1080p30"]) == 0
     config = seen["render"][3]["config"]
-    assert (config.fps, config.latency_s, config.measure_latency) == (30.0, None, False)
-    assert config.cc_budget_hz == session_mod.CC_BUDGET_HZ
-    assert cli.main(argv + ["--latency-ms", "25", "--measure-latency", "--cc-budget", "150"]) == 0
-    config = seen["render"][3]["config"]
-    assert (config.latency_s, config.measure_latency, config.cc_budget_hz) == (0.025, True, 150.0)
+    assert config.fps == 30.0 and config.cc_budget_hz == session_mod.CC_BUDGET_HZ
+    assert cli.main(argv + ["--cc-budget", "150"]) == 0
+    assert seen["render"][3]["config"].cc_budget_hz == 150.0
+    with pytest.raises(SystemExit):
+        cli.main(argv + ["--latency-ms", "25"])
+
+
+def test_evidence_proves_each_take_and_fails_on_any_unproven(monkeypatch, tmp_path, capsys):
+    import numpy as np
+
+    from syncsummoner.compose import locktake
+    from syncsummoner.device.wire import save_wire
+
+    takes = [tmp_path / "take-Derez.mkv", tmp_path / "take-Lorenz.mkv"]
+    for take in takes:
+        save_wire(take, program=np.array(take.stem.split("-")[1]))
+    seen = []
+
+    def take_evidence(take, *, program, clip, config):
+        seen.append((Path(take).name, program, clip, config.fps, config.strip_px))
+        ok = program != "Lorenz"
+        return SimpleNamespace(
+            ok=ok, lines=lambda: [f"{program} proven {ok}"], to_json=lambda: f'{{"ok": {str(ok).lower()}}}'
+        )
+
+    monkeypatch.setattr(locktake, "take_evidence", take_evidence)
+    argv = ["evidence", *map(str, takes), "--source", "tc.mkv", "--strip-px", "4"]
+    assert cli.main(argv) == 1
+    assert seen == [
+        ("take-Derez.mkv", "Derez", "tc.mkv", 30.0, 4),
+        ("take-Lorenz.mkv", "Lorenz", "tc.mkv", 30.0, 4),
+    ]
+    assert capsys.readouterr().out.splitlines() == ["Derez proven True", "Lorenz proven False"]
+    assert locktake.evidence_path(takes[1]).read_text(encoding="utf-8") == '{"ok": false}'
+    assert cli.main(["evidence", str(takes[0]), "--source", "tc.mkv", "--program", "Other"]) == 0
+    assert seen[-1][1] == "Other"
 
 
 def _check_stubs(monkeypatch, seen, *, failed=False):

@@ -139,7 +139,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a ca
         argv_out = encoder_argv(
             args.input_format, args.width, args.height, rate, args.out_args, args.out, ffmpeg=args.ffmpeg
         )
-        with subprocess.Popen(argv_out, stdin=subprocess.PIPE) as enc, open(sidecar(args.out), "wb") as log:
+        with (
+            subprocess.Popen(argv_out, stdin=subprocess.PIPE) as enc,
+            open(sidecar(args.out), "wb", buffering=0) as log,
+        ):
             try:
                 with VideoCapture(cam, size=BUFFERS) as stream:
                     kept = record(

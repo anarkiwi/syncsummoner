@@ -21,9 +21,9 @@ DARK = R.TakeReport(frames=4)
 @pytest.mark.parametrize(
     ("video", "when", "recorded"),
     [
-        ([tx.UNREPORTED], "Passthru: the firmware reports no transmitter state after the load", 0),
+        ([tx.UNREPORTED], "Teletext: the firmware reports no transmitter state after the load", 0),
         (
-            [LIVE] * 3 + [tx.DEAD],
+            [LIVE] * 2 + [tx.DEAD],
             f"Teletext: the transmitter is not driving {LOCKED.timing} as the pass ended",
             1,
         ),
@@ -66,7 +66,7 @@ def test_a_program_driving_a_uniform_field_is_judged_only_after_a_passing_contro
     rig = controlled(monkeypatch, DARK)
     with pytest.raises(R.BlankTakeError, match="Teletext: the program outputs no picture .* Passthru"):
         render_locked(rig, tmp_path / "take.mkv")
-    assert loads(rig) == ["Passthru", "Teletext", "Passthru", "Passthru"] * (R.PASS_RETRIES + 1)
+    assert loads(rig) == ["Teletext", "Passthru", "Passthru"] * (R.PASS_RETRIES + 1)
     assert rig.steps.count("record") == R.PASS_RETRIES + 1
 
 
@@ -76,7 +76,7 @@ def test_a_dark_passthrough_is_a_rig_fault_not_a_program_verdict(monkeypatch, tm
     with pytest.raises(R.RigFaultError) as caught:
         render_locked(rig, tmp_path / "take.mkv")
     assert not isinstance(caught.value, R.BlankTakeError)
-    assert loads(rig) == ["Passthru", "Teletext", "Passthru", "Passthru"]
+    assert loads(rig) == ["Teletext", "Passthru", "Passthru"]
     said = str(caught.value)
     assert "black output from a live source" in said and "outputs no picture" not in said
     assert "Vid Route Mode 1 (HDMI In)" in said and "transmitter vic 34 de 2FE90F" in said
@@ -86,7 +86,7 @@ def test_a_dark_take_is_controlled_and_its_pass_retried(monkeypatch, tmp_path):
     """Unattended renders recover a one-off dark take: the control passes and the pass runs again."""
     rig = controlled(monkeypatch, DARK, PROBED)
     assert render_locked(rig, tmp_path / "take.mkv") == PROBED
-    assert loads(rig) == ["Passthru", "Teletext", "Passthru", "Passthru", "Passthru", "Teletext"]
+    assert loads(rig) == ["Teletext", "Passthru", "Passthru", "Teletext"]
     assert rig.steps.count("record") == 2 and rig.steps.count("drive") == 2
 
 
@@ -100,11 +100,11 @@ def test_a_wrong_route_stops_the_render_before_anything_loads(monkeypatch, tmp_p
 
 def test_a_route_changed_by_the_load_is_never_a_dead_program(monkeypatch, tmp_path):
     """A route that goes wrong with the program's load stops the take there, before any picture verdict."""
-    routes = [1, 1]
+    routes = [1]
     rig = controlled(monkeypatch, DARK, transport=rig_transport(route=lambda: routes.pop(0) if routes else 5))
     with pytest.raises(RouteError, match="Teletext: Vid Route Mode reads 5"):
         render_locked(rig, tmp_path / "take.mkv")
-    assert loads(rig) == ["Passthru", "Teletext"] and "inspect" not in rig.steps
+    assert loads(rig) == ["Teletext"] and "record" not in rig.steps
 
 
 def test_the_route_check_can_be_skipped(monkeypatch, tmp_path):

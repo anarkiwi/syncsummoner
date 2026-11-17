@@ -210,6 +210,21 @@ def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) ->
     return list(plans.sobol(spec, n=config.setpoints, rng=rng))
 
 
+class ReadbackError(RuntimeError):
+    """The device read back parameter values other than the setpoint it was sent."""
+
+
+def verify_readback(session: Any, setpoint: int, want: Sequence[int]) -> None:
+    """Raise :class:`ReadbackError` unless the device's combined values are exactly ``want``."""
+    got = [int(v) for v in session.transport.program_state()]
+    wrong = [i + 1 for i, (a, b) in enumerate(zip(want, got)) if a != b]
+    if wrong:
+        raise ReadbackError(
+            f"setpoint {setpoint}: P{', P'.join(map(str, wrong))} read back "
+            f"{[got[i - 1] for i in wrong]}, sent {[int(want[i - 1]) for i in wrong]}"
+        )
+
+
 def sweep(
     session: Any,
     base: dict,
@@ -221,13 +236,14 @@ def sweep(
 ) -> list[Window]:
     """Write every setpoint in turn, returning the span each was held over.
 
-    A window opens only after the parameters have settled, so the frames it
-    claims were captured under that vector and no other.
+    A window opens only after the parameters have settled and the device has read back the
+    setpoint exactly, so the frames it claims were captured under that vector and no other.
     """
     windows = []
     for setpoint, vector in enumerate(vectors):
         session.set_params(vector)
         sleep(config.settle_s)
+        verify_readback(session, setpoint, raw_params({**base, **vector}))
         start = clock()
         sleep(config.dwell_s)
         windows.append(Window(setpoint, raw_params({**base, **vector}), start, clock()))

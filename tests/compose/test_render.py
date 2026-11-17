@@ -5,6 +5,7 @@
 import contextlib
 import io
 import dataclasses
+import json
 import sys
 import time
 import types
@@ -14,30 +15,15 @@ import pytest
 from pyvmancer import CcMapError
 
 from syncsummoner.compose import lock as L
+from syncsummoner.compose import locktake
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
 from syncsummoner.compose.vocabulary import Automation
 from syncsummoner.probe.patterns import read_timecode
 from tests.compose import PROBED, rig_transport
-from tests.compose.locked import LOCKED, Clock, locked_pass, render_locked
+from tests.compose.locked import LOCKED, Clock, Proof, locked_pass, render_locked
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
-
-
-class FakeSession:
-    """Records program loads and CC batches; a real Session would rate-limit and cache."""
-
-    def __init__(self):
-        self.programs = []
-        self.calls = []
-        self.links = []
-
-    def load_program(self, name, *, link=None):
-        self.programs.append(name)
-        self.links.append(link)
-
-    def set_params(self, values):
-        self.calls.append(dict(values))
 
 
 @pytest.fixture(autouse=True)
@@ -60,93 +46,6 @@ def test_timecode_absent_or_washed_out_reads_none():
     assert read_timecode(flat, bits=16, strip_px=4) is None
     burned = R.burn_timecode(np.zeros((24, 32, 3), np.float32), 5, bits=16, strip_px=4)
     assert read_timecode(burned * 0.1, bits=16, strip_px=4) is None
-
-
-def test_schedule_biases_visuals_early():
-    auto = Automation.of([1.0], 2, 500)
-    shifted = R.schedule(auto, latency_s=0.08, early_bias_s=R.EARLY_BIAS_S)
-    assert shifted.times[0] == pytest.approx(1.0 - 0.08 - 0.015)
-    assert 0.010 <= R.EARLY_BIAS_S <= 0.020
-    assert R.schedule(auto).times[0] < auto.times[0]
-
-
-def test_write_latency_defaults_to_a_frame_and_takes_an_override():
-    assert R.write_latency(R.RenderConfig.for_format("1080p30"), None) == pytest.approx(1 / 30)
-    assert R.write_latency(R.RenderConfig.for_format("720p60"), None) == pytest.approx(1 / 60)
-    assert R.write_latency(dataclasses.replace(CONFIG, latency_s=0.02), None) == 0.02
-    late = R.schedule(Automation.of([1.0], 2, 500), latency_s=R.write_latency(CONFIG, None), early_bias_s=0.0)
-    assert late.times[0] == pytest.approx(1.0 - 1 / CONFIG.fps)
-
-
-@pytest.mark.parametrize("measured,want", [(0.031, 0.031), (None, 0.02)])
-def test_measured_latency_falls_back_to_the_configured_figure(monkeypatch, measured, want):
-    from syncsummoner.device import doctor
-
-    seen = []
-    monkeypatch.setattr(doctor, "write_latency", lambda transport: seen.append(transport) or measured)
-    config = dataclasses.replace(CONFIG, latency_s=0.02, measure_latency=True)
-    assert R.write_latency(config, "transport") == want and seen == ["transport"]
-
-
-def test_schedule_pulls_simultaneous_writes_forward_into_their_own_slots():
-    auto = Automation.concat([Automation.of([0.5, 1.0], i, [100, 200]) for i in (1, 2, 3)])
-    paced = R.schedule(auto, latency_s=0.0, early_bias_s=0.0, cc_budget_hz=100.0)
-    assert paced.times == pytest.approx([0.48, 0.49, 0.5, 0.98, 0.99, 1.0])
-    assert paced.indices.tolist() == [1, 2, 3, 1, 2, 3], "order within an instant is kept"
-    start = R.schedule(Automation.of([0.0, 0.0, 0.0], 1, [1, 2, 3]), early_bias_s=0.0, cc_budget_hz=100.0)
-    assert start.times == pytest.approx([0.0, 0.01, 0.02]), "nothing is due before the pass starts"
-
-
-class StampedTransport:
-    """Records when each CC write leaves, on a clock only sleeps advance."""
-
-    def __init__(self, clock, msgs_per_param):
-        self.clock, self.msgs_per_param, self.sent = clock, msgs_per_param, []
-
-    def set_param(self, index, value):
-        self.sent.append((self.clock(), index, value))
-
-
-@pytest.mark.parametrize("msgs_per_param", [1, 2])
-def test_a_schedule_at_the_planners_budget_is_delivered_on_time(msgs_per_param):
-    from syncsummoner.compose import planner
-    from syncsummoner.device.session import Session
-
-    from . import make_profile
-
-    budget, burst = 64.0, 4
-    cues = np.repeat(np.arange(1.0, 3.0, burst / budget), burst)
-    unsettled = np.array([4, 5, 6, 8], dtype=np.int32)
-    auto = Automation(cues, np.tile(unsettled, cues.size // burst), np.arange(cues.size, dtype=np.int32) + 1)
-    thinned = planner.thin(auto, make_profile(), fps=30.0, cc_budget_hz=budget)
-    assert len(thinned) == len(auto) and thinned.max_rate() == budget
-    paced = R.schedule(thinned, latency_s=0.033, early_bias_s=R.EARLY_BIAS_S, cc_budget_hz=budget)
-    clock = Clock()
-    transport = StampedTransport(clock, msgs_per_param)
-    session = Session(transport, cc_budget_hz=budget, clock=clock, sleep=clock.sleep)
-    rig = R.Rig(session=session, capture=None, playout=None)
-    assert R.drive(rig, paced, duration=3.0, clock=clock, sleep=clock.sleep) == len(auto)
-    sent = np.array([t for t, _, _ in transport.sent])
-    assert sent == pytest.approx(paced.times, abs=1e-9), "the session never holds a write back"
-    order = np.argsort(auto.times, kind="stable")
-    lead = auto.times[order] - sent
-    assert (
-        lead.min() >= 0.033 + R.EARLY_BIAS_S - 1e-9 and lead.max() <= 0.033 + R.EARLY_BIAS_S + burst / budget
-    )
-
-
-def test_drive_wakes_only_when_a_parameter_is_due():
-    """The host does nothing per frame: simultaneous writes are one batch, not one call each."""
-    auto = Automation.concat([Automation.of([0.0, 0.4], 2, [500, 900]), Automation.of([0.0], 5, 300)])
-    rig = R.Rig(session=FakeSession(), capture=None, playout=None)
-    clock = Clock()
-    written = R.drive(rig, auto, duration=1.0, clock=clock, sleep=clock.sleep)
-    assert written == 3
-    assert rig.session.calls == [
-        {2: 500 / R.PARAM_MAX, 5: 300 / R.PARAM_MAX},
-        {2: 900 / R.PARAM_MAX},
-    ]
-    assert clock.slept == pytest.approx([0.4, 0.6]), "it sleeps to the next event, then out the take"
 
 
 def test_open_rig_builds_from_the_device_layer(monkeypatch):
@@ -374,8 +273,8 @@ def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
 
 
 @pytest.mark.parametrize("corrupted", [False, True])
-def test_a_locked_take_loads_its_program_in_the_lead_in_and_keeps_its_lock(monkeypatch, tmp_path, corrupted):
-    """Passthru first, then recording and player; the program loads inside, the lock saved once stopped."""
+def test_a_locked_take_is_proven_and_judged_once_its_cc_map_holds(monkeypatch, tmp_path, corrupted):
+    """The program loads, the take records frame-locked, the CC map is checked, then the take is proven."""
 
     def verify():
         rig.log.append(("verify",))
@@ -386,31 +285,47 @@ def test_a_locked_take_loads_its_program_in_the_lead_in_and_keeps_its_lock(monke
     out = tmp_path / "take.mkv"
     with pytest.raises(CcMapError) if corrupted else contextlib.nullcontext():
         assert render_locked(rig, out) == PROBED
-    steps = [
-        "upload",
-        "load",
-        "record",
-        "play",
-        "load",
-        "params",
-        "drive",
-        "stop",
-        "recorded",
-        "flips",
-        "verify",
-    ]
-    assert rig.steps == steps + ([] if corrupted else ["inspect"])
-    assert [step[1:] for step in rig.log if step[0] == "load"] == [("Passthru", "link"), ("Teletext", "link")]
-    began = next(step[2] for step in rig.log if step[0] == "play")
-    assert rig.log[6] == ("drive", pytest.approx(began + 8 / 30), 0.2), "the pass is timed from clip frame 0"
-    assert rig.clock.now == pytest.approx(began + 8 / 30 + 0.2 + LOCKED.tail_s)
+    steps = ["upload", "load", "record", "play", "drive", "stop", "recorded", "flips", "verify"]
+    assert rig.steps == steps + ([] if corrupted else ["evidence", "inspect"])
+    assert [step[1:] for step in rig.log if step[0] == "load"] == [("Teletext", "link")]
     record = np.load(L.lock_path(out))
     assert (int(record["hold"]), int(record["lead"]), int(record["count"])) == (2, 8, 6)
     assert np.array_equal(record["flips"], rig.take.flips)
     if not corrupted:
         picked = rig.take.picked()
         assert np.load(L.picked_path(out)).tolist() == picked.tolist()
+        assert rig.log[-2] == ("evidence", "Teletext", "tc.mkv", "take.mkv"), "proven against the clip played"
         assert rig.log[-1] == ("inspect", pytest.approx(picked[0] / 60))
+        assert json.loads(locktake.evidence_path(out).read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_an_unproven_take_is_never_judged(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch, proof=[Proof(ok=False)])
+    out = tmp_path / "take.mkv"
+    with pytest.raises(R.UnverifiedTakeError, match="Teletext: the take's parameters are unproven"):
+        render_locked(rig, out)
+    assert "inspect" not in rig.steps and json.loads(
+        locktake.evidence_path(out).read_text(encoding="utf-8")
+    ) == {"ok": False}
+
+
+def test_a_take_plans_only_the_writes_inside_its_clip(monkeypatch, tmp_path):
+    """Writes are targeted on clip frames; one due past the clip's last frame is never sent."""
+    rig = locked_pass(monkeypatch)
+    planned = []
+    take_fn = locktake.locked_take
+
+    def capture(*args, plan, **kw):
+        planned.append(plan.copy())
+        return take_fn(*args, plan=plan, **kw)
+
+    monkeypatch.setattr(locktake, "locked_take", capture)
+    auto = Automation.of([0.0, 0.05, 0.3], 2, [100, 200, 300])
+    monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {0: auto})
+    render_locked(rig, tmp_path / "take.mkv")
+    assert len(planned) == 1
+    plan = planned[0]
+    assert plan["target"].tolist() == [0, 2] and plan["value"].tolist() == [100, 200]
 
 
 def test_a_passthru_take_loads_nothing_inside_its_lead_in(monkeypatch, tmp_path):
@@ -421,23 +336,23 @@ def test_a_passthru_take_loads_nothing_inside_its_lead_in(monkeypatch, tmp_path)
     assert L.lock_path(out).is_file()
 
 
-@pytest.mark.parametrize(
-    "load_s,skew_s,match,locked",
-    [
-        (0.3, 0.0, r"Teletext: loading took 0.3s, past the 0.3s lead-in; raise lead_in_s", False),
-        (0.2, -0.1, r"Teletext: clip frame 0 reached the card 0.03s before the load ended", True),
-    ],
-    ids=["load-overran", "clip-before-load"],
-)
-def test_a_load_not_done_before_clip_frame_0_is_a_lead_in_error(
-    monkeypatch, tmp_path, load_s, skew_s, match, locked
-):
-    rig = locked_pass(monkeypatch, load_s={"Teletext": load_s}, skew_s=skew_s)
+def test_a_lockcheck_take_loads_its_program_inside_the_lead_in(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch, load_s={"Teletext": 0.1})
     out = tmp_path / "take.mkv"
-    with pytest.raises(R.LeadInError, match=match):
-        render_locked(rig, out)
-    assert ("drive" in rig.steps) is locked
-    assert L.lock_path(out).is_file() is locked and "inspect" not in rig.steps
+    loaded = R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED)
+    assert [step[1] for step in rig.log if step[0] == "load"] == ["Passthru", "Teletext"]
+    assert rig.steps[:5] == ["load", "record", "play", "load", "params"] and loaded == pytest.approx(0.1)
+    assert rig.clock.now == pytest.approx(8 / 30 + 0.2 + LOCKED.tail_s)
+
+
+def test_a_load_that_overruns_the_lead_in_is_a_lead_in_error(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch, load_s={"Teletext": 0.3})
+    out = tmp_path / "take.mkv"
+    with pytest.raises(
+        R.LeadInError, match=r"Teletext: loading took 0.3s, past the 0.3s lead-in; raise lead_in_s"
+    ):
+        R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED)
+    assert not L.lock_path(out).is_file()
 
 
 def test_lead_frames_rounds_the_lead_in_to_whole_frames():
@@ -588,21 +503,22 @@ def test_programs_beyond_the_sections_are_reported_not_dropped(monkeypatch, tmp_
 
 
 def test_a_long_wait_reports_progress_while_it_waits():
-    """A five minute pass with one gesture would otherwise print nothing for five minutes."""
-    auto = Automation.of([0.0], 2, 500)
-    rig = R.Rig(session=FakeSession(), capture=None, playout=None)
-    clock = Clock()
-    assert R.drive(rig, auto, duration=5.0, clock=clock, sleep=clock.sleep, tick_s=1.0) == 1
-    assert clock.slept == pytest.approx([1.0] * 5), "it wakes each tick, not once at the end"
+    """A five minute pass would otherwise print nothing for five minutes."""
+    clock, said = Clock(), []
+    R._wait_until(5.0, clock=clock, sleep=clock.sleep, tick_s=1.0, report=said.append)
+    assert clock.slept == pytest.approx([1.0] * 5) and said == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
 
 
-def test_ticks_never_outrun_the_event_they_wait_for():
-    """Subdividing a wait must not move when a parameter lands."""
-    auto = Automation.of([0.0, 2.5], 2, [100, 900])
-    rig = R.Rig(session=FakeSession(), capture=None, playout=None)
+def test_ticks_never_outrun_the_instant_they_wait_for():
     clock = Clock()
-    R.drive(rig, auto, duration=2.5, clock=clock, sleep=clock.sleep, tick_s=1.0)
-    assert clock.slept == pytest.approx([1.0, 1.0, 0.5]), "the last tick is short, landing on the event"
+    R._wait_until(2.5, clock=clock, sleep=clock.sleep, tick_s=1.0)
+    assert clock.slept == pytest.approx([1.0, 1.0, 0.5]), "the last tick is short, landing on the instant"
+
+
+def test_a_clock_that_never_advances_ends_the_wait():
+    slept = []
+    R._wait_until(1.0, clock=lambda: 0.0, sleep=slept.append, tick_s=0.25)
+    assert slept == [0.25]
 
 
 def test_unknown_programs_reports_what_the_device_will_not_load():

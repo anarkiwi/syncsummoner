@@ -76,12 +76,45 @@ clean range. To re-derive it, run `device doctor --latency` with
 `--latency-params` naming as many knobs as a score drives and take the
 `midi.backlog` finding's fastest clean rate times the parameter count.
 
-Render compensates the write latency by bringing every write forward by one
-frame period of the session format, plus the 15 ms perceptual bias of design
-4.4. `--latency-ms` overrides the figure; `--measure-latency` times single writes
-on each loaded program instead, and falls back to the figure, logged, when
-pyvmancer refuses the program's first knob (a toggle, or a modulated slot) or a
-write never reads back.
+## CCs latch on the device's frame tick
+
+Measured on firmware 1.0.1 at 1080p30 with the locked player, a still strip-coded
+lead-in, and a bypass or crossfader toggled at random phases on eight programs:
+
+| Measure | Value |
+| --- | --- |
+| Picture change | always on a frame start, never part way down a frame (0 mixed captures in 120 toggles) |
+| Readback (`modulation status` combined value) | changes once per output frame, on the same tick that latches the picture |
+| CC to readback value | exact for all 1024 values, high-resolution CC with manual parked at 0 |
+| Serial `modulation status` round trip | about 1.4 to 2.2 ms, 279-byte reply |
+| Tick to the card's first capture of the latched frame | 0.99 to 1.26 frames, constant within a take to under 0.5 ms; it moves between takes with the card's capture phase |
+| Write lead needed before a tick | under 4.4 ms |
+
+Render therefore sends each write midway between the ticks around its target
+frame's, and proves where it landed ([evidence.md](evidence.md)). The early bias
+of design 4.4 picks the target: the first frame starting at or after the write's
+time less 15 ms.
+
+## The crossfader is not a dry control
+
+pyvmancer calls P12 the crossfader that gates every program's output. On the
+still lead-in, against Passthru's capture of the same picture (noise 0.12 mean
+absolute difference in 8-bit codes):
+
+| Program | P12 role | P12 = 0 | Bypass on | Strip legible held dry |
+| --- | --- | --- | --- | --- |
+| boneoh/YUV Bit Rotator | Global Blend, wet | dry (0.24) | dry | yes |
+| teletect/Teletect RamBend | Wet | dry (0.23) | no bypass | yes |
+| Pinwheel | Chroma Crush | black (54.4) | dry | yes |
+| YUV Amplifier | Fade Amount, wet | flat field (15.0) | dry | yes |
+| homegrownvhs/Pigment | Mix, wet | black (54.4) | dry | yes |
+| czartroniks/Quilt | Density | 48 to 53 | no bypass | no |
+| czartroniks/Fray | Length | 14.6 | no bypass | no |
+| czartroniks/Porthole | Drift | 0.55, 1.03 at the working point | no bypass | yes |
+
+So P12 gives dry passthrough for two of the eight. A program's own bypass, or a
+P12 whose role is wet where there is no bypass, does for all five that have one;
+`locktake.dry_state` picks it.
 
 ## The MIDI CC map must be checked
 
@@ -279,7 +312,7 @@ a load.
 | YUV Amplifier after czartroniks/Fray | 9.2 s | |
 | czartroniks/Fray after Pinwheel | 13.7 s | |
 
-A load that changes author is the slow one. A locked take's lead-in is 20 s for that reason.
+A load that changes author is the slow one. A program loaded inside a locked take's lead-in, which only a program with no dry control still is, needs most of its 40 s for that reason: a load that enumerates another author takes about 20 s inside the take.
 
 Across eleven link-dropped Passthru loads in one recording, the capture time of each frame's
 first capture, against the Pi's flip time for that frame, moved by between -4.5 and +10.0 ms

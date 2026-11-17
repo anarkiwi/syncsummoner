@@ -112,12 +112,16 @@ def test_the_recorder_runs_the_v4l2_recorder_asking_the_card_for_its_mode():
         "mjpeg",
     ]
     assert option(argv, "--seconds") == "12.500"
-    assert argv[-4:] == [
+    tail = argv[argv.index("--") - 1 :]
+    assert tail[:4] == [
         "/tmp/take.mkv",
         "--",
         "-c:v",
         "copy",
     ], "the card compresses; the host does not re-encode"
+    assert (
+        option(tail, "-flush_packets") == "1" and int(option(tail, "-cluster_time_limit")) > 0
+    ), "readable live"
 
 
 @pytest.mark.parametrize("mode", [RAW_422, FFV1])
