@@ -211,20 +211,44 @@ worker per core by default (`--jobs` caps it), so its cost is the FFV1 decode pl
 the per-pair optical flow, spread evenly over the cores.
 
 The codeframe loop says what each parameter does to a test signal. To also
-measure what each keeps of real footage, archive against a clip:
+measure what each keeps of real footage, archive against the timecoded clip a
+render plays, as frame-locked takes ([evidence.md](evidence.md)):
 
 ```sh
-ss probe archive --footage source.mkv --out archive/ --source-host pi@videopi
-ss probe archive --footage source.mkv --footage-start 30 --footage-seconds 120 --out archive/ ...
+ss probe hold takes/take-*.mkv --source clip.mkv --out holds/      # settle and hold per program
+ss probe sweep plan NAME --structural --hold holds/hold-NAME.json --source clip.mkv --takes sweep/
+ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi   # rig, one take
+ss probe sweep collect sweep/sweep-NAME.json --chunk K   # judge it, keep its archive rows
+ss probe sweep commit sweep/sweep-NAME.json --archive archive/
 ```
 
-The footage is conformed to the session raster, timecoded, and written to
-`archive/stimulus.mkv`, with `archive/stimulus.json` (source, excerpt, rate,
-strip, SHA-256) written last as its commit marker; the Pi plays it on a loop for
-the whole run. A resume reuses the clip when the record names the same excerpt
-and the clip still hashes the same, and skips a program only when its archive
-was recorded against that same clip; one recorded against the codeframe loop or
-another clip is recorded again. The clip has to fit the Pi's tmpfs.
+`probe hold` measures how long each program's picture keeps moving after a step
+lands (`compose.response`). Every frame of a locked take is scored as the
+evidence scores it; each value-changing step's early lags are compared, step by
+step, with the later half of its own quiet period, the state it settled into
+(Wilcoxon signed-rank), so a lasting change of regime is not mistaken for motion.
+The landing lags are one test, since the change shows on either; past them each
+lag is tested only while the one before departed (a fixed sequence), at the
+evidence's family-wise bound over the parameters and the pooled steps. The
+settle is the last lag departing; the hold is the settle plus the two settled
+frames a frame-to-frame measure needs. It is bounded when the next lag reached
+at least the steps the exact signed-rank test needs to reject at all.
+
+`probe sweep plan` takes the program's covering sweep (`Cover.vectors`, each
+parameter walked by `gates.tour`) and targets one setpoint every hold, all of a
+setpoint's changed slots on one frame, cut into takes no longer than the clip
+after its lead-in; each take opens on its setpoint as the start state. Nothing
+settles or reads back per setpoint. `capture` records one take on the rig (exit
+2 on a take fault, with the device state in `<take>.meta.json`). `collect`
+judges it and writes `<take>.rows.parquet`: one row per capture, under the
+parameter state the take realized on that frame from the landed writes. A
+frame keeps its setpoint only once every write of it has landed, one frame more
+for a write on a tick, plus the settle, until the next setpoint's first write
+lands, and only where the realized state is that setpoint's; frames a readback
+disagreed on keep none. `commit` joins the takes' card MJPEG streams with no
+re-encode into one archive, keyed on name and firmware, with the clip linked
+beside it and each row naming the clip frame it shows, so the survival metrics
+need no clock fit.
 
 A refit of a footage archive adds three survival curves to each parameter:
 `si_ratio` and `ti_ratio`, the share of the source's spatial and temporal
@@ -658,7 +682,7 @@ doing it twice, which is what the audition is for.
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
 | `SpliceError: <program>: no capture shows clip frames ...` | the take ends early, or a fitted take was never aligned; check its `aligned by` line in the take check |
 | `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or not following the clip, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
-| `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `--footage` and refit |
+| `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `probe sweep` and refit |
 | `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
 | `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, cadence, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |
 | `LeadInError: ...` | the program's load ran past the lead-in, or clip frame 0 reached the card before it ended; raise `RenderConfig.lead_in_s` (`lockcheck --program NAME --lead-in S` tries a value) |

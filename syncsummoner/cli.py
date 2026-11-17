@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from syncsummoner.probe import sweep_cmds
 from syncsummoner.progress import LOG, configure
 
 
@@ -288,11 +289,11 @@ def _names_cmd(args: argparse.Namespace) -> int:
 def _harvest_cmd(args: argparse.Namespace) -> int:
     """Drive a whole-library native frame archive run against the rig."""
     from syncsummoner.compose.render import SESSION_FORMATS
-    from syncsummoner.device.playout import ClipPlayer, LoopPlayer
+    from syncsummoner.device.playout import LoopPlayer
     from syncsummoner.device.recorder import FFV1, Recorder, require_ffmpeg
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
-    from syncsummoner.probe.harvest import HarvestConfig, harvest, prepare_footage, read_focus
+    from syncsummoner.probe.harvest import HarvestConfig, harvest, read_focus
 
     if args.format not in SESSION_FORMATS:
         raise ValueError(f"unknown format {args.format!r}; known: {', '.join(SESSION_FORMATS)}")
@@ -309,26 +310,6 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
     )
     host = {} if args.source_host is None else {"host": args.source_host}
     player: Any = LoopPlayer(width=config.width, height=config.height, **host)
-    if args.footage:
-        from syncsummoner.compose.render import RenderConfig, write_timecoded
-
-        stimulus = prepare_footage(
-            args.footage,
-            args.out,
-            render=RenderConfig.for_format(args.format),
-            write=write_timecoded,
-            start=args.footage_start,
-            seconds=args.footage_seconds,
-        )
-        config = dataclasses.replace(config, footage=str(Path(args.out) / stimulus["clip"]), loop_fps=fps)
-        player = ClipPlayer(width=config.width, height=config.height, loop=True, **host)
-        LOG.info(
-            "stimulus: %d frames (%.1fs) of %s, sha256 %s",
-            stimulus["frames"],
-            stimulus["frames"] / stimulus["fps"],
-            stimulus["source"],
-            stimulus["sha256"][:12],
-        )
     archive = FrameArchive(args.out)
     dark = sorted(archive.darkened())
     if dark:
@@ -851,16 +832,10 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument(
         "--retry-dark", action="store_true", help="re-run programs marked dark, re-judging them"
     )
-    collect.add_argument(
-        "--footage", metavar="PATH", help="natural footage to archive against; any clip ffmpeg reads"
-    )
-    collect.add_argument("--footage-start", type=float, default=0.0, metavar="SECONDS")
-    collect.add_argument(
-        "--footage-seconds", type=float, default=None, metavar="SECONDS", help="default: the whole clip"
-    )
     _add_link_args(collect)
     _add_route_arg(collect)
     collect.set_defaults(func=_harvest_cmd)
+    sweep_cmds.add_parsers(probe_sub)
 
     profile = sub.add_parser("profile", help="inspect fitted profiles")
     profile_sub = profile.add_subparsers(dest="profile_cmd", required=True)

@@ -29,6 +29,7 @@ __all__ = [
     "DARK_SUFFIX",
     "DECODERS",
     "GAP",
+    "MJPEG_PIX_FMT",
     "PROGRAM_INFO",
     "READABLE_SCHEMAS",
     "STIMULUS",
@@ -57,6 +58,10 @@ DARK_SUFFIX = ".dark.json"
 GAP = -1
 #: What the card is asked for; the recorder swaps the chroma pair back before encoding.
 CAPTURE_PIX_FMT = "yuyv422"
+#: The card's own compressed stream, as a locked take records it.
+MJPEG_PIX_FMT = "mjpeg"
+#: Card formats an archive may hold.
+CAPTURE_PIX_FMTS = frozenset({CAPTURE_PIX_FMT, MJPEG_PIX_FMT})
 #: Metadata key holding the device's own ``program info`` reply for the archived program.
 PROGRAM_INFO = "program_info"
 #: Planar 4:2:2 is the same samples deinterleaved into the canonical plane order.
@@ -113,7 +118,8 @@ class FrameRow:
     """One archived frame: where it sits in the stream, and what produced it.
 
     ``setpoint`` is :data:`GAP` for a frame captured while the sweep was moving
-    between setpoints; ``captured`` is the card's monotonic capture time.
+    between setpoints; ``captured`` is the card's monotonic capture time, ``shown`` the frame of
+    the stimulus clip it shows when a locked take attributed it, else :data:`GAP`.
     """
 
     frame: int
@@ -121,6 +127,7 @@ class FrameRow:
     params: tuple[int, ...]
     setpoint: int
     captured: float = 0.0
+    shown: int = GAP
 
     def as_row(self) -> dict[str, Any]:
         """Flatten to a Parquet-friendly row, sharing ``MeasurementRecord`` param naming."""
@@ -129,6 +136,7 @@ class FrameRow:
             "program": self.program,
             "setpoint": self.setpoint,
             "captured": self.captured,
+            "shown": self.shown,
         }
         row.update(dict(zip(_PARAM_COLUMNS, self.params)))
         return row
@@ -142,6 +150,7 @@ class FrameRow:
             params=tuple(int(row[name]) for name in _PARAM_COLUMNS),
             setpoint=int(row["setpoint"]),
             captured=float(row.get("captured") or 0.0),
+            shown=GAP if row.get("shown") is None else int(row["shown"]),
         )
 
 
@@ -422,7 +431,7 @@ class FrameArchive:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if str(meta.get("pix_fmt")) != CAPTURE_PIX_FMT:
+        if str(meta.get("pix_fmt")) not in CAPTURE_PIX_FMTS:
             return None
         if int(meta.get("schema_version", 0)) not in READABLE_SCHEMAS:
             return None
@@ -526,6 +535,7 @@ class FrameArchive:
         program_info: Mapping[str, Any] | None = None,
         stimulus: Mapping[str, Any] | None = None,
         schedule: Sequence[Mapping[str, Any]] | None = None,
+        pix_fmt: str = CAPTURE_PIX_FMT,
     ) -> dict[str, Any]:
         """Publish a recording as this program's archive: video, sidecar, then marker.
 
@@ -533,7 +543,8 @@ class FrameArchive:
         store: a run killed mid-recording leaves at most an uncommitted temp file.
         ``program_info`` is the device's reply for the program, kept so a refit
         knows each parameter's name and native range, and ``stimulus`` names what was
-        played; ``schedule`` lists each setpoint with the full state it was stepped from.
+        played; ``schedule`` lists each setpoint with the full state it was stepped from, and
+        ``pix_fmt`` names the card format recorded, raw (FFV1) or the card's MJPEG.
         A committed archive supersedes any earlier dark verdict for the program.
         """
         if not rows:
@@ -552,9 +563,9 @@ class FrameArchive:
             "key_kind": key.kind.value,
             "key_material": key.material,
             "key_digest": key.digest,
-            "codec": "ffv1",
+            "codec": "mjpeg" if pix_fmt == MJPEG_PIX_FMT else "ffv1",
             "container": CONTAINER,
-            "pix_fmt": CAPTURE_PIX_FMT,
+            "pix_fmt": pix_fmt,
             "stored_pix_fmt": STORED_PIX_FMT,
             "width": int(width),
             "height": int(height),

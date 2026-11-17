@@ -105,3 +105,19 @@ def test_the_report_is_the_cover_as_table_or_json(tiny):
 
     assert "base states" in report(tiny, tiny.initial(), steps=False)
     assert json.loads(report(tiny, tiny.initial(), as_json=True))["one_at_a_time"]["states"] == 1
+
+
+def test_the_tour_moves_at_most_two_settings_and_no_more_than_any_closed_walk():
+    from syncsummoner.program.gates import tour  # pylint: disable=import-outside-toplevel
+
+    rng = np.random.default_rng(3)
+    for n in range(1, 12):
+        values = np.sort(rng.choice(1024, n, replace=False))
+        for base in (int(values[0]), int(values[n // 2]), int(values[-1]), 1023, 0):
+            walk = tour(values, base)
+            assert sorted(walk.tolist()) == sorted(set(values.tolist()) - {base})
+            line = np.union1d(values, [base])
+            steps = np.abs(np.diff(np.searchsorted(line, np.r_[base, walk, base])))
+            assert steps.max(initial=0) <= 2
+            moved = np.abs(np.diff(np.r_[base, walk, base])).sum()
+            assert moved == 2 * (line[-1] - line[0]) or line.size == 1
