@@ -491,9 +491,18 @@ def capture(
 
 
 def collect(
-    take: str | Path, chunk: Chunk, *, clip: str | Path, config: Any, workers: int | None = None
+    take: str | Path,
+    chunk: Chunk,
+    *,
+    clip: str | Path,
+    config: Any,
+    workers: int | None = None,
+    settle: dict | None = None,
 ) -> dict:
-    """Judge a sweep take, keeping its evidence, and its archive rows beside it; a summary of both."""
+    """Judge a sweep take, keeping its evidence, and its archive rows beside it; a summary of both.
+
+    ``settle`` says which settle the rows waited and where it was measured; it is kept in the evidence.
+    """
     from syncsummoner.compose.judge import judge_take  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.wire import load_wire  # pylint: disable=import-outside-toplevel
@@ -531,6 +540,7 @@ def collect(
         )
         save_clock(take, clock)
     save_rows(take, rows)
+    _note_settle(take, settle or {"frames": int(chunk.settle), "source": "plan"})
     kept = {r.setpoint for r in rows if r.setpoint != GAP}
     judged = verdict(chunk, seen.proof.landed, disagreeing(seen.proof.applied), seen.found.picked.size)
     return {
@@ -538,6 +548,7 @@ def collect(
         "program": program,
         "evidence_ok": judged.ok,
         "verdict": judged.as_dict(),
+        "settle": settle or {"frames": int(chunk.settle), "source": "plan"},
         "landed": seen.proof.landed.summary(),
         "applied": seen.proof.applied.summary(),
         "received": None if seen.proof.received is None else seen.proof.received.summary(),
@@ -598,6 +609,15 @@ def number_runs(
                 moved = rows[c].shown - chosen["shift"] if rows[c].shown >= 0 else rows[c].shown
                 rows[c] = replace(rows[c], shown=moved, ambiguity=0)
     return rows
+
+
+def _note_settle(take: str | Path, settle: dict) -> None:
+    """Add the settle a take's rows waited, and its source, to the take's evidence report."""
+    from syncsummoner.compose.locktake import evidence_path  # pylint: disable=import-outside-toplevel
+
+    path = evidence_path(take)
+    report = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    path.write_text(json.dumps({**report, "settle": settle}, indent=1), encoding="utf-8")
 
 
 def disagreeing(applied: Any) -> np.ndarray:

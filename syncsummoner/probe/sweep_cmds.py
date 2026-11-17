@@ -209,6 +209,18 @@ def _sweep_cmd(args: argparse.Namespace) -> int:  # pragma: no cover - needs the
     return 2 if "fault" in record else 0
 
 
+def settled_by(chunk: Any, program: str, hold: str | None, plan: str) -> tuple[Any, dict]:
+    """``chunk`` with the settle a ``probe hold`` record measured, else its plan's; and where it came from."""
+    from dataclasses import replace  # pylint: disable=import-outside-toplevel
+
+    if hold is None:
+        return chunk, {"frames": int(chunk.settle), "source": str(plan)}
+    held = json.loads(Path(hold).read_text(encoding="utf-8"))
+    if held["program"] != program:
+        raise ValueError(f"{hold} measured {held['program']}, not {program}")
+    return replace(chunk, settle=int(held["settle"])), {"frames": int(held["settle"]), "source": str(hold)}
+
+
 def _sweep_collect_cmd(args: argparse.Namespace) -> int:
     """Judge one captured sweep take and keep its archive rows beside it."""
     from syncsummoner.compose.render import RenderConfig
@@ -217,7 +229,8 @@ def _sweep_collect_cmd(args: argparse.Namespace) -> int:
     chunks, said = read_plan(args.plan)
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     take = _sweep_take(Path(args.plan).parent, said["program"], args.chunk)
-    summary = collect(take, chunks[args.chunk], clip=said["source"], config=config, workers=args.workers)
+    chunk, settle = settled_by(chunks[args.chunk], said["program"], args.hold, args.plan)
+    summary = collect(take, chunk, clip=said["source"], config=config, workers=args.workers, settle=settle)
     print(json.dumps(summary, indent=1))
     return 0 if summary["evidence_ok"] else 1
 
@@ -333,6 +346,7 @@ def add_parsers(probe_sub: Any) -> None:
     gather = sweep_sub.add_parser("collect", help="judge one captured take and keep its archive rows")
     gather.add_argument("plan")
     gather.add_argument("--chunk", type=int, required=True)
+    gather.add_argument("--hold", help="a hold-<program>.json whose measured settle overrides the plan's")
     gather.set_defaults(func=_sweep_collect_cmd)
     commit = sweep_sub.add_parser("commit", help="join a program's collected takes into its archive")
     commit.add_argument("plan")
