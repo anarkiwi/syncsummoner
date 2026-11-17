@@ -295,7 +295,7 @@ def test_a_locked_take_is_proven_and_judged_once_its_cc_map_holds(monkeypatch, t
         picked = rig.take.picked()
         assert np.load(L.picked_path(out)).tolist() == picked.tolist()
         assert rig.log[-2] == ("evidence", "Teletext", "tc.mkv", "take.mkv"), "proven against the clip played"
-        assert rig.log[-1] == ("inspect", pytest.approx(picked[0] / 60))
+        assert rig.log[-1] == ("inspect", picked[0] - 1)
         assert json.loads(locktake.evidence_path(out).read_text(encoding="utf-8")) == {"ok": True}
 
 
@@ -315,7 +315,7 @@ def failed_attribution(monkeypatch, sequence):
     def attribute(*_, **__):
         raise L.LockError("clip frames 3..5 have no capture")
 
-    monkeypatch.setattr(R, "attribute_take", attribute)
+    monkeypatch.setattr("syncsummoner.compose.judge.attribute_take", attribute)
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: np.array(sequence, dtype=[("sequence", "<i8")]))
 
 

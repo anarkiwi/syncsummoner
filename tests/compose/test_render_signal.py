@@ -50,7 +50,9 @@ def controlled(monkeypatch, *takes, passthru=PROBED, transport=None):
     """A locked pass whose takes judge as ``takes`` in turn, holding the last; its control as ``passthru``."""
     rig = locked_pass(monkeypatch, transport=transport)
     seen = list(takes)
-    monkeypatch.setattr(R, "inspect_take", lambda *a, **k: seen.pop(0) if len(seen) > 1 else seen[0])
+    monkeypatch.setattr(
+        "syncsummoner.compose.judge.inspect_luma", lambda *a, **k: seen.pop(0) if len(seen) > 1 else seen[0]
+    )
     monkeypatch.setattr(
         H, "settle", lambda *a, program, **k: rig.log.append(("control", program)) or passthru
     )

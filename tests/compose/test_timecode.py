@@ -9,6 +9,7 @@ import pytest
 
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import render as R
+from syncsummoner.probe import decoded
 
 CONFIG = R.RenderConfig(width=160, height=48, fps=10.0, strip_px=8, bits=16)
 
@@ -27,7 +28,7 @@ def clip_fixture(monkeypatch, tmp_path):
 
 
 def test_an_encoded_clip_reads_back_its_wrapped_lead_in_then_every_frame(clip):
-    codes = L.strip_codes(clip, width=CONFIG.width, strip_px=CONFIG.strip_px, bits=CONFIG.bits)
+    codes = decoded.features(clip, decoded.Spec.of(CONFIG)).codes
     assert L.signed(codes, CONFIG.bits).tolist() == [-4, -3, -2, -1, 0, 1, 2, 3, 4]
 
 
@@ -38,4 +39,4 @@ def test_a_program_that_turns_the_picture_over_leaves_no_legible_strip(clip, tmp
         ["ffmpeg", "-loglevel", "error", "-i", str(clip), "-vf", "vflip", "-c:v", "ffv1", str(flipped)],
         check=True,
     )
-    assert (L.strip_codes(flipped, width=CONFIG.width, strip_px=CONFIG.strip_px) == -1).all()
+    assert (decoded.features(flipped, decoded.Spec.of(CONFIG)).codes == -1).all()

@@ -13,6 +13,7 @@ from syncsummoner.compose import lockcheck as LC
 from syncsummoner.compose import render as R
 from syncsummoner.device import recorder as recorder_mod
 from syncsummoner.device.v4l2rec import sidecar
+from syncsummoner.probe import decoded
 from tests.compose.locked import CLEAN, STANDARD, take
 
 CONFIG = R.RenderConfig(width=160, height=24, fps=30.0, strip_px=8, bits=16)
@@ -41,9 +42,17 @@ def recorded(tmp_path, monkeypatch, played, *, luma=None):
     path = tmp_path / "take.mkv"
     L.save_lock(path, played.flips, **played.kw)
     sidecar(path).write_bytes(played.frames.tobytes())
-    monkeypatch.setattr(LC, "strip_codes", lambda *a, **k: played.codes)
-    if luma is not None:
-        monkeypatch.setattr(LC, "luma", lambda p, **k: luma[str(p)])
+    luma = luma or {}
+
+    def features(p, spec, **kw):
+        del spec, kw
+        small = luma.get(str(p))
+        arrays = {"codes": played.codes}
+        if small is not None:
+            arrays["small"] = np.stack([small] * 3, axis=1)
+        return decoded.Features(arrays, "")
+
+    monkeypatch.setattr(LC.decoded, "features", features)
     return path
 
 
@@ -93,8 +102,6 @@ def test_a_clip_is_measured_after_its_lead_in_and_read_small(tmp_path):
     encode(tmp_path / "clip.mkv", 9)
     config = R.RenderConfig(fps=30.0, lead_in_s=0.1)
     assert LC.clip_seconds(tmp_path / "clip.mkv", config) == pytest.approx(6 / 30)
-    width, height = LC.TEAR_SIZE
-    assert LC.luma(tmp_path / "clip.mkv").shape == (9, height, width)
 
 
 @pytest.mark.parametrize("program", [None, "Teletext"])

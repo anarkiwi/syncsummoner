@@ -24,3 +24,5 @@ robotsofdeath/
 *.flac
 .rig/
 .program-cache/
+.bench/
+*.features.npz

@@ -55,8 +55,8 @@ syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
 syncsummoner check score.yaml --source timecoded.mkv --takes takes/ \
                    --cut-programs Derez,Lorenz,Scramble [--splice cut.mp4]   # dead picture per take
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
-syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv   # each write sent, read back, acted upon
-syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv --predict   # each verdict against the program model, contradictions flagged
+syncsummoner judge takes/take-*.mkv --source timecoded.mkv [--score score.yaml] [--jobs 2]   # offline: lock, evidence, picture, bars
+syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv --predict   # the same; each verdict against the program model
 ```
 
 Every command logs each stage and its elapsed time to stderr (`-v` for detail,
@@ -83,6 +83,7 @@ through `docker run`.
 - [docs/program-model.md](docs/program-model.md) — each program's parameters from its `.vmprog`, and which are live from its HDL
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
 - [docs/evidence.md](docs/evidence.md) — frame-locked parameter writes and the per-take proof they landed
+- [docs/judging.md](docs/judging.md) — judging finished takes offline from one decode per recording
 - [docs/contracts.md](docs/contracts.md) — normative cross-package signatures
 - [docs/rig.md](docs/rig.md) — wiring, permissions, and bring-up
 

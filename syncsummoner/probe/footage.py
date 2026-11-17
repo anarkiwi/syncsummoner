@@ -7,10 +7,6 @@ over the loop; a capture is attributed by its time, so a program that mangles th
 
 from __future__ import annotations
 
-import os
-import re
-import subprocess
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +16,7 @@ from scipy.optimize import linprog
 
 from syncsummoner import aesthetics
 from syncsummoner.device.recorder import INSPECT_SIZE
-from syncsummoner.probe.patterns import read_timecode
+from syncsummoner.probe import decoded
 
 __all__ = [
     "ClockModel",
@@ -29,18 +25,17 @@ __all__ = [
     "clock_model",
     "decode_recording",
     "motion_model",
+    "recording_of",
     "source_series",
     "unit_frames",
 ]
-
-_PTS = re.compile(rb"pts_time:\s*(-?[0-9.]+)")
 
 
 @dataclass(frozen=True)
 class ClockModel:
     """When the player showed each clip frame, in the capture clock's seconds.
 
-    ``origin`` is the centre of frame 0's display interval and ``interval`` the measured frame
+    ``origin`` is the centre of frame 0's display interval and ``interval`` the fitted frame
     period; ``period`` is the loop length in frames, or None for a clip played once.
     """
 
@@ -257,76 +252,35 @@ def decode_recording(
     size: tuple[int, int] = INSPECT_SIZE,
     ffmpeg: str = "ffmpeg",
 ) -> Recording:
-    """One decode of a recording: the body area-scaled to ``size`` in luma, the strip read at full width.
+    """A recording as :class:`Recording`: luma area-scaled to ``size``, the strip read at full width.
 
-    Times come from the decoder's own ``showinfo``, frame for frame, so a packet the decoder
-    drops cannot shift every later frame onto its neighbour's time.
+    Read from the recording's :func:`~syncsummoner.probe.decoded.features`, decoded once and cached.
     """
-    width, height = size
-    graph = (
-        f"[0:v]split[a][b];[a]crop=iw:ih-{strip_px}:0:0,scale={width}:{height}:flags=area,format=gray[s];"
-        f"[b]crop=iw:{strip_px}:0:ih-{strip_px},showinfo,format=rgb24[t]"
-    )
-    argv = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-nostats",
-        "-i",
-        str(path),
-        "-filter_complex",
-        graph,
-    ]
-    argv += ["-map", "[s]", "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
-    read_fd, write_fd = os.pipe()
-    argv += ["-map", "[t]", "-fps_mode", "passthrough", "-f", "rawvideo", f"pipe:{write_fd}"]
-    proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(write_fd,)
-    )
-    os.close(write_fd)
-    strips: list[bytes] = []
-    said: list[bytes] = []
-    readers = [
-        threading.Thread(target=_drain, args=(os.fdopen(read_fd, "rb"), strips), daemon=True),
-        threading.Thread(target=lambda: said.extend(proc.stderr), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
-    body = proc.stdout.read()
-    proc.wait()
-    for reader in readers:
-        reader.join()
-    times = np.array([float(m.group(1)) for line in said for m in [_PTS.search(line)] if m], dtype=np.float64)
-    blob = b"".join(strips)
-    stride = width * height
-    strip_stride = len(blob) // max(1, times.size) if times.size else 0
-    count = min(len(body) // stride, times.size, len(blob) // strip_stride if strip_stride else 0)
-    frames = np.frombuffer(body, np.uint8, count * stride).reshape(count, height, width)
-    codes = np.full(count, -1, dtype=np.int64)
-    if count:
-        full = strip_stride // (strip_px * 3)
-        rows = np.frombuffer(blob, np.uint8, count * strip_stride).reshape(count, strip_px, full, 3)
-        for i, strip in enumerate(rows):
-            code = read_timecode(strip.astype(np.float32) / 255.0, bits=bits, strip_px=strip_px)
-            codes[i] = -1 if code is None else code
-    return Recording(times=times[:count], codes=codes, frames=frames)
+    found = decoded.features(path, decoded.Spec(strip_px=strip_px, bits=bits, survival=size), ffmpeg=ffmpeg)
+    return recording_of(found)
 
 
-def _drain(pipe, into: list[bytes]) -> None:
-    with pipe:
-        while chunk := pipe.read(1 << 20):
-            into.append(chunk)
+def recording_of(found: decoded.Features) -> Recording:
+    """The :class:`Recording` a recording's features hold."""
+    return Recording(times=found.times, codes=found.codes, frames=found.luma)
 
 
 def source_series(
-    clip: str | Path, *, strip_px: int, size: tuple[int, int] = INSPECT_SIZE, ffmpeg: str = "ffmpeg"
+    clip: str | Path | decoded.Features,
+    *,
+    strip_px: int,
+    size: tuple[int, int] = INSPECT_SIZE,
+    ffmpeg: str = "ffmpeg",
 ) -> tuple[np.ndarray, np.ndarray]:
     """SI and TI of every frame of the clip that was played, in clip order, at survival size.
 
-    A locked take's lead-in, numbered below zero and so wrapped to the strip's top half, is skipped.
+    ``clip`` is a path or its decoded features. A locked take's lead-in, numbered below zero and
+    so wrapped to the strip's top half, is skipped.
     """
-    recording = decode_recording(clip, strip_px=strip_px, bits=16, size=size, ffmpeg=ffmpeg)
+    if isinstance(clip, decoded.Features):
+        recording = recording_of(clip)
+    else:
+        recording = decode_recording(clip, strip_px=strip_px, bits=16, size=size, ffmpeg=ffmpeg)
     clip_codes = (recording.codes >= 0) & (recording.codes < 1 << 15)
     lead = int(np.argmax(clip_codes)) if np.any(recording.codes >= 1 << 15) else 0
     return aesthetics.information(unit_frames(recording.frames[lead:]))

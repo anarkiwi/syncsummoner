@@ -9,11 +9,13 @@ from pathlib import Path
 import numpy as np
 
 from syncsummoner.compose import lock as L
+from syncsummoner.compose import judge as J
 from syncsummoner.compose import locktake
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import Layer, Score, Section
 from syncsummoner.device.playout import FLIP
 from syncsummoner.device.v4l2rec import FRAME, sidecar
+from syncsummoner.probe import decoded
 from tests.compose import PROBED, rig_transport
 
 VBLANK_NS = 16_666_667
@@ -219,7 +221,11 @@ def locked_pass(monkeypatch, played=None, transport=None, *, proof=None, **kwarg
     """
     rig = Played(take(STANDARD) if played is None else played, transport, **kwargs)
     monkeypatch.setattr(R, "time", types.SimpleNamespace(monotonic=rig.clock, sleep=rig.clock.sleep))
-    monkeypatch.setattr(L, "strip_codes", lambda *a, **k: rig.take.codes)
+    monkeypatch.setattr(
+        decoded,
+        "features",
+        lambda *a, **k: decoded.Features({"codes": rig.take.codes, "luma": np.zeros(0)}, ""),
+    )
     monkeypatch.setattr(R, "plan_automation", lambda *a, **k: {})
     proofs = list(proof or [Proof()])
 
@@ -232,16 +238,14 @@ def locked_pass(monkeypatch, played=None, transport=None, *, proof=None, **kwarg
             hold = int(player.status()["hold"])
         L.save_lock(out, rig_.playout.flips(), hold=hold, lead=lead, count=count)
 
-    def take_evidence(take_path, *, program, clip, config):
-        del config
+    def take_evidence(take_path, *, program, clip, config, **kw):
+        del config, kw
         rig.log.append(("evidence", program, str(clip), Path(take_path).name))
         return proofs.pop(0) if len(proofs) > 1 else proofs[0]
 
     monkeypatch.setattr(locktake, "locked_take", locked_take)
     monkeypatch.setattr(locktake, "take_evidence", take_evidence)
-    monkeypatch.setattr(
-        R, "inspect_take", lambda path, **kw: rig.log.append(("inspect", kw["start_s"])) or PROBED
-    )
+    monkeypatch.setattr(J, "inspect_luma", lambda luma, start: rig.log.append(("inspect", start)) or PROBED)
     return rig
 
 

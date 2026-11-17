@@ -15,11 +15,10 @@ from typing import Any
 import numpy as np
 
 from syncsummoner.compose import render
-from syncsummoner.compose.lock import Run, signed, strip_codes
+from syncsummoner.compose.lock import Run, signed
+from syncsummoner.probe import decoded
 from syncsummoner.progress import LOG, stage
 
-#: Size frames are compared at for the tear check.
-TEAR_SIZE = (96, 54)
 #: Bands judged for tearing: the top and middle thirds, as row fractions.
 BANDS = ((0.0, 1 / 3), (1 / 3, 2 / 3))
 
@@ -66,16 +65,6 @@ class LockReport:
         )
 
 
-def luma(path: str | Path, *, ffmpeg: str = "ffmpeg") -> np.ndarray:
-    """Every frame of a recording as small luma, area-averaged."""
-    width, height = TEAR_SIZE
-    argv = [ffmpeg, "-loglevel", "error", "-i", str(path), "-fps_mode", "passthrough"]
-    argv += ["-vf", f"scale={width}:{height}:flags=area", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
-    data = subprocess.run(argv, check=True, capture_output=True).stdout
-    size = width * height
-    return np.frombuffer(data[: len(data) - len(data) % size], np.uint8).reshape(-1, height, width)
-
-
 def band_error(a: np.ndarray, b: np.ndarray, band: slice) -> np.ndarray:
     """Mean absolute difference of two frame stacks over a band of rows, per frame."""
     return np.abs(a[:, band] - b[:, band]).mean(axis=(1, 2))
@@ -109,9 +98,10 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
     from syncsummoner.device.playout import flip_summary
     from syncsummoner.device.v4l2rec import read_log
 
-    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    codes = strip_codes(take, width=config.width, strip_px=config.strip_px, bits=config.bits, ffmpeg=ffmpeg)
-    found = render.attribute_take(take, config=config, codes=codes)
+    ffmpeg, spec = getattr(config, "ffmpeg", "ffmpeg"), decoded.Spec.of(config)
+    features = decoded.features(take, spec, ffmpeg=ffmpeg)
+    codes = features.codes
+    found = render.attribute_take(take, config=config, features=features)
     record = np.load(render.lock_path(take))
     frames = read_log(take)
     m, run = found.per_frame, found.run
@@ -126,8 +116,10 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
     judged = torn = 0
     if clip is not None:
         with stage("tears", take=str(take)) as said:
-            source = luma(clip, ffmpeg=ffmpeg)[found.lead : found.lead + found.picked.size]
-            judged, torn = tears(luma(take, ffmpeg=ffmpeg)[found.picked], source)
+            source = decoded.features(clip, spec, ffmpeg=ffmpeg).small[
+                found.lead : found.lead + found.picked.size
+            ]
+            judged, torn = tears(features.small[found.picked, 0], source[:, 0])
             said.update(judged=judged, torn=torn)
     return LockReport(
         frames=int(found.picked.size),

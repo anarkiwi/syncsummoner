@@ -22,7 +22,8 @@ def _checked(monkeypatch, *, spans=(), cuts=None):
     """
     seen = {"attributed": []}
 
-    def attribute(take, *, config):
+    def attribute(take, *, config, **kw):
+        del kw
         seen["attributed"].append((Path(take).name, config.fps))
         return types.SimpleNamespace(picked=np.arange(5) * len(Path(take).name))
 
@@ -34,6 +35,7 @@ def _checked(monkeypatch, *, spans=(), cuts=None):
 
     monkeypatch.setattr(R, "attribute_take", attribute)
     monkeypatch.setattr(T, "check_takes", check)
+    monkeypatch.setattr("syncsummoner.probe.decoded.features", lambda path, spec, **kw: str(path))
     return seen
 
 

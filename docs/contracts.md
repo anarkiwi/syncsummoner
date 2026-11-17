@@ -143,6 +143,7 @@ class Recorder:                      # ffmpeg owns the card; the host touches no
     def command(self, path, *, seconds=None) -> list[str]     # -t is unusable under copyts
     def recording(self, path, *, seconds=None) -> ContextManager   # records for the block
     def timestamps(self, path) -> np.ndarray   # per-frame CLOCK_MONOTONIC capture times
+inspect_luma(frames, *, start=0, every=4) -> TakeReport   # inspect_take over decoded luma
 inspect_take(path) -> TakeReport   # picture/uniform counts, luma range, motion; .mostly_picture (load), .usable (render), .ever_structured (archive), .frozen
 held(frames) -> (motion, frozen)   # consecutive-difference correlation; -1/2 for one picture plus noise
 settle(recorder, transport, *, program, timing, timeout_s, probe_path) -> TakeReport  # transmitting() first, then the first probe with frames; SignalLostError / BlankTakeError
@@ -261,6 +262,8 @@ render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
 locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias
 locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
-locktake.take_evidence(take, *, program, clip, config, names=None, predict=False) -> evidence.Evidence   # the three links; .ok is the hard check
+locktake.take_evidence(take, *, program, clip, config, names=None, predict=False, found=None, features=None, source=None) -> evidence.Evidence   # the three links; .ok is the hard check
+judge.judge_take(take, *, clip, config, program=None, score=None, source=None, features=None, predict=False, workers=None) -> judge.Judged   # one attribution handed to evidence, picture and take check
+decoded.features(path, spec=Spec(), *, workers=None, ffmpeg="ffmpeg", store=True) -> decoded.Features   # one decode per recording, cached beside it (docs/judging.md)
 evidence.send_time(frames, ticks, times, delta) -> ns   # half a frame before the instant each frame's write must precede
 ```

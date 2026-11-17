@@ -42,6 +42,7 @@ __all__ = [
     "await_transmitting",
     "die_with_parent",
     "held",
+    "inspect_luma",
     "inspect_take",
     "require_ffmpeg",
     "require_input",
@@ -470,7 +471,20 @@ def inspect_take(
         return TakeReport()
     rgb = np.frombuffer(data, np.uint8, count * stride).reshape(count, height, width, 3)
     weights = (LUMA_709 / 255.0).astype(np.float32)
-    luma = np.einsum("...c,c->...", rgb, weights, dtype=np.float32, casting="unsafe")
+    return luma_report(np.einsum("...c,c->...", rgb, weights, dtype=np.float32, casting="unsafe"))
+
+
+def inspect_luma(frames: np.ndarray, *, start: int = 0, every: int = 4) -> TakeReport:
+    """:func:`inspect_take` over decoded 8-bit luma: every ``every``-th frame from ``start``."""
+    picked = np.asarray(frames)[max(0, start) :: max(1, every)]
+    if not picked.size:
+        return TakeReport()
+    return luma_report(picked.astype(np.float32) / np.float32(255.0))
+
+
+def luma_report(luma: np.ndarray) -> TakeReport:
+    """A take's :class:`TakeReport` from its sampled luma in ``[0, 1]``."""
+    count = len(luma)
     steps = np.rint(np.ptp(luma.reshape(count, -1), axis=1) / QUANTUM)
     motion, frozen = held(luma)
     return TakeReport(
