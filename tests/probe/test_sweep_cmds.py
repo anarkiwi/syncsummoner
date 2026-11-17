@@ -175,7 +175,7 @@ def test_sweep_plan_takes_a_recorded_cover_and_joint_moves(tmp_path, monkeypatch
     hold.write_text(json.dumps({"program": "p", "settle": 0, "hold": 2}))
     cover_file = tmp_path / "cover.json"
     cover_file.write_text(json.dumps({"states": [[0] * 12], "chosen": [0], "stepped": {"0": [1]}}))
-    monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(1200 + 40))
+    monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(2 * 1200 + 40))
     fake = SimpleNamespace(resolution=lambda: {1: (0, 1), 11: (0,), 6: (0, 1)})
     monkeypatch.setattr("syncsummoner.program.model", lambda name: fake)
     monkeypatch.setattr(gates, "representatives", lambda m, p, bits: np.array([0, 512]))
