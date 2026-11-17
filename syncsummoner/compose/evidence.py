@@ -211,12 +211,12 @@ def frame_of_tick(n: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) 
 
 
 def send_time(frames: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) -> np.ndarray:
-    """When to send a CC so it lands on each frame: the latest instant the tick before its own can fall.
+    """When to send a CC to land on each frame: just after the latest instant the tick before it can fall.
 
     A sending thread can only wake late, never early, so this leaves almost a whole frame for it.
     """
     tick = np.rint((times.at(frames) - delta - ticks.phase) / ticks.period)
-    return ticks.hi + (tick - 1) * ticks.period
+    return ticks.hi + (tick - 1) * ticks.period + 1.0
 
 
 def toggle_landings(
@@ -399,6 +399,11 @@ def landed(
         early=int(np.count_nonzero(rows["landed"][sent] < rows["target"][sent])),
         ambiguous=int(
             np.count_nonzero((clear < 0) | ((rows["seen"][sent] >= 0) & (rows["seen"][sent] != n)))
+        ),
+        wake_ms=(
+            float((live["t0_ns"] - live["due_ns"]).max()) / 1e6
+            if "due_ns" in (live.dtype.names or ()) and live.size
+            else float("nan")
         ),
     )
 

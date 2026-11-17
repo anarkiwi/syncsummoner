@@ -17,8 +17,17 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
-#: One CC write: its send interval, parameter (1-based), value put on the wire, and target clip frame.
-SEND = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("param", "<i8"), ("value", "<i8"), ("target", "<i8")])
+#: One CC write: send interval, parameter (1-based), value on the wire, target clip frame, when it was due.
+SEND = np.dtype(
+    [
+        ("t0_ns", "<i8"),
+        ("t1_ns", "<i8"),
+        ("param", "<i8"),
+        ("value", "<i8"),
+        ("target", "<i8"),
+        ("due_ns", "<i8"),
+    ]
+)
 #: One ``modulation status`` reply: its request interval and the 12 combined values.
 READ = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("o", "<i8", (12,))])
 #: One CC message the firmware logged receiving, at the latest host time it can have arrived.
