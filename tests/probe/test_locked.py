@@ -305,7 +305,7 @@ def test_a_uniquely_numbered_run_records_its_one_numbering():
 
 
 def test_pooled_numbering_follows_the_clip_only_when_its_series_counts_the_lead_in():
-    """Rows name played frames, lead-in included; scored against a series without it, nothing is chosen."""
+    """Rows name played frames, lead-in counted; read past the lead-in the series picks the true shift."""
     from syncsummoner import aesthetics  # pylint: disable=import-outside-toplevel
 
     rng = np.random.default_rng(3)
@@ -323,11 +323,10 @@ def test_pooled_numbering_follows_the_clip_only_when_its_series_counts_the_lead_
             seg.append(2)
     seg = np.array(seg)
     luma = clip[[r.shown for r in rows]]
-    aligned = aesthetics.information(clip.astype(np.float32) / 255.0)
+    series = aesthetics.information(clip[lead:].astype(np.float32) / 255.0)
     clock = [{"run": 2, "candidates": [7, 8]}]
-    L.number_runs(list(rows), clock, seg, luma, aligned)
+    L.number_runs(list(rows), clock, seg, luma, series, lead=lead)
     assert clock[0]["selection"]["shift"] == 0
-    offset = aesthetics.information(clip[lead:].astype(np.float32) / 255.0)
     clock = [{"run": 2, "candidates": [7, 8]}]
-    L.number_runs(list(rows), clock, seg, luma, offset)
+    L.number_runs(list(rows), clock, seg, luma, series)
     assert clock[0]["selection"]["shift"] != 0

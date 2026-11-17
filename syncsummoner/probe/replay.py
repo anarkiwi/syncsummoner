@@ -35,6 +35,7 @@ from syncsummoner.probe.footage import (
     attribute,
     clock_model,
     motion_model,
+    source_frame,
     source_series,
     unit_frames,
 )
@@ -284,7 +285,7 @@ def survival_metrics(
     period = int(stimulus["frames"])
     if live.size and np.all(named[live] >= 0):
         late = np.array([getattr(row, "ambiguity", 0) for row in rows], dtype=np.int64)
-        clip = named - int(stimulus.get("lead", 0))
+        clip = source_frame(named, int(stimulus.get("lead", 0)))
         return [
             _kept(frames, members, clip[members], series, period, int(late[members].max()))
             for members in groups

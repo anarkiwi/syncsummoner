@@ -286,6 +286,14 @@ def source_series(
     return aesthetics.information(unit_frames(recording.frames[lead:]))
 
 
+def source_frame(shown: np.ndarray, lead: int) -> np.ndarray:
+    """The :func:`source_series` frame a capture shows, from the played frame it names, lead-in counted.
+
+    The one conversion between the two numberings: rows name played frames, the series starts at clip frame 0.
+    """
+    return np.asarray(shown, dtype=np.int64) - int(lead)
+
+
 def unit_frames(frames: np.ndarray):
     """Stored 8-bit frames one at a time in the unit range the metrics take."""
     return (frame.astype(np.float32) / np.float32(255.0) for frame in frames)
