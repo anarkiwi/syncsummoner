@@ -138,7 +138,7 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
         6: np.array([0, 1023]),
         11: np.array([0, 1023]),
     }
-    model = SimpleNamespace(resolution=lambda: {p: (0,) for p in values}, bypass=lambda state: 11)
+    model = SimpleNamespace(resolution=lambda: {p: (0,) for p in values}, bypass=lambda: 11)
     monkeypatch.setattr("syncsummoner.program.model", lambda name: model)
     monkeypatch.setattr("syncsummoner.program.gates.representatives", lambda m, p, bits: values[p])
     cover.write_text(
