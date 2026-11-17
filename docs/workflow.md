@@ -221,6 +221,7 @@ ss probe sweep regions NAME --cover cover-NAME.json --hold holds/hold-NAME.json 
 ss probe sweep plan NAME --structural --hold holds/hold-NAME.json --source clip.mkv --takes sweep/
 ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi   # rig, one take
 ss probe sweep collect sweep/sweep-NAME.json --chunk K   # judge it, keep its archive rows
+ss probe sweep collect sweep/sweep-NAME.json --chunk K --hold holds/hold-NAME.json   # waiting the settle a probe hold measured
 ss probe sweep commit sweep/sweep-NAME.json --archive archive/
 ```
 
@@ -275,7 +276,7 @@ balanced only there. The plan's `regions` record has the settings, the capacity 
 budget held, the per-regime counts, the guard and the hold range. `--joint` adds the
 selector moves below, each held the same way. A take plays the clip once, since its
 strips name each clip frame once, so a program's sweep is several takes. `probe sweep collect`
-judges a take by what its rows need (`locked.verdict`): every write sent, echoed, once and in
+judges a take by what its rows need (`locked.verdict`); `--hold` makes its rows wait the settle a `probe hold` record measured in place of the plan's, and the evidence report says which settle was used and where it came from (`settle`): every write sent, echoed, once and in
 order; every setting's window, opening its settle after its writes' latest landing window,
 opening before the next setting's writes may land; and no readback disagreeing inside an open
 window. A write that takes effect after its nominal frame but before its window opens, as the

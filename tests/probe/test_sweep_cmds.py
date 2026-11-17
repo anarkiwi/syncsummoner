@@ -6,12 +6,14 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from syncsummoner import cli
 from syncsummoner.compose import response as response_mod
 from syncsummoner.compose.evidence import DISAGREE, LANDED
 from syncsummoner.probe import decoded
 from syncsummoner.probe import locked as L
+from syncsummoner.probe import sweep_cmds
 from syncsummoner.probe.archive import FrameArchive
 from syncsummoner.program import gates
 
@@ -156,7 +158,22 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     said = L.collect(tmp_path / "t.mkv", chunk, clip="c.mkv", config=None)
     assert said["setpoints_kept"] == len(chunk.states) and said["rows_measured"] == n
     assert said["evidence_ok"] and said["verdict"]["late"] == 2
+    assert said["settle"] == {"frames": 0, "source": "plan"}
+    kept = json.loads((tmp_path / "t.mkv.evidence.json").read_text())
+    assert kept["settle"] == said["settle"]
     assert L.rows_path(tmp_path / "t.mkv").is_file()
+
+
+def test_a_measured_hold_overrides_a_plans_settle_and_says_so(tmp_path):
+    chunk = L.plan_sweep(plan_states(), settle=1, hold=2, frames=20)[0]
+    hold = tmp_path / "hold-p.json"
+    hold.write_text(json.dumps({"program": "p", "settle": 27, "hold": 29}))
+    moved, said = sweep_cmds.settled_by(chunk, "p", str(hold), "plan.json")
+    assert moved.settle == 27 and said == {"frames": 27, "source": str(hold)}
+    kept, said = sweep_cmds.settled_by(chunk, "p", None, "plan.json")
+    assert kept is chunk and said == {"frames": 1, "source": "plan.json"}
+    with pytest.raises(ValueError, match="not q"):
+        sweep_cmds.settled_by(chunk, "q", str(hold), "plan.json")
 
 
 def test_judge_offline_writes_nothing(tmp_path, monkeypatch):
