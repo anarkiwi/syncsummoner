@@ -216,11 +216,15 @@ def attribute(
     count: int,
     tail: int = 0,
     bits: int = 16,
+    trusted: np.ndarray | None = None,
 ) -> Attribution:
     """Attribute every capture of a take to the clip frame it shows.
 
     ``codes`` are the captures' strip codes, ``frames`` their V4L2 records and ``flips`` the Pi's
     flip log; the clip played ``lead`` lead-in frames, ``count`` clip frames and ``tail`` lead-out.
+    Only strips on captures ``trusted`` (all by default) are evidence: a program processing its input shows
+    its own picture there, so those strips neither anchor the line nor count against it. A run with no strip
+    the Pi's flips cannot number is left unattributed; the take stays exact only if the clip needs none of it.
     """
     seg = frameline.segments(frames["t_ns"], frames["sequence"])
     resolution = float(np.gcd.reduce(frames["t_ns"])) if frames.size else 0.0
@@ -231,6 +235,8 @@ def attribute(
     shown_at[up[::-1]] = starts[::-1]
     clip = signed(np.asarray(codes, dtype=np.int64), bits)
     legible = (codes >= 0) & (clip >= -lead) & (clip < count + tail)
+    if trusted is not None:
+        legible &= np.asarray(trusted, dtype=bool)
     played = np.where(legible, clip + lead, -1)
     dry = np.where((clip < 0) | (clip >= count), played, -1)
     named, group = anchors(dry, seg)
@@ -333,7 +339,11 @@ def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, err
         lines[s] = fitted(s, period)
     for s in runs:
         if not (own[s] >= 0).any():
-            lines[s] = _bridge(lines[s], lag, rate, shown_at)
+            try:
+                lines[s] = _bridge(lines[s], lag, rate, shown_at)
+            except LockError as err:
+                LOG.warning("captures in run %d are left unattributed: %s", s, err)
+                del lines[s]
     return lines
 
 
@@ -446,10 +456,68 @@ def picked_path(take: str | Path) -> Path:
 
 
 def save_lock(
-    take: str | Path, flips: np.ndarray, *, hold: int, lead: int, count: int, tail: int = 0
+    take: str | Path, flips: np.ndarray, *, hold: int, lead: int, count: int, tail: int = 0, wet: bool = False
 ) -> None:
-    """Keep what attribution needs from the Pi next to the take."""
-    np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count, tail=tail)
+    """Keep what attribution needs from the Pi next to the take; ``wet`` when a program played the clip."""
+    np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count, tail=tail, wet=wet)
+
+
+def _trusted(take: str | Path, record: Any, frames: np.ndarray) -> np.ndarray | None:
+    span = processed(take, record, frames)
+    if span is None:
+        return None
+    t = frames["t_ns"].astype(np.float64)
+    return (t < span[0]) | (t > span[1])
+
+
+def processed(take: str | Path, record: Any, frames: np.ndarray) -> tuple[float, float] | None:
+    """When a program processed the take's picture, ``(from, to)`` on the host clock; None if it never did.
+
+    From the first write leaving the dry state, or the program's load command, to the close of the
+    landing window of the write or reload making it dry again: that write's echo, or the reload's
+    return, then the latency band and the frame it lands on. A take without those times on file, a wet
+    lockcheck's, is processed from the end of its first run to the start of its last: the loads' outages.
+    """
+    from syncsummoner.device.wire import load_wire, wire_path  # pylint: disable=import-outside-toplevel
+
+    wet = bool(record["wet"]) if "wet" in record else wire_path(take).is_file()
+    if not wet:
+        return None
+    if wire_path(take).is_file():
+        wire = load_wire(take)
+        span = _written_span(wire, int(record["count"]))
+        if span is not None:
+            return span
+    seg = frameline.segments(frames["t_ns"], frames["sequence"])
+    t = frames["t_ns"].astype(np.float64)
+    return float(t[seg == seg[0]][-1]), float(t[seg == seg[-1]][0])
+
+
+def _written_span(wire: Any, count: int) -> tuple[float, float] | None:
+    """:func:`processed` from a wire record: the dry control's writes, else the loads it recorded."""
+    import json  # pylint: disable=import-outside-toplevel
+
+    from syncsummoner.compose.evidence import START  # pylint: disable=import-outside-toplevel
+    from syncsummoner.device.wire import echoed  # pylint: disable=import-outside-toplevel
+
+    lat = json.loads(str(wire["latency"])) if "latency" in wire else {}
+    if "hi" not in lat:
+        return None
+    after = float(lat["hi"]) + float(lat["period"])
+    loads = json.loads(str(wire["loads"])) if "loads" in wire else []
+    if json.loads(str(wire["dry"])) is None:
+        if len(loads) < 2:
+            return None
+        return float(loads[0]["t0_ns"]), float(loads[-1]["t1_ns"]) + after
+    sends = wire["sends"]
+    moved = np.flatnonzero(sends["target"] != START)
+    back = np.flatnonzero(sends["target"] == count)
+    if not moved.size or not back.size:
+        return None
+    took = echoed(sends, wire["receipts"], wire["reads"], wire["cc_map"], read_errors=wire.get("read_errors"))
+    end = took[back[-1], 1]
+    end = float(sends["t1_ns"][back[-1]]) if not np.isfinite(end) else float(end)
+    return float(sends["t0_ns"][moved[0]]), end + after
 
 
 def attribute_take(
@@ -477,15 +545,17 @@ def attribute_take(
                 take, decoded.Spec.of(config), ffmpeg=getattr(config, "ffmpeg", "ffmpeg")
             )
         codes = features.codes
+    frames = read_log(take)
     found = attribute(
         codes,
-        read_log(take),
+        frames,
         record["flips"],
         hold=int(record["hold"]),
         lead=int(record["lead"]),
         count=int(record["count"]),
         tail=int(record["tail"]) if "tail" in record else 0,
         bits=config.bits,
+        trusted=_trusted(take, record, frames),
     )
     LOG.info("%s: %s", take, found.summary())
     if not found.complete:

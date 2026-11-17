@@ -779,6 +779,9 @@ def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch
     shell = rig.transport.device.shell
     at, quiet = shell.loads[-1]
     assert quiet and shell.said[at - 1] == ("midi", "monitor", "off")
+    timed = json.loads(str(np.load(tmp_path / "take.mkv.wire.npz")["loads"]))
+    assert [x["program"] for x in timed] == ["Teletext", "Passthru"]
+    assert all(x["t0_ns"] <= x["t1_ns"] for x in timed) and timed[0]["t1_ns"] <= timed[1]["t0_ns"]
     assert loads[-1][1] >= T0 + (120 + 30) * P
     assert record.dry is None and record.delta == pytest.approx(DELTA)
     assert not (record.sends["target"] == ev.CALIBRATION).any()
