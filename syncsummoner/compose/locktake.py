@@ -12,7 +12,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -21,7 +21,7 @@ import numpy as np
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import live_attribution, read_live, save_lock
 from syncsummoner.device.profile import CROSSFADER_INDEX, PARAM_MAX, Role
-from syncsummoner.device.wire import READ, Poller, Sender, save_wire
+from syncsummoner.device.wire import Poller, Sender, save_wire
 from syncsummoner.progress import LOG, meter
 
 #: Settings key the device counts its boots in.
@@ -33,7 +33,7 @@ PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
 #: Interpreter thread switch interval during a take, well inside the tick a late wake-up must make.
 SWITCH_S = 0.0005
 #: Where a take directory keeps the latest CC-to-picture latency a dry take measured.
-LATENCY_FILE = "cclatency.json"
+LATENCY_FILE = "ccpicture.json"
 
 
 class RebootError(RuntimeError):
@@ -131,23 +131,24 @@ def frame_starts(size: int, runs: Any, per_frame: int) -> np.ndarray:
 
 @dataclass
 class Clock:
-    """The take's clock as measured so far: frame times, the device's tick, and the tick-to-capture delay."""
+    """The take's clock as measured so far: frame times and the send-to-capture latency."""
 
     times: ev.FrameTimes
-    ticks: ev.Ticks
-    delta: float
+    lat: ev.Latency
     run: Any = None
     per_frame: int = 2
-    shown: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+
+    @property
+    def ticks(self) -> ev.Ticks:
+        """The instants a write must precede to land on each frame."""
+        return ev.grid(self.times, self.lat)
 
     def when(self, target: int) -> int:
         """Host time to send a write that should land on ``target``."""
-        return int(ev.send_time(np.array([target]), self.ticks, self.times, self.delta)[0])
+        return int(ev.send_time(np.array([target]), self.ticks, self.times, self.lat.delta)[0])
 
-    def extend(self, t_ns: np.ndarray, sequence: np.ndarray, moves: np.ndarray | None = None) -> None:
-        """Carry the clock on: the frame line over every frame start the anchored run has, the tick grid
-        over every readback change so far. A grid the readback cannot hold leaves the last one standing.
-        """
+    def extend(self, t_ns: np.ndarray, sequence: np.ndarray) -> None:
+        """Carry the frame line on over every frame start the anchored run has gained."""
         run = self.run
         if run is None:
             return
@@ -159,12 +160,6 @@ class Clock:
         if start.size > 2:
             slope, icept = np.polyfit(frame, t_ns[start].astype(np.float64), 1)
             self.times = ev.FrameTimes(self.times.ns, self.times.lead, float(icept), float(slope))
-            self.ticks = ev.Ticks(self.ticks.lo, self.ticks.hi, float(slope), self.ticks.count)
-        if moves is not None and moves.size:
-            try:
-                self.ticks = ev.tick_bracket(moves["a"], moves["b"], self.times.period)
-            except ev.EvidenceError as err:
-                LOG.warning("tick grid kept from %d changes: %s", self.ticks.count, err)
 
 
 @dataclass
@@ -186,19 +181,16 @@ def measure_latency(
     frames: np.ndarray,
     found: Any,
     toggles: np.ndarray,
-    moves: np.ndarray,
     times: ev.FrameTimes,
-    ticks: ev.Ticks,
     until: float | None = None,
 ) -> ev.Latency:
-    """The tick-to-capture delay from where each calibration write showed in the lead-in's picture."""
+    """The send-to-capture latency from where each calibration write showed in the lead-in's picture."""
     size = min(images.shape[0], frames.size, found.shown.size)
     starts = frame_starts(size, found.runs, found.per_frame)
     landed = ev.toggle_landings(
         images[:size], frames["t_ns"][:size], starts, found.shown[:size], toggles, until
     )
-    n = ev.observed_ticks(toggles, moves, ticks)
-    return ev.latency(np.where((landed >= -times.lead) & (n >= 0), landed, ev.CALIBRATION), n, ticks, times)
+    return ev.latency(toggles["t1_ns"], landed, times)
 
 
 def write_latency(directory: str | Path, measured: ev.Latency, program: str) -> None:
@@ -209,12 +201,12 @@ def write_latency(directory: str | Path, measured: ev.Latency, program: str) -> 
     path.write_text(json.dumps({"takes": takes}, indent=1), encoding="utf-8")
 
 
-def read_latency(directory: str | Path) -> float:
-    """The tick-to-capture delay for a take whose card phase no picture measured, in ns.
+def read_latency(directory: str | Path) -> ev.Latency:
+    """The send-to-capture latency for a take whose card phase no picture measured.
 
-    The delay is a constant plus the card's capture phase, which two captures a frame keep
-    within half a frame; the midpoint of the dry takes' extremes is the value whose worst
-    error is least. Takes spread by half a frame or more contradict that.
+    It is a constant plus the card's capture phase, which two captures a frame keep within half a
+    frame; the band runs from the dry takes' least bound less the unseen part of that half frame
+    to their greatest plus it. A band of half a frame or more cannot name a landing frame.
     """
     path = Path(directory, LATENCY_FILE)
     if not path.is_file():
@@ -223,21 +215,23 @@ def read_latency(directory: str | Path) -> float:
             "measured CC-to-picture latency; render a program with a bypass first"
         )
     takes = json.loads(path.read_text(encoding="utf-8"))["takes"]
-    deltas = np.array([t["delta"] for t in takes], dtype=np.float64)
-    half = 0.5 * float(np.median([t["period"] for t in takes]))
-    if np.ptp(deltas) >= half:
+    lo = min(t["lo"] for t in takes)
+    hi = max(t["hi"] for t in takes)
+    period = float(np.median([t["period"] for t in takes]))
+    if hi - lo >= period / 2:
         raise LeadInTimeError(
-            f"dry takes in {path} put the tick-to-capture delay at {np.round(deltas / 1e6, 2).tolist()} ms, "
-            "half a frame or more apart, so no card phase explains them"
+            f"dry takes in {path} put the CC-to-picture latency over {lo / 1e6:.2f}..{hi / 1e6:.2f} ms, "
+            "half a frame or more, too wide to say which frame a write lands on"
         )
-    centre = 0.5 * float(deltas.min() + deltas.max())
+    unseen = 0.5 * (period / 2 - (hi - lo))
+    found = ev.Latency(lo=lo - unseen, hi=hi + unseen, samples=0, period=period)
     LOG.info(
-        "tick-to-capture delay %.2f ms from %d dry takes, wrong by at most %.2f ms",
-        centre / 1e6,
-        deltas.size,
-        (half - 0.5 * float(np.ptp(deltas))) / 1e6,
+        "CC-to-picture %.2f ms from %d dry takes, within %.2f ms",
+        found.delta / 1e6,
+        len(takes),
+        found.spread / 1e6,
     )
-    return centre
+    return found
 
 
 def _sleep_until(
@@ -255,15 +249,6 @@ def calibrate(sender: Sender, dry: Mapping[int, int], initial: Mapping[int, int]
     for index in range(2 * lead_in.toggles):
         time.sleep(float(rng.uniform(*lead_in.toggle_s)))
         sender.send(slot, wet if index % 2 == 0 else dry_value, int(ev.CALIBRATION))
-
-
-def probe_ticks(sender: Sender, initial: Mapping[int, int], lead_in: LeadIn) -> None:
-    """Step every slot off its initial value and back, so the readback shows the device's tick."""
-    for slot, value in sorted(initial.items()):
-        sender.send(slot, value + 1 if value < PARAM_MAX else value - 1, int(ev.CALIBRATION))
-        time.sleep(lead_in.probe_s)
-        sender.send(slot, value, int(ev.CALIBRATION))
-        time.sleep(lead_in.probe_s)
 
 
 def locked_take(
@@ -342,6 +327,7 @@ def locked_take(
             start=np.array(start_vector, dtype=np.int64),
             sends=sender.array(),
             delta=np.float64(held["delta"]),
+            latency=np.array(json.dumps(held.get("latency", {}))),
             cc_map=np.asarray(midi.cc_map, dtype=np.int64),
             loaded=np.array(
                 json.dumps(
@@ -453,8 +439,6 @@ def _run(
     time.sleep(lead_in.settle_s)
     if dry is not None:
         calibrate(sender, dry, initial, lead_in)
-    else:
-        probe_ticks(sender, initial, lead_in)
     hold = int(player.status().get("hold", 1))
     ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
     codes, images = read_live(
@@ -464,26 +448,16 @@ def _run(
         out, rig.playout.flips(), codes, config=config, hold=hold, lead=lead, count=count
     )
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, lead)
-    changes = Changes(poller)
-    moves = changes.update()
-    ticks = ev.tick_bracket(moves["a"], moves["b"], times.period)
     calibration = sender.array()
     calibration = calibration[calibration["target"] == ev.CALIBRATION]
     if dry is not None:
-        measured = measure_latency(images, frames, found, calibration, moves, times, ticks)
-        held["delta"] = measured.delta
-        write_latency(Path(out).parent, measured, program)
-        LOG.info(
-            "%s: CC-to-picture %.3f frames tick to capture over %d writes",
-            program,
-            measured.frames,
-            measured.samples,
-        )
+        lat = measure_latency(images, frames, found, calibration, times)
+        write_latency(Path(out).parent, lat, program)
+        LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
     else:
-        held["delta"] = read_latency(Path(out).parent)
-    clock = Clock(
-        times=times, ticks=ticks, delta=held["delta"], run=found.runs[-1], per_frame=found.per_frame
-    )
+        lat = read_latency(Path(out).parent)
+    held["delta"], held["latency"] = lat.delta, lat.as_dict()
+    clock = Clock(times=times, lat=lat, run=found.runs[-1], per_frame=found.per_frame)
     rows = plan_rows(held["rows"], dry, initial, wet_frame=-int(round(lead_in.wet_s * fps)))
     held["rows"] = rows
     first_due = clock.when(int(rows["target"][0])) if rows.size else clock.when(0)
@@ -493,7 +467,7 @@ def _run(
             "first write was due; lengthen the lead-in"
         )
     log = _read_sidecar(out)
-    clock.extend(log["t_ns"], log["sequence"], changes.update())
+    clock.extend(log["t_ns"], log["sequence"])
     sender.when = clock.when
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
@@ -504,7 +478,7 @@ def _run(
         while (now := time.monotonic_ns()) < end:
             time.sleep(min(1.0, (end - now) / 1e9))
             log = _read_sidecar(out)
-            clock.extend(log["t_ns"], log["sequence"], changes.update())
+            clock.extend(log["t_ns"], log["sequence"])
             progress.to((time.monotonic_ns() - began) / 1e9)
     sender.drain(timeout_s=1.0)
 
@@ -531,28 +505,6 @@ def _monitored(shell: Any, poller: Poller, sender: Sender) -> Iterator[None]:
             shell.command("midi", "monitor", "off")
         except Exception as err:  # pylint: disable=broad-exception-caught
             LOG.warning("midi monitor left on: %s", err)
-
-
-class Changes:
-    """The poller's readback changes so far, converted a batch of new reads at a time.
-
-    Converting every read on each refresh would hold the interpreter long enough to make a send late.
-    """
-
-    def __init__(self, poller: Poller):
-        self.poller, self.done, self.last = poller, 0, None
-        self.moves = ev.transitions(np.zeros(0, dtype=READ))
-
-    def update(self) -> np.ndarray:
-        """Every change up to the latest read."""
-        fresh = list(self.poller.reads[self.done :])
-        if fresh:
-            self.done += len(fresh)
-            batch = np.array([(a, b, tuple(o)) for a, b, o in fresh], dtype=READ)
-            joined = batch if self.last is None else np.r_[self.last, batch]
-            self.moves = np.r_[self.moves, ev.transitions(joined)]
-            self.last = batch[-1:]
-        return self.moves
 
 
 def _read_sidecar(take: str | Path) -> np.ndarray:
@@ -612,23 +564,20 @@ def take_evidence(
     found = attribute_take(take, config=config)
     frames = read_log(take)
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, found.lead)
-    moves = ev.transitions(wire["reads"])
-    ticks = ev.tick_bracket(moves["a"], moves["b"], times.period)
     sends = wire["sends"]
     calibration = sends[sends["target"] == ev.CALIBRATION]
     ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
     images = small_frames(take, size=CALIBRATION_SIZE, strip_px=config.strip_px, ffmpeg=ffmpeg)
-    delta = float(wire["delta"])
-    measured = {"delta": delta, "frames": delta / ticks.period, "spread": float("nan"), "samples": 0}
+    used = json.loads(str(wire["latency"])) if "latency" in wire else {}
+    lat = ev.Latency(lo=used.get("lo", np.nan), hi=used.get("hi", np.nan), samples=0, period=times.period)
     if json.loads(str(wire["dry"])) is not None and calibration.size:
         later = sends["t0_ns"][(sends["target"] > ev.START) & (sends["t0_ns"] > calibration["t1_ns"].max())]
         until = float(later.min()) if later.size else None
-        lat = measure_latency(images, frames, found, calibration, moves, times, ticks, until)
-        delta, measured = lat.delta, lat.as_dict()
+        lat = measure_latency(images, frames, found, calibration, times, until)
+    ticks, delta = ev.grid(times, lat), lat.delta
     plan = wire["plan"]
-    seen = ev.observed_ticks(sends, moves, ticks)
-    landed_rows = ev.landed(plan, sends, ticks, times, delta, seen)
-    applied_rows = ev.applied(wire["reads"], sends, wire["initial"], ticks, times, delta, seen)
+    landed_rows = ev.landed(plan, sends, ticks, times, delta)
+    applied_rows = ev.applied(wire["reads"], sends, wire["initial"], ticks, times, delta)
     receipts = wire.get("receipts")
     got = None
     if receipts is not None and receipts.size:
@@ -643,13 +592,8 @@ def take_evidence(
     moved = ev.acted_upon(out, src, luma_range, rows["landed"][sent], rows["param"][sent], names)
     return ev.Evidence(
         program=program,
-        latency=measured,
-        ticks={
-            "width_ms": ticks.width / 1e6,
-            "count": ticks.count,
-            "period_ns": ticks.period,
-            "deadline_ms": [v / 1e6 for v in ev.deadline(sends, seen, ticks)],
-        },
+        latency=lat.as_dict(),
+        ticks={"width_ms": ticks.width / 1e6, "count": ticks.count, "period_ns": ticks.period},
         landed=landed_rows,
         applied=applied_rows,
         received=got,

@@ -457,8 +457,8 @@ loaded before playout and held dry through the lead-in while its bypass is toggl
 to time the device ([evidence.md](evidence.md)); each take logs the measured
 CC-to-picture latency, its attribution summary, the evidence report (every write's
 landing frame, readback and receipt counts, and one line per parameter: acted upon
-or not, and why), then the take's picture report. A take whose writes did not all
-land on their frames and read back fails with `UnverifiedTakeError`.
+or not, and why), then the take's picture report. A take whose capture driver lost
+frames is recaptured once (`TakeFaultError`).
 
 The take is longer than the excerpt because it opens on the lead-in, and holds
 more captures than frames because the card runs its own cadence

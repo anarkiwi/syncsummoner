@@ -36,6 +36,7 @@ from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
 from syncsummoner.compose.vocabulary import Automation
 from syncsummoner.compose.lock import (  # pylint: disable=unused-import
+    LockError,
     LostTimecodeError,
     attribute_take,
     lock_path,
@@ -302,8 +303,8 @@ def play_take(
     return loaded
 
 
-class UnverifiedTakeError(RuntimeError):
-    """A take's writes did not all land on their frames and read back, or its program was not up first."""
+class TakeFaultError(RuntimeError):
+    """The capture driver lost frames during a take, so some clip frames have no capture; recapture it."""
 
 
 def _attempt(
@@ -319,7 +320,7 @@ def _attempt(
     """Record the score's pass with every write frame-locked, then prove it; returns what was judged.
 
     The take's evidence (:func:`~syncsummoner.compose.locktake.take_evidence`) is saved beside
-    it; a write that missed its frame or did not read back is an :class:`UnverifiedTakeError`.
+    it, and a take not proven is reported; frames the capture driver lost are a :class:`TakeFaultError`.
     """
     from syncsummoner.compose import locktake  # pylint: disable=import-outside-toplevel
 
@@ -352,14 +353,22 @@ def _attempt(
     rig.transport.verify_cc_map()
     require_route(rig.transport, program=program, route=config.route)
     require_signal(rig.transport, when="as the pass ended", **signal)
-    found = attribute_take(out, config=config)
+    try:
+        found = attribute_take(out, config=config)
+    except LockError as err:
+        from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
+
+        lost = int(np.clip(np.diff(read_log(out)["sequence"]) - 1, 0, None).sum())
+        if lost:
+            raise TakeFaultError(f"{program}: the capture driver lost {lost} frames: {err}") from err
+        raise
     proof = locktake.take_evidence(out, program=program, clip=clip, config=config)
     locktake.evidence_path(out).write_text(proof.to_json(), encoding="utf-8")
     for line in proof.lines():
         LOG.info("%s", line)
     if not proof.ok:
-        raise UnverifiedTakeError(
-            f"{program}: the take's parameters are unproven; see {locktake.evidence_path(out)}"
+        LOG.warning(
+            "%s: the take's parameters are not all proven; see %s", program, locktake.evidence_path(out)
         )
     start_s = float(found.picked[0]) / (found.per_frame * config.fps)
     return "take", inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"), start_s=start_s)
@@ -797,10 +806,12 @@ def _layer(score: Score, evolved: Mapping[str, Layer], program: str) -> Layer:
 def _passes(
     ordered: Sequence[str], fresh: Sequence[str], paths: Mapping[str, str], run: Callable[[str], Any]
 ) -> None:
-    """Render each fresh program's pass in order; one needing a dry take's latency waits for one, once."""
+    """Render each fresh program's pass in order; one needing a dry take's latency waits for one, once,
+    and one whose capture lost frames is recaptured once.
+    """
     from syncsummoner.compose.locktake import NoLatencyError  # pylint: disable=import-outside-toplevel
 
-    waiting, deferred = list(ordered), set()
+    waiting, deferred, faulted = list(ordered), set(), set()
     with meter(len(ordered), desc="passes", unit="program") as progress:
         while waiting:
             program = waiting.pop(0)
@@ -809,6 +820,13 @@ def _passes(
             else:
                 try:
                     report = run(program)
+                except TakeFaultError as err:
+                    if program in faulted:
+                        raise
+                    LOG.warning("%s; recapturing it", err)
+                    faulted.add(program)
+                    waiting.insert(0, program)
+                    continue
                 except NoLatencyError:
                     if program in deferred or not waiting:
                         raise

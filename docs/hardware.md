@@ -84,14 +84,13 @@ lead-in, and a bypass or crossfader toggled at random phases on eight programs:
 | Measure | Value |
 | --- | --- |
 | Picture change | always on a frame start, never part way down a frame (0 mixed captures in 120 toggles) |
-| Readback (`modulation status` combined value) | changes once per output frame, on the same tick that latches the picture |
+| Readback (`modulation status` combined value) | changes once per output frame; its serial timing is too coarse to time the latch, so landings rest on the picture |
 | CC to readback value | exact for all 1024 values, high-resolution CC with manual parked at 0 |
 | Serial `modulation status` round trip | about 1.4 to 2.2 ms, 279-byte reply |
-| Tick to the card's first capture of the latched frame | 0.99 to 1.26 frames, constant within a take to under 0.5 ms; it moves between takes with the card's capture phase |
-| Write lead needed before a tick | under 4.4 ms |
+| Send to the card's first capture of the frame a write lands on | 1.0 to 1.5 frames, known per take to about 2 ms from 16 calibration writes; it moves between takes with the card's capture phase, over less than half a frame |
 
-Render therefore sends each write midway between the ticks around its target
-frame's, and proves where it landed ([evidence.md](evidence.md)). The early bias
+Render therefore sends each write half a frame before the instant it must precede
+to land on its target frame, and proves where it landed ([evidence.md](evidence.md)). The early bias
 of design 4.4 picks the target: the first frame starting at or after the write's
 time less 15 ms.
 

@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.optimize import linprog
 from scipy.stats import chi2, norm
 
 from syncsummoner.aesthetics.survival import SIGMA
@@ -24,8 +23,6 @@ CALIBRATION = int(np.iinfo(np.int64).min)
 START = CALIBRATION + 1
 #: Lags, in frames after the modelled landing, at which a step's picture is tested.
 LAGS = (0, 1)
-#: Most two host clocks' rates can differ: the kernel's frequency correction limit, 500 ppm (MAXFREQ).
-MAX_RATE = 500e-6
 #: Luma range, in 8-bit codes, at or below which a frame is a uniform field (docs/hardware.md).
 FLAT_CODES = 1
 
@@ -89,18 +86,6 @@ def frame_times(
     return FrameTimes(ns=ns, lead=lead, origin=float(line[1] - slope * line[0]), period=slope)
 
 
-def transitions(reads: np.ndarray) -> np.ndarray:
-    """Every readback change: slot, the interval ``(a, b]`` the device's tick lies in, old and new value."""
-    o = np.asarray(reads["o"], dtype=np.int64)
-    k, slot = np.nonzero(o[1:] != o[:-1])
-    out = np.empty(
-        k.size, dtype=[("slot", "<i8"), ("a", "<f8"), ("b", "<f8"), ("old", "<i8"), ("new", "<i8")]
-    )
-    out["slot"], out["a"], out["b"] = slot + 1, reads["t0_ns"][k], reads["t1_ns"][k + 1]
-    out["old"], out["new"] = o[k, slot], o[k + 1, slot]
-    return out
-
-
 @dataclass(frozen=True)
 class Ticks:
     """The device's frame tick: one lies in ``(lo, hi] + n * period`` for every integer ``n``."""
@@ -132,86 +117,6 @@ class Ticks:
     def at(self, n: np.ndarray) -> np.ndarray:
         """Midpoint time of tick ``n``."""
         return self.phase + np.asarray(n, dtype=np.float64) * self.period
-
-
-def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
-    """The tick grid every readback change's interval ``(a, b]`` holds one tick of.
-
-    The grid keeps ``period``, measured from the captures, while every interval admits it; only
-    readback that rules it out, which takes a long span, sets the period itself, as the Chebyshev
-    centre of ``a_i < phase + n_i period <= b_i`` within :data:`MAX_RATE` of ``period``. No
-    feasible grid is an :class:`EvidenceError`. An interval half a frame wide or more, from a late
-    poll, cannot be numbered by its midpoint and is left out.
-    """
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    narrow = (b - a) < period / 2
-    a, b = a[narrow], b[narrow]
-    if not a.size:
-        raise EvidenceError(
-            "no readback changed within half a frame, so the device's frame tick was never seen"
-        )
-    ref = 0.5 * (a[0] + b[0])
-    n = np.rint((0.5 * (a + b) - ref) / period)
-    lo_s, hi_s = a - ref, b - ref
-    grid = float(period)
-    if (lo_s - n * grid).max() >= (hi_s - n * grid).min() and np.ptp(n) > 0:
-        scale = float(np.abs(n).max())
-        ones = np.ones_like(n)
-        solved = linprog(
-            [0.0, 0.0, -1.0],
-            A_ub=np.r_[np.c_[-ones, -n / scale, ones], np.c_[ones, n / scale, ones]],
-            b_ub=np.r_[n * period - lo_s, hi_s - n * period],
-            bounds=[(None, None), (-MAX_RATE * period * scale, MAX_RATE * period * scale), (None, None)],
-            method="highs",
-        )
-        if not solved.success:
-            raise EvidenceError(f"readback changes fit no single tick grid across {a.size} changes")
-        grid = float(period + solved.x[1] / scale)
-    lo, hi = float((lo_s - n * grid).max()), float((hi_s - n * grid).min())
-    if lo >= hi:
-        raise EvidenceError(
-            f"readback changes disagree on the device's frame tick by {(lo - hi) / 1e6:.2f} ms "
-            f"across {a.size} changes"
-        )
-    return Ticks(lo=ref + lo, hi=ref + hi, period=grid, count=int(a.size))
-
-
-def observed_ticks(sends: np.ndarray, moves: np.ndarray, ticks: Ticks) -> np.ndarray:
-    """The tick at which each write first read back: its slot's next change to its value; -1 if none did.
-
-    The tick is the first of the grid after the change's interval opens; a write that leaves its
-    slot unchanged, is overtaken before a read sees it, or reads back over an interval that could
-    hold two ticks has no observed tick.
-    """
-    out = np.full(len(sends), -1, dtype=np.int64)
-    first = np.ceil((moves["a"] - ticks.hi) / ticks.period)
-    single = ticks.lo + (first + 1) * ticks.period >= moves["b"]
-    for slot in np.unique(sends["param"]):
-        mine = np.flatnonzero(sends["param"] == slot)
-        here = np.flatnonzero(moves["slot"] == slot)
-        if not here.size:
-            continue
-        nxt = np.searchsorted(moves["b"][here], sends["t1_ns"][mine].astype(np.float64), side="right")
-        ok = nxt < here.size
-        at = here[np.clip(nxt, 0, here.size - 1)]
-        ok &= (moves["new"][at] == sends["value"][mine]) & single[at]
-        ok &= np.r_[nxt[1:] > nxt[:-1], True]
-        out[mine[ok]] = first[at[ok]].astype(np.int64)
-    return out
-
-
-def deadline(sends: np.ndarray, seen: np.ndarray, ticks: Ticks) -> tuple[float, float]:
-    """How long before a tick a write must leave the host to be latched by it, as ``(lo, hi]`` in ns.
-
-    Writes read back on the tick after the one they were sent before bound it from below, writes
-    latched by it from above; the bracket is open where no write fell on that side.
-    """
-    known = np.asarray(seen) >= 0
-    n, clear = ticks.after(sends["t1_ns"][known].astype(np.float64))
-    late = np.asarray(seen)[known] > n
-    lo = float(clear[late].max()) if late.any() else -math.inf
-    hi = float(clear[~late].min()) if (~late).any() else math.inf
-    return lo, hi
 
 
 def frame_of_tick(n: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) -> np.ndarray:
@@ -272,45 +177,75 @@ def toggle_landings(
 
 @dataclass(frozen=True)
 class Latency:
-    """From the device's latching tick to the card's first capture of the frame it latched, per write.
+    """From a write leaving the host to the card's first capture of the frame it lands on, per take.
 
-    ``delta`` is the median, ``spread`` the widest departure from it, both in ns.
+    Each calibration write that showed in the picture bounds it: after the start of the frame
+    before the one it landed on, at or before its own. ``lo`` and ``hi`` are those bounds
+    intersected; where writes disagree by a little, they are the band they disagree over.
+    ``delta`` is the band's middle, in ns.
     """
 
-    delta: float
-    spread: float
+    lo: float
+    hi: float
     samples: int
     period: float
 
     @property
+    def delta(self) -> float:
+        """The middle of the band."""
+        return 0.5 * (self.lo + self.hi)
+
+    @property
+    def spread(self) -> float:
+        """Half the band's width."""
+        return 0.5 * abs(self.hi - self.lo)
+
+    @property
     def frames(self) -> float:
-        """Tick to capture, in frames."""
+        """Send to capture, in frames."""
         return self.delta / self.period
 
     def as_dict(self) -> dict:
         """JSON-ready."""
-        return {**asdict(self), "frames": self.frames}
+        return {
+            "lo": self.lo,
+            "hi": self.hi,
+            "samples": self.samples,
+            "period": self.period,
+            "delta": self.delta,
+            "spread": self.spread,
+            "frames": self.frames,
+        }
 
 
-def latency(shown_at: np.ndarray, ticks_n: np.ndarray, ticks: Ticks, times: FrameTimes) -> Latency:
-    """Tick-to-capture delay from writes whose landing frame the picture showed.
+def latency(sent: np.ndarray, shown_at: np.ndarray, times: FrameTimes) -> Latency:
+    """The send-to-capture latency from where each calibration write first showed in the picture.
 
-    Every write must agree to within half a frame, else no single tick-to-frame map holds.
+    A write sent at ``t`` and first shown in frame ``F`` puts the latency in ``(T(F-1) - t, T(F) - t]``.
+    Bounds that cross by more than half a frame mean no single latency holds, which is an error.
     """
     ok = shown_at >= -times.lead
     if not ok.any():
         raise EvidenceError(
             "no calibration write showed in the picture, so the CC-to-picture latency is unknown"
         )
-    d = times.at(shown_at[ok]) - ticks.at(ticks_n[ok])
-    centre = float(np.median(d))
-    spread = float(np.abs(d - centre).max())
-    if spread >= ticks.period / 2:
+    t = np.asarray(sent, dtype=np.float64)[ok]
+    lo = float((times.at(shown_at[ok] - 1) - t).max())
+    hi = float((times.at(shown_at[ok]) - t).min())
+    if lo - hi >= times.period / 2:
         raise EvidenceError(
-            f"calibration writes put the picture {np.round(d / 1e6, 2).tolist()} ms after their ticks; "
-            "more than half a frame apart, so no single frame latches a tick"
+            f"calibration writes disagree on the CC-to-picture latency by {(lo - hi) / 1e6:.2f} ms, "
+            "half a frame or more, so no single latency holds"
         )
-    return Latency(delta=centre, spread=spread, samples=int(ok.sum()), period=ticks.period)
+    return Latency(lo=min(lo, hi), hi=max(lo, hi), samples=int(ok.sum()), period=times.period)
+
+
+def grid(times: FrameTimes, lat: Latency) -> Ticks:
+    """The instants a write must precede to land on each frame: every frame's capture less the latency.
+
+    The bracket is the latency band; tick ``n`` is frame ``n``'s, on the frame line.
+    """
+    return Ticks(lo=times.origin - lat.hi, hi=times.origin - lat.lo, period=times.period, count=lat.samples)
 
 
 @dataclass(frozen=True)
@@ -454,10 +389,11 @@ def applied(
     delta: float,
     seen: np.ndarray | None = None,
 ) -> Applied:
-    """Check every readback slot against the value the writes landed so far say it holds.
+    """Check every readback slot against the values its frames held while the read was in flight.
 
-    A read whose request interval contains a tick may show the state either side of it. A write
-    lands on its ``seen`` tick where the readback showed one, else on the first tick after it.
+    A read's request interval, widened by a frame each side for the readback's own lag, spans the
+    frames it can report; any value the slot held over them agrees. A write lands on its ``seen``
+    tick where one is given, else on the first tick at or after it.
     """
     o = np.asarray(reads["o"], dtype=np.int64)
     t0, t1 = reads["t0_ns"].astype(np.float64), reads["t1_ns"].astype(np.float64)
@@ -465,27 +401,28 @@ def applied(
     n_send, _ = ticks.after(sends["t1_ns"].astype(np.float64))
     if seen is not None:
         n_send = np.where(np.asarray(seen) >= 0, seen, n_send)
-    tick_send = ticks.lo + n_send * ticks.period
-    tick_end = ticks.hi + n_send * ticks.period
+    lands = ticks.at(n_send)
     for slot in range(1, 13):
         mine = np.flatnonzero(sends["param"] == slot)
         values = np.r_[int(initial[slot - 1]), sends["value"][mine]]
-        lands_lo, lands_hi = tick_send[mine], tick_end[mine]
-        before = np.searchsorted(lands_hi, t0, side="right")
-        either = np.searchsorted(lands_lo, t1, side="right")
-        want, alt = values[before], values[either]
+        at = lands[mine]
+        before = np.searchsorted(at, t0 - ticks.period, side="right")
+        after = np.searchsorted(at, t1 + ticks.period, side="right")
         got = o[:, slot - 1]
-        straddle = either != before
-        ok = (got == want) | (straddle & (got == alt))
+        ok = values[before] == got
+        span = after != before
+        for k in np.flatnonzero(~ok & span):
+            ok[k] = got[k] in values[before[k] : after[k] + 1]
         checked += int(o.shape[0])
-        ambiguous += int(straddle.sum())
+        ambiguous += int(span.sum())
         for k in np.flatnonzero(~ok):
-            frame = int(times.frame_of(t0[k] + delta))
-            disagree.append((k, slot, frame, int(want[k]), int(got[k])))
+            disagree.append(
+                (k, slot, int(times.frame_of(t0[k] + delta)), int(values[before[k]]), int(got[k]))
+            )
         changed = np.r_[True, values[1:] != values[:-1]][1:]
-        first = np.searchsorted(t0, lands_hi, side="left")
-        seen = (first < o.shape[0]) & (got[np.clip(first, 0, o.shape[0] - 1)] == values[1:])
-        confirmed += int((seen & changed).sum())
+        first = np.searchsorted(t0, at + ticks.period, side="left")
+        shown = (first < o.shape[0]) & (got[np.clip(first, 0, o.shape[0] - 1)] == values[1:])
+        confirmed += int((shown & changed).sum())
         unconfirmed += int((~changed).sum())
     return Applied(
         reads=int(o.shape[0]),
@@ -788,9 +725,9 @@ class Evidence:
         """The report as log lines."""
         lat, tick = self.latency, self.ticks
         said = [
-            f"{self.program}: CC-to-picture {lat.get('frames', float('nan')):.3f} frames, tick to capture "
-            f"(spread {lat.get('spread', 0) / 1e6:.2f} ms, {lat.get('samples', 0)} writes); tick known to "
-            f"{tick.get('width_ms', float('nan')):.2f} ms from {tick.get('count', 0)} readback changes",
+            f"{self.program}: CC-to-picture {lat.get('frames', float('nan')):.3f} frames send to capture, "
+            f"known to {tick.get('width_ms', float('nan')):.2f} ms from {lat.get('samples', 0)} calibration "
+            "writes (0: the dry takes' range)",
             f"{self.program}: loaded before clip frame 0: {self.loaded.get('summary', 'not checked')}",
             f"{self.program}: {self.landed.summary()}",
             f"{self.program}: {self.applied.summary()}",

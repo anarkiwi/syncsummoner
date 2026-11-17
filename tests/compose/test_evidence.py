@@ -81,55 +81,12 @@ def test_frame_times_fall_back_to_the_line_where_no_capture_started_a_frame():
     assert times.frame_of(TIMES.origin + 7 * PERIOD + 0.4 * PERIOD) == 7
 
 
-def test_transitions_bracket_each_change_between_the_reads_either_side():
-    reads = np.zeros(3, dtype=READ)
-    reads["t0_ns"], reads["t1_ns"] = [0, 10, 20], [5, 15, 25]
-    reads["o"][2, 1] = 9
-    moves = ev.transitions(reads)
-    assert moves.tolist() == [(2, 10.0, 25.0, 0, 9)]
-
-
 def test_after_finds_the_first_tick_and_its_clearance():
     ticks = ev.Ticks(lo=0.0, hi=1e6, period=33e6, count=1)
     n, clear = ticks.after(np.array([5e6, 0.5e6, 33.5e6, -1e6]))
     assert n.tolist() == [1, 0, 1, 0]
     assert clear.tolist() == [28e6, -0.5e6, -0.5e6, 1e6]
     assert ticks.at(2) == pytest.approx(0.5e6 + 66e6) and ticks.width == 1e6
-
-
-def test_tick_bracket_intersects_intervals_holding_the_same_tick():
-    a = TRUE_TICK - np.array([2e6, 0.5e6, 1e6])
-    b = TRUE_TICK + np.array([1e6, 2e6, 0.3e6])
-    ticks = ev.tick_bracket(a, b, PERIOD)
-    assert (ticks.lo, ticks.hi, ticks.period, ticks.count) == (
-        pytest.approx(TRUE_TICK - 0.5e6),
-        pytest.approx(TRUE_TICK + 0.3e6),
-        PERIOD,
-        3,
-    )
-
-
-def test_tick_bracket_fits_a_device_period_a_few_ppm_off_the_given_one():
-    rng = np.random.default_rng(3)
-    true_period = PERIOD * (1 + 4e-6)
-    n = np.sort(rng.choice(30_000, size=60, replace=False))
-    tick = TRUE_TICK + n * true_period
-    a, b = tick - rng.uniform(0.2e6, 3e6, n.size), tick + rng.uniform(0.2e6, 3e6, n.size)
-    fixed = n * PERIOD
-    assert (a - fixed).max() > (b - fixed).min()
-    ticks = ev.tick_bracket(a, b, PERIOD)
-    assert ticks.period == pytest.approx(true_period, rel=5e-7)
-    k = np.rint((0.5 * (a + b) - ticks.phase) / ticks.period)
-    assert np.all((ticks.lo + k * ticks.period > a - 1) & (ticks.hi + k * ticks.period <= b + 1))
-    assert k.tolist() == (n - n[0]).tolist()
-
-
-def test_tick_bracket_rejects_changes_off_one_grid_and_no_changes():
-    a = np.array([0.0, PERIOD + 2e6, 2 * PERIOD])
-    with pytest.raises(ev.EvidenceError, match="disagree|grid"):
-        ev.tick_bracket(a, a + 1e6, PERIOD)
-    with pytest.raises(ev.EvidenceError, match="never seen"):
-        ev.tick_bracket(np.zeros(0), np.zeros(0), PERIOD)
 
 
 def test_send_time_is_midway_between_ticks_so_errors_either_way_still_land():
@@ -144,37 +101,6 @@ def test_send_time_is_midway_between_ticks_so_errors_either_way_still_land():
         assert np.allclose(clear, (PERIOD - TICKS.width) / 2 - off) and np.all(clear > 0)
     n, _ = TICKS.after(due + PERIOD)
     assert np.all(ev.frame_of_tick(n, TICKS, TIMES, DELTA) == frames + 1)
-
-
-def test_read_back_changes_recover_the_true_tick_and_each_writes_tick():
-    rows = [(2, 1, 100), (5, 1, 200), (5, 2, 50), (8, 1, 200), (9, 3, 7), (9, 3, 8)]
-    sends = sends_at(rows + [(t, 7 + t % 3, t) for t in range(12, 38, 2)])
-    sends["t1_ns"][5] = sends["t1_ns"][4] + 1e6
-    initial = np.zeros(12, dtype=np.int64)
-    reads = device_reads(sends, initial, start=TIMES.at(0), stop=TIMES.at(39))
-    moves = ev.transitions(reads)
-    ticks = ev.tick_bracket(moves["a"], moves["b"], PERIOD)
-    assert ticks.period == pytest.approx(PERIOD, rel=1e-3) and ticks.count == moves.size
-    base = int(np.rint((ticks.phase - TRUE_TICK) / PERIOD))
-    k = np.rint((0.5 * (moves["a"] + moves["b"]) - ticks.phase) / ticks.period)
-    assert np.all((moves["a"] < ticks.at(k)) & (ticks.at(k) <= moves["b"]))
-    seen = ev.observed_ticks(sends, moves, ticks)
-    want = np.ceil((sends["t1_ns"] - TRUE_TICK) / PERIOD).astype(np.int64) - base
-    assert seen[[0, 1, 2, 5]].tolist() == want[[0, 1, 2, 5]].tolist()
-    assert seen[3] == -1 and seen[4] == -1
-    assert ev.observed_ticks(sends[sends["param"] == 4], moves, ticks).size == 0
-    four = sends[:1].copy()
-    four["param"] = 4
-    assert ev.observed_ticks(four, moves, ticks).tolist() == [-1]
-
-
-def test_deadline_is_bounded_by_late_writes_below_and_latched_writes_above():
-    ticks = ev.Ticks(lo=0.0, hi=1e6, period=33e6, count=1)
-    sends = np.zeros(3, dtype=SEND)
-    sends["t1_ns"] = [32.5e6, 20e6, 10e6]
-    lo, hi = ev.deadline(sends, np.array([2, 1, -1]), ticks)
-    assert (lo, hi) == (pytest.approx(0.5e6), pytest.approx(13e6))
-    assert ev.deadline(sends, np.full(3, -1), ticks) == (-np.inf, np.inf)
 
 
 def toggle_take(switch, *, flicker=None, count=60):
@@ -221,17 +147,60 @@ def test_toggle_landings_need_two_states_each_with_a_picture():
     assert ev.toggle_landings(images, t, starts, shown, late).tolist() == [ev.CALIBRATION] * 2
 
 
-def test_latency_is_the_median_tick_to_capture_delay_and_rejects_disagreement():
-    n = np.array([3, 7, 11, 15])
-    ticks = ev.Ticks(lo=TRUE_TICK, hi=TRUE_TICK, period=PERIOD, count=1)
-    measured = ev.latency(n + 1, n, ticks, TIMES)
-    assert measured.delta == pytest.approx(DELTA + PERIOD) and measured.samples == 4
-    assert measured.frames == pytest.approx(2.25) and measured.spread == pytest.approx(0.0, abs=1)
-    assert measured.as_dict()["frames"] == pytest.approx(2.25)
+def shown_with(latency, sent):
+    """The frame each write sent at ``sent`` first shows in, for a true send-to-capture ``latency``."""
+    return np.ceil((np.asarray(sent) + latency - TIMES.origin) / PERIOD).astype(np.int64)
+
+
+def test_latency_brackets_the_true_send_to_capture_delay_from_where_each_write_showed():
+    rng = np.random.default_rng(5)
+    sent = TIMES.origin + rng.uniform(0, 30 * PERIOD, 24)
+    true = 1.37 * PERIOD
+    shown = shown_with(true, sent)
+    measured = ev.latency(sent, shown, TIMES)
+    lo = (TIMES.at(shown - 1) - sent).max()
+    hi = (TIMES.at(shown) - sent).min()
+    assert (measured.lo, measured.hi) == (pytest.approx(lo), pytest.approx(hi))
+    assert measured.lo < true <= measured.hi and measured.hi - measured.lo < PERIOD / 4
+    assert measured.samples == 24 and measured.delta == pytest.approx(0.5 * (lo + hi))
+    assert measured.spread == pytest.approx(0.5 * (hi - lo)) and measured.frames == pytest.approx(
+        1.37, abs=0.13
+    )
+    said = measured.as_dict()
+    assert said["lo"] == measured.lo and said["delta"] == measured.delta and said["frames"] == measured.frames
+    off = np.r_[sent[:1], sent]
+    assert ev.latency(off, np.r_[ev.CALIBRATION, shown], TIMES).samples == 24
+
+
+def test_latency_writes_that_disagree_a_little_give_the_band_they_disagree_over():
+    sent = TIMES.origin + np.array([0.5, 0.4]) * PERIOD
+    measured = ev.latency(sent, np.array([2, 3]), TIMES)
+    assert (measured.lo, measured.hi) == (pytest.approx(1.5 * PERIOD), pytest.approx(1.6 * PERIOD))
+    assert measured.samples == 2
+
+
+def test_latency_rejects_writes_half_a_frame_apart_and_none_shown():
+    sent = TIMES.origin + np.array([0.95, 0.4]) * PERIOD
     with pytest.raises(ev.EvidenceError, match="half a frame"):
-        ev.latency(np.array([4, 8, 12, 16]), np.array([3, 7, 11, 14]), ticks, TIMES)
+        ev.latency(sent, np.array([2, 3]), TIMES)
     with pytest.raises(ev.EvidenceError, match="no calibration"):
-        ev.latency(np.full(2, ev.CALIBRATION), n[:2], ticks, TIMES)
+        ev.latency(sent, np.full(2, ev.CALIBRATION), TIMES)
+    with pytest.raises(ev.EvidenceError, match="no calibration"):
+        ev.latency(sent, np.full(2, -LEAD - 1), TIMES)
+
+
+def test_the_grid_puts_each_frames_tick_its_latency_band_before_its_capture():
+    lat = ev.Latency(lo=DELTA - 600_000.0, hi=DELTA + 400_000.0, samples=7, period=PERIOD)
+    ticks = ev.grid(TIMES, lat)
+    assert (ticks.lo, ticks.hi, ticks.period, ticks.count) == (TICKS.lo, TICKS.hi, PERIOD, 7)
+    rng = np.random.default_rng(8)
+    true = DELTA + rng.uniform(-600_000.0, 400_000.0)
+    sent = TIMES.origin + rng.uniform(0, 30 * PERIOD, 200)
+    n, clear = ticks.after(sent)
+    sure = clear >= 0
+    assert sure.mean() > 0.9
+    got = ev.frame_of_tick(n, ticks, TIMES, lat.delta)
+    assert got[sure].tolist() == shown_with(true, sent)[sure].tolist()
 
 
 def test_writes_sent_on_schedule_land_on_their_targets():
@@ -294,30 +263,33 @@ def test_a_readback_disagreeing_is_attributed_to_its_slot_and_frame():
     assert got.disagree.tolist() == [(k, 2, 7, 50, 49)]
 
 
-def test_a_read_straddling_a_tick_may_show_either_side_of_it():
+def test_a_read_within_a_frame_of_a_landing_may_show_either_side_of_it():
     sends = sends_at([(3, 1, 100)])
-    tick = TICKS.at(np.ceil((sends["t1_ns"][0] - TICKS.hi) / PERIOD))
-    reads = np.zeros(3, dtype=READ)
-    reads["t0_ns"] = [tick - 10e6, tick - 1e6, tick + 10e6]
-    reads["t1_ns"] = reads["t0_ns"] + np.array([1e6, 2e6, 1e6])
-    reads["o"][2, 0] = 100
+    tick = TICKS.at(TICKS.after(sends["t1_ns"])[0][0])
+    reads = np.zeros(4, dtype=READ)
+    reads["t0_ns"] = [tick - PERIOD - 3e6, tick - 1e6, tick + PERIOD - 1e6, tick + PERIOD + 2e6]
+    reads["t1_ns"] = reads["t0_ns"] + 1e6
+    reads["o"][[2, 3], 0] = 100
     for value in (0, 100):
-        reads["o"][1, 0] = value
+        reads["o"][1:3, 0] = value
         got = ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA)
-        assert got.ok and got.ambiguous == 1
+        assert got.ok and got.ambiguous == 2
     reads["o"][1, 0] = 7
-    assert ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).disagree["read"].tolist() == [1]
+    reads["o"][0, 0], reads["o"][3, 0] = 100, 0
+    bad = ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).disagree
+    assert bad[["read", "want", "got"]].tolist() == [(0, 0, 100), (1, 0, 7), (3, 100, 0)]
 
 
-def test_applied_lands_a_write_on_its_observed_tick():
+def test_applied_lands_a_write_on_its_given_tick():
     sends = sends_at([(3, 1, 100)])
     n = int(TICKS.after(sends["t1_ns"])[0][0])
     reads = np.zeros(2, dtype=READ)
-    reads["t0_ns"] = [TICKS.at(n) + 5e6, TICKS.at(n + 1) + 5e6]
+    reads["t0_ns"] = [TICKS.at(n) - 2 * PERIOD, TICKS.at(n + 1) + 5e6]
     reads["t1_ns"] = reads["t0_ns"] + 1e6
     reads["o"][1, 0] = 100
-    assert not ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).ok
-    assert ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA, np.array([n + 1])).ok
+    assert ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).ok
+    late = ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA, np.array([n + 3]))
+    assert late.disagree[["read", "want", "got"]].tolist() == [(1, 0, 100)]
 
 
 def test_expected_messages_follow_the_cc_encoding():

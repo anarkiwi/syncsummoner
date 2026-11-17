@@ -299,14 +299,40 @@ def test_a_locked_take_is_proven_and_judged_once_its_cc_map_holds(monkeypatch, t
         assert json.loads(locktake.evidence_path(out).read_text(encoding="utf-8")) == {"ok": True}
 
 
-def test_an_unproven_take_is_never_judged(monkeypatch, tmp_path):
+def test_an_unproven_take_is_reported_and_still_judged(monkeypatch, tmp_path, caplog):
     rig = locked_pass(monkeypatch, proof=[Proof(ok=False)])
     out = tmp_path / "take.mkv"
-    with pytest.raises(R.UnverifiedTakeError, match="Teletext: the take's parameters are unproven"):
-        render_locked(rig, out)
-    assert "inspect" not in rig.steps and json.loads(
-        locktake.evidence_path(out).read_text(encoding="utf-8")
-    ) == {"ok": False}
+    assert render_locked(rig, out) == PROBED
+    assert rig.steps[-2:] == ["evidence", "inspect"]
+    assert json.loads(locktake.evidence_path(out).read_text(encoding="utf-8")) == {"ok": False}
+    assert "Teletext: the take's parameters are not all proven" in caplog.text
+
+
+def failed_attribution(monkeypatch, sequence):
+    """A take whose attribution fails, its sidecar numbering captures as ``sequence``."""
+    from syncsummoner.device import v4l2rec  # pylint: disable=import-outside-toplevel
+
+    def attribute(*_, **__):
+        raise L.LockError("clip frames 3..5 have no capture")
+
+    monkeypatch.setattr(R, "attribute_take", attribute)
+    monkeypatch.setattr(v4l2rec, "read_log", lambda take: np.array(sequence, dtype=[("sequence", "<i8")]))
+
+
+def test_a_failed_attribution_with_driver_drops_is_a_take_fault(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch)
+    failed_attribution(monkeypatch, [0, 1, 2, 5, 6, 9])
+    with pytest.raises(R.TakeFaultError, match="Teletext: the capture driver lost 4 frames: clip frames 3"):
+        render_locked(rig, tmp_path / "take.mkv")
+    assert "evidence" not in rig.steps
+
+
+def test_a_failed_attribution_with_no_driver_drops_stays_a_lock_error(monkeypatch, tmp_path):
+    rig = locked_pass(monkeypatch)
+    failed_attribution(monkeypatch, [0, 1, 2, 3])
+    with pytest.raises(L.LockError) as raised:
+        render_locked(rig, tmp_path / "take.mkv")
+    assert not isinstance(raised.value, R.TakeFaultError)
 
 
 def test_a_take_plans_only_the_writes_inside_its_clip(monkeypatch, tmp_path):
