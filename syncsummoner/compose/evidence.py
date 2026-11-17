@@ -135,10 +135,9 @@ class Ticks:
 def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
     """The tick grid every readback change's interval ``(a, b]`` holds one tick of.
 
-    ``period`` numbers the intervals' ticks; the grid's own phase and period are the Chebyshev
-    centre of the linear constraints ``a_i < phase + n_i period <= b_i``, so the host clock's rate
-    against the device's is measured, not assumed. No feasible grid means the readback changed off
-    any one grid, which the landing model forbids.
+    The grid keeps ``period``, measured from the captures, while every interval admits it; only
+    readback that rules it out, which takes a long span, sets the period itself, as the Chebyshev
+    centre of ``a_i < phase + n_i period <= b_i``. No feasible grid is an :class:`EvidenceError`.
     """
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     if not a.size:
@@ -147,7 +146,7 @@ def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
     n = np.rint((0.5 * (a + b) - ref) / period)
     lo_s, hi_s = a - ref, b - ref
     grid = float(period)
-    if np.ptp(n) > 0:
+    if (lo_s - n * grid).max() >= (hi_s - n * grid).min() and np.ptp(n) > 0:
         scale = float(np.abs(n).max())
         ones = np.ones_like(n)
         solved = linprog(

@@ -485,6 +485,8 @@ def _run(
             f"{program}: the clock was measured {(time.monotonic_ns() - first_due) / 1e9:.2f}s after the "
             "first write was due; lengthen the lead-in"
         )
+    log = _read_sidecar(out)
+    clock.extend(log["t_ns"], log["sequence"])
     sender.when = clock.when
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
