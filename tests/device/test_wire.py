@@ -66,7 +66,7 @@ def test_receipts_parse_only_monitor_lines_stamped_with_their_reply():
 
 def test_a_wire_record_round_trips_beside_its_take(tmp_path):
     take = tmp_path / "take.mkv"
-    sends = np.array([(1, 2, 3, 4, 5)], dtype=W.SEND)
+    sends = np.array([(1, 2, 3, 4, 5, 0)], dtype=W.SEND)
     path = W.save_wire(take, sends=sends, program=np.array("Edge"))
     assert path == tmp_path / "take.mkv.wire.npz" == W.wire_path(take)
     back = W.load_wire(take)
@@ -140,8 +140,9 @@ def test_a_send_records_its_interval_and_the_value_the_wire_encoded():
 
     sender = W.Sender(write, clock=Ticker(step=10))
     sender.send(3, 500, 7)
-    assert written == [(3, 500)]
-    assert sender.array().tolist() == [(10, 20, 3, 499, 7)]
+    sender.send(4, 9, 8, due=5)
+    assert written == [(3, 500), (4, 9)]
+    assert sender.array().tolist() == [(10, 20, 3, 499, 7, 10), (30, 40, 4, 8, 8, 5)]
 
 
 def test_waiting_sleeps_to_within_the_spin_window_then_spins():
@@ -181,7 +182,8 @@ def test_a_threaded_sender_writes_each_row_in_order_no_earlier_than_due():
     sender.stop()
     sent = sender.array()
     assert order == [(1, 10), (2, 20), (3, 30)]
-    assert np.all(sent["t0_ns"] >= base + sent["target"] * 2_000_000)
+    assert sent["due_ns"].tolist() == (base + sent["target"] * 2_000_000).tolist()
+    assert np.all(sent["t0_ns"] >= sent["due_ns"])
     assert sent["target"].tolist() == [0, 2, 1] and sender._thread is None
 
 

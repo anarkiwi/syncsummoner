@@ -23,8 +23,9 @@ During a take one thread keeps exactly one `modulation status` in flight, every
 few milliseconds, timestamping each request and reply on host `CLOCK_MONOTONIC`.
 Each readback change brackets one tick; the brackets of all changes, folded onto
 the frame period measured from the capture timestamps, intersect in one interval
-that holds every tick (`evidence.tick_bracket`). An empty intersection means the
-readback changed off the grid, which is an error, not a fit.
+that holds every tick (`evidence.tick_bracket`). Only readback that rules that period
+out, which takes minutes of changes, sets the grid's period itself, as the Chebyshev
+centre of the interval constraints; no feasible grid is an error, not a fit.
 
 ## Frame-locked sends
 
@@ -39,9 +40,11 @@ readback changed off the grid, which is an error, not a fit.
    holds and the take stops.
 3. While the recording runs, its stored captures are read (`lock.read_live`) and
    attributed (`lock.live_attribution`), giving each clip frame's capture time.
-4. Each planned write for frame `j` is sent midway between the ticks either side of
-   the tick that latches `j` (`evidence.send_time`), half a frame clear of both. The
-   frame clock is carried on from the growing sidecar while the take runs.
+4. Each planned write for frame `j` is sent just after the latest instant the tick
+   before the one that latches `j` can fall (`evidence.send_time`). A sending thread
+   can only wake late, so this leaves almost a whole frame for it; each send records
+   when it was due, and the report gives the worst wake-up. The frame clock is carried
+   on from the growing sidecar while the take runs.
 5. Two seconds before clip frame 0 the dry control is set to its take value; the
    last readback before frame 0's tick must equal frame 0's planned parameters,
    and `fpga status` must name the program (`locktake.loaded_before`).

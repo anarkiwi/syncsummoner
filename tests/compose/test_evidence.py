@@ -25,6 +25,8 @@ TIMES = ev.FrameTimes(
     period=PERIOD,
 )
 PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
+WAKE = 100_000.0
+WRITE = 200_000.0
 
 
 def true_tick(n):
@@ -32,11 +34,12 @@ def true_tick(n):
 
 
 def sends_at(rows, t1=None):
-    """SEND records for ``(target, param, value)`` rows, sent when :func:`ev.send_time` says."""
+    """SEND records for ``(target, param, value)`` rows, woken just after :func:`ev.send_time` says."""
     rows = np.array(rows, dtype=PLAN)
-    t1 = ev.send_time(rows["target"], TICKS, TIMES, DELTA) if t1 is None else np.asarray(t1, np.float64)
+    due = ev.send_time(rows["target"], TICKS, TIMES, DELTA)
+    t1 = due + WAKE + WRITE if t1 is None else np.asarray(t1, np.float64)
     out = np.zeros(len(rows), dtype=SEND)
-    out["t0_ns"], out["t1_ns"] = t1 - 200_000, t1
+    out["t0_ns"], out["t1_ns"], out["due_ns"] = t1 - WRITE, t1, due
     out["param"], out["value"], out["target"] = rows["param"], rows["value"], rows["target"]
     return out
 
@@ -94,45 +97,71 @@ def test_after_finds_the_first_tick_and_its_clearance():
     assert ticks.at(2) == pytest.approx(0.5e6 + 66e6) and ticks.width == 1e6
 
 
-def test_tick_bracket_intersects_intervals_shifted_by_whole_periods():
-    a = true_tick([0, 3, 7, -2]) - np.array([2e6, 0.5e6, 1e6, 3e6])
-    b = true_tick([0, 3, 7, -2]) + np.array([1e6, 2e6, 0.3e6, 4e6])
+def test_tick_bracket_intersects_intervals_holding_the_same_tick():
+    a = TRUE_TICK - np.array([2e6, 0.5e6, 1e6])
+    b = TRUE_TICK + np.array([1e6, 2e6, 0.3e6])
     ticks = ev.tick_bracket(a, b, PERIOD)
-    assert (ticks.lo, ticks.hi, ticks.count) == (
+    assert (ticks.lo, ticks.hi, ticks.period, ticks.count) == (
         pytest.approx(TRUE_TICK - 0.5e6),
         pytest.approx(TRUE_TICK + 0.3e6),
-        4,
+        PERIOD,
+        3,
     )
 
 
+def test_tick_bracket_fits_a_device_period_a_few_ppm_off_the_given_one():
+    rng = np.random.default_rng(3)
+    true_period = PERIOD * (1 + 4e-6)
+    n = np.sort(rng.choice(30_000, size=60, replace=False))
+    tick = TRUE_TICK + n * true_period
+    a, b = tick - rng.uniform(0.2e6, 3e6, n.size), tick + rng.uniform(0.2e6, 3e6, n.size)
+    fixed = n * PERIOD
+    assert (a - fixed).max() > (b - fixed).min()
+    ticks = ev.tick_bracket(a, b, PERIOD)
+    assert ticks.period == pytest.approx(true_period, rel=5e-7)
+    k = np.rint((0.5 * (a + b) - ticks.phase) / ticks.period)
+    assert np.all((ticks.lo + k * ticks.period > a - 1) & (ticks.hi + k * ticks.period <= b + 1))
+    assert k.tolist() == (n - n[0]).tolist()
+
+
 def test_tick_bracket_rejects_changes_off_one_grid_and_no_changes():
-    a, b = np.array([0.0, PERIOD + 2e6]), np.array([1e6, PERIOD + 3e6])
-    with pytest.raises(ev.EvidenceError, match="disagree"):
-        ev.tick_bracket(a, b, PERIOD)
+    a = np.array([0.0, PERIOD + 2e6, 2 * PERIOD])
+    with pytest.raises(ev.EvidenceError, match="disagree|grid"):
+        ev.tick_bracket(a, a + 1e6, PERIOD)
     with pytest.raises(ev.EvidenceError, match="never seen"):
         ev.tick_bracket(np.zeros(0), np.zeros(0), PERIOD)
 
 
-def test_send_time_lands_each_write_on_its_frame_midway_between_ticks():
+def test_send_time_is_the_latest_the_previous_tick_can_fall_so_late_wakes_still_land():
     frames = np.arange(-LEAD, FRAMES + 10)
-    t = ev.send_time(frames, TICKS, TIMES, DELTA)
-    n, clear = TICKS.after(t)
-    assert ev.frame_of_tick(n, TICKS, TIMES, DELTA).tolist() == frames.tolist()
-    assert np.allclose(clear, PERIOD / 2 - TICKS.width / 2)
-    true_n = np.ceil((t - TRUE_TICK) / PERIOD)
-    assert np.all(true_tick(true_n - 1) < t) and np.all(t < true_tick(true_n))
-    assert np.allclose(true_tick(true_n) - t, PERIOD / 2 - (TICKS.phase - TRUE_TICK))
+    due = ev.send_time(frames, TICKS, TIMES, DELTA)
+    true_n = np.ceil((due - TRUE_TICK) / PERIOD)
+    assert np.all(true_tick(true_n - 1) < due) and np.all(due < true_tick(true_n))
+    assert np.allclose(due - true_tick(true_n - 1), TICKS.hi - TRUE_TICK + 1.0)
+    margin = TRUE_TICK - TICKS.lo
+    for late in np.linspace(0.0, PERIOD - TICKS.width - margin - 1.0, 7):
+        n, clear = TICKS.after(due + late)
+        assert ev.frame_of_tick(n, TICKS, TIMES, DELTA).tolist() == frames.tolist()
+        assert np.allclose(clear, PERIOD - TICKS.width - late - 1.0) and np.all(clear >= margin - 2)
+        assert np.all(due + late <= true_tick(true_n))
+    n, clear = TICKS.after(due + PERIOD - TICKS.width + 1.0)
+    assert np.all(clear < 0) and np.all(ev.frame_of_tick(n, TICKS, TIMES, DELTA) == frames)
+    n, _ = TICKS.after(due + PERIOD + 1.0)
+    assert np.all(ev.frame_of_tick(n, TICKS, TIMES, DELTA) == frames + 1)
 
 
 def test_read_back_changes_recover_the_true_tick_and_each_writes_tick():
-    sends = sends_at([(2, 1, 100), (5, 1, 200), (5, 2, 50), (8, 1, 200), (9, 3, 7), (9, 3, 8)])
-    sends["t1_ns"][-1] = sends["t1_ns"][-2] + 1e6
+    rows = [(2, 1, 100), (5, 1, 200), (5, 2, 50), (8, 1, 200), (9, 3, 7), (9, 3, 8)]
+    sends = sends_at(rows + [(t, 7 + t % 3, t) for t in range(12, 38, 2)])
+    sends["t1_ns"][5] = sends["t1_ns"][4] + 1e6
     initial = np.zeros(12, dtype=np.int64)
-    reads = device_reads(sends, initial, start=TIMES.at(0), stop=TIMES.at(14))
+    reads = device_reads(sends, initial, start=TIMES.at(0), stop=TIMES.at(39))
     moves = ev.transitions(reads)
     ticks = ev.tick_bracket(moves["a"], moves["b"], PERIOD)
+    assert ticks.period == pytest.approx(PERIOD, rel=1e-3) and ticks.count == moves.size
     base = int(np.rint((ticks.phase - TRUE_TICK) / PERIOD))
-    assert ticks.lo < true_tick(base) < ticks.hi
+    k = np.rint((0.5 * (moves["a"] + moves["b"]) - ticks.phase) / ticks.period)
+    assert np.all((moves["a"] < ticks.at(k)) & (ticks.at(k) <= moves["b"]))
     seen = ev.observed_ticks(sends, moves, ticks)
     want = np.ceil((sends["t1_ns"] - TRUE_TICK) / PERIOD).astype(np.int64) - base
     assert seen[[0, 1, 2, 5]].tolist() == want[[0, 1, 2, 5]].tolist()
@@ -216,11 +245,19 @@ def test_writes_sent_on_schedule_land_on_their_targets():
     got = ev.landed(plan, sends, TICKS, TIMES, DELTA)
     assert got.ok and got.rows["landed"].tolist() == [2, 2, 5, 9]
     assert got.rows["sent"].tolist() == [0, 1, 2, 3] and "4 writes scheduled: 0 missing" in got.summary()
+    assert got.wake_ms == pytest.approx(WAKE / 1e6) and "0.10 ms after due" in got.summary()
+    sends["t0_ns"][3] += 2_500_000
+    assert ev.landed(plan, sends, TICKS, TIMES, DELTA).wake_ms == pytest.approx(2.6)
+    bare = np.dtype([(name, SEND[name]) for name in SEND.names if name != "due_ns"])
+    undue = np.zeros(len(sends), dtype=bare)
+    for name in bare.names:
+        undue[name] = sends[name]
+    assert np.isnan(ev.landed(plan, undue, TICKS, TIMES, DELTA).wake_ms)
 
 
 def test_late_early_missing_duplicated_and_out_of_order_writes_are_counted():
     plan = np.array([(2, 1, 10), (2, 2, 20), (5, 1, 30), (9, 3, 40), (12, 4, 50)], dtype=PLAN)
-    on_time = ev.send_time(plan["target"], TICKS, TIMES, DELTA)
+    on_time = ev.send_time(plan["target"], TICKS, TIMES, DELTA) + WAKE + WRITE
     t1 = on_time + np.array([0, 0, PERIOD, -PERIOD, 0])
     sends = sends_at(plan.tolist(), t1)
     sends = np.r_[sends[[1, 0, 2, 3]], sends[[3]]]

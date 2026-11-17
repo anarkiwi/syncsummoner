@@ -140,15 +140,16 @@ def times_for(lead=10, period=P):
 
 
 @pytest.mark.parametrize("target", [-7, 0, 1, 13])
-def test_a_clock_sends_each_write_midway_between_ticks_so_it_lands_on_its_frame(target):
-    """The first tick after the send latches the target, clear by half a period less the bracket."""
+def test_a_clock_sends_each_write_once_the_previous_tick_is_past_so_late_wakes_still_land(target):
+    """Due as the previous tick's bracket ends; any wake short of a period less the bracket lands it."""
     ticks, times = ticks_for(), times_for()
     clock = LT.Clock(times=times, ticks=ticks, delta=DELTA)
     t = clock.when(target)
-    n, clear = ticks.after(np.array([t]))
-    assert int(ev.frame_of_tick(n, ticks, times, DELTA)[0]) == target
-    assert clear[0] == pytest.approx(P / 2 - ticks.width / 2, abs=1.0)
     assert t == pytest.approx(ev.send_time(np.array([target]), ticks, times, DELTA)[0], abs=1.0)
+    for late in (1.0, P / 2, P - ticks.width - 1.0):
+        n, clear = ticks.after(np.array([t + late]))
+        assert int(ev.frame_of_tick(n, ticks, times, DELTA)[0]) == target
+        assert clear[0] == pytest.approx(P - ticks.width - late - 1.0, abs=1.0)
 
 
 def test_extending_the_clock_refits_the_period_from_the_growing_frame_log():
@@ -394,7 +395,7 @@ class Sim:
                 self.poller.poll_once()
             else:
                 target, param, value = rows.popleft()
-                self.sender.send(param, value, target)
+                self.sender.send(param, value, target, int(at))
         self.now = max(self.now, end)
 
 
@@ -634,7 +635,7 @@ def test_measured_latency_comes_from_where_each_toggle_showed(simulate):
     for k, t in enumerate(T0 + np.array([0.3, 0.62, 0.95, 1.3]) * 1e9):
         value = 0 if k % 2 == 0 else PARAM_MAX
         sim.writes.append((int(t), 1, value))
-        sends.append((int(t), int(t), 1, value, ev.CALIBRATION))
+        sends.append((int(t), int(t), 1, value, ev.CALIBRATION, int(t)))
     toggles = np.array(sends, dtype=SEND)
     sim.now = int(T0 + 1.9e9)
     polls = np.arange(S0, sim.now, 5_000_000)
