@@ -224,9 +224,10 @@ def settled_rows(
 
     A frame belongs to the setpoint whose writes may have started landing last by then, once
     ``chunk.settle`` frames have passed since the end of its writes' latest landing window, and only
-    where the realized state is that setpoint's. Frames in ``bad_frames`` keep no setpoint.
+    where the realized state is that setpoint's. Frames in ``bad_frames`` keep no setpoint. The
+    dry control's writes around the clip, in the lead-in and from the lead-out on, own no setpoint.
     """
-    rows = landed[landed["target"] > 0]
+    rows = landed[(landed["target"] > 0) & (landed["target"] < chunk.frames)]
     owner = owners(chunk, rows)
     count, n = picked.size, len(chunk.states)
     state = realized(chunk.states[0], rows, count)
