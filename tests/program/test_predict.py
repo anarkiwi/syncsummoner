@@ -71,3 +71,10 @@ def test_the_switch_regime_codes_each_frames_switches(tiny):
     code, own = P.regimes(tiny, tiny.initial(), rows, 7)
     assert own == {7: 1, 8: 2}, "the knobs are no part of the regime"
     assert code.tolist() == [0, 0, 2, 2, 3, 1, 1]
+
+
+def test_a_crossfader_bypass_is_a_regime_bit_of_its_own(mixer):
+    rows = rows_of((1, 7, 1023), (2, 12, 0), (4, 12, 600), (5, 7, 0))
+    code, own = P.regimes(mixer, mixer.initial(), rows, 7)
+    assert own == {7: 1, 12: 2}
+    assert code.tolist() == [0, 1, 3, 3, 1, 0, 0]

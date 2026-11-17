@@ -2,10 +2,13 @@
 
 # pylint: disable=missing-function-docstring
 
+import json
+
 import numpy as np
 
 import pytest
 
+from syncsummoner.compose.evidence import LANDED
 from syncsummoner.program import parse_state
 from syncsummoner.program.model import ProgramModel, model
 from syncsummoner.program.report import rows, table
@@ -60,8 +63,41 @@ def test_state_parsing_and_the_table(tiny):
 
 
 def test_the_bypass_is_the_switch_that_silences_every_other_control(tiny):
-    assert tiny.bypass() == 8
+    found = tiny.bypass()
+    assert (found.parameter_id, found.value) == (8, 1023)
+    assert found.proven == tuple(range(512, 1024)) and found.holds([0, 511, 512, 1023]).tolist() == [
+        False,
+        False,
+        True,
+        True,
+    ]
     assert tiny.carries_input(tiny.initial())
+
+
+def test_a_setting_passes_only_where_every_other_control_is_dead_for_all_their_values(tiny):
+    assert tiny.passes(8).tolist() == list(range(512, 1024)), "the switch's own proof agrees"
+    for p in (1, 2, 3, 7):
+        assert not tiny.passes(p).size, f"P{p} leaves the bypass switch live"
+    assert not tiny.passes(9).size, "an undeclared control proves nothing"
+
+
+def test_with_no_switch_a_crossfader_at_the_end_that_returns_its_input_is_the_bypass(mixer):
+    assert mixer.passes(12).tolist() == [0], "only an exact pass-through counts: 1023 is the effect"
+    assert mixer.passes(12, timing=0).tolist() == [0]
+    assert not mixer.passes(1).size and not mixer.passes(7).size
+    found = mixer.bypass()
+    assert (found.parameter_id, found.value, found.proven) == (12, 0, (0,))
+    held = mixer.initial()
+    held[11] = 0
+    assert not any(l.live for p, l in mixer.live(held, gates=False).items() if p != 12)
+    assert mixer.carries_input(held)
+
+
+def test_the_ternary_simulator_proves_a_crossfader_bypass_as_well(mixer, tmp_path):
+    coarse = ProgramModel(mixer.program, mixer.library, cache=tmp_path)
+    coarse.memory = 0
+    assert coarse.passes(12).tolist() == [0] and coarse.method == "ternary"
+    assert not coarse.passes(7).size
 
 
 def test_a_source_that_reads_other_bits_than_the_package_yields_to_the_bitstream(tiny, monkeypatch, tmp_path):
@@ -110,3 +146,57 @@ def test_conditions_are_cached_per_free_set(tiny):
     assert tiny.conditions({1, "timing"}) is first
     assert any(p.name.startswith("observe-1-timing") for p in tiny.cache.iterdir())
     assert tiny.reach(tiny.preset("Gain"), [1], timing=0)[1] == [6, 7, 8, 9]
+
+
+@pytest.mark.parametrize("fixture", ["tiny", "mixer"])
+def test_the_cli_states_the_bypass_setting(fixture, request, monkeypatch, capsys):
+    from syncsummoner import cli  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program import Library  # pylint: disable=import-outside-toplevel
+
+    built = request.getfixturevalue(fixture)
+    monkeypatch.setattr(Library, "default", classmethod(lambda cls: built.library))
+    monkeypatch.setattr("syncsummoner.program.model", lambda *a, **k: built)
+    assert cli.main(["program", "bypass", "x", "--json"]) == 0
+    said = json.loads(capsys.readouterr().out)
+    assert (said["parameter_id"], said["value"]) == {"tiny": (8, 1023), "mixer": (12, 0)}[fixture]
+    assert cli.main(["program", "bypass", "x", "--state", "Gain" if fixture == "tiny" else "initial"]) == 0
+    assert " at " in capsys.readouterr().out
+
+
+def test_the_cli_says_when_no_setting_passes(tiny, monkeypatch, capsys):
+    from syncsummoner import cli  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program import Library  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(Library, "default", classmethod(lambda cls: tiny.library))
+    monkeypatch.setattr("syncsummoner.program.model", lambda *a, **k: tiny)
+    monkeypatch.setattr(ProgramModel, "bypass", lambda self, *a: None)
+    assert cli.main(["program", "bypass", "x", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) is None
+    assert cli.main(["program", "bypass", "x"]) == 0
+    assert "no setting is proven" in capsys.readouterr().out
+
+
+ARCHIVED_BYPASS = (
+    "com.homegrownvhs.pigment",
+    "com.lzxindustries.yuv_amplifier",
+    "com.lzxindustries.pinwheel",
+    "com.peteappleby.yuv_bit_rotator",
+)
+
+
+@pytest.mark.parametrize("program_id", ARCHIVED_BYPASS)
+def test_archived_bypass_programs_keep_their_bypass_switch(program_id):
+    """The four programs archived with Bypass on as their dry state keep it: switch 11 turned on."""
+    from syncsummoner.compose.locktake import dry_state  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program import Library, predict  # pylint: disable=import-outside-toplevel
+
+    library = Library.default()
+    try:
+        built = model(program_id, library)
+    except KeyError:
+        pytest.skip(f"{program_id} is not in this library")
+    found = built.bypass()
+    assert (found.parameter_id, found.value, found.proven) == (11, 1023, tuple(range(512, 1024)))
+    assert dry_state(None, lambda info: found) == {11: 1023}
+    _, own = predict.regimes(built, built.initial(), np.zeros(0, dtype=LANDED), 2)
+    assert 11 in own and set(own) == {d.parameter_id for d in built.params if 7 <= d.parameter_id <= 11}

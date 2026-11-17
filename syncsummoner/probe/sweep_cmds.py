@@ -111,6 +111,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         guard_frames,
         region_dims,
         slots,
+        without_bypass,
     )
     from syncsummoner.probe.store import slug
     from syncsummoner.program import model
@@ -138,17 +139,17 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
     states = np.asarray(record["states"], dtype=np.int64)
     chosen = [int(i) for i in record["chosen"]]
-    dims = region_dims(record, values, m.bypass())
+    kept = without_bypass(values, m.bypass())
+    dims = region_dims(record, kept)
     extra = np.zeros((0, PARAM_COUNT), dtype=np.int64)
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
     counts = [
-        min(n, distinct(d, values))
+        min(n, distinct(d, kept))
         for n, d in zip(allot(max(len(placed) - len(extra), 0), [len(d) for d in dims]), dims)
     ]
     sampled = [
-        design(states[i], d, values, n, args.seed + k)
-        for k, (i, d, n) in enumerate(zip(chosen, dims, counts))
+        design(states[i], d, kept, n, args.seed + k) for k, (i, d, n) in enumerate(zip(chosen, dims, counts))
     ]
     every = np.concatenate([*sampled, extra]) if sampled else extra
     capacity, placed = len(placed), placed[: len(every)]

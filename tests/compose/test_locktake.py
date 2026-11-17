@@ -18,6 +18,7 @@ from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device import wire as W
 from syncsummoner.device.wire import SEND, Echoes, Poller, Sender
 from syncsummoner.probe import decoded
+from syncsummoner.program.model import Bypass
 from tests.compose import locked
 
 FPS = 30.0
@@ -36,9 +37,15 @@ def specs():
     return [ParamSpec(index=i, name=f"p{i}", native_min=0.0, native_max=1.0) for i in range(1, 13)]
 
 
+def switch(slot):
+    """A bypass switch on ``slot``, as the program model states one."""
+    return Bypass(slot, PARAM_MAX, tuple(range(512, PARAM_MAX + 1)))
+
+
 def info_with(dry=None):
-    """A program info whose program model names ``dry`` its bypass switch."""
-    return types.SimpleNamespace(params=specs(), name="Teletext", dry=dry)
+    """A program info whose program model finds ``dry`` its bypass: a switch's slot or a :class:`Bypass`."""
+    found = switch(dry) if isinstance(dry, int) else dry
+    return types.SimpleNamespace(params=specs(), name="Teletext", dry=found)
 
 
 def bypass_of(info):
@@ -46,9 +53,12 @@ def bypass_of(info):
     return info.dry
 
 
-@pytest.mark.parametrize("dry, want", [(1, {1: PARAM_MAX}), (7, {7: PARAM_MAX}), (None, None)])
+@pytest.mark.parametrize(
+    "dry, want",
+    [(1, {1: PARAM_MAX}), (7, {7: PARAM_MAX}), (Bypass(12, 0, (0, 1)), {12: 0}), (None, None)],
+)
 def test_the_dry_state_is_the_bypass_the_program_model_finds(dry, want):
-    """The dry state is the model's bypass switch turned on; no slot or label stands in for one."""
+    """The dry state is the model's bypass setting; no slot or label stands in for one."""
     assert LT.dry_state(info_with(dry), bypass_of) == want
 
 
@@ -389,6 +399,7 @@ class Sim:
 
     def __init__(self, *, lead, count, tail=20, drop=None):
         self.now, self.lead, self.count = S0, lead, count
+        self.dry = switch(1)
         self.size = 2 * (lead + count + tail)
         self.writes = []
         self.drop = drop
@@ -426,7 +437,7 @@ class Sim:
         """Capture ``k``: the clip frame, or its processed form when bypass is off."""
         f = k // 2
         s = self.state(TAU + (f - 2) * P)
-        if s[0] == PARAM_MAX:
+        if self.dry.holds(s[self.dry.parameter_id - 1]):
             return self.base[f]
         return 0.2 * self.base[f] + 100 + 0.1 * s[2]
 
@@ -619,7 +630,9 @@ def take_and_prove(
 ):
     """A whole simulated take, then its evidence from the files it left."""
     sim = simulate(lead=120, count=30, drop=drop)
-    rig, recorder, load, loads = rigged(sim, info_with(dry), boots=boots, lose=lose)
+    info = info_with(dry)
+    sim.dry = info.dry or sim.dry
+    rig, recorder, load, loads = rigged(sim, info, boots=boots, lose=lose)
     out = tmp_path / "take.mkv"
     record = LT.locked_take(
         rig,
@@ -695,6 +708,21 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert {m.param for m in proof.moved} == {3, 4, 5}
     assert json.loads(proof.to_json())["ok"]
     assert sim.sender is None and sim.poller is None
+
+
+def test_a_fader_bypass_toggles_against_the_working_value_and_lands_like_a_switch(
+    monkeypatch, simulate, tmp_path
+):
+    """A fader proven a pass-through at 0 holds the lead-in dry, times the device and dries the lead-out."""
+    _, _, record, proof, loads = take_and_prove(
+        monkeypatch, simulate, tmp_path, dry=Bypass(12, 0, (0,)), working={12: 700, 3: 0.5, 4: 100}
+    )
+    assert [name for name, _ in loads] == ["Teletext"] and record.dry == {12: 0}
+    calibration = record.sends[record.sends["target"] == ev.CALIBRATION]
+    assert calibration["param"].tolist() == [12] * 6 and calibration["value"].tolist() == [700, 0] * 3
+    assert record.plan[0].tolist() == (-15, 12, 700) and record.plan[-1].tolist() == (30, 12, 0)
+    assert proof.ok, proof.lines()
+    assert proof.latency["lo"] <= DELTA <= proof.latency["hi"]
 
 
 def test_every_write_waits_for_the_previous_ones_echo_and_lands_on_its_frame(monkeypatch, simulate, tmp_path):

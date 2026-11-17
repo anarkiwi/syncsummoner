@@ -184,6 +184,31 @@ The netlist, `gates.json` and the conditions (`observe.json`) are cached under
 program id, version, package digest, netlist source and IO configuration. Step
 verdicts are cached there by their exact ties.
 
+## Bypass
+
+`ProgramModel.bypass()` finds the one control setting that returns the input with
+every other declared control dead. It returns it as a `Bypass`: the control, the
+manual value to write, and every manual value the proof covers.
+
+1. A declared switch comes first. Turned on, it must leave every other control
+   dead with the rest held at the state, and the video input must still reach
+   the outputs (`carries_input`).
+2. If there is no such switch, any control can qualify through `passes()` at a
+   setting. The input must reach the outputs there, and no bit of any other
+   declared control may be observable for any value of those controls taken
+   together. The candidate's own bits stay BDD variables. The other controls'
+   conditions are ORed and their variables quantified away
+   (`Conditions.heard`), so each register value of the control is decided in
+   one pass. The joint analysis, with every other control varying, is built
+   only for a control that first passes the cheaper test of each other control
+   being dead alone.
+
+This finds a Mix or Blend fader at the end of its range that returns the input
+exactly, such as the SDK's `interpolator_u` at `t = 0`. It does not find an end
+that only approaches the input. A fader's bypass is written at the middle of the
+longest run of proven values. Names and roles play no part. `syncsummoner
+program bypass NAME [--json]` prints the bypass.
+
 ## Finding programs
 
 `Library.default()` reads the card copy (`captures/card/programs`,

@@ -259,9 +259,10 @@ parameters it steps there are sampled together by a scrambled Sobol design
 (`scipy.stats.qmc.Sobol`, `--seed`), each coordinate picking among the settings the
 program's read bits tell apart by the stratum it falls in, so interactions are seen, a
 switch or a few-setting control comes up in equal shares, and no unread bit is spent;
-other parameters keep the regime's base. The program's bypass switch (`ProgramModel.bypass`)
-is never sampled: turned on, it leaves every other control dead, so it would spend half the
-settings on the input, and the take's calibration toggles it against the start setting. Each setting is held long enough for the
+other parameters keep the regime's base. The program's bypass setting (`ProgramModel.bypass`)
+is never sampled (`regions.without_bypass`). It leaves every other control dead, so it would
+spend settings on the input, and the take's calibration toggles it against the start setting.
+A switch bypass leaves its switch unsampled. A fader bypass keeps its fader's other settings. Each setting is held long enough for the
 follow test (`survival.follow_z`) to see the least follow the planner's dead-bar test
 resolves over the bar it plays in (`regions.effect_sizes`, bars from the track's
 downbeats, the clip played from the track's start), with a miss as rare as a false call:
@@ -529,8 +530,8 @@ ss audition score.yaml --source source.mkv --audio track.flac \
 ```
 
 An excerpt costs a program load, the lead-in and the excerpt. The program is
-loaded before playout and held dry through the lead-in by its bypass switch (the
-declared switch that, turned on, leaves every other control dead in its HDL),
+loaded before playout and held dry through the lead-in by its bypass setting (a
+declared switch, or else any control setting, that leaves every other control dead in its HDL),
 toggled to time the device; one with none loads inside a Passthru
 lead-in ([evidence.md](evidence.md)). Each take logs the measured
 CC-to-picture latency, its attribution summary, the evidence report (every write's

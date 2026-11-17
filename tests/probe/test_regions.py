@@ -16,6 +16,7 @@ from syncsummoner.probe import decoded
 from syncsummoner.probe import locked as L
 from syncsummoner.probe import regions as R
 from syncsummoner.probe import sweep_cmds
+from syncsummoner.program.model import Bypass
 
 
 def ar1(n, a, seed):
@@ -138,7 +139,9 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
         6: np.array([0, 1023]),
         11: np.array([0, 1023]),
     }
-    model = SimpleNamespace(resolution=lambda: {p: (0,) for p in values}, bypass=lambda: 11)
+    model = SimpleNamespace(
+        resolution=lambda: {p: (0,) for p in values}, bypass=lambda: Bypass(11, 1023, tuple(range(512, 1024)))
+    )
     monkeypatch.setattr("syncsummoner.program.model", lambda name: model)
     monkeypatch.setattr("syncsummoner.program.gates.representatives", lambda m, p, bits: values[p])
     cover.write_text(
@@ -169,8 +172,18 @@ def test_clip_ti_compares_each_frame_with_the_one_played_before():
 def test_region_dims_keep_the_read_stepped_parameters_and_never_the_bypass():
     record = {"chosen": [0, 2], "stepped": {"0": [1, 2, 11], "2": [3, 9]}}
     values = {1: np.arange(4), 2: np.arange(4), 3: np.arange(4), 11: np.array([0, 1023])}
-    assert R.region_dims(record, values, 11) == [[1, 2], [3]]
-    assert R.region_dims(record, values, None) == [[1, 2, 11], [3]]
+    switch = Bypass(11, 1023, tuple(range(512, 1024)))
+    assert R.region_dims(record, R.without_bypass(values, switch)) == [[1, 2], [3]]
+    assert R.region_dims(record, R.without_bypass(values, None)) == [[1, 2, 11], [3]]
+
+
+def test_a_fader_bypass_keeps_its_fader_sampled_away_from_the_bypass_setting():
+    record = {"chosen": [0], "stepped": {"0": [1, 12]}}
+    values = {1: np.arange(4), 12: np.array([0, 300, 700, 1023])}
+    kept = R.without_bypass(values, Bypass(12, 0, (0,)))
+    assert kept[12].tolist() == [300, 700, 1023] and kept[1] is values[1]
+    assert R.region_dims(record, kept) == [[1, 12]]
+    assert R.without_bypass(values, Bypass(5, 0, (0,)))[12] is values[12]
 
 
 def test_a_design_asks_for_no_more_settings_than_its_dimensions_have():
