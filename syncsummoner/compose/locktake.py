@@ -728,16 +728,31 @@ def loaded_before(
     return {"ok": bool(running and agree and early), "summary": summary, "want": want.tolist()}
 
 
-def predicted(program: str, wire: Mapping[str, Any]) -> dict:
-    """The program model's prediction for the take's planned steps; empty when the model cannot be built."""
+def judged_steps(program: str, start: np.ndarray, rows: np.ndarray) -> np.ndarray | None:
+    """The program model's verdict on each landed write's step, from the state it was taken in.
+
+    None when the model cannot be built, so the take is judged without it.
+    """
     from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
-    from syncsummoner.program.predict import predict  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program.predict import classify  # pylint: disable=import-outside-toplevel
 
     try:
-        return predict(model(program), wire["start"], wire["plan"])
+        return classify(model(program), start, rows)
     except (KeyError, RuntimeError, OSError) as err:
-        LOG.warning("%s: no prediction from the program model: %s", program, err)
+        LOG.warning("%s: no step verdicts from the program model: %s", program, err)
+        return None
+
+
+def step_counts(rows: np.ndarray, kinds: np.ndarray | None) -> dict[int, dict[str, int]]:
+    """Per parameter, how many of its sent writes the model judged each way."""
+    if kinds is None:
         return {}
+    sent = rows["sent"] >= 0
+    out: dict[int, dict[str, int]] = {}
+    for param, kind in zip(rows["param"][sent], kinds[sent]):
+        mine = out.setdefault(int(param), {})
+        mine[str(kind)] = mine.get(str(kind), 0) + 1
+    return out
 
 
 def take_evidence(
@@ -747,7 +762,7 @@ def take_evidence(
     clip: str | Path,
     config: Any,
     names: Mapping[int, str] | None = None,
-    predict: bool = False,
+    predict: bool = True,
     found: Any = None,
     features: decoded.Features | None = None,
     source: decoded.Features | None = None,
@@ -755,7 +770,8 @@ def take_evidence(
     """The three links for a recorded take, from its wire record, its attribution and its picture.
 
     ``found`` is the take's attribution and ``features`` and ``source`` the take's and the clip's
-    decodes, each made here when not given. With ``predict``, verdicts meet the program model's predictions.
+    decodes, each made here when not given. With ``predict``, the program model judges each step from
+    the state it was taken in, and only the steps it leaves live test a parameter.
     """
     from syncsummoner.compose.lock import attribute_take  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
@@ -806,7 +822,16 @@ def take_evidence(
     luma_range = np.ptp(out[:, 0].reshape(count, -1), axis=1)
     rows = landed_rows.rows
     sent = rows["sent"] >= 0
-    moved = ev.acted_upon(out, src, luma_range, rows["landed"][sent], rows["param"][sent], names)
+    kinds = judged_steps(program, wire["start"], rows) if predict else None
+    moved = ev.acted_upon(
+        out,
+        src,
+        luma_range,
+        rows["landed"][sent],
+        rows["param"][sent],
+        names,
+        kinds=None if kinds is None else kinds[sent],
+    )
     return ev.Evidence(
         program=program,
         latency=lat.as_dict(),
@@ -816,7 +841,7 @@ def take_evidence(
         received=got,
         moved=moved,
         loaded=loaded_before(program, wire, ticks, times, delta),
-        predicted=predicted(program, wire) if predict else {},
+        predicted=step_counts(rows, kinds),
     )
 
 

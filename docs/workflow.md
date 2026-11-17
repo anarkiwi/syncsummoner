@@ -472,10 +472,10 @@ more captures than frames because the card runs its own cadence
 is the attribution line: every clip frame has a capture, and the clip's run agrees
 on its cadence. `ss judge takes/take-Derez.mkv --source timecoded.mkv` judges a
 take again from its sidecars and one cached decode, with no device, so it can run
-while the rig captures the next ([judging.md](judging.md)); with `--predict` it sets each parameter's
-verdict against the program model's prediction for the take's steps, and flags a
-parameter predicted dead in every step that the picture shows moved as a
-contradiction ([program-model.md](program-model.md)).
+while the rig captures the next ([judging.md](judging.md)). Each step is judged by
+the program model from the state it was taken in, so a parameter is tested only on
+the steps that can change the picture, and one moved by steps the model proves
+inert is flagged as a contradiction ([evidence.md](evidence.md#link-3-applied-vs-acted-upon)).
 
 Iterate here, not on the full render. A different `--seed`, `--style` or
 `--density` at step 2 is seconds of CPU; a full render is most of an hour.

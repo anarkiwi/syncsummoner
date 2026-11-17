@@ -136,23 +136,54 @@ so a hue change counts); the source change is the same measure on the clip
 - **Error rate.** The critical z is the one-sided three-sigma tail divided across
   every parameter and lag tested in the take (Bonferroni), as survival.py does.
 
-A parameter that only ever lands together with others is tested on those frames and
-reported with its partners.
+**Steps judged by the program model.** Each sent write is a step from the state the
+take's parameter stream held when it landed: every write landing on the same frame
+applied, its own parameter at its value before the frame
+(`program.predict.pre_states`). The model's folded cone judges each step
+(`program.predict.classify`): **dead** (no bit of the parameter reaches the video
+there), **no-op** (its two values differ only in bits that do not reach it) or
+**live**. A step that writes the value already held is **unchanged** and not tested.
+No step is simulated: that is `program step`'s job, on demand.
 
-Failing to reject is not evidence of no effect, so a parameter not acted upon is one
-of two verdicts (`Moved.verdict`):
+The cone is folded once per gating class, and the fold is memoised in
+`.program-cache`. A parameter the model finds dead at its reference state and
+revived by a knob is folded with every other control tied, at each state its
+steps start from. Any other parameter is folded with every knob free, so only the
+switches tie it and a take has a handful of classes. Dead with knobs free holds
+for every knob value; live with knobs free means some knob value reaches the
+video, so a knob that kills it elsewhere can leave a dead step in the live pool,
+where it can only fail to move.
 
-- **no effect**: the steps' mean matched score plus the least mean they could detect
-  at the family-wise bound (`critical * scatter / sqrt(effective steps)`) stays below
-  the smallest mean score of any parameter the same take found acted upon. The steps
-  had the power to see an effect that size, and exclude it.
-- **undetermined**: they did not, or nothing in the take moved the picture to give an
-  effect size. The report gives the least detectable effect and the steps that would
-  decide it; they are written to the take directory's `schedule.json`, and
-  `probe archive --schedule schedule.json` adds that many one-at-a-time steps of each
-  listed parameter to the program's sweep.
+A parameter's steps are then tested in two pools: those the model leaves live
+(live), and those it proves cannot change the picture (dead and
+no-op). A live step is tested on frames where no other live step lands, so a proven
+no-op beside it is not a partner. A dead step is tested only more than the longest
+lag from every live step, its own parameter's included, and where nothing else lands. Steps
+that never land alone are tested with their partners. Every pool tested counts
+toward the family-wise bound.
 
-Before either verdict, the reason comes from the first link that broke: not sent on
+**Verdicts** (`Evidence.verdict`), per parameter:
+
+- **live, moved**: its live steps moved the picture beyond chance.
+- **live, not seen**: they did not. The report gives the minimum detectable effect in
+  the measure's own units, `critical * scatter / sqrt(effective steps)`, where
+  `scatter` is the spread of the step-free controls' change about their matched
+  median: the null the z score is taken against. It never compares against another
+  parameter. With a positive observed mean change, it also gives the steps at which
+  that change would clear the bound; these go to the take directory's
+  `schedule.json`.
+- **dead, moved**: its proven no-op or dead steps moved the picture. That is a hard
+  finding: the model or the firmware is wrong (`Evidence.contradictions`).
+- **never live**: every step was dead or a proven no-op in the state it was taken
+  from. It is not tested, and says nothing about the parameter's effect elsewhere;
+  `schedule.json` lists it with 0 steps, so `probe archive --schedule` steps it
+  through every level in a base state where the model makes it live.
+
+"No effect" is never a statistical verdict. It is only what the model proves, as
+dead or no-op steps. With `--no-model`, or when the model cannot be built, every
+step is tested in one pool and the verdict is **moved** or **not seen**.
+
+Before a not-seen verdict, the reason comes from the first link that broke: not sent on
 time; the firmware did not take it; the program names the slot unused; or the
 picture was a uniform field at most of its steps.
 

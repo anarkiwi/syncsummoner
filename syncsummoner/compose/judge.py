@@ -107,7 +107,7 @@ def judge_take(
     score: Score | None = None,
     source: decoded.Features | None = None,
     features: decoded.Features | None = None,
-    predict: bool = False,
+    predict: bool = True,
     workers: int | None = None,
 ) -> Judged:
     """Attribute a take once, prove its parameters, check its picture and, given a ``score``, its bars.

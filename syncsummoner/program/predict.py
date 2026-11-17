@@ -1,70 +1,117 @@
-"""Predictions for a planned run of CC steps: which steps can reach the picture, per parameter.
-
-A step is dead when its two values differ only in bits no video output depends on with every
-other control at its value then, which the fold decides exactly; any other step is live.
-"""
+"""The program model's verdict on every step a take sent, from the state it was taken in."""
 
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 import numpy as np
 
 from syncsummoner.progress import track
 
+from .hdl import cpus
+from .declared import PARAM_COUNT, field, register_value
 from .model import ProgramModel
 
-
-@dataclass(frozen=True)
-class Prediction:
-    """One parameter's planned steps split into those that reach the picture and those that cannot."""
-
-    param: int
-    live: int
-    dead: int
-
-    @property
-    def verdict(self) -> str:
-        """``live`` if any step reaches the picture, ``dead`` if none can, ``untested`` with no steps."""
-        return "live" if self.live else ("dead" if self.dead else "untested")
-
-    def check(self, moved: bool) -> str:
-        """The prediction set against a measured verdict; ``contradiction`` flags a dead step that moved."""
-        if self.verdict == "untested":
-            return "no step to predict"
-        if self.verdict == "dead":
-            return "contradiction: predicted dead, but moved" if moved else "predicted dead, and did not move"
-        return "predicted live, and moved" if moved else "predicted live, did not move"
+#: Per-write verdicts of :func:`classify`, from no step at all to a step the cone says can show.
+UNSENT, UNCHANGED, DEAD, NOOP, LIVE = "unsent", "unchanged", "dead", "no-op", "live"
 
 
-def steps(start: np.ndarray, plan: np.ndarray) -> list[tuple[np.ndarray, int, int, int]]:
-    """``(state before, param, a, b)`` for each plan row that changes its parameter, in frame order."""
-    state = np.asarray(start, dtype=np.int64).copy()
-    out = []
-    for row in plan[np.argsort(plan["target"], kind="stable")]:
-        p, b = int(row["param"]), int(row["value"])
-        if 1 <= p <= state.size and state[p - 1] != b:
-            out.append((state.copy(), p, int(state[p - 1]), b))
-            state[p - 1] = b
-    return out
+def pre_states(start: np.ndarray, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each sent write's state before it, and its value before and after, from what was sent.
+
+    Writes landing on one frame move together: each is a step from the frame's new state with its own
+    parameter at its value before the frame. Unsent writes get the state they would have stepped from.
+    """
+    state = np.zeros(PARAM_COUNT, dtype=np.int64)
+    state[: np.size(start)] = np.asarray(start, dtype=np.int64)[:PARAM_COUNT]
+    sent = rows["sent"] >= 0
+    frame = np.where(sent, rows["landed"], np.iinfo(np.int64).max)
+    order = np.argsort(frame, kind="stable")
+    pre = np.zeros((len(rows), PARAM_COUNT), dtype=np.int64)
+    a, b = np.zeros(len(rows), dtype=np.int64), np.zeros(len(rows), dtype=np.int64)
+    bounds = np.flatnonzero(np.r_[True, np.diff(frame[order]) != 0, True])
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        group = order[lo:hi]
+        after = state.copy()
+        for i in group[sent[group]]:
+            after[rows["param"][i] - 1] = rows["wire"][i]
+        for i in group:
+            p = int(rows["param"][i]) - 1
+            pre[i], a[i] = after, state[p]
+            pre[i, p] = state[p]
+            b[i] = after[p] if sent[i] else rows["value"][i]
+        state = after
+    return pre, a, b
 
 
-def predict(model: ProgramModel, start: np.ndarray, plan: np.ndarray, timing: int | None = None) -> dict:
-    """Per parameter, how many of the plan's steps can reach the picture and how many cannot."""
-    todo = steps(start, plan)
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-        seen = list(
-            track(
-                pool.map(lambda s: model.visible(s[0], s[1], s[2], s[3], timing), todo),
-                total=len(todo),
-                desc=f"{model.program.name} predict",
-                unit="step",
+def gating_class(model: ProgramModel, state: np.ndarray, param: int, gated: frozenset[int]) -> tuple:
+    """The controls a step's liveness query ties, and their register values there.
+
+    A parameter the model found gated by a knob at its reference is queried with every other
+    control tied; any other is queried with every knob free, so only the switches tie it.
+    """
+    knobs = {d.parameter_id for d in model.params if len(field(d.parameter_id).bits) > 1}
+    tied = [d.parameter_id for d in model.params if d.parameter_id != param]
+    if param not in gated:
+        tied = [q for q in tied if q not in knobs]
+    held = tuple(int(register_value(model.decl(q), int(state[q - 1]))) for q in tied)
+    free = sorted((set() if param in gated else knobs) | {param})
+    return param, tuple(tied), held, tuple(free)
+
+
+def knob_gated(model: ProgramModel, reference: np.ndarray | None = None) -> frozenset[int]:
+    """Parameters dead at ``reference`` (default: initial) that some knob revives."""
+    knobs = {f"P{d.parameter_id}" for d in model.params if len(field(d.parameter_id).bits) > 1}
+    live = model.live(reference)
+    return frozenset(p for p, l in live.items() if not l.live and set(l.gated_by) & knobs)
+
+
+def classify(
+    model: ProgramModel, start: np.ndarray, rows: np.ndarray, timing: int | None = None
+) -> np.ndarray:
+    """Each landed write's step as the model's folded cone predicts it from the state it was taken in.
+
+    ``dead`` when no bit of the parameter reaches the video, ``no-op`` when the step changes only dead
+    bits, ``live`` otherwise. One fold per gating class (:func:`gating_class`), memoised on disk.
+    """
+    pre, a, b = pre_states(start, rows)
+    out = np.full(len(rows), UNSENT, dtype=object)
+    sent = rows["sent"] >= 0
+    out[sent & (a == b)] = UNCHANGED
+    todo = np.flatnonzero(sent & (a != b))
+    gated = knob_gated(model)
+    read = model.resolution()
+    keys = [gating_class(model, pre[i], int(rows["param"][i]), gated) for i in todo]
+    first = {}
+    for i, key in zip(todo, keys):
+        first.setdefault(key, i)
+
+    def query(key: tuple) -> tuple[int, ...]:
+        param, free = key[0], key[3]
+        if model.decl(param) is None or not read.get(param):
+            return ()
+        return tuple(model.reach(pre[first[key]], free, timing)[param])
+
+    classes = list(first)
+    with ThreadPoolExecutor(max_workers=cpus()) as pool:
+        live = dict(
+            zip(
+                classes,
+                track(
+                    pool.map(query, classes),
+                    total=len(classes),
+                    desc=f"{model.program.name} classes",
+                    unit="class",
+                ),
             )
         )
-    out = {}
-    for (_, p, _, _), live in zip(todo, seen):
-        prev = out.get(p, Prediction(p, 0, 0))
-        out[p] = Prediction(p, prev.live + live, prev.dead + (not live))
+    for i, key in track(list(zip(todo, keys)), desc=f"{model.program.name} steps", unit="step"):
+        p, bits = int(rows["param"][i]), live[key]
+        if not bits:
+            out[i] = DEAD
+            continue
+        decl = model.decl(p)
+        mask = sum(1 << bit for bit in bits) if len(field(p).bits) > 1 else 1
+        changed = int(register_value(decl, int(a[i]))) ^ int(register_value(decl, int(b[i])))
+        out[i] = LIVE if changed & mask else NOOP
     return out

@@ -2,6 +2,12 @@
 
 # pylint: disable=missing-function-docstring
 
+import os
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 from syncsummoner.program import hdl
 from syncsummoner.program.library import Program
 from syncsummoner.program.model import ProgramModel, model
@@ -48,3 +54,30 @@ def test_a_register_derived_from_a_control_is_not_taken_for_the_control(library,
     chip = ProgramModel(Program(package, "fray", "czartroniks"), library, cache=tmp_path, source="bitstream")
     assert chip.latched()[1] == tuple(range(10))
     assert chip.resolution()[1] == tuple(range(10)) and chip.resolution()[5] == (7, 8, 9)
+
+
+def test_tool_processes_never_exceed_the_cpus_the_process_may_use(monkeypatch, tmp_path):
+    allowed = len(os.sched_getaffinity(0))
+    quota = tmp_path / "cpu.max"
+    quota.write_text("150000 100000\n")
+    assert hdl.cpus(quota) == min(2, allowed)
+    quota.write_text("max 100000\n")
+    assert hdl.cpus(quota) == allowed == hdl.cpus(tmp_path / "absent")
+    monkeypatch.setattr(hdl, "_SLOTS", [threading.BoundedSemaphore(2)])
+    running, peak, lock = [0], [0], threading.Lock()
+
+    def fake_run(*_args, **_kwargs):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.01)
+        with lock:
+            running[0] -= 1
+        return subprocess.CompletedProcess([], 0, "ok", "")
+
+    monkeypatch.setattr(hdl.subprocess, "run", fake_run)
+    tools = hdl.Tools()
+    monkeypatch.setattr(tools, "path", lambda name: name)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        assert set(pool.map(lambda _: tools.run(["yosys"], tmp_path), range(64))) == {"ok"}
+    assert peak[0] == 2

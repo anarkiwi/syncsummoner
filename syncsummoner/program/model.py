@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -98,6 +99,7 @@ class ProgramModel:
         self.cache = root / program.key / f"{self.source}-{config}"
         self._net: hdl.Netlist | None = None
         self._lock = threading.Lock()
+        self._recent: OrderedDict[str, hdl.Netlist] = OrderedDict()
         self.note = ""
 
     @property
@@ -213,10 +215,7 @@ class ProgramModel:
         key = {"ties": sorted(ties.items()), "named": sorted((k, v) for k, v in named.items())}
 
         def compute():
-            net = hdl.tie(
-                self.netlist, ties, {f"{n}_b{i}": [k] for n, ks in named.items() for i, k in enumerate(ks)}
-            )
-            reached = hdl.reaching(hdl.fold(self.tools, net, self.cache))
+            reached = hdl.reaching(self._folded(state, timing, free))
             out = {}
             for name, ks in named.items():
                 pid = int(name[1:])
@@ -225,6 +224,15 @@ class ProgramModel:
             return out
 
         return {int(k): v for k, v in self._cached("reach", key, compute).items()}
+
+    def reach(
+        self, state: np.ndarray, free: Sequence[int], timing: int | None = None
+    ) -> dict[int, list[int]]:
+        """Live bits of each control in ``free`` with all of them free together and the rest at ``state``.
+
+        Dead is exact for every value of the freed controls; live means some value reaches the video.
+        """
+        return self._reach(np.asarray(state, dtype=np.int64), timing, list(free))
 
     def resolution(self) -> dict[int, tuple[int, ...]]:
         """Bits of each control the program reads at all, every register free."""
@@ -239,7 +247,7 @@ class ProgramModel:
         """
         state = self.initial() if state is None else np.asarray(state, dtype=np.int64)
         pids = [d.parameter_id for d in self.params]
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+        with ThreadPoolExecutor(max_workers=hdl.cpus()) as pool:
             reach = dict(
                 zip(
                     pids,
@@ -272,9 +280,21 @@ class ProgramModel:
             out[p] = Liveness(p, (), names)
         return out
 
-    def _folded(self, state: np.ndarray, timing: int | None) -> hdl.Netlist:
-        ties, _ = self._ties(state, timing, [])
-        return hdl.fold(self.tools, hdl.tie(self.netlist, ties, {}), self.cache)
+    def _folded(self, state: np.ndarray, timing: int | None, free: Sequence[int] = ()) -> hdl.Netlist:
+        """The design folded at ``state``; the last few are kept, as a step ends where the next starts."""
+        ties, named = self._ties(state, timing, free)
+        key = _hash({"ties": sorted(ties.items()), "named": sorted((k, v) for k, v in named.items())})
+        with self._lock:
+            if key in self._recent:
+                self._recent.move_to_end(key)
+                return self._recent[key]
+        names = {f"{n}_b{i}": [k] for n, ks in named.items() for i, k in enumerate(ks)}
+        net = hdl.fold(self.tools, hdl.tie(self.netlist, ties, names), self.cache)
+        with self._lock:
+            self._recent[key] = net
+            while len(self._recent) > 2 * hdl.cpus():
+                self._recent.popitem(last=False)
+        return net
 
     def visible(
         self, state: np.ndarray, parameter_id: int, a: int, b: int, timing: int | None = None
@@ -288,22 +308,34 @@ class ProgramModel:
         return bool((int(register_value(decl, a)) ^ int(register_value(decl, b))) & mask)
 
     def step_matters(
-        self, state: np.ndarray | None, parameter_id: int, a: int, b: int, timing: int | None = None
+        self,
+        state: np.ndarray | None,
+        parameter_id: int,
+        a: int,
+        b: int,
+        timing: int | None = None,
+        free: Sequence[int] = (),
     ) -> Step:
-        """Whether changing one control from ``a`` to ``b`` can change the video, others held at ``state``."""
+        """Whether changing one control from ``a`` to ``b`` can change the video, others held at ``state``.
+
+        Controls in ``free`` are left as inputs: no change is then proven for every value they take.
+        """
         state = self.initial() if state is None else np.asarray(state, dtype=np.int64)
         decl = self.decl(parameter_id)
+        free = sorted(set(free) - {parameter_id})
         if decl is None:
             return Step(parameter_id, a, b, False, "the program declares no such parameter")
-        if not self.visible(state, parameter_id, a, b, timing):
+        if not free and not self.visible(state, parameter_id, a, b, timing):
             return Step(parameter_id, a, b, False, "the values differ only in bits no output depends on here")
         sa, sb = state.copy(), state.copy()
         sa[parameter_id - 1], sb[parameter_id - 1] = a, b
-        key = {"a": sa.tolist(), "b": sb.tolist(), "timing": timing}
+        key = {"a": sa.tolist(), "b": sb.tolist(), "timing": timing, **({"free": free} if free else {})}
 
         def compute():
             clock = "clk" if self.source == "rtl" else hdl.ICE40_PINS["clk"]
-            verdict = hdl.compare(self.tools, self._folded(sa, timing), self._folded(sb, timing), clock)
+            verdict = hdl.compare(
+                self.tools, self._folded(sa, timing, free), self._folded(sb, timing, free), clock
+            )
             return asdict(verdict)
 
         verdict = self._cached("step", key, compute)

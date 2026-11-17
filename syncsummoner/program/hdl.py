@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -29,10 +30,37 @@ ABC_GATES = "AND,NAND,OR,NOR,XOR,XNOR,ANDNOT,ORNOT,MUX"
 FOLD = f"opt -full; techmap; opt -full; abc -g {ABC_GATES}; opt -full -purge"
 _FF = re.compile(r"^\$_(DFFE?|SDFFC?E?)_([PN]+)([01]?)([PN]?)_$")
 MAX_ROUNDS = 16
+#: Cycles of shared random stimulus a co-simulation runs before it reports no difference.
+COSIM_CYCLES = 200_000
+
+
+CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
 
 
 class ToolError(RuntimeError):
     """An HDL tool is missing or failed."""
+
+
+def cpus(cpu_max: Path = CPU_MAX) -> int:
+    """CPUs this process may use: its affinity, cut to the cgroup's ``cpu.max`` quota where one is set."""
+    count = len(os.sched_getaffinity(0))
+    try:
+        quota, period = cpu_max.read_text(encoding="utf-8").split()[:2]
+    except (OSError, ValueError):
+        return count
+    return count if quota == "max" else max(1, min(count, -(-int(quota) // int(period))))
+
+
+_SLOTS: list[threading.BoundedSemaphore] = []
+_SLOTS_LOCK = threading.Lock()
+
+
+def slots() -> threading.BoundedSemaphore:
+    """The one bound on HDL tool processes running at once in this process, sized by :func:`cpus`."""
+    with _SLOTS_LOCK:
+        if not _SLOTS:
+            _SLOTS.append(threading.BoundedSemaphore(cpus()))
+        return _SLOTS[0]
 
 
 class Tools:
@@ -63,15 +91,20 @@ class Tools:
         return True
 
     def run(self, args: list[str], cwd: Path, timeout: float | None = None) -> str:
-        """Run a tool, returning stdout; failure raises with the tail of its output."""
-        proc = subprocess.run(
-            [self.path(args[0]), *args[1:]],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        """Run a tool, returning stdout; failure raises with the tail of its output.
+
+        Every tool process waits for one of :func:`slots`, however many threads ask at once.
+        """
+        tool = self.path(args[0])
+        with slots():
+            proc = subprocess.run(
+                [tool, *args[1:]],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
         if proc.returncode:
             raise ToolError(f"{args[0]} failed: {(proc.stdout + proc.stderr)[-2000:]}")
         return proc.stdout
@@ -306,7 +339,13 @@ endmodule
 
 
 def cosimulate(
-    tools: Tools, gold: Netlist, gate: Netlist, clock: str, *, cycles: int, seed: int = 1
+    tools: Tools,
+    gold: Netlist,
+    gate: Netlist,
+    clock: str,
+    *,
+    cycles: int,
+    seed: int = 1,
 ) -> int | None:
     """First cycle at which the two designs' outputs differ under one random stimulus, from zeroed state."""
     tmp = _scratch(None)
@@ -468,7 +507,7 @@ def equivalent(tools: Tools, gold: Netlist, gate: Netlist, *, seq: int = 4, time
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def compare(tools: Tools, gold: Netlist, gate: Netlist, clock: str, *, cycles: int = 200_000) -> Verdict:
+def compare(tools: Tools, gold: Netlist, gate: Netlist, clock: str, *, cycles: int = COSIM_CYCLES) -> Verdict:
     """Whether two folded designs can drive different video: proof, concrete witness, or undecided."""
     if isomorphic(gold, gate):
         return Verdict(False, "the two folded designs are the same circuit")

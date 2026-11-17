@@ -98,7 +98,22 @@ def meter(total: float, *, desc: str, unit: str = "s") -> Iterator[Meter]:
 
 
 def track(iterable: Iterable, *, desc: str, total: int | None = None, unit: str = "it") -> Iterable:
-    """Wrap a loop in a progress bar when there is a terminal and a tqdm to draw it."""
-    if tqdm is None or not sys.stderr.isatty() or not LOG.isEnabledFor(logging.INFO):
+    """Wrap a loop in a progress bar when there is a terminal, else log its count and rate as it goes."""
+    if not LOG.isEnabledFor(logging.INFO):
         return iterable
-    return tqdm(iterable, desc=desc, total=total, unit=unit, leave=False, file=sys.stderr)
+    if tqdm is not None and sys.stderr.isatty():
+        return tqdm(iterable, desc=desc, total=total, unit=unit, leave=False, file=sys.stderr)
+    return _heartbeat(iterable, desc=desc, total=total, unit=unit)
+
+
+def _heartbeat(iterable: Iterable, *, desc: str, total: int | None, unit: str) -> Iterator:
+    start = said = time.monotonic()
+    count = 0
+    for item in iterable:
+        yield item
+        count += 1
+        now = time.monotonic()
+        if now - said >= HEARTBEAT_S:
+            said = now
+            of = f"/{total}" if total is not None else ""
+            LOG.info("%s %d%s %s, %.2f %s/s", desc, count, of, unit, count / (now - start), unit)

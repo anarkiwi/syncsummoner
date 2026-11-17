@@ -525,6 +525,7 @@ class FrameArchive:
         fps: float = ARCHIVE_FPS,
         program_info: Mapping[str, Any] | None = None,
         stimulus: Mapping[str, Any] | None = None,
+        schedule: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Publish a recording as this program's archive: video, sidecar, then marker.
 
@@ -532,7 +533,8 @@ class FrameArchive:
         store: a run killed mid-recording leaves at most an uncommitted temp file.
         ``program_info`` is the device's reply for the program, kept so a refit
         knows each parameter's name and native range, and ``stimulus`` names what was
-        played. A committed archive supersedes any earlier dark verdict for the program.
+        played; ``schedule`` lists each setpoint with the full state it was stepped from.
+        A committed archive supersedes any earlier dark verdict for the program.
         """
         if not rows:
             raise ArchiveError(f"no frames archived for {program!r}")
@@ -568,6 +570,8 @@ class FrameArchive:
             meta[PROGRAM_INFO] = dict(program_info)
         if stimulus is not None:
             meta[STIMULUS] = dict(stimulus)
+        if schedule is not None:
+            meta["schedule"] = [dict(entry) for entry in schedule]
         self._write_meta(meta_path, meta)
         self.dark_path(program).unlink(missing_ok=True)
         return meta

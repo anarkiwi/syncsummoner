@@ -20,7 +20,6 @@ from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.errors import DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
 from syncsummoner.device.playout import DEFAULT_LOOP_FPS
-from syncsummoner.device.profile import ParamKind
 from syncsummoner.device.recorder import (
     BlankTakeError,
     RouteError,
@@ -33,7 +32,7 @@ from syncsummoner.device.recorder import (
     settle,
 )
 from syncsummoner.device.session import Session
-from syncsummoner.probe import codeframes, plans
+from syncsummoner.probe import codeframes
 from syncsummoner.probe.archive import GAP, FrameRow
 from syncsummoner.probe.runner import raw_params
 from syncsummoner.probe.store import KeyKind, ProgramKey, atomic_write
@@ -94,7 +93,6 @@ class HarvestConfig:
     #: A whole number of vblanks per loop frame, as the locked player requires.
     loop_fps: float = DEFAULT_LOOP_FPS
     loop_frames: int = codeframes.DEFAULT_COUNT
-    setpoints: int = 32
     dwell_s: float = 1.0
     settle_s: float = 0.35
     #: The card's budget to deliver a probe once the transmitter drives the session timing.
@@ -108,22 +106,22 @@ class HarvestConfig:
     startup_s: float = 2.0
     health_timeout_s: float = 3600.0
     health_poll_s: float = 10.0
-    seed: int = 11
     loop_seed: int = 7
     #: A prepared timecoded clip played in place of the codeframe loop; None plays the loop.
     footage: str | None = None
-    #: Per program, parameters a render's evidence left undetermined and the steps each needs.
+    #: Per program, parameters a render's evidence could not show and the steps each needs (0: every level).
     focus: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
 class Window:
-    """One setpoint, its raw parameter vector, and the span it was held over."""
+    """One setpoint, its raw parameter vector, the span it was held over, and the vector held before it."""
 
     setpoint: int
     params: tuple[int, ...]
     start: float
     end: float
+    previous: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -199,11 +197,30 @@ class HarvestReport:
         return lines + ([f"stopped: {self.fault}"] if self.fault else [])
 
 
-def sweep_vectors(info: Any, config: HarvestConfig, rng: np.random.Generator) -> list[dict]:
-    """Sobol vectors over every declared parameter, each sampled as its kind."""
-    if not info.used:
+def model_cover(info: Any) -> Any:
+    """The program model's covering base states for a declared program; None for an undeclared one."""
+    if info.declared is None:
+        return None
+    from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program.gates import cover  # pylint: disable=import-outside-toplevel
+
+    return cover(model(info.declared.program_id))
+
+
+def _vector(info: Any, state: np.ndarray) -> dict[int, int]:
+    """Every declared parameter of a full state, in device units."""
+    return {p.index: int(state[p.index - 1]) for p in info.used}
+
+
+def sweep_vectors(info: Any, found: Any) -> list[dict]:
+    """The cover's schedule: each base state, then each parameter it is live in stepped one at a time.
+
+    Every setpoint is the full declared state, so each window holds the state its step was taken
+    from and the one before it the state it left. An undeclared program holds its working point.
+    """
+    if not info.used or found is None:
         return [{}]
-    return list(plans.sobol(info.params, n=config.setpoints, rng=rng))
+    return [_vector(info, after) for _, after in found.vectors()]
 
 
 class ReadbackError(RuntimeError):
@@ -221,22 +238,33 @@ def verify_readback(session: Any, setpoint: int, want: Sequence[int]) -> None:
         )
 
 
-def focus_vectors(program: str, info: Any, config: HarvestConfig) -> list[dict]:
-    """One-at-a-time steps across each parameter ``config.focus`` names for ``program``, evenly spaced.
+def focus_vectors(program: str, info: Any, config: HarvestConfig, found: Any) -> list[dict]:
+    """Steps of each parameter ``config.focus`` names for ``program``, taken from a base state it is live in.
 
-    These are the parameters a render's evidence could not decide; their steps follow the sweep.
+    ``steps`` settings evenly spaced over those the program tells apart there, cycling when there are
+    fewer; 0 steps through every one. A parameter the cover never makes live is not stepped.
     """
     out = []
     for name, param, steps in config.focus:
-        spec = next((p for p in info.params if p.index == param), None)
-        if name != program or spec is None or steps < 1:
+        where = found.where(param) if found is not None else []
+        if name != program or not where or steps < 0 or param not in {p.index for p in info.used}:
             continue
-        values = (
-            [bool(k % 2) for k in range(steps)]
-            if spec.kind is ParamKind.BOOLEAN
-            else np.linspace(0.0, 1.0, steps)
+        base = found.states[where[0]]
+        values = found.schedule(where[0], param)
+        pick = (
+            np.arange(values.size)
+            if steps == 0
+            else (
+                np.rint(np.linspace(0, values.size - 1, steps)).astype(int)
+                if steps <= values.size
+                else np.arange(steps) % values.size
+            )
         )
-        out.extend({param: v if isinstance(v, bool) else float(v)} for v in values)
+        out.append(_vector(info, base))
+        for v in values[pick]:
+            state = base.copy()
+            state[param - 1] = v
+            out.append(_vector(info, state))
     return out
 
 
@@ -262,14 +290,16 @@ def sweep(
     A window opens only after the parameters have settled and the device has read back the
     setpoint exactly, so the frames it claims were captured under that vector and no other.
     """
-    windows = []
+    windows, previous = [], raw_params(base)
     for setpoint, vector in enumerate(vectors):
         session.set_params(vector)
         sleep(config.settle_s)
-        verify_readback(session, setpoint, raw_params({**base, **vector}))
+        held = raw_params({**base, **vector})
+        verify_readback(session, setpoint, held)
         start = clock()
         sleep(config.dwell_s)
-        windows.append(Window(setpoint, raw_params({**base, **vector}), start, clock()))
+        windows.append(Window(setpoint, held, start, clock(), previous))
+        previous = held
     return windows
 
 
@@ -550,7 +580,7 @@ def harvest_program(
     key: ProgramKey,
     *,
     config: HarvestConfig,
-    rng: np.random.Generator,
+    plan: Callable[[Any], Any] = model_cover,
     link: Any = None,
     player: Any = None,
     stimulus: dict[str, Any] | None = None,
@@ -570,6 +600,7 @@ def harvest_program(
         player.start(fps=config.loop_fps)
     payload = transport.program_payload()
     info = transport.describe(payload)
+    found = plan(info)
     base = session.working_point(info)
     session.set_params(base)
     settle(
@@ -591,7 +622,7 @@ def harvest_program(
             windows = sweep(
                 session,
                 base,
-                sweep_vectors(info, config, rng) + focus_vectors(program, info, config),
+                sweep_vectors(info, found) + focus_vectors(program, info, config, found),
                 config=config,
                 sleep=sleep,
                 clock=clock,
@@ -611,6 +642,9 @@ def harvest_program(
             fps=config.capture_fps,
             program_info=payload,
             stimulus=run_stimulus(config) if stimulus is None else stimulus,
+            schedule=[
+                {"setpoint": w.setpoint, "from": list(w.previous), "to": list(w.params)} for w in windows
+            ],
         )
     finally:
         video.unlink(missing_ok=True)
@@ -632,7 +666,7 @@ def harvest(
     link: Any = None,
     programs: Iterable[str] | None = None,
     config: HarvestConfig | None = None,
-    rng: np.random.Generator | None = None,
+    plan: Callable[[Any], Any] = model_cover,
     session_factory: Callable[..., Any] = Session,
     log: Callable[[str], None] | None = None,
     retry_dark: bool = False,
@@ -650,7 +684,6 @@ def harvest(
     unless ``retry_dark``, which re-judges them under the current criterion.
     """
     config = HarvestConfig() if config is None else config
-    rng = np.random.default_rng(config.seed) if rng is None else rng
     note = log if log is not None else lambda _message: None
     archive.directory.mkdir(parents=True, exist_ok=True)
     stimulus = run_stimulus(config)
@@ -687,7 +720,7 @@ def harvest(
                             name,
                             key,
                             config=config,
-                            rng=rng,
+                            plan=plan,
                             stimulus=stimulus,
                             **live,
                         )

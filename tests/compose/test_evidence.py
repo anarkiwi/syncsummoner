@@ -504,24 +504,99 @@ def verdict(**kw):
         (verdict(steps=0), "Gain", True, True, "no step landed"),
         (verdict(partners=(2, 3)), "Gain", True, True, "even with P2, P3"),
         (verdict(flat=0.75), "Gain", True, True, "uniform field at 75%"),
-        (verdict(effect=0.1, scatter=0.5, reference=5.0), "Gain", True, True, "ignores it in this state"),
-        (verdict(effect=0.1, scatter=5.0, reference=2.0), "Gain", True, True, "steps would decide it"),
-        (verdict(), "Gain", True, True, "no parameter in the take moved"),
+        (verdict(effect=0.1, scatter=0.5), "Gain", True, True, "minimum detectable effect"),
+        (verdict(effect=0.1, scatter=5.0), "Gain", True, True, "steps would show its observed mean change"),
+        (verdict(effect=-0.1, scatter=5.0), "Gain", True, True, "no mean change to build on"),
     ],
 )
 def test_why_not_names_the_earliest_broken_link(moved, name, applied_ok, landed_ok, reason):
     assert reason in ev.why_not(moved, name, applied_ok, landed_ok)
 
 
-def test_a_verdict_is_acted_upon_no_effect_or_undetermined_by_power():
-    """No effect needs the steps' bound below the least acted-upon effect; else steps are scheduled."""
-    assert verdict(z=4.0).verdict == "acted upon" and verdict(z=4.0).steps_needed == 0
-    none = verdict(effect=0.1, scatter=0.5, reference=5.0)
-    assert none.detectable == pytest.approx(3.0 * 0.5 / np.sqrt(5.0)) and none.verdict == "no effect"
-    weak = verdict(effect=0.1, scatter=5.0, reference=2.0)
-    assert weak.verdict == "undetermined" and weak.steps_needed == int(np.ceil((3.0 * 5.0 / 2.0) ** 2))
-    assert verdict().verdict == "undetermined" and verdict().steps_needed == 0
-    assert verdict(effect=0.1, scatter=0.0, reference=2.0, effective=0.0).detectable == np.inf
+def test_a_statistic_says_moved_or_not_seen_with_an_absolute_minimum_detectable_effect():
+    assert verdict(z=4.0).verdict == "moved" and verdict(z=4.0).steps_needed == 0
+    weak = verdict(effect=0.1, scatter=5.0)
+    assert weak.verdict == "not seen" and weak.detectable == pytest.approx(3.0 * 5.0 / np.sqrt(5.0))
+    assert weak.steps_needed == int(np.ceil((3.0 * 5.0 / 0.1) ** 2))
+    assert verdict().steps_needed == 0 and verdict(effect=-1.0, scatter=1.0).steps_needed == 0
+    assert verdict(effect=0.1, scatter=1.0, effective=0.0).detectable == np.inf
+
+
+def test_a_small_real_effect_beside_a_huge_one_is_never_called_no_effect():
+    """The lead's Porthole case: one toggle moves the picture hugely, another parameter only a little."""
+    rng = np.random.default_rng(21)
+    big = spaced(rng, 240, 12)
+    small = spaced(rng, 240, 12, avoid=np.r_[big - 3, big, big + 3])
+    out, src = picture(21, np.r_[big, small], jump=np.r_[np.full(12, 60.0), np.full(12, 0.4)])
+    order = np.argsort(np.r_[big, small])
+    frames, params = np.r_[big, small][order], np.r_[np.full(12, 1), np.full(12, 2)][order]
+    kinds = np.full(24, ev.LIVE, dtype=object)
+    moved = ev.acted_upon(
+        out, src, np.full(240, 100.0), frames, params, {1: "Window", 2: "Curve"}, kinds=kinds
+    )
+    proof = evidence_of(moved, {1: {ev.LIVE: 12}, 2: {ev.LIVE: 12}})
+    rows = {row["param"]: row for row in proof.table()}
+    assert rows[1]["verdict"] == "live, moved"
+    assert rows[2]["verdict"] in ("live, moved", "live, not seen")
+    if rows[2]["verdict"] == "live, not seen":
+        assert "minimum detectable effect" in rows[2]["why_not"] and rows[2]["mde"] > 0
+    assert all("no effect" not in str(row["why_not"]) for row in rows.values())
+
+
+def kinds_picture(seed):
+    """P1's live steps jump the picture; P2's steps are proven no-ops and do not; P3 is dead and jumps it."""
+    rng = np.random.default_rng(seed)
+    live = spaced(rng, 240, 12)
+    noop = spaced(rng, 240, 12, avoid=np.r_[live - 3, live, live + 3])
+    bad = spaced(rng, 240, 8, avoid=np.r_[live - 3, live, live + 3, noop - 3, noop, noop + 3])
+    out, src = picture(seed, np.r_[live, bad], jump=40.0)
+    frames = np.r_[live, live[:4], noop, bad]
+    params = np.r_[np.full(12, 1), np.full(4, 2), np.full(12, 2), np.full(8, 3)]
+    kinds = np.r_[
+        np.full(12, ev.LIVE, dtype=object),
+        np.full(4, ev.NOOP, dtype=object),
+        np.full(12, ev.NOOP, dtype=object),
+        np.full(8, ev.DEAD, dtype=object),
+    ]
+    return out, src, frames, params, kinds
+
+
+def test_steps_are_tested_by_pool_and_proven_no_ops_beside_a_step_are_not_its_partners():
+    out, src, frames, params, kinds = kinds_picture(3)
+    moved = ev.acted_upon(out, src, np.full(240, 100.0), frames, params, {}, kinds=kinds)
+    by = {(v.param, v.pool): v for v in moved}
+    assert set(by) == {(1, ev.LIVE_POOL), (2, ev.DEAD_POOL), (3, ev.DEAD_POOL)}
+    assert (
+        by[1, ev.LIVE_POOL].moved and by[1, ev.LIVE_POOL].partners == () and by[1, ev.LIVE_POOL].steps == 12
+    )
+    assert by[2, ev.DEAD_POOL].steps == 12 and not by[2, ev.DEAD_POOL].moved
+    assert by[3, ev.DEAD_POOL].moved
+    assert by[1, ev.LIVE_POOL].critical == pytest.approx(ev.critical(3 * len(ev.LAGS)))
+    proof = evidence_of(
+        moved, {1: {ev.LIVE: 12}, 2: {ev.NOOP: 16}, 3: {ev.DEAD: 8}, 4: {ev.DEAD: 2}, 5: {ev.LIVE: 1}}
+    )
+    rows = {row["param"]: row for row in proof.table()}
+    assert rows[1]["verdict"] == "live, moved" and rows[1]["why_not"] is None
+    assert rows[2]["verdict"] == "never live" and "16 proven no-ops" in rows[2]["why_not"]
+    assert rows[3]["verdict"] == "dead, moved" and "contradiction" in rows[3]["why_not"]
+    assert rows[4]["verdict"] == "never live" and rows[4]["steps_tested"] == 0
+    assert rows[5]["verdict"] == "untested" and "outside the clip" in rows[5]["why_not"]
+    assert proof.contradictions == [3]
+    assert [e["param"] for e in proof.schedule()] == [2, 4, 5]
+    assert any("model: 16 no-op" in line for line in proof.lines())
+
+
+def test_steps_that_change_no_value_are_not_tested():
+    out, src, frames, params, kinds = kinds_picture(4)
+    kinds = np.where(params == 1, ev.UNCHANGED, kinds)
+    assert all(v.param != 1 for v in ev.acted_upon(out, src, np.zeros(240), frames, params, {}, kinds=kinds))
+
+
+def evidence_of(moved, predicted):
+    plan = np.array([(2, 1, 10)], dtype=PLAN)
+    landed = ev.landed(plan, sends_at(plan.tolist()), TICKS, TIMES, DELTA)
+    applied = ev.Applied(1, 12, 0, np.zeros(0, dtype=ev.DISAGREE), 1, 0)
+    return ev.Evidence("Edge", {}, {}, landed, applied, None, moved, {"ok": True}, predicted)
 
 
 def evidence(loaded_ok=True, received=None):
@@ -571,14 +646,13 @@ def test_evidence_reports_per_parameter_verdicts():
     assert said["late"] == [] and said["received"].startswith("4 messages")
 
 
-def test_predictions_join_each_verdict_and_flag_a_dead_step_that_moved():
-    from syncsummoner.program.predict import Prediction  # pylint: disable=import-outside-toplevel
-
-    proof = evidence()
-    proof.predicted = {1: Prediction(1, live=0, dead=3), 2: Prediction(2, live=4, dead=1)}
-    rows = {row["param"]: row for row in proof.table()}
-    assert rows[1]["check"] == "contradiction: predicted dead, but moved" and rows[1]["dead_steps"] == 3
-    assert rows[2]["check"] == "predicted live, did not move" and rows[2]["predicted"] == "live"
-    assert proof.contradictions == [1]
-    assert any("contradiction" in line for line in proof.lines())
-    assert "check" not in evidence().table()[0] and evidence().contradictions == []
+def test_a_proven_no_op_next_to_a_live_step_is_not_tested_for_a_contradiction():
+    """A live step's picture lingers into the next frame, so the no-op after it cannot be judged."""
+    rng = np.random.default_rng(8)
+    live = spaced(rng, 240, 12)
+    out, src = picture(8, live, jump=40.0, delay=1)
+    frames = np.r_[live, live + 1]
+    params = np.ones(24, dtype=int)
+    kinds = np.r_[np.full(12, ev.LIVE, dtype=object), np.full(12, ev.NOOP, dtype=object)]
+    pools = {v.pool for v in ev.acted_upon(out, src, np.full(240, 100.0), frames, params, {}, kinds=kinds)}
+    assert pools == {ev.LIVE_POOL}

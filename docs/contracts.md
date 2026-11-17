@@ -231,10 +231,11 @@ replay.replay(archive, *, analyzer, programs=None, jobs=None) -> dict[str, Repla
 replay.replay_program(archive, program, *, analyzer, loop) -> Replayed   # records, profile, behaviour, notes
 replay.setpoints(reader, *, width) -> Iterator[(setpoint, params, frames)]   # GAP rows dropped
 
-harvest.sweep(session, base, vectors, *, config) -> list[Window]   # when each setpoint was held
+harvest.sweep_vectors(info, cover) -> list[dict]   # the model cover's full states, one parameter stepped at a time
+harvest.sweep(session, base, vectors, *, config) -> list[Window]   # when each setpoint was held, and the state before it
 harvest.attribute(times, windows, program, *, base) -> list[FrameRow]   # frame -> setpoint
 harvest.harvest(archive, *, open_transport, recorder, player=None, link=None,
-                programs=None, config=HarvestConfig(), session_factory=Session,
+                programs=None, config=HarvestConfig(), plan=model_cover, session_factory=Session,
                 retry_dark=False) -> HarvestReport   # dark = no frame ever structured
 harvest.control(session, recorder, transport, *, config) -> str   # Passthru control: "" only on a picture
 harvest.rig_fault(session, recorder, transport, *, config) -> str   # "" unless gone, wrong route or a black Passthru
@@ -265,8 +266,8 @@ locktake.schedule(plan, state=None) -> PLAN array   # last write per (frame, slo
 locktake.pace(plan, capacity, per_write, *, floor) -> PLAN array   # no frame over capacity messages; InfeasibleScheduleError otherwise
 session.frame_capacity(cc_budget_hz, fps, per_write) -> int   # messages a frame the budget's rate carries
 locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
-locktake.take_evidence(take, *, program, clip, config, names=None, predict=False, found=None, features=None, source=None) -> evidence.Evidence   # the three links; .ok is the hard check
-judge.judge_take(take, *, clip, config, program=None, score=None, source=None, features=None, predict=False, workers=None) -> judge.Judged   # one attribution handed to evidence, picture and take check
+locktake.take_evidence(take, *, program, clip, config, names=None, predict=True, found=None, features=None, source=None) -> evidence.Evidence   # the three links; steps judged by the program model; .ok is the hard check
+judge.judge_take(take, *, clip, config, program=None, score=None, source=None, features=None, predict=True, workers=None) -> judge.Judged   # one attribution handed to evidence, picture and take check
 decoded.features(path, spec=Spec(), *, workers=None, ffmpeg="ffmpeg", store=True) -> decoded.Features   # one decode per recording, cached beside it (docs/judging.md)
 evidence.send_time(frames, ticks, times, delta) -> ns   # half a frame before the instant each frame's write must precede
 ```
