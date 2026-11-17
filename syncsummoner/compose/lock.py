@@ -476,7 +476,8 @@ def processed(take: str | Path, record: Any, frames: np.ndarray) -> tuple[float,
     From the first write leaving the dry state, or the program's load command, to the close of the
     landing window of the write or reload making it dry again: that write's echo, or the reload's
     return, then the latency band and the frame it lands on. A take without those times on file, a wet
-    lockcheck's, is processed from the end of its first run to the start of its last: the loads' outages.
+    lockcheck's, is processed from the end of its first run, the load's outage, to the start of its last
+    when it played a lead-out, the reload's, and to its end when it did not.
     """
     from syncsummoner.device.wire import load_wire, wire_path  # pylint: disable=import-outside-toplevel
 
@@ -490,7 +491,10 @@ def processed(take: str | Path, record: Any, frames: np.ndarray) -> tuple[float,
             return span
     seg = frameline.segments(frames["t_ns"], frames["sequence"])
     t = frames["t_ns"].astype(np.float64)
-    return float(t[seg == seg[0]][-1]), float(t[seg == seg[-1]][0])
+    reloaded = int(record["tail"]) > 0 if "tail" in record else False
+    return float(t[seg == seg[0]][-1]), (
+        float(t[seg == seg[-1]][0]) if reloaded and seg[-1] != seg[0] else np.inf
+    )
 
 
 def _written_span(wire: Any, count: int) -> tuple[float, float] | None:

@@ -294,6 +294,9 @@ def test_a_program_processed_the_picture_from_its_first_wet_write_to_its_dry_wri
     L.save_lock(path, played.flips, **played.kw, wet=True)
     record, t = np.load(L.lock_path(path)), played.frames["t_ns"]
     seg = L.frameline.segments(t, played.frames["sequence"])
+    assert L.processed(path, record, played.frames) == (float(t[seg == 0][-1]), np.inf)
+    L.save_lock(path, played.flips, **{**played.kw, "tail": 2}, wet=True)
+    record = np.load(L.lock_path(path))
     assert L.processed(path, record, played.frames) == (float(t[seg == 0][-1]), float(t[seg == seg[-1]][0]))
     sends = np.zeros(4, dtype=SEND)
     sends["target"] = [ev.START, ev.CALIBRATION, 2, played.count]
