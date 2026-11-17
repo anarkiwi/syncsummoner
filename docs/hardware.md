@@ -94,9 +94,9 @@ to land on its target frame, and proves where it landed ([evidence.md](evidence.
 of design 4.4 picks the target: the first frame starting at or after the write's
 time less 15 ms.
 
-## The crossfader is not a dry control
+## P12 is not a crossfader
 
-pyvmancer calls P12 the crossfader that gates every program's output. On the
+pyvmancer and this project's profile code call P12 a crossfader that gates every program's output. That is false. On the
 still lead-in, against Passthru's capture of the same picture (noise 0.12 mean
 absolute difference in 8-bit codes):
 
@@ -111,9 +111,11 @@ absolute difference in 8-bit codes):
 | czartroniks/Fray | Length | 14.6 | no bypass | no |
 | czartroniks/Porthole | Drift | 0.55, 1.03 at the working point | no bypass | yes |
 
-So P12 gives dry passthrough for two of the eight. A program's own bypass, or a
-P12 whose role is wet where there is no bypass, does for all five that have one;
-`locktake.dry_state` picks it.
+So P12 gives dry passthrough for two of the eight, and does something different in
+each: parameters are patch-specific, and no slot means the same in every program.
+`locktake.dry_state` therefore uses only a parameter the program itself labels
+Bypass; the four with one pass the strip with it on. The rest load inside a
+Passthru lead-in.
 
 ## The MIDI CC map must be checked
 

@@ -31,9 +31,9 @@ land on it (`evidence.grid`).
 
 ## Frame-locked sends
 
-1. The program is loaded before playout and held dry for the lead-in: its bypass on,
-   or, for a program without one, a crossfader slot whose role is wet set to 0
-   (`locktake.dry_state`). The strip-coded lead-in then passes through unprocessed,
+1. The program is loaded before playout and held dry for the lead-in: the parameter
+   it labels Bypass turned on (`locktake.dry_state`); no slot is assumed to do the
+   same thing across programs. The strip-coded lead-in then passes through unprocessed,
    so the take is one gap-free run that the strips anchor; no load interrupts it.
 2. The dry control is toggled at random intervals and each toggle's first frame in
    the lead-in's picture measures the latency band.
@@ -49,7 +49,7 @@ land on it (`evidence.grid`).
    last readback before frame 0's latch must equal frame 0's planned parameters,
    and `fpga status` must name the program (`locktake.loaded_before`).
 
-A program with neither a bypass nor a wet crossfader keeps the old lead-in: Passthru
+A program that labels no bypass keeps the old lead-in: Passthru
 under the strips, the program loaded inside it, the outage bridged by the Pi's flip
 log. Its latency band is the dry takes' (`ccpicture.json`) widened by the part of the
 capture phase's half-frame range they have not shown; `render --cut-programs` renders

@@ -20,7 +20,7 @@ import numpy as np
 
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import live_attribution, read_live, save_lock
-from syncsummoner.device.profile import CROSSFADER_INDEX, PARAM_MAX, Role
+from syncsummoner.device.profile import PARAM_MAX
 from syncsummoner.device.wire import Poller, Sender, save_wire
 from syncsummoner.progress import LOG, meter
 
@@ -62,16 +62,14 @@ class LeadIn:
 
 
 def dry_state(info: Any) -> dict[int, int] | None:
-    """The write that returns a program's input unprocessed: its bypass on, or a crossfader wet control off.
+    """The write that returns a program's input unprocessed: the parameter the program itself labels
+    its bypass, turned on. None when it labels none, so its lead-in cannot carry the strip.
 
-    None when the program names neither, so its lead-in cannot carry the strip.
+    No slot is assumed to do the same thing in every program.
     """
     for spec in info.params:
-        if spec.role is Role.BYPASS:
+        if spec.name.strip().casefold() == "bypass":
             return {spec.index: PARAM_MAX}
-    for spec in info.params:
-        if spec.role is Role.WET and spec.index == CROSSFADER_INDEX:
-            return {spec.index: 0}
     return None
 
 

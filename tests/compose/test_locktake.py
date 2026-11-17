@@ -31,7 +31,13 @@ def specs(roles=None):
     """Twelve parameter specs, ``roles`` mapping index to role."""
     roles = roles or {}
     return [
-        ParamSpec(index=i, name=f"p{i}", native_min=0.0, native_max=1.0, role=roles.get(i, Role.EFFECT))
+        ParamSpec(
+            index=i,
+            name="Bypass" if roles.get(i) is Role.BYPASS else f"p{i}",
+            native_min=0.0,
+            native_max=1.0,
+            role=roles.get(i, Role.EFFECT),
+        )
         for i in range(1, 13)
     ]
 
@@ -45,13 +51,13 @@ def info_with(roles=None):
     "roles, want",
     [
         ({1: Role.BYPASS, 12: Role.WET}, {1: PARAM_MAX}),
-        ({12: Role.WET}, {12: 0}),
-        ({5: Role.WET}, None),
+        ({7: Role.BYPASS}, {7: PARAM_MAX}),
+        ({12: Role.WET}, None),
         ({}, None),
     ],
 )
-def test_the_dry_state_is_a_bypass_on_or_a_crossfader_wet_control_off(roles, want):
-    """Bypass wins over the crossfader; a wet control off the crossfader slot is no dry state."""
+def test_the_dry_state_is_the_programs_own_bypass_and_no_slot_is_assumed(roles, want):
+    """Only a parameter the program labels Bypass is a dry state; P12 is nothing in particular."""
     assert LT.dry_state(info_with(roles)) == want
 
 
