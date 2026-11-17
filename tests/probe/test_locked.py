@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,7 +31,12 @@ def landed_from(chunk, *, late=(), unsent=(), ambiguous=()):
     rows = np.zeros(plan.size, dtype=ev.LANDED)
     for name in ("target", "param", "value"):
         rows[name] = plan[name]
-    rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = plan["value"], np.arange(plan.size), plan["target"], 1.0
+    rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = (
+        plan["value"],
+        np.arange(plan.size),
+        plan["target"],
+        1.0,
+    )
     for i, by in late:
         rows["landed"][i] += by
     rows["sent"][list(unsent)] = -1
@@ -57,7 +63,7 @@ def test_levels_are_the_covers_states_in_order():
 
 
 def test_writes_moved_by_the_take_still_find_their_setpoint():
-    (chunk,) = L.plan_sweep(sweep_states(4), settle=0, hold=2, frames=20)
+    chunk = L.plan_sweep(sweep_states(4), settle=0, hold=2, frames=20)[0]
     rows = landed_from(chunk)
     rows["target"][1] -= 1
     assert L.owners(chunk, rows).tolist() == [1, 2, 3][: rows.size]
@@ -67,7 +73,7 @@ def test_writes_moved_by_the_take_still_find_their_setpoint():
 
 
 def test_each_setpoint_keeps_the_frames_after_it_settled_until_the_next_lands():
-    (chunk,) = L.plan_sweep(sweep_states(4), settle=1, hold=3, frames=20)
+    chunk = L.plan_sweep(sweep_states(4), settle=1, hold=3, frames=20)[0]
     count = chunk.frames
     picked = np.arange(count) * 2
     shown = np.repeat(np.arange(count), 2)
@@ -88,7 +94,7 @@ def test_each_setpoint_keeps_the_frames_after_it_settled_until_the_next_lands():
 
 
 def test_an_unsent_write_and_a_write_on_a_tick_cost_their_setpoint_frames():
-    (chunk,) = L.plan_sweep(sweep_states(4), settle=0, hold=3, frames=20)
+    chunk = L.plan_sweep(sweep_states(4), settle=0, hold=3, frames=20)[0]
     count = chunk.frames
     rows = L.settled_rows(
         chunk,
@@ -123,7 +129,11 @@ def test_plans_and_rows_round_trip(tmp_path):
 
 def test_a_failed_join_raises(tmp_path):
     with pytest.raises(L.SweepError):
-        L.concat([tmp_path / "a.mkv"], tmp_path / "out.mkv", run=lambda *a, **k: SimpleNamespace(returncode=1, stderr=b"no"))
+        L.concat(
+            [tmp_path / "a.mkv"],
+            tmp_path / "out.mkv",
+            run=lambda *a, **k: SimpleNamespace(returncode=1, stderr=b"no"),
+        )
 
 
 def test_takes_join_into_one_archive_of_every_capture(tmp_path):
@@ -145,9 +155,9 @@ def test_takes_join_into_one_archive_of_every_capture(tmp_path):
         takes.append(take)
 
     def run(argv, **_kw):
-        listing = argv[argv.index("-i") + 1]
-        assert len(open(listing, encoding="utf-8").read().splitlines()) == len(takes)
-        open(argv[-1], "wb").write(b"joined")
+        listing = Path(argv[argv.index("-i") + 1])
+        assert len(listing.read_text(encoding="utf-8").splitlines()) == len(takes)
+        Path(argv[-1]).write_bytes(b"joined")
         return SimpleNamespace(returncode=0, stderr=b"")
 
     archive = FrameArchive(tmp_path / "archive")
@@ -174,3 +184,10 @@ def test_takes_join_into_one_archive_of_every_capture(tmp_path):
 def test_disagreeing_frames_come_from_the_readback():
     applied = SimpleNamespace(disagree=np.array([(0, 1, 7, 0, 1), (1, 2, 7, 0, 1)], dtype=ev.DISAGREE))
     assert L.disagreeing(applied).tolist() == [7]
+
+
+def test_toggles_go_out_as_off_or_on_and_repeats_drop():
+    states = np.zeros((4, 12), dtype=np.int64)
+    states[1, 6], states[2, 6], states[3, 0] = 768, 1000, 5
+    out = L.carried(states, [7])
+    assert out[:, 6].tolist() == [0, 1023, 1023] and out[:, 0].tolist() == [0, 0, 5]

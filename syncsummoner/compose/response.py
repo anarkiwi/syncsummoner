@@ -54,7 +54,11 @@ def differences(scores: np.ndarray, frames: np.ndarray, params: np.ndarray) -> t
     diff = np.where(np.arange(lags) < (width // 2)[:, None], scores[np.clip(index, 0, count - 1)], np.nan)
     settled = np.array(
         [
-            np.nanmedian(scores[f + w // 2 : f + w]) if np.isfinite(scores[f + w // 2 : f + w]).any() else np.nan
+            (
+                np.nanmedian(scores[f + w // 2 : f + w])
+                if np.isfinite(scores[f + w // 2 : f + w]).any()
+                else np.nan
+            )
             for f, w in zip(at, width)
         ]
     )
@@ -63,7 +67,7 @@ def differences(scores: np.ndarray, frames: np.ndarray, params: np.ndarray) -> t
 
 @dataclass(frozen=True)
 class Response:
-    """Per parameter, and pooled in row :data:`POOLED`, the z of each lag's departure from the settled state."""
+    """Per parameter, and pooled in row :data:`POOLED`, each lag's z of departure from the settled state."""
 
     program: str
     params: tuple[int, ...]
@@ -73,7 +77,7 @@ class Response:
     takes: tuple[str, ...] = field(default_factory=tuple)
 
     def moving(self, row: int) -> int:
-        """The last lag ``row`` departs at, in a fixed sequence: the landing lags, then each next while it departs.
+        """The last lag ``row`` departs at, tested in a fixed sequence: the landing lags, then each next in turn.
 
         The evidence's landing lags are one step, since the change shows on either; past them each
         lag is tested only if the one before departed, so no lag spends the error rate. -1 if none.
@@ -82,10 +86,11 @@ class Response:
         landing = [k for k in ev.LAGS if k < z.size and z[k]]
         if not landing:
             return -1
-        k = max(ev.LAGS) + 1
+        past = max(ev.LAGS) + 1
+        k = past
         while k < z.size and z[k]:
             k += 1
-        return max(max(landing), k - 1) if k > max(ev.LAGS) + 1 else max(landing)
+        return k - 1 if k > past else max(landing)
 
     @property
     def settle(self) -> int:
@@ -98,10 +103,15 @@ class Response:
         return int(np.ceil(1 - np.log2(2 * norm.sf(self.critical))))
 
     @property
+    def next_steps(self) -> int:
+        """Steps, pooled, that reached the lag after the settle."""
+        k = self.settle + 1
+        return int(self.steps[POOLED, k]) if k < self.steps.shape[1] else 0
+
+    @property
     def bounded(self) -> bool:
         """Whether the lag after the settle had steps enough, pooled, to have shown a departure."""
-        k = self.settle + 1
-        return k < self.steps.shape[1] and int(self.steps[POOLED, k]) >= self.least
+        return self.next_steps >= self.least
 
     @property
     def hold(self) -> int:
@@ -127,13 +137,15 @@ class Response:
         """Plain text: per row, the lags departing beyond chance, then the first lags' z and steps."""
         lines = [
             f"{self.program}: settles {self.settle} frames after landing "
-            f"({'bounded' if self.bounded else 'NOT bounded'}: {self.steps[POOLED, self.settle + 1] if self.settle + 1 < self.steps.shape[1] else 0} "
-            f"steps at the next lag, {self.least} needed), hold {self.hold}, critical z {self.critical:.2f}"
+            f"({'bounded' if self.bounded else 'NOT bounded'}: {self.next_steps} steps at the next lag, "
+            f"{self.least} needed), hold {self.hold}, critical z {self.critical:.2f}"
         ]
         for row, param in enumerate((POOLED, *self.params)):
             z, n = self.z[row], self.steps[row]
             head = " ".join(f"{v:.1f}/{c}" for v, c in zip(z[:6], n[:6]) if c)
-            lines.append(f"  {'all' if param == POOLED else f'P{param}':>4}: to lag {self.moving(row)}  {head}")
+            lines.append(
+                f"  {'all' if param == POOLED else f'P{param}':>4}: to lag {self.moving(row)}  {head}"
+            )
         return "\n".join(lines)
 
     def save(self, path: str | Path) -> None:
@@ -195,7 +207,7 @@ def take_scores(judged: Any, start: Sequence[int]) -> tuple[np.ndarray, np.ndarr
     return scores, frames, params
 
 
-def judged(take: str | Path, *, clip: str | Path, config: Any, workers: int | None = None) -> Any:
+def judge_offline(take: str | Path, *, clip: str | Path, config: Any, workers: int | None = None) -> Any:
     """A take attributed and its writes landed, decodes cached, nothing written beside it."""
     from types import SimpleNamespace  # pylint: disable=import-outside-toplevel
 
@@ -220,18 +232,25 @@ def judged(take: str | Path, *, clip: str | Path, config: Any, workers: int | No
         source=source,
     )
     return SimpleNamespace(
-        found=found, features=features, source=source, proof=proof, start=wire["start"], program=str(wire["program"])
+        found=found,
+        features=features,
+        source=source,
+        proof=proof,
+        start=wire["start"],
+        program=str(wire["program"]),
     )
 
 
-def of_takes(takes: Sequence[str | Path], *, clip: str | Path, config: Any, workers: int | None = None) -> dict[str, Response]:
+def of_takes(
+    takes: Sequence[str | Path], *, clip: str | Path, config: Any, workers: int | None = None
+) -> dict[str, Response]:
     """Each program's :class:`Response` over every take of it among ``takes``."""
     from syncsummoner.progress import track  # pylint: disable=import-outside-toplevel
 
     parts: dict[str, list] = {}
     names: dict[str, list[str]] = {}
     for take in track(list(takes), desc="response", unit="take"):
-        seen = judged(take, clip=clip, config=config, workers=workers)
+        seen = judge_offline(take, clip=clip, config=config, workers=workers)
         scores, frames, params = take_scores(seen, seen.start)
         parts.setdefault(seen.program, []).append(differences(scores, frames, params))
         names.setdefault(seen.program, []).append(str(take))

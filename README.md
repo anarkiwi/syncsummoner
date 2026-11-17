@@ -37,7 +37,8 @@ syncsummoner program step NAME P A B [--state ...]   # can one step of P from A 
 syncsummoner probe run --program all --plan oat,sobol,tongue --out profiles/
 syncsummoner probe sim --program blur --image zoneplate.png
 syncsummoner probe archive --out archive/    # native frames for every program, resumable
-syncsummoner probe archive --footage source.mkv --out archive/   # the same, against looped real footage
+syncsummoner probe hold takes/take-*.mkv --source clip.mkv --out holds/   # each program's settle and hold
+syncsummoner probe sweep plan|capture|collect|commit ...   # an archive on real footage as locked takes
 syncsummoner probe names --archive archive/   # add each program's program info to its archive
 syncsummoner probe refit --archive archive/ --out profiles/   # profiles from the archive, no device
 

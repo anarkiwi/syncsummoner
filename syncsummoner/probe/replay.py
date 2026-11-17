@@ -141,8 +141,10 @@ def clip_series(archive: Any, meta: dict[str, Any]) -> tuple[np.ndarray, np.ndar
     return source_series(Path(archive.directory) / stimulus["clip"], strip_px=int(stimulus["strip_px"]))
 
 
-def _survival_frames(frames: Iterable[np.ndarray], into: list, keep: np.ndarray | None = None) -> Iterator[np.ndarray]:
-    """Pass frames through, keeping each ``keep`` marks (all by default) in 8-bit luma at the clip series' size.
+def _survival_frames(
+    frames: Iterable[np.ndarray], into: list, keep: np.ndarray | None = None
+) -> Iterator[np.ndarray]:
+    """Pass frames through, keeping those ``keep`` marks (all by default) as 8-bit luma at the series' size.
 
     A frame not kept is held as None, so indices still follow the stream.
     """
@@ -151,7 +153,8 @@ def _survival_frames(frames: Iterable[np.ndarray], into: list, keep: np.ndarray 
             into.append(None)
         else:
             luma = cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_RGB2GRAY)  # pylint: disable=no-member
-            into.append(cv2.resize(luma, INSPECT_SIZE, interpolation=cv2.INTER_AREA))  # pylint: disable=no-member
+            small = cv2.resize(luma, INSPECT_SIZE, interpolation=cv2.INTER_AREA)  # pylint: disable=no-member
+            into.append(small)
         yield frame
 
 

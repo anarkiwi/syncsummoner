@@ -17,7 +17,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from syncsummoner.compose.locktake import PLAN
-from syncsummoner.device.profile import PARAM_COUNT
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
 from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameRow
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import atomic_write
@@ -26,6 +26,7 @@ __all__ = [
     "Chunk",
     "SweepError",
     "capture",
+    "carried",
     "collect",
     "commit_sweep",
     "concat",
@@ -93,8 +94,19 @@ def levels(found: Any) -> np.ndarray:
     return np.array([after for _, after in found.vectors()], dtype=np.int64).reshape(-1, PARAM_COUNT)
 
 
+def carried(states: np.ndarray, toggles: Sequence[int]) -> np.ndarray:
+    """``states`` as the link carries them, with any setpoint that then repeats the one before dropped.
+
+    A toggle slot is sent as off or on, so each of its values goes to the end of the half it reads as.
+    """
+    out = np.asarray(states, dtype=np.int64).copy()
+    slots = np.asarray(toggles, dtype=np.int64) - 1
+    out[:, slots] = np.where(out[:, slots] > PARAM_MAX // 2, PARAM_MAX, 0)
+    return out[np.r_[True, np.any(np.diff(out, axis=0) != 0, axis=1)]]
+
+
 def plan_sweep(states: np.ndarray, *, settle: int, hold: int, frames: int) -> list[Chunk]:
-    """Cut a sweep into takes of at most ``frames`` clip frames, each setpoint targeted one ``hold`` after the last.
+    """Cut a sweep into takes of at most ``frames`` clip frames, each setpoint one ``hold`` after the last.
 
     A setpoint's changed slots all target one frame; when they land is what the take realizes, and
     :func:`settled_rows` keeps only the frames after it. A take opens on its setpoint as the start state.
@@ -147,7 +159,7 @@ def owners(chunk: Chunk, landed: np.ndarray) -> np.ndarray:
 
 
 def realized(start: np.ndarray, rows: np.ndarray, count: int) -> np.ndarray:
-    """The state in effect on each of ``count`` frames: ``start``, then every sent write from its landing frame."""
+    """The state in effect on each of ``count`` frames: ``start``, then each sent write from its landing."""
     state = np.repeat(np.asarray(start, dtype=np.int64)[None, :], count, axis=0)
     sent = rows[rows["sent"] >= 0]
     for i in np.argsort(sent["landed"], kind="stable"):
@@ -166,7 +178,7 @@ def settled_rows(
     program: str,
     bad_frames: Sequence[int] = (),
 ) -> list[FrameRow]:
-    """One archive row per capture, under the state the take realized: its setpoint once settled, else :data:`GAP`.
+    """One archive row per capture, under the state the take realized: its settled setpoint, else :data:`GAP`.
 
     A frame belongs to the setpoint whose writes landed last by then, once ``chunk.settle`` frames
     have passed since the latest (one more for a write on a tick), and only where the realized state
@@ -229,7 +241,11 @@ def rows_path(take: str | Path) -> Path:
 
 
 def concat(
-    videos: Sequence[str | Path], out: str | Path, *, ffmpeg: str = "ffmpeg", run: Callable[..., Any] = subprocess.run
+    videos: Sequence[str | Path],
+    out: str | Path,
+    *,
+    ffmpeg: str = "ffmpeg",
+    run: Callable[..., Any] = subprocess.run,
 ) -> None:
     """Join ``videos`` into ``out`` packet for packet, with no re-encode."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", dir=Path(out).parent, delete=False) as listing:
@@ -263,7 +279,8 @@ def commit_sweep(
     for take in takes:
         offset = len(rows)
         rows += [
-            FrameRow.from_row({**r, "frame": int(r["frame"]) + offset}) for r in load_measurements(rows_path(take))
+            FrameRow.from_row({**r, "frame": int(r["frame"]) + offset})
+            for r in load_measurements(rows_path(take))
         ]
     states = np.concatenate([c.states for c in chunks])
     video = archive.scratch(program)
@@ -296,7 +313,7 @@ def save_rows(take: str | Path, rows: Sequence[FrameRow]) -> Path:
 def capture(
     config: Any, chunk: Chunk, out: str | Path, *, program: str, clip: str | Path
 ) -> dict:  # pragma: no cover - needs the rig
-    """Record one chunk as a locked take of ``program`` on the clip; its device state and faults, for the take's meta."""
+    """Record one chunk as a locked take of ``program`` on the clip; its device state and any fault."""
     from pyvmancer.ccmap import cc_map_report  # pylint: disable=import-outside-toplevel
 
     from syncsummoner.compose import locktake, render  # pylint: disable=import-outside-toplevel
@@ -365,7 +382,9 @@ def capture(
     return record
 
 
-def collect(take: str | Path, chunk: Chunk, *, clip: str | Path, config: Any, workers: int | None = None) -> dict:
+def collect(
+    take: str | Path, chunk: Chunk, *, clip: str | Path, config: Any, workers: int | None = None
+) -> dict:
     """Judge a sweep take, keeping its evidence, and its archive rows beside it; a summary of both."""
     from syncsummoner.compose.judge import judge_take  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel

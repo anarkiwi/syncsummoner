@@ -167,10 +167,13 @@ it live, and picks the fewest base states that step every one where it is.
   solved exactly by `scipy.optimize.milp`. Elements no state reaches are reported
   as never covered.
 
-`probe archive` takes its sweep from the cover (`harvest.sweep_vectors`). It
-holds each chosen base state, then steps each parameter assigned to it through
-every setting it shows there, one at a time, and returns to the base before the
-next. Every setpoint is the full declared state, and the archive's `schedule`
+`probe archive` and `probe sweep plan` take their sweep from the cover
+(`Cover.vectors`). It holds each chosen base state, then steps each parameter
+assigned to it through every setting it shows there, one at a time, and returns
+to the base before the next. The settings are walked by `gates.tour`: evens
+ascending then odds descending from the base value, a closed walk that moves
+`2 * (max - min)` in all, the least any walk reaching both ends can, and never
+more than two settings at a step, so no step is a jump across the range. Every setpoint is the full declared state, and the archive's `schedule`
 records each setpoint's state together with the one it was stepped from. A
 `--schedule` focus steps its parameter in a base state where the cover makes it
 live. All HDL tool processes share one bound sized to the CPUs the process may
