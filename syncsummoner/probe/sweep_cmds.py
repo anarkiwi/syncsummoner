@@ -103,7 +103,15 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.device.profile import PARAM_COUNT
     from syncsummoner.probe import decoded
     from syncsummoner.probe.locked import joint, plan_path, write_plan
-    from syncsummoner.probe.regions import allot, chunks_of, design, guard_frames, region_dims, slots
+    from syncsummoner.probe.regions import (
+        allot,
+        chunks_of,
+        design,
+        distinct,
+        guard_frames,
+        region_dims,
+        slots,
+    )
     from syncsummoner.probe.store import slug
     from syncsummoner.program import model
     from syncsummoner.program.gates import representatives
@@ -134,7 +142,10 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     extra = np.zeros((0, PARAM_COUNT), dtype=np.int64)
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
-    counts = allot(max(len(placed) - len(extra), 0), [len(d) for d in dims])
+    counts = [
+        min(n, distinct(d, values))
+        for n, d in zip(allot(max(len(placed) - len(extra), 0), [len(d) for d in dims]), dims)
+    ]
     sampled = [
         design(states[i], d, values, n, args.seed + k)
         for k, (i, d, n) in enumerate(zip(chosen, dims, counts))

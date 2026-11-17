@@ -898,8 +898,8 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
     Imported here so compose never needs hardware. A recorded pass wants no
-    capture at all: the recorder opens the card itself, and a handle held here would
-    keep it from doing so.
+    capture at all: the recorder opens the card itself, and a handle held here would keep it from doing so.
+    A device wait seeing nothing for a lead-in, sized to hold a load, fails unless ``stall_s`` is set.
     """
     from syncsummoner.device import capture as capture_mod
     from syncsummoner.device import link as link_mod
@@ -907,7 +907,9 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     from syncsummoner.device import session as session_mod
     from syncsummoner.device import transport as transport_mod
 
-    transport = transport_mod.Transport.open(stall=config.stall_s)
+    transport = transport_mod.Transport.open(
+        stall=config.lead_in_s if config.stall_s is None else config.stall_s
+    )
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         transport=transport,

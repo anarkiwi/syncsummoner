@@ -209,6 +209,74 @@ def realized(start: np.ndarray, rows: np.ndarray, count: int) -> np.ndarray:
     return state
 
 
+def windows(chunk: Chunk, landed: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A take's in-clip writes; per setpoint, the first frame its writes may land on and its window's opening.
+
+    A setpoint's window opens ``chunk.settle`` frames after the end of its writes' latest landing window.
+    The dry control's writes around the clip, in the lead-in and from the lead-out on, own no setpoint;
+    a setpoint no write moves to, repeating the one before, starts at ``count``, never.
+    """
+    rows = landed[(landed["target"] > 0) & (landed["target"] < chunk.frames)]
+    owner = owners(chunk, rows)
+    n = len(chunk.states)
+    sent = rows["sent"] >= 0
+    first, last = np.full(n, count, dtype=np.int64), np.zeros(n, dtype=np.int64)
+    first[0] = 0
+    np.minimum.at(first, owner[sent], rows["first"][sent])
+    np.maximum.at(last, owner[sent], rows["last"][sent])
+    return rows, first, last + chunk.settle
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """Whether a sweep take measured what it planned: every write taken and applied before its window opened.
+
+    ``untaken`` are writes never sent, never echoed, duplicated or out of order; ``unopened`` setpoints
+    whose window does not open before the next setpoint's writes may land; ``misapplied`` readbacks that
+    disagree with the landed writes inside an open window. ``late`` writes took effect after their
+    nominal frame but are only reported: a setting's window waits for its last write.
+    """
+
+    untaken: int
+    unopened: int
+    misapplied: int
+    late: int
+
+    @property
+    def ok(self) -> bool:
+        """No fault that could put a measured frame under a state other than its setpoint's."""
+        return not (self.untaken or self.unopened or self.misapplied)
+
+    def as_dict(self) -> dict:
+        """JSON-ready, with the verdict."""
+        return {
+            "ok": self.ok,
+            "untaken": self.untaken,
+            "unopened": self.unopened,
+            "misapplied": self.misapplied,
+            "late": self.late,
+        }
+
+
+def verdict(chunk: Chunk, landed: Any, disagree: np.ndarray, count: int) -> Verdict:
+    """A sweep take's :class:`Verdict` from its landings (:class:`evidence.Landed`) and disagreeing frames."""
+    _, first, opens = windows(chunk, landed.rows, count)
+    moved = first < count
+    starts = np.sort(first[moved])
+    ends = np.r_[starts[1:], count]
+    window_end = ends[np.searchsorted(starts, first[moved])]
+    frames = np.asarray(disagree, dtype=np.int64)
+    inside = np.zeros(frames.size, dtype=bool)
+    for a, b in zip(opens[moved], window_end):
+        inside |= (frames >= a) & (frames < b)
+    return Verdict(
+        untaken=int(landed.missing + landed.unechoed + landed.duplicated + landed.out_of_order),
+        unopened=int(np.count_nonzero(opens[moved] >= window_end)),
+        misapplied=int(inside.sum()),
+        late=int(landed.late),
+    )
+
+
 def settled_rows(
     chunk: Chunk,
     landed: np.ndarray,
@@ -224,22 +292,15 @@ def settled_rows(
 
     A frame belongs to the setpoint whose writes may have started landing last by then, once
     ``chunk.settle`` frames have passed since the end of its writes' latest landing window, and only
-    where the realized state is that setpoint's. Frames in ``bad_frames`` keep no setpoint. The
-    dry control's writes around the clip, in the lead-in and from the lead-out on, own no setpoint.
+    where the realized state is that setpoint's (:func:`windows`). Frames in ``bad_frames`` keep no setpoint.
     """
-    rows = landed[(landed["target"] > 0) & (landed["target"] < chunk.frames)]
-    owner = owners(chunk, rows)
     count, n = picked.size, len(chunk.states)
+    rows, first, opens = windows(chunk, landed, count)
     state = realized(chunk.states[0], rows, count)
-    sent = rows["sent"] >= 0
-    first, last = np.full(n, count, dtype=np.int64), np.zeros(n, dtype=np.int64)
-    first[0] = 0
-    np.minimum.at(first, owner[sent], rows["first"][sent])
-    np.maximum.at(last, owner[sent], rows["last"][sent])
     order = np.argsort(first, kind="stable")
     frame = np.arange(count)
     k = order[np.clip(np.searchsorted(first[order], frame, side="right") - 1, 0, n - 1)]
-    ok = (frame >= last[k] + chunk.settle) & np.all(state == chunk.states[k], axis=1)
+    ok = (frame >= opens[k]) & np.all(state == chunk.states[k], axis=1)
     setpoint = np.where(ok, chunk.first + k, GAP)
     bad = np.asarray(bad_frames, dtype=np.int64)
     setpoint[bad[(bad >= 0) & (bad < count)]] = GAP
@@ -447,10 +508,12 @@ def collect(
     )
     save_rows(take, rows)
     kept = {r.setpoint for r in rows if r.setpoint != GAP}
+    judged = verdict(chunk, seen.proof.landed, disagreeing(seen.proof.applied), seen.found.picked.size)
     return {
         "take": str(take),
         "program": program,
-        "evidence_ok": bool(seen.proof.ok),
+        "evidence_ok": judged.ok,
+        "verdict": judged.as_dict(),
         "landed": seen.proof.landed.summary(),
         "applied": seen.proof.applied.summary(),
         "received": None if seen.proof.received is None else seen.proof.received.summary(),

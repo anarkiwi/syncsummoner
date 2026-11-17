@@ -274,7 +274,14 @@ power of two settings its share (by dimensions sampled) allows, a Sobol design b
 balanced only there. The plan's `regions` record has the settings, the capacity the
 budget held, the per-regime counts, the guard and the hold range. `--joint` adds the
 selector moves below, each held the same way. A take plays the clip once, since its
-strips name each clip frame once, so a program's sweep is several takes.
+strips name each clip frame once, so a program's sweep is several takes. `probe sweep collect`
+judges a take by what its rows need (`locked.verdict`): every write sent, echoed, once and in
+order; every setting's window, opening its settle after its writes' latest landing window,
+opening before the next setting's writes may land; and no readback disagreeing inside an open
+window. A write that takes effect after its nominal frame but before its window opens, as the
+later writes of a setting that moves many slots do over an ack-gated link, is counted as
+`late` and is no fault. A design never asks a regime for more settings than its dimensions
+have between them (`regions.distinct`), so consecutive settings are never the same.
 
 `--cover FILE` plans from a cover `program cover --json` already wrote, each stepped
 parameter's settings taken from the bits the program reads, so no cover is searched.
@@ -349,7 +356,9 @@ Loads, and the transmitter's return after them, wait for as long as the device
 stays on USB, logging `still loading ...` lines as they go; author switches take
 several seconds of shell silence. `--stall SECONDS` (before the subcommand) is an
 opt-in guard for unattended runs: it fails a wait once nothing the device reports
-has changed for that long. It is off by default.
+has changed for that long. A rig a render or a sweep take opens defaults it to the lead-in,
+which is sized to hold a program load, the longest the shell is silent, so a lost sync
+marker fails the take instead of holding it; elsewhere it is off by default.
 
 An archive keeps the device's own `program info` reply beside its frames, and a
 refit carries it into every parameter's name and native range. An archive

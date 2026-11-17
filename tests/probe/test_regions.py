@@ -171,3 +171,9 @@ def test_region_dims_keep_the_read_stepped_parameters_and_never_the_bypass():
     values = {1: np.arange(4), 2: np.arange(4), 3: np.arange(4), 11: np.array([0, 1023])}
     assert R.region_dims(record, values, 11) == [[1, 2], [3]]
     assert R.region_dims(record, values, None) == [[1, 2, 11], [3]]
+
+
+def test_a_design_asks_for_no_more_settings_than_its_dimensions_have():
+    values = {7: np.array([0, 1023]), 1: np.arange(0, 1024, 64), 2: np.arange(3)}
+    assert R.distinct([7], values) == 2 and R.distinct([7, 1], values) == 32
+    assert R.distinct([2], values) == 2 and R.distinct([], values) == 1

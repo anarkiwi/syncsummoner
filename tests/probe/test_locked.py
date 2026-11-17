@@ -207,3 +207,38 @@ def test_a_selector_is_held_at_each_setting_with_a_mover_move_under_each():
     out = L.joint(base, 11, 6, {11: np.array([0, 1023]), 6: np.array([0, 300, 1023])})
     assert out[:, 10].tolist() == [0, 0, 0, 1023, 1023, 1023, 0]
     assert out[:, 5].tolist() == [300, 1023, 300, 300, 1023, 300, 300]
+
+
+def judged(rows, **counts):
+    """A :class:`evidence.Landed` stand-in over ``rows``, its fault counts zero unless given."""
+    base = {"missing": 0, "unechoed": 0, "duplicated": 0, "out_of_order": 0, "late": 0}
+    return SimpleNamespace(rows=rows, **{**base, **counts})
+
+
+def test_a_write_late_on_its_frame_but_landed_before_its_window_is_no_fault():
+    chunk = L.plan_sweep(sweep_states(4), settle=1, hold=3, frames=20)[0]
+    got = L.verdict(chunk, judged(landed_from(chunk, late=[(1, 1)]), late=1), np.array([3]), chunk.frames)
+    assert got.ok and got.late == 1 and got.misapplied == 0
+    assert got.as_dict() == {"ok": True, "untaken": 0, "unopened": 0, "misapplied": 0, "late": 1}
+
+
+def test_a_write_landing_past_its_settings_window_fails_the_take():
+    chunk = L.plan_sweep(sweep_states(4), settle=1, hold=3, frames=20)[0]
+    rows = landed_from(chunk)
+    rows["last"][0] += 2
+    got = L.verdict(chunk, judged(rows), np.zeros(0), chunk.frames)
+    assert not got.ok and got.unopened == 1
+
+
+def test_a_readback_disagreeing_inside_an_open_window_fails_the_take():
+    chunk = L.plan_sweep(sweep_states(4), settle=1, hold=3, frames=20)[0]
+    rows = landed_from(chunk)
+    assert L.verdict(chunk, judged(rows), np.array([3, 6, 9]), chunk.frames).ok
+    got = L.verdict(chunk, judged(rows), np.array([5]), chunk.frames)
+    assert not got.ok and got.misapplied == 1
+
+
+def test_a_write_never_taken_fails_the_take():
+    chunk = L.plan_sweep(sweep_states(4), settle=0, hold=3, frames=20)[0]
+    got = L.verdict(chunk, judged(landed_from(chunk), unechoed=1), np.zeros(0), chunk.frames)
+    assert not got.ok and got.untaken == 1
