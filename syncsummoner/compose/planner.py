@@ -17,6 +17,7 @@ from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, P
 from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, track
 from syncsummoner import aesthetics
+from syncsummoner.compose.gating import model_gate
 from syncsummoner.compose.features import Features, Section, information_content, phrases
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext
@@ -132,7 +133,7 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _response(spec: ParamSpec, values: np.ndarray) -> np.ndarray:
-    """Measured metric response of one parameter, normalized to ``[0, 1]``."""
+    """The profiled metric response of one parameter, normalized to ``[0, 1]``."""
     v = np.asarray(spec.values, dtype=np.float64)
     r = np.asarray(spec.response, dtype=np.float64)
     if v.size < 2 or r.size != v.size:
@@ -225,8 +226,13 @@ def plan_automation(
     *,
     fps: float | None = None,
     cc_budget_hz: float = CC_BUDGET_HZ,
+    gates: Mapping[str, Callable[[Automation], Automation] | None] | None = None,
 ) -> dict[int, Automation]:
-    """Expand a score to reachable automation per layer; this is what the renderer plays."""
+    """Expand a score to reachable automation per layer; this is what the renderer plays.
+
+    Each layer's writes then pass its program's gate (default: from the program model), which pairs
+    a write to a dead parameter with the move that makes it live or refuses it.
+    """
     fps = score.fps if fps is None else fps
     out = {}
     for layer in score.layers:
@@ -234,7 +240,9 @@ def plan_automation(
         if profile is None:
             continue
         auto = score.render_layer(layer, profile, rate=control_rate(fps))
-        out[layer.index] = thin(auto, profile, fps=fps, cc_budget_hz=cc_budget_hz)
+        auto = thin(auto, profile, fps=fps, cc_budget_hz=cc_budget_hz)
+        gate = model_gate(layer.program) if gates is None else gates.get(layer.program)
+        out[layer.index] = auto if gate is None else gate(auto)
     return out
 
 

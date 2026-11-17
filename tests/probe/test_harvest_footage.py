@@ -7,7 +7,6 @@ import hashlib
 import json
 from pathlib import Path
 
-import numpy as np
 
 from syncsummoner.compose.render import RenderConfig
 from syncsummoner.probe import harvest as H
@@ -100,7 +99,7 @@ def test_harvest_program_alone_names_the_runs_stimulus(tmp_path):
         "Alpha",
         KEY,
         config=CONFIG,
-        rng=np.random.default_rng(0),
+        plan=lambda info: None,
         sleep=clock.sleep,
         clock=clock,
     )

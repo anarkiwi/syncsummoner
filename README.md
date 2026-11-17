@@ -55,8 +55,7 @@ syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
 syncsummoner check score.yaml --source timecoded.mkv --takes takes/ \
                    --cut-programs Derez,Lorenz,Scramble [--splice cut.mp4]   # dead picture per take
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
-syncsummoner judge takes/take-*.mkv --source timecoded.mkv [--score score.yaml] [--jobs 2]   # offline: lock, evidence, picture, bars
-syncsummoner evidence takes/take-Derez.mkv --source timecoded.mkv --predict   # the same; each verdict against the program model
+syncsummoner judge takes/take-*.mkv --source timecoded.mkv [--score score.yaml] [--jobs 2]   # offline: lock, evidence, picture, bars; steps judged by the program model
 ```
 
 Every command logs each stage and its elapsed time to stderr (`-v` for detail,

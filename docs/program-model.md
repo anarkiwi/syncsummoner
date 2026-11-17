@@ -11,7 +11,8 @@ syncsummoner program list
 syncsummoner program show czartroniks/Quilt                       # at its declared initial values
 syncsummoner program show Pinwheel --state "Luma Rainbow" --set 11=1023
 syncsummoner program step czartroniks/Quilt 3 512 518 --state 512,512,512,262,512,512,0,0,0,0,0,512
-syncsummoner evidence takes/take-czartroniks_Quilt.mkv --source timecoded.mkv --predict
+syncsummoner program cover homegrownvhs/Pigment                  # what makes each parameter live, and the base states that step all
+syncsummoner evidence takes/take-czartroniks_Quilt.mkv --source timecoded.mkv
 ```
 
 ```python
@@ -24,6 +25,13 @@ m.resolution()                # {parameter_id: bits the program reads at all}
 m.live(state)                 # {parameter_id: Liveness(live_bits, gated_by)}
 m.step_matters(state, 3, 512, 518)   # Step(matters=True | False | None, how)
 m.schedule(state)             # {parameter_id: one manual value per setting the program can tell apart}
+m.reach(state, [4, 9])        # live bits with P4 and P9 both free: dead here is dead for every value of both
+
+from syncsummoner.program.gates import cover
+c = cover(m)                  # gating structure and covering base states, from the initial state
+c.gating()                    # {parameter_id: ["dead at the reference", "live when P9 in 0..511", ...]}
+c.chosen, c.stepped           # the base states to sweep, and the parameters stepped in each
+c.vectors()                   # (from, to) full states in sweep order
 ```
 
 ## Declarations
@@ -131,15 +139,50 @@ Yosys plugin, IceStorm, Icarus) and the SDK and community sources at pinned
 commits. The lint, test and runtime targets build on it. Outside Docker, set
 `SYNCSUMMONER_HDL_BIN` to the suite's `bin`.
 
+## Gating and the covering sweep
+
+`program.gates.cover` answers, for every parameter the program reads, what makes
+it live, and picks the fewest base states that step every one where it is.
+
+- **Live** at a state: some bit of the parameter is in the folded cone, and its
+  two representative steps (lowest to middle and middle to highest distinct
+  setting) are not both proven no-ops by `step_matters`. A parameter whose bits
+  reach the video but whose steps are proven inert is a **no-op** there.
+- **Revival.** For a parameter that is dead or a no-op, freeing every other
+  control at once and still finding it dead (or its steps still proven inert)
+  rules out any revival. Otherwise single controls are tried freed beside it,
+  each refuted exactly when dead stays dead, and each control left is scanned
+  over every setting it can tell apart (its resolution classes). The settings
+  that revive it are merged into maximal intervals of manual values. Only when
+  no single control revives it are pairs tried, then triples, with a witness
+  setting found by tying one control at a time.
+- **States.** Starting from the reference (the declared initial values), each
+  revival's move gives a new state, and revivals are followed from every state
+  reached, each control moved at most once along a path. Every query is cached.
+- **Cover.** The cover must reach every bit each parameter reads, live in some
+  stepped state, and, for every gate found, the parameter live with that gate in
+  a reviving interval. Binary `y[s]` picks a state and `z[s, p]` steps `p` in it
+  (`z <= y`). Each element needs one covering `z`. The objective weights a state
+  above every step combined, so it minimises states first and then steps. It is
+  solved exactly by `scipy.optimize.milp`. Elements no state reaches are reported
+  as never covered.
+
+`probe archive` takes its sweep from the cover (`harvest.sweep_vectors`). It
+holds each chosen base state, then steps each parameter assigned to it through
+every setting it shows there, one at a time, and returns to the base before the
+next. Every setpoint is the full declared state, and the archive's `schedule`
+records each setpoint's state together with the one it was stepped from. A
+`--schedule` focus steps its parameter in a base state where the cover makes it
+live. All HDL tool processes share one bound sized to the CPUs the process may
+use: the cgroup `cpu.max` quota, else its affinity (`hdl.cpus`).
+
 ## Integration
 
-- `syncsummoner evidence --predict` adds to each parameter's row the planned
-  steps the model calls live and dead, and a check: predicted live and moved,
-  predicted live and did not move, predicted dead and did not move, or a
-  contradiction (predicted dead in every step, yet moved).
-  `Evidence.contradictions` lists the parameters with a contradiction.
-- `ProgramModel.schedule(state)` gives a planner or harvest one manual value per
-  setting the program can see in a state. `predict.steps` and
-  `ProgramModel.visible` classify any planned step. The harvest sweep does not
-  use them yet, so wiring them into `probe.harvest.sweep_vectors` is the
-  follow-up.
+- `syncsummoner evidence` judges every step of a take with `predict.classify`
+  and tests only the steps the model leaves live ([evidence.md](evidence.md)).
+- `compose.planner.plan_automation` passes each layer through its program's gate
+  (`compose.gating`). A write to a parameter with no live bit in the state the
+  plan holds then is written together with a gate move from the cover that makes
+  it live there, or is refused.
+- `ProgramModel.schedule(state)` gives one manual value per setting the program
+  can see in a state.

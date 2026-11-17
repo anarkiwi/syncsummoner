@@ -75,3 +75,19 @@ def test_a_source_that_reads_other_bits_than_the_package_yields_to_the_bitstream
     monkeypatch.undo()
     with pytest.raises(ValueError, match="bitstream"):
         tiny.latched()
+
+
+def test_a_folded_state_is_reused_by_the_next_step(tiny, monkeypatch):
+    from syncsummoner.program import hdl  # pylint: disable=import-outside-toplevel
+
+    real, calls = hdl.fold, []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(hdl, "fold", counting)
+    monkeypatch.setattr(tiny, "_recent", type(tiny._recent)())  # pylint: disable=protected-access
+    state = tiny.initial()
+    first = tiny._folded(state, None)  # pylint: disable=protected-access
+    assert tiny._folded(state.copy(), None) is first and len(calls) == 1  # pylint: disable=protected-access

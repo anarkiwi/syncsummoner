@@ -306,9 +306,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         height=height,
         capture_fps=round(fps),
         timing=args.format,
-        setpoints=args.setpoints,
         dwell_s=args.dwell,
-        seed=args.seed,
         route=args.route,
         focus=read_focus(args.schedule) if args.schedule else (),
     )
@@ -603,7 +601,7 @@ def _judge_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose import judge as judge_mod
     from syncsummoner.compose.render import RenderConfig
 
-    options = {k: getattr(args, k) for k in ("source", "program", "score", "predict")}
+    options = {k: getattr(args, k) for k in ("source", "program", "score")} | {"predict": not args.no_model}
     options["config"] = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     results = judge_mod.judge_takes(
         args.takes, options, jobs=args.jobs, workers=args.workers, verbosity=args.verbose
@@ -670,7 +668,7 @@ def _check_cmd(args: argparse.Namespace) -> int:
 
 def _program_cmd(args: argparse.Namespace) -> int:
     """List programs, or show or step one program's parameter model."""
-    from syncsummoner.program import Library, model, parse_state
+    from syncsummoner.program import Library, gates, model, parse_state
     from syncsummoner.program.report import rows, table
 
     library = Library.default()
@@ -690,6 +688,10 @@ def _program_cmd(args: argparse.Namespace) -> int:
             else f"P{step.parameter_id} {step.a}->{step.b}: "
             f"{ {True: 'changes', False: 'no change', None: 'undetermined'}[step.matters]} ({step.how})"
         )
+        return 0
+    if args.program_cmd == "cover":
+        found = gates.cover(m, state, gating=gates.Gating(m, args.timing))
+        print(json.dumps(found.as_dict(), indent=1) if args.json else found.table())
         return 0
     print(json.dumps(rows(m, state, args.timing), indent=1) if args.json else table(m, state, args.timing))
     return 0
@@ -776,6 +778,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     for name, text in (
         ("show", "register bits, levels, liveness and gates"),
         ("step", "can one step change it"),
+        ("cover", "what makes each parameter live, and the fewest base states that step every one live"),
     ):
         node = program_sub.add_parser(name, help=text)
         node.add_argument("name", help="device name (author/Name), bare built-in name, or program id")
@@ -845,13 +848,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--capture", default="/dev/video0")
     collect.add_argument("--out", default="archive/")
     collect.add_argument("--format", default="1080p30", help="session format the rig runs at")
-    collect.add_argument("--setpoints", type=int, default=32)
     collect.add_argument(
         "--schedule",
-        help="a render's schedule.json: undetermined parameters, swept with the steps each needs",
+        help="a render's schedule.json: parameters it could not show, stepped where they are live",
     )
     collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
-    collect.add_argument("--seed", type=int, default=11)
     collect.add_argument(
         "--retry-dark", action="store_true", help="re-run programs marked dark, re-judging them"
     )
@@ -965,7 +966,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     judging.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
     judging.add_argument("--jobs", type=int, default=1, help="takes judged at once, each in its own process")
     judging.add_argument("--workers", type=int, help="decoders per take (default: the jobs' share)")
-    judging.add_argument("--predict", action="store_true", help="meet each verdict with the program model's")
+    judging.add_argument("--no-model", action="store_true", help="test every step, not just live ones")
     judging.set_defaults(func=_judge_cmd)
 
     check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")

@@ -179,10 +179,10 @@ def harvested_fixture(monkeypatch):
 
 
 def test_probe_archive_drives_a_harvest_run_with_link_and_stimulus(harvested, tmp_path, capsys):
-    args = ["--out", str(tmp_path), "--setpoints", "3", "--dwell", "2.5", "--capture", "/dev/video9"]
+    args = ["--out", str(tmp_path), "--dwell", "2.5", "--capture", "/dev/video9"]
     assert cli.main(["probe", "archive"] + args) == 0
     assert isinstance(harvested["link"], Link) and harvested["player"] is not None
-    assert harvested["config"].setpoints == 3 and harvested["config"].dwell_s == 2.5
+    assert harvested["config"].dwell_s == 2.5
     assert harvested["programs"] is None
     err = capsys.readouterr().err
     assert (
@@ -334,7 +334,6 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
             "probe archive",
             [
                 "--capture",
-                "--setpoints",
                 "--dwell",
                 "--format",
                 "--no-link",
@@ -757,10 +756,20 @@ def test_takes_are_judged_offline_and_their_outcome_kept_beside_them(monkeypatch
     _judge_stub(monkeypatch, seen)
     takes = [tmp_path / "take-a.mkv", tmp_path / "take-unproven.mkv"]
     Path(f"{takes[0]}.meta.json").write_text(json.dumps({"attempt-1": {"program": "a"}}), encoding="utf-8")
-    argv = ["judge", *map(str, takes), "--source", "tc.mkv", "--strip-px", "4", "--workers", "3", "--predict"]
+    argv = [
+        "judge",
+        *map(str, takes),
+        "--source",
+        "tc.mkv",
+        "--strip-px",
+        "4",
+        "--workers",
+        "3",
+        "--no-model",
+    ]
     assert cli.main(argv) == 1
     assert seen[0] == ("clip", "tc.mkv", {"workers": 3, "ffmpeg": "ffmpeg"})
-    assert seen[1] == ("judge", "take-a.mkv", "tc.mkv", 4, None, False, True, 3)
+    assert seen[1] == ("judge", "take-a.mkv", "tc.mkv", 4, None, False, False, 3)
     meta = json.loads(Path(f"{takes[0]}.meta.json").read_text(encoding="utf-8"))
     assert meta["attempt-1"] == {"program": "a"} and meta["judged"]["lock"] == "ok"
     assert meta["judged"]["evidence_ok"] and meta["judged"]["clip_frames"] == 6

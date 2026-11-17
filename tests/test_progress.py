@@ -108,3 +108,9 @@ def test_a_meter_draws_a_bar_on_a_terminal(monkeypatch):
     assert drawn["n"] == 10.0, "a meter cannot run past its total"
     assert drawn["closed"] and drawn["kw"]["desc"] == "pass"
     logging.getLogger("syncsummoner").handlers.clear()
+
+
+def test_tracking_with_no_terminal_logs_its_count_and_rate(logs, monkeypatch):
+    monkeypatch.setattr(progress, "HEARTBEAT_S", 0.0)
+    assert list(progress.track(range(3), desc="steps", total=3, unit="step")) == [0, 1, 2]
+    assert "steps 3/3 step" in logs.getvalue() and "step/s" in logs.getvalue()

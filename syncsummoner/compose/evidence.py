@@ -10,7 +10,7 @@ from __future__ import annotations
 import difflib
 import json
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -18,6 +18,7 @@ from scipy.stats import chi2, norm
 
 from syncsummoner.aesthetics.survival import SIGMA
 from syncsummoner.device.session import LSB_OFFSET, wire_messages
+from syncsummoner.program.predict import DEAD, LIVE, NOOP, UNCHANGED
 
 #: Target of a calibration write, which no clip frame schedules.
 CALIBRATION = int(np.iinfo(np.int64).min)
@@ -543,12 +544,20 @@ def received(expected: np.ndarray, got: np.ndarray, sends: np.ndarray | None = N
     return Received(sent=int(exp.size), received=int(rec.size), matched=int(hit.sum()), missing=missing)
 
 
+#: Steps the model does not prove leave the picture alone: the ones a parameter is tested on.
+TESTED = (LIVE,)
+#: The pool of a parameter's steps a test ran on: those predicted to change the picture, those
+#: proven not to, or every step when no model judged them.
+LIVE_POOL, DEAD_POOL, ALL_POOL = "live", "dead", "all"
+
+
 @dataclass(frozen=True)
 class Moved:
-    """Applied against acted upon, for one parameter: did its steps move the picture?
+    """Applied against acted upon, for one parameter's pool of steps: did they move the picture?
 
     Each step's output change is scored against frames of matched source motion with no step and
     placed among the scores of all such frames; Fisher's combination at the best lag decides ``moved``.
+    ``effect`` and ``scatter`` are the steps' mean and the null's spread of that change, in its own units.
     """
 
     param: int
@@ -564,7 +573,7 @@ class Moved:
     partners: tuple[int, ...] = ()
     effect: float = float("nan")
     scatter: float = float("nan")
-    reference: float = float("nan")
+    pool: str = ALL_POOL
 
     @property
     def moved(self) -> bool:
@@ -573,30 +582,22 @@ class Moved:
 
     @property
     def detectable(self) -> float:
-        """The least mean step score these steps would tell from none at the family-wise bound."""
-        return self.critical * self.scatter / math.sqrt(self.effective) if self.effective > 0 else math.inf
+        """The least mean output change these steps would tell from none at the family-wise bound."""
+        if self.effective > 0 and np.isfinite(self.scatter):
+            return self.critical * self.scatter / math.sqrt(self.effective)
+        return math.inf
 
     @property
     def verdict(self) -> str:
-        """``acted upon``; ``no effect`` if its steps exclude the least acted-upon effect; else undetermined.
-
-        The equivalence bound is the steps' mean score plus :attr:`detectable`; it must fall below
-        :attr:`reference`, the smallest mean step score of a parameter the take found acted upon.
-        """
-        if self.moved:
-            return "acted upon"
-        if np.isfinite(self.reference) and self.effect + self.detectable < self.reference:
-            return "no effect"
-        return "undetermined"
+        """``moved`` or ``not seen``: a statistic never shows that a parameter has no effect."""
+        return "moved" if self.moved else "not seen"
 
     @property
     def steps_needed(self) -> int:
-        """Steps whose bound would exclude :attr:`reference` with no effect at this scatter; 0 if decided."""
-        if self.verdict != "undetermined" or not np.isfinite(self.reference) or self.reference <= 0:
+        """Steps at which the observed mean change would clear the bound; 0 if moved or none was seen."""
+        if self.moved or not (np.isfinite(self.effect) and self.effect > 0 and np.isfinite(self.scatter)):
             return 0
-        if not np.isfinite(self.scatter) or self.scatter <= 0:
-            return 0
-        need = (self.critical * self.scatter / self.reference) ** 2
+        need = (self.critical * self.scatter / self.effect) ** 2
         return int(math.ceil(need * self.steps / max(self.effective, 1.0)))
 
 
@@ -606,18 +607,18 @@ def frame_change(stack: np.ndarray) -> np.ndarray:
     return np.r_[np.nan, np.abs(np.diff(flat, axis=0)).mean(axis=1)]
 
 
-def matched_scores(
+def matched_change(
     d_out: np.ndarray, d_src: np.ndarray, frames: np.ndarray, controls: np.ndarray, quantum: float
-) -> np.ndarray:
-    """Each frame's output change against the controls nearest it in source change, in robust units.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each frame's output change less the median of the controls nearest it in source change, and their MAD.
 
-    The ``sqrt(n)`` nearest controls (Loftsgaarden and Quesenberry), the frame itself left out,
-    give a median and a MAD; ``quantum``, the measure's resolution, stands in for a MAD of zero.
+    The ``sqrt(n)`` nearest controls (Loftsgaarden and Quesenberry), the frame itself left out;
+    ``quantum``, the measure's resolution, stands in for a MAD of zero.
     """
     k = max(1, int(round(math.sqrt(controls.size))))
     order = np.argsort(d_src[controls], kind="stable")
     ranked, values = controls[order], d_src[controls][order]
-    out = np.full(frames.size, np.nan)
+    residual, spread = np.full(frames.size, np.nan), np.full(frames.size, np.nan)
     for i, frame in enumerate(frames):
         at = int(np.searchsorted(values, d_src[frame]))
         lo, hi = max(0, at - k - 1), min(values.size, at + k + 1)
@@ -626,9 +627,17 @@ def matched_scores(
         near = window[np.argsort(np.abs(d_src[window] - d_src[frame]), kind="stable")[:k]]
         ref = d_out[near]
         centre = float(np.median(ref))
-        spread = max(1.4826 * float(np.median(np.abs(ref - centre))), quantum)
-        out[i] = (d_out[frame] - centre) / spread
-    return out
+        residual[i] = d_out[frame] - centre
+        spread[i] = max(1.4826 * float(np.median(np.abs(ref - centre))), quantum)
+    return residual, spread
+
+
+def matched_scores(
+    d_out: np.ndarray, d_src: np.ndarray, frames: np.ndarray, controls: np.ndarray, quantum: float
+) -> np.ndarray:
+    """Each frame's output change against the controls nearest it in source change, in robust units."""
+    residual, spread = matched_change(d_out, d_src, frames, controls, quantum)
+    return residual / spread
 
 
 def tail_p(scores: np.ndarray, null: np.ndarray) -> np.ndarray:
@@ -668,6 +677,42 @@ def critical(tests: int, sigma: float = SIGMA) -> float:
     return float(norm.isf(norm.sf(sigma) / max(1, int(tests))))
 
 
+def _groups(frames: np.ndarray, params: np.ndarray, kinds: np.ndarray | None, reach: int) -> list[tuple]:
+    """``(param, pool, frames, alone, partners)`` for every pool of steps to test.
+
+    A live step is tested on frames where no other step the model leaves live lands, so proven
+    no-ops beside it do not count as partners. A dead pool keeps only frames more than ``reach``
+    from every live step, its own parameter's included, so no live step's picture can reach it.
+    Steps that never land alone are tested with their partners.
+    """
+    tested = np.ones(frames.size, dtype=bool) if kinds is None else np.isin(kinds, TESTED)
+    proven = np.zeros(frames.size, dtype=bool) if kinds is None else np.isin(kinds, (NOOP, DEAD))
+    live = np.unique(frames[tested])
+    near_live = np.zeros(frames.size, dtype=bool)
+    if live.size:
+        at = np.clip(np.searchsorted(live, frames), 1, live.size) - 1
+        gap = np.minimum(np.abs(frames - live[at]), np.abs(frames - live[np.clip(at + 1, 0, live.size - 1)]))
+        near_live = gap <= reach
+    out = []
+    for param in sorted(set(int(p) for p in params[tested | proven])):
+        for pool, mask, rivals in (
+            (ALL_POOL if kinds is None else LIVE_POOL, tested, tested),
+            (DEAD_POOL, proven & ~near_live, tested | proven),
+        ):
+            mine = np.unique(frames[mask & (params == param)])
+            if not mine.size:
+                continue
+            others = {(int(f), int(p)) for f, p in zip(frames[rivals], params[rivals]) if p != param}
+            busy = np.array(sorted({f for f, _ in others}), dtype=np.int64)
+            alone = mine[~np.isin(mine, busy)]
+            partners: tuple[int, ...] = ()
+            if not alone.size:
+                alone, near = mine, set(mine.tolist())
+                partners = tuple(sorted({p for f, p in others if f in near}))
+            out.append((param, pool, mine, alone, partners))
+    return out
+
+
 def acted_upon(
     out: np.ndarray,
     src: np.ndarray,
@@ -677,49 +722,53 @@ def acted_upon(
     names: Mapping[int, str],
     *,
     lags: Sequence[int] = LAGS,
+    kinds: Sequence[str] | None = None,
 ) -> list[Moved]:
     """Test every parameter's steps against frames of matched source motion with no step.
 
-    ``out`` and ``src`` are per clip frame; ``landed_frames`` and ``params`` give each write's
-    frame. A parameter is tested on the frames it lands on alone; one that never lands alone is
-    tested with its ``partners``, the parameters landing with it. Family-wise over all tests.
+    ``out`` and ``src`` are per clip frame; ``landed_frames``, ``params`` and ``kinds`` give each
+    write's frame and the model's verdict on its step. With ``kinds``, a parameter's steps the
+    model leaves live and those it proves no-ops are tested apart; steps that change no value are
+    not tested. Family-wise over all tests.
     """
     d_out, d_src = frame_change(out), frame_change(src)
     count = d_out.size
     quantum = 1.0 / float(np.prod(np.shape(out)[1:]))
     frames = np.asarray(landed_frames, dtype=np.int64)
+    kinds = None if kinds is None else np.asarray(kinds, dtype=object)
     inside = (frames >= 1) & (frames < count - max(lags))
-    frames, params = frames[inside], np.asarray(params)[inside]
     stepped = np.zeros(count, dtype=bool)
     for lag in (0, *lags):
-        stepped[np.clip(frames + lag, 0, count - 1)] = True
+        stepped[np.clip(frames[inside] + lag, 0, count - 1)] = True
+    if kinds is not None:
+        inside &= kinds != UNCHANGED
+        kinds = kinds[inside]
+    frames, params = frames[inside], np.asarray(params)[inside]
     measured = np.isfinite(d_out) & np.isfinite(d_src)
     controls = np.flatnonzero(~stepped & measured)
-    null = matched_scores(d_out, d_src, controls, controls, quantum) if controls.size > 1 else np.zeros(0)
-    pairs = {(int(f), int(p)) for f, p in zip(frames, params)}
-    per_frame = np.bincount([f for f, _ in pairs], minlength=count)
-    tested = sorted(set(int(p) for p in params))
-    limit = critical(len(tested) * len(lags))
+    null_res, null_spread = (
+        matched_change(d_out, d_src, controls, controls, quantum)
+        if controls.size > 1
+        else (np.zeros(0), np.zeros(0))
+    )
+    null = null_res / null_spread if null_res.size else np.zeros(0)
+    groups = _groups(frames, params, kinds, max(lags))
+    limit = critical(len(groups) * len(lags))
+    scatter = float(np.std(null_res, ddof=1)) if null_res.size > 1 else float("nan")
     verdicts = []
-    for param in tested:
-        mine = np.unique(frames[params == param])
-        alone = mine[per_frame[mine] == 1]
-        partners: tuple[int, ...] = ()
-        if not alone.size:
-            alone = mine
-            partners = tuple(sorted({p for f, p in pairs if f in set(mine.tolist()) and p != param}))
+    for param, pool, mine, alone, partners in groups:
         best = (np.zeros(0), 0.0, -math.inf, lags[0], np.zeros(0))
         for lag in lags:
             x = alone + lag
             x = x[measured[x]]
             if not (x.size and null.size):
                 continue
-            score = matched_scores(d_out, d_src, x, controls, quantum)
-            p_e = tail_p(score, null)
+            residual, spread = matched_change(d_out, d_src, x, controls, quantum)
+            p_e = tail_p(residual / spread, null)
             z, n_eff = fisher_z(p_e)
             if z > best[2]:
-                best = (p_e, n_eff, z, lag, np.clip(score, *np.percentile(null, [0, 100])))
-        p_e, n_eff, z, lag, score = best
+                best = (p_e, n_eff, z, lag, residual)
+        p_e, n_eff, z, lag, residual = best
         verdicts.append(
             Moved(
                 param=param,
@@ -733,20 +782,19 @@ def acted_upon(
                 flat=float(np.mean(luma_range[alone] <= FLAT_CODES)) if alone.size else float("nan"),
                 jointly=int(mine.size - alone.size) if not partners else int(mine.size),
                 partners=partners,
-                effect=float(score.mean()) if score.size else float("nan"),
-                scatter=float(score.std(ddof=1)) if score.size > 1 else float("nan"),
+                effect=float(residual.mean()) if residual.size else float("nan"),
+                scatter=scatter,
+                pool=pool,
             )
         )
-    acted = [v.effect for v in verdicts if v.moved and np.isfinite(v.effect)]
-    floor = min(acted) if acted else float("nan")
-    return [replace(v, reference=floor) for v in verdicts]
+    return verdicts
 
 
 def why_not(moved: Moved, name: str, applied_ok: bool, landed_ok: bool) -> str:
-    """Why a parameter is not acted upon, from the earliest link of the chain that broke.
+    """Why a parameter's steps did not show, from the earliest link of the chain that broke.
 
     A picture that was a uniform field at most of the steps, as a take's ``mostly_picture`` counts,
-    had nothing to move. Past the chain, the verdict says whether the steps could have shown it.
+    had nothing to move. Past the chain, the least change the steps could have shown, in its own units.
     """
     partners = ", P".join(map(str, moved.partners))
     reasons = (
@@ -760,21 +808,14 @@ def why_not(moved: Moved, name: str, applied_ok: bool, landed_ok: bool) -> str:
     if broke is not None:
         return broke
     joint = f", even with P{partners} changing at once" if moved.partners else ""
-    if moved.verdict == "no effect":
-        return (
-            f"no effect{joint}: its steps exclude a mean score of {moved.reference:.1f}, "
-            "the least the take's "
-            "acted-upon parameters show; the firmware took it and the program ignores it in this state"
-        )
-    if not np.isfinite(moved.reference):
-        return (
-            f"undetermined{joint}: no parameter in the take moved the picture, "
-            "so no effect size to test against"
-        )
+    need = (
+        f"; about {moved.steps_needed} steps would show its observed mean change of {moved.effect:.3g}"
+        if moved.steps_needed
+        else "; its steps show no mean change to build on"
+    )
     return (
-        f"undetermined{joint}: {moved.steps} steps detect only a mean score of {moved.detectable:.1f}, "
-        f"against {moved.reference:.1f} for the least acted-upon parameter; "
-        f"about {moved.steps_needed} steps would decide it"
+        f"not seen{joint}: {moved.steps} steps detect only a mean change of {moved.detectable:.3g} "
+        f"(minimum detectable effect, against step-free scatter {moved.scatter:.3g}){need}"
     )
 
 
@@ -790,7 +831,7 @@ class Evidence:
     received: Received | None
     moved: list[Moved]
     loaded: dict = field(default_factory=dict)
-    #: The program model's per-parameter prediction for the take's steps (``syncsummoner.program.predict``).
+    #: Per parameter, how many of its steps the program model judged each way (:data:`LIVE` ...).
     predicted: dict = field(default_factory=dict)
 
     @property
@@ -803,62 +844,103 @@ class Evidence:
             and (self.received is None or self.received.ok)
         )
 
+    def pools(self) -> dict[int, dict[str, Moved]]:
+        """Each parameter's tests by pool."""
+        out: dict[int, dict[str, Moved]] = {int(p): {} for p in self.predicted}
+        for m in self.moved:
+            out.setdefault(m.param, {})[m.pool] = m
+        return dict(sorted(out.items()))
+
+    @staticmethod
+    def verdict(pools: Mapping[str, Moved], counts: Mapping[str, int] = ()) -> str:
+        """``dead, moved`` (the model or firmware is wrong), ``live, moved``, ``live, not seen``,
+        ``never live`` or ``untested`` (live steps, none inside the clip); ``moved`` or ``not seen``
+        when no model judged the steps."""
+        dead, live = pools.get(DEAD_POOL), pools.get(LIVE_POOL)
+        if dead is not None and dead.moved:
+            return "dead, moved"
+        if live is not None:
+            return f"live, {live.verdict}"
+        if ALL_POOL in pools:
+            return pools[ALL_POOL].verdict
+        return "untested" if dict(counts).get(LIVE) else "never live"
+
+    def _why(
+        self, verdict: str, test: Moved | None, dead: Moved | None, counts: Mapping, ok: tuple
+    ) -> str | None:
+        if verdict == "dead, moved":
+            return (
+                f"contradiction: {dead.steps} steps the model proves cannot change the picture moved it "
+                f"(z {dead.z:+.2f}, critical {dead.critical:.2f}); the model or the firmware is wrong"
+            )
+        if verdict == "never live":
+            return (
+                f"never live in this take: {counts.get(DEAD, 0)} steps dead, {counts.get(NOOP, 0)} proven "
+                "no-ops in the states it was stepped from; not tested, so this says nothing of its effect"
+            )
+        if verdict == "untested":
+            return f"untested: its {counts[LIVE]} live steps all landed outside the clip's measured frames"
+        if test is None or test.moved:
+            return None
+        return why_not(test, test.name, *ok)
+
     def table(self) -> list[dict]:
-        """Per parameter: writes sent, landing frames, readback agreement, acted upon or not, and why."""
+        """Per parameter: writes, landings, readback, the model's step counts, the verdict, and why."""
         rows = self.landed.rows
         bad = set(int(s) for s in self.applied.disagree["slot"]) if self.applied.disagree.size else set()
         out = []
-        for verdict in self.moved:
-            mine = rows[rows["param"] == verdict.param]
+        for param, pools in self.pools().items():
+            test = pools.get(LIVE_POOL) or pools.get(ALL_POOL)
+            dead = pools.get(DEAD_POOL)
+            shown = test or dead
+            mine = rows[rows["param"] == param]
             on_time = bool(np.all(mine["landed"] == mine["target"])) and bool(np.all(mine["sent"] >= 0))
-            agree = verdict.param not in bad
+            agree = param not in bad
+            counts = {k: int(v) for k, v in self.predicted.get(param, {}).items()}
+            verdict = self.verdict(pools, counts)
             out.append(
                 {
-                    "param": verdict.param,
-                    "name": verdict.name,
+                    "param": param,
+                    "name": shown.name if shown else f"P{param}",
                     "writes": int(mine.size),
                     "sent": int(np.count_nonzero(mine["sent"] >= 0)),
                     "on_target": int(np.count_nonzero(mine["landed"] == mine["target"])),
                     "readback": "agrees" if agree else "disagrees",
-                    "steps_tested": verdict.steps,
-                    "z": round(verdict.z, 2),
-                    "critical_z": round(verdict.critical, 2),
-                    "lag": verdict.lag,
-                    "acted_upon": verdict.moved,
-                    "verdict": verdict.verdict,
-                    "effect": round(verdict.effect, 2),
-                    "detectable": round(verdict.detectable, 2),
-                    "reference": round(verdict.reference, 2),
-                    "steps_needed": verdict.steps_needed,
-                    "with": list(verdict.partners),
-                    "why_not": None if verdict.moved else why_not(verdict, verdict.name, agree, on_time),
-                    **self._prediction(verdict),
+                    "model_steps": counts,
+                    "steps_tested": test.steps if test else 0,
+                    "z": round(test.z, 2) if test else None,
+                    "critical_z": round(test.critical, 2) if test else None,
+                    "lag": test.lag if test else None,
+                    "acted_upon": bool(test and test.moved),
+                    "verdict": verdict,
+                    "effect": round(test.effect, 4) if test else None,
+                    "mde": round(test.detectable, 4) if test else None,
+                    "scatter": round(test.scatter, 4) if test else None,
+                    "steps_needed": test.steps_needed if test else 0,
+                    "with": list(test.partners) if test else [],
+                    "dead_steps_tested": dead.steps if dead else 0,
+                    "dead_z": round(dead.z, 2) if dead else None,
+                    "why_not": self._why(verdict, test, dead, counts, (agree, on_time)),
                 }
             )
         return out
 
-    def _prediction(self, verdict: Moved) -> dict:
-        guess = self.predicted.get(verdict.param)
-        if guess is None:
-            return {}
-        return {
-            "predicted": guess.verdict,
-            "live_steps": guess.live,
-            "dead_steps": guess.dead,
-            "check": guess.check(verdict.moved),
-        }
-
     @property
     def contradictions(self) -> list[int]:
-        """Parameters the program model calls dead in every step that the picture shows moved anyway."""
-        return [row["param"] for row in self.table() if row.get("check", "").startswith("contradiction")]
+        """Parameters whose steps the model proves cannot change the picture, that moved it anyway."""
+        return [row["param"] for row in self.table() if row["verdict"] == "dead, moved"]
 
     def schedule(self) -> list[dict]:
-        """Undetermined parameters and the steps a sweep would need to decide each."""
+        """Parameters this take could not show: steps a sweep needs for each, 0 for every level where live."""
         return [
-            {"program": self.program, "param": v.param, "name": v.name, "steps": v.steps_needed}
-            for v in self.moved
-            if v.steps_needed
+            {
+                "program": self.program,
+                "param": row["param"],
+                "name": row["name"],
+                "steps": row["steps_needed"],
+            }
+            for row in self.table()
+            if row["verdict"] in ("never live", "untested") or (not row["acted_upon"] and row["steps_needed"])
         ]
 
     def lines(self) -> list[str]:
@@ -875,15 +957,21 @@ class Evidence:
         if self.received is not None:
             said.append(f"{self.program}: {self.received.summary()}")
         for row in self.table():
-            verdict = "acted upon" if row["acted_upon"] else row["why_not"]
+            verdict = row["verdict"] if row["why_not"] is None else row["why_not"]
             if row["acted_upon"] and row["with"]:
                 verdict += f" only together with P{', P'.join(map(str, row['with']))}"
+            model = ", ".join(f"{v} {k}" for k, v in sorted(row["model_steps"].items()))
             said.append(
                 f"{self.program}:   P{row['param']:<2} {row['name'][:16]:16s} "
                 f"{row['sent']}/{row['writes']} sent, {row['on_target']} on target, "
-                f"readback {row['readback']}, z {row['z']:+.2f} "
-                f"(lag {row['lag']}, critical {row['critical_z']:.2f}): {verdict}"
-                + (f"; {row['check']}" if "check" in row else "")
+                f"readback {row['readback']}"
+                + (f", model: {model}" if model else "")
+                + (
+                    f", z {row['z']:+.2f} (lag {row['lag']}, critical {row['critical_z']:.2f})"
+                    if row["z"] is not None
+                    else ""
+                )
+                + f": {verdict}"
             )
         return said
 

@@ -6,7 +6,7 @@ opened, so one process can capture the next take while another judges the last.
 
 ```sh
 syncsummoner judge takes/take-*.mkv --source timecoded.mkv \
-    [--score score.yaml] [--jobs 2] [--workers N] [--predict]
+    [--score score.yaml] [--jobs 2] [--workers N] [--no-model]
 ```
 
 Each take gets, beside it:
@@ -15,7 +15,7 @@ Each take gets, beside it:
 | --- | --- |
 | `<take>.picked.npy` | per clip frame, the capture showing it |
 | `<take>.evidence.json` | every write sent, landed, read back and acted upon ([evidence.md](evidence.md)) |
-| `<take>.schedule.json` | the undetermined parameters and the steps a sweep needs |
+| `<take>.schedule.json` | the parameters the take could not show, and the steps a sweep needs |
 | `<take>.check.json` | with `--score`, every bar judged against the clip, as a render's take check |
 | `<take>.meta.json` | under `judged`: the lock, evidence and picture outcome |
 | `<take>.features.npz` | the decode everything above was read from |

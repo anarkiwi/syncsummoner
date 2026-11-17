@@ -21,6 +21,7 @@ from syncsummoner.probe.store import KeyKind, ProgramKey, slug
 from tests import transmitter as tx
 from tests.device.conftest import COLORBARS_DECLARED, COLORBARS_INFO, FakeClock, FakeTransport, Readback
 from tests.device.test_liveness import mjpeg, needs_ffmpeg
+from tests.probe.covers import FakeCover, fake_plan
 
 FIRMWARE = "1.0.0-rc.37"
 INFO = ProgramInfo.from_json(COLORBARS_INFO, COLORBARS_DECLARED)
@@ -29,7 +30,6 @@ CONFIG = H.HarvestConfig(
     width=64,
     height=48,
     capture_fps=4,
-    setpoints=2,
     settle_s=0.25,
     dwell_s=1.0,
     startup_s=0.0,
@@ -170,6 +170,7 @@ class Archive:
         self.directory = Path(directory)
         self.stored = {program: key.digest for program, key in stored}
         self.stimuli = {}
+        self.schedules = {}
         self.rows = {}
         self.infos = {}
         self.keys = {}
@@ -202,8 +203,22 @@ class Archive:
         self.directory.mkdir(parents=True, exist_ok=True)
         return self.directory / f"{slug(program)}.scratch.mkv"
 
-    def commit(self, program, key, video, rows, *, width, height, fps, program_info=None, stimulus=None):
+    def commit(
+        self,
+        program,
+        key,
+        video,
+        rows,
+        *,
+        width,
+        height,
+        fps,
+        program_info=None,
+        stimulus=None,
+        schedule=None,
+    ):
         assert Path(video).exists(), "the recording is published, not re-encoded"
+        self.schedules[program] = schedule
         self.stimuli[program] = dict(stimulus or CODEFRAMES)
         self.infos[program] = program_info
         self.keys[program] = key
@@ -290,6 +305,7 @@ def run(archive, *, port=None, recorder=None, sessions=None, clock=None, **kwarg
         return made[-1]
 
     kwargs.setdefault("config", CONFIG)
+    kwargs.setdefault("plan", fake_plan)
     kwargs.setdefault("session_factory", factory)
     return H.harvest(
         archive,
@@ -304,23 +320,6 @@ def run(archive, *, port=None, recorder=None, sessions=None, clock=None, **kwarg
 def window(setpoint, start, end):
     """One held setpoint, with a vector that names it."""
     return H.Window(setpoint, tuple([setpoint] * 12), start, end)
-
-
-def test_sweep_varies_every_declared_parameter_and_nothing_else():
-    vectors = H.sweep_vectors(INFO, CONFIG, np.random.default_rng(0))
-    assert vectors and all(set(v) == {p.index for p in INFO.used} for v in vectors)
-    assert len({v[12] for v in vectors}) > 1, "P12 is swept as the continuous control it is declared"
-    booleans = {p.index for p in INFO.params if p.kind is ParamKind.BOOLEAN}
-    assert booleans == {7, 8, 9, 10, 11}
-
-
-def test_sweep_of_an_undeclared_program_is_one_empty_vector():
-    assert H.sweep_vectors(ProgramInfo.from_json(COLORBARS_INFO), CONFIG, np.random.default_rng(0)) == [{}]
-
-
-def test_sweep_of_a_program_reporting_no_parameters_at_all_is_one_empty_vector():
-    info = ProgramInfo.from_json({"name": "Null", "parameters": []})
-    assert H.sweep_vectors(info, CONFIG, np.random.default_rng(0)) == [{}]
 
 
 def test_a_window_opens_only_once_the_parameters_have_settled():
@@ -500,7 +499,7 @@ def test_a_program_is_swept_into_exactly_one_recording(tmp_path):
         "Alpha",
         KEY,
         config=CONFIG,
-        rng=np.random.default_rng(0),
+        plan=fake_plan,
         sleep=clock.sleep,
         clock=clock,
     )
@@ -510,7 +509,7 @@ def test_a_program_is_swept_into_exactly_one_recording(tmp_path):
     assert archive.geometry["Alpha"] == (CONFIG.width, CONFIG.height, CONFIG.capture_fps)
     assert (result.frames, result.measured) == (PER_PROGRAM, MEASURED)
     assert result.seconds == pytest.approx(2.5) and result.report is LIVE and not result.dark
-    assert len(session.vectors) == 1 + CONFIG.setpoints, "the working point, then every setpoint"
+    assert len(session.vectors) == 1 + len(FakeCover().vectors()), "the working point, then every setpoint"
     assert archive.infos["Alpha"] == COLORBARS_INFO, "the device's reply is archived with the frames"
 
 
