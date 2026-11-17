@@ -470,8 +470,9 @@ The take is longer than the excerpt because it opens on the lead-in, and holds
 more captures than frames because the card runs its own cadence
 ([hardware.md](hardware.md#the-cards-cadence)). What makes the finished clip right
 is the attribution line: every clip frame has a capture, and the clip's run agrees
-on its cadence. `ss evidence takes/take-Derez.mkv --source timecoded.mkv` prints a
-take's evidence again from its sidecars; with `--predict` it sets each parameter's
+on its cadence. `ss judge takes/take-Derez.mkv --source timecoded.mkv` judges a
+take again from its sidecars and one cached decode, with no device, so it can run
+while the rig captures the next ([judging.md](judging.md)); with `--predict` it sets each parameter's
 verdict against the program model's prediction for the take's steps, and flags a
 parameter predicted dead in every step that the picture shows moved as a
 contradiction ([program-model.md](program-model.md)).

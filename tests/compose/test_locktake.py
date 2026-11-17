@@ -15,6 +15,7 @@ from syncsummoner.device.playout import FLIP
 from syncsummoner.device.profile import PARAM_MAX, ParamSpec
 from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device.wire import SEND, Poller, Sender
+from syncsummoner.probe import decoded
 
 FPS = 30.0
 P = 1e9 / FPS
@@ -101,23 +102,6 @@ def test_the_boot_count_is_read_from_its_setting():
         get_setting=lambda key: asked.append(key) or json.dumps({"key": key, "type": "uint32", "value": 7})
     )
     assert LT.boot_count(shell) == 7 and asked == [LT.BOOT_COUNT_KEY]
-
-
-def test_small_frames_keeps_only_whole_frames_with_the_strip_cropped(monkeypatch):
-    """A partial tail frame is dropped; the crop removes the strip rows."""
-    seen = {}
-    frame = np.arange(3 * 2 * 3, dtype=np.uint8)
-
-    def run(argv, **kw):
-        seen["argv"], seen["kw"] = argv, kw
-        return types.SimpleNamespace(stdout=np.r_[frame, frame + 1, frame[:5]].tobytes())
-
-    monkeypatch.setattr(LT.subprocess, "run", run)
-    out = LT.small_frames("take.mkv", size=(3, 2), strip_px=8, ffmpeg="ff")
-    assert out.shape == (2, 3, 2, 3)
-    assert out[1].ravel().tolist() == (frame + 1).tolist()
-    assert seen["argv"][0] == "ff" and "crop=iw:ih-8:0:0,scale=3:2:flags=area" in seen["argv"]
-    assert seen["kw"]["check"] is False
 
 
 def run_of(first, last, slot=0):
@@ -534,7 +518,11 @@ def take_and_prove(monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: sim.frames)
     clip = sim.base.astype(np.uint8)
     monkeypatch.setattr(
-        LT, "small_frames", lambda path, **k: clip if str(path) == "clip.mkv" else sim.images(sim.size)
+        LT.decoded,
+        "features",
+        lambda path, spec, **k: decoded.Features(
+            {"small": clip if str(path) == "clip.mkv" else sim.images(sim.size)}, ""
+        ),
     )
     proof = LT.take_evidence(out, program="Teletext", clip="clip.mkv", config=config_for(4.0))
     return sim, rig, record, proof, loads

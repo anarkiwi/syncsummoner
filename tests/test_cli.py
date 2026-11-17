@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring,protected-access
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -577,35 +578,9 @@ def test_render_timing_flags_reach_the_config(monkeypatch, tmp_path):
         cli.main(argv + ["--latency-ms", "25"])
 
 
-def test_evidence_proves_each_take_and_fails_on_any_unproven(monkeypatch, tmp_path, capsys):
-    import numpy as np
-
-    from syncsummoner.compose import locktake
-    from syncsummoner.device.wire import save_wire
-
-    takes = [tmp_path / "take-Derez.mkv", tmp_path / "take-Lorenz.mkv"]
-    for take in takes:
-        save_wire(take, program=np.array(take.stem.split("-")[1]))
-    seen = []
-
-    def take_evidence(take, *, program, clip, config, predict=False):
-        seen.append((Path(take).name, program, clip, config.fps, config.strip_px, predict))
-        ok = program != "Lorenz"
-        return SimpleNamespace(
-            ok=ok, lines=lambda: [f"{program} proven {ok}"], to_json=lambda: f'{{"ok": {str(ok).lower()}}}'
-        )
-
-    monkeypatch.setattr(locktake, "take_evidence", take_evidence)
-    argv = ["evidence", *map(str, takes), "--source", "tc.mkv", "--strip-px", "4"]
-    assert cli.main(argv) == 1
-    assert seen == [
-        ("take-Derez.mkv", "Derez", "tc.mkv", 30.0, 4, False),
-        ("take-Lorenz.mkv", "Lorenz", "tc.mkv", 30.0, 4, False),
-    ]
-    assert capsys.readouterr().out.splitlines() == ["Derez proven True", "Lorenz proven False"]
-    assert locktake.evidence_path(takes[1]).read_text(encoding="utf-8") == '{"ok": false}'
-    assert cli.main(["evidence", str(takes[0]), "--source", "tc.mkv", "--program", "Other", "--predict"]) == 0
-    assert seen[-1][1] == "Other" and seen[-1][-1] is True
+def test_evidence_is_judging_by_another_name():
+    args = cli.build_parser().parse_args(["evidence", "take.mkv", "--source", "tc.mkv"])
+    assert args.func is cli._judge_cmd and args.score is None  # pylint: disable=protected-access
 
 
 def _check_stubs(monkeypatch, seen, *, failed=False):
@@ -745,3 +720,74 @@ def test_lockcheck_plays_a_prepared_clip_as_it_is(monkeypatch, tmp_path):
     assert cli.main(argv + ["--program", "Teletext"]) == 0
     assert "timecoded" not in seen and seen["played"][1]["seconds"] is None
     assert seen["played"][1]["program"] == "Teletext"
+
+
+def _judge_stub(monkeypatch, seen):
+    """Stand in for judging a take: one that names ``unlocked`` does not lock, ``unproven`` is not proven."""
+    import numpy as np
+
+    from syncsummoner.compose import judge as judge_mod
+    from syncsummoner.compose.lock import LockError
+    from syncsummoner.device.recorder import TakeReport
+    from syncsummoner.probe import decoded
+
+    monkeypatch.setattr(decoded, "features", lambda path, spec, **kw: seen.append(("clip", str(path), kw)))
+
+    def judge_take(take, *, clip, config, program, score, predict, workers):
+        seen.append(
+            ("judge", Path(take).name, clip, config.strip_px, program, score is not None, predict, workers)
+        )
+        if "unlocked" in str(take):
+            raise LockError("4/6 clip frames attributed")
+        proof = SimpleNamespace(ok="unproven" not in str(take), schedule=lambda: [{"param": 3}])
+        found = SimpleNamespace(per_frame=2, picked=np.arange(6))
+        return SimpleNamespace(
+            proof=proof,
+            found=found,
+            report=TakeReport(frames=4, picture=4),
+            check=None,
+            lines=lambda: ["judged"],
+        )
+
+    monkeypatch.setattr(judge_mod, "judge_take", judge_take)
+
+
+def test_takes_are_judged_offline_and_their_outcome_kept_beside_them(monkeypatch, tmp_path, capsys):
+    seen = []
+    _judge_stub(monkeypatch, seen)
+    takes = [tmp_path / "take-a.mkv", tmp_path / "take-unproven.mkv"]
+    Path(f"{takes[0]}.meta.json").write_text(json.dumps({"attempt-1": {"program": "a"}}), encoding="utf-8")
+    argv = ["judge", *map(str, takes), "--source", "tc.mkv", "--strip-px", "4", "--workers", "3", "--predict"]
+    assert cli.main(argv) == 1
+    assert seen[0] == ("clip", "tc.mkv", {"workers": 3, "ffmpeg": "ffmpeg"})
+    assert seen[1] == ("judge", "take-a.mkv", "tc.mkv", 4, None, False, True, 3)
+    meta = json.loads(Path(f"{takes[0]}.meta.json").read_text(encoding="utf-8"))
+    assert meta["attempt-1"] == {"program": "a"} and meta["judged"]["lock"] == "ok"
+    assert meta["judged"]["evidence_ok"] and meta["judged"]["clip_frames"] == 6
+    assert json.loads(Path(f"{takes[1]}.schedule.json").read_text(encoding="utf-8")) == [{"param": 3}]
+    assert len(capsys.readouterr().out.splitlines()) == 2
+    assert cli.main(["judge", str(takes[0]), "--source", "tc.mkv"]) == 0
+
+
+def test_a_take_that_does_not_lock_is_said_and_exits_2(monkeypatch, tmp_path):
+    seen = []
+    _judge_stub(monkeypatch, seen)
+    take = tmp_path / "take-unlocked.mkv"
+    score = tmp_path / "score.yaml"
+    score.write_text("duration: 4.0\nfps: 30.0\n", encoding="utf-8")
+    assert cli.main(["judge", str(take), "--source", "tc.mkv", "--score", str(score), "--jobs", "1"]) == 2
+    assert seen[-1][5] is True
+    judged = json.loads(Path(f"{take}.meta.json").read_text(encoding="utf-8"))["judged"]
+    assert judged == {"lock": "LockError: 4/6 clip frames attributed"}
+
+
+def test_several_takes_are_judged_in_parallel_processes(monkeypatch, tmp_path):
+    seen = []
+    _judge_stub(monkeypatch, seen)
+    monkeypatch.setattr("syncsummoner.compose.judge.START_METHOD", "fork")
+    takes = [tmp_path / f"take-{n}.mkv" for n in ("a", "b", "c")]
+    assert cli.main(["judge", *map(str, takes), "--source", "tc.mkv", "--jobs", "2", "--workers", "1"]) == 0
+    assert all(
+        json.loads(Path(f"{t}.meta.json").read_text(encoding="utf-8"))["judged"]["lock"] == "ok"
+        for t in takes
+    )

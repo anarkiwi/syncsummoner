@@ -10,6 +10,7 @@ import pytest
 
 from syncsummoner.compose import lock as L
 from syncsummoner.device.v4l2rec import sidecar
+from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import burn_timecode, read_timecode
 from tests.compose.locked import CARD_NS, CLEAN, PI_T0, STANDARD, VBLANK_NS, WRAP, take
 
@@ -56,20 +57,15 @@ def encode(path, frames, fps=30):
     subprocess.run(argv, input=raw.tobytes(), check=True)
 
 
-def test_strip_codes_reads_every_stored_frame(tmp_path):
+def test_every_stored_frame_has_its_strip_read(tmp_path):
     codes = [(i & WRAP) for i in range(-3, 5)]
     plate = np.full((24, 160, 3), 0.3, np.float32)
     frames = np.stack([burn_timecode(plate, c, bits=16, strip_px=8) for c in codes])
     frames[2] = plate
     encode(tmp_path / "take.mkv", frames)
-    got = L.strip_codes(tmp_path / "take.mkv", width=160)
+    got = decoded.features(tmp_path / "take.mkv", decoded.Spec(), workers=3).codes
     assert got.tolist() == codes[:2] + [-1] + codes[3:]
     assert L.signed(got, 16).tolist() == [-3, -2, -1, 0, 1, 2, 3, 4]
-
-
-def test_strip_codes_of_an_unreadable_take_is_a_lock_error(tmp_path):
-    with pytest.raises(L.LockError, match="failed with exit"):
-        L.strip_codes(tmp_path / "missing.mkv", width=160)
 
 
 @pytest.mark.parametrize(
@@ -160,9 +156,14 @@ def test_a_take_is_attributed_from_its_lock_record_and_its_picks_kept(tmp_path, 
     played = take(STANDARD)
     path = saved(tmp_path, played)
     asked = []
-    monkeypatch.setattr(L, "strip_codes", lambda take_, **kw: asked.append((take_, kw)) or played.codes)
+    monkeypatch.setattr(
+        L.decoded,
+        "features",
+        lambda take_, spec, **kw: asked.append((take_, spec, kw))
+        or decoded.Features({"codes": played.codes}, ""),
+    )
     found = L.attribute_take(path, config=CONFIG)
-    assert asked == [(path, {"width": 160, "strip_px": 8, "bits": 16, "ffmpeg": "ffmpeg"})]
+    assert asked == [(path, decoded.Spec(strip_px=8, bits=16), {"ffmpeg": "ffmpeg"})]
     assert np.load(L.picked_path(path)).tolist() == played.picked().tolist() == found.picked.tolist()
     first = int(np.flatnonzero(played.slots == 2 * played.lead)[0])
     assert L.take_start(path, config=CONFIG) == pytest.approx(first / (2 * CONFIG.fps))

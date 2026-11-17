@@ -19,6 +19,7 @@ from syncsummoner import aesthetics
 from syncsummoner.compose.cut import Cut
 from syncsummoner.compose.score import Score
 from syncsummoner.device.recorder import held
+from syncsummoner.probe.decoded import Features
 from syncsummoner.probe.footage import (
     ClockModel,
     Recording,
@@ -26,6 +27,7 @@ from syncsummoner.probe.footage import (
     clock_model,
     decode_recording,
     motion_model,
+    recording_of,
     source_series,
     unit_frames,
 )
@@ -343,24 +345,36 @@ def check_takes(
     bar: float | None = None,
     models: Mapping[str, ClockModel] | None = None,
     attributions: Mapping[str, np.ndarray] | None = None,
+    features: Mapping[str, Features] | None = None,
+    source: Features | None = None,
     ffmpeg: str = "ffmpeg",
 ) -> CheckReport:
     """Trace every take against the clip, judge every bar, and cover the cut plan.
 
     ``attributions`` gives a recording's per-clip-frame capture indices outright, with the
-    meaning of :attr:`Trace.picked`, and ``models`` fixes a recording's clock, as a master's
-    identity clock is; any other recording's clock is fitted.
+    meaning of :attr:`Trace.picked`, and ``models`` fixes a recording's clock, as a master's identity
+    clock is; any other is fitted. ``features`` and ``source`` are decodes already made of takes and clip.
     """
     fps = float(score.fps)
     with_bar = float(bar or score.meta.get("bar") or 4 * 60.0 / score.bpm)
     LOG.info("reading the played clip %s", clip)
-    source_si, source_ti = source_series(clip, strip_px=strip_px, ffmpeg=ffmpeg)
+    source_si, source_ti = source_series(clip if source is None else source, strip_px=strip_px, ffmpeg=ffmpeg)
     if source_si.size < 2:
         raise DeadTakeError(f"cannot judge any take: {clip} decoded to {source_si.size} frames")
     edges = bar_edges(min(score.duration, source_si.size / fps), with_bar, fps)
-    fixed, given = dict(models or {}), dict(attributions or {})
+    fixed, given, decodes = dict(models or {}), dict(attributions or {}), dict(features or {})
 
     def read(name: str) -> tuple[str, Trace]:
+        if name in decodes:
+            return name, trace(
+                recording_of(decodes[name]),
+                source_si,
+                source_ti,
+                fps=fps,
+                bits=bits,
+                model=fixed.get(name),
+                picked=given.get(name),
+            )
         return name, read_recording(
             takes[name],
             source_si,

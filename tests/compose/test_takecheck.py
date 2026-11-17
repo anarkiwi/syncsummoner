@@ -212,7 +212,7 @@ def test_takes_are_read_and_checked_from_files(tmp_path):
     score = Score(duration=2.0, fps=FPS, sections=[Section(0.0, 2.0, "A")])
     report = T.check_takes(score, [R.Cut(0.0, 2.0, "p")], {"p": clip}, clip, strip_px=8, bar=0.5)
     assert report.traces["p"].how == "strip" and not report.failed
-    with pytest.raises(T.DeadTakeError):
+    with pytest.raises(FileNotFoundError):
         T.check_takes(score, [], {}, tmp_path / "missing.mkv", strip_px=8)
 
 

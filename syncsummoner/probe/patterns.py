@@ -317,3 +317,19 @@ def read_timecode(
         return None
     binary = np.bitwise_xor.accumulate((cells[1:] > cells.mean()).astype(np.int64))
     return int((binary * (1 << np.arange(bits - 1, -1, -1))).sum())
+
+
+def read_codes(strips: np.ndarray, *, bits: int, min_contrast: float = 0.25) -> np.ndarray:
+    """Frame indices from ``(n, rows, width, 3)`` strips in ``[0, 1]``; -1 where unreadable.
+
+    Vectorised :func:`read_timecode`: a marker cell, then ``bits``
+    Gray-coded cells, thresholded against the strip's own mean.
+    """
+    strip = np.asarray(strips, dtype=np.float64).mean(axis=(1, 3))
+    edges = np.round(np.linspace(0, strip.shape[1], bits + 2)).astype(int)
+    cells = np.add.reduceat(strip, edges[:-1], axis=1) / np.maximum(np.diff(edges), 1)
+    mean = cells.mean(axis=1, keepdims=True)
+    legible = (np.ptp(cells, axis=1) >= min_contrast) & (cells[:, 0] >= mean[:, 0])
+    binary = np.bitwise_xor.accumulate((cells[:, 1:] > mean).astype(np.int64), axis=1)
+    codes = (binary << np.arange(bits - 1, -1, -1)).sum(axis=1)
+    return np.where(legible, codes, -1)

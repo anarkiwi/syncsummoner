@@ -140,6 +140,7 @@ class Transport:
         self._loaded: str | None = None
         self._held: str | None = None
         self._authored: bool | None = None
+        self._listed: dict[str, set[str]] | None = None
 
     @classmethod
     def open(
@@ -242,8 +243,32 @@ class Transport:
         return self._shell.version()
 
     def programs(self) -> list[str]:
-        """Every installed FPGA program name."""
-        return list(self._device.programs())
+        """Every installed FPGA program name, kept per author for :meth:`_needs_enumerate`."""
+        names = list(self._device.programs())
+        listed: dict[str, set[str]] = {}
+        for name in names:
+            author, slash, plain = name.partition("/")
+            listed.setdefault(author if slash else DEFAULT_AUTHOR, set()).add(
+                _match_key(plain if slash else name)
+            )
+        self._listed = listed
+        return names
+
+    def _needs_enumerate(self, author: str, plain: str) -> bool:
+        """Whether ``program load plain`` could load another author's program unless ``author`` is enumerated.
+
+        The firmware matches a name in the active author's index first and otherwise searches every
+        author's folder and switches to the one holding it, so an active ``author``, or a name this
+        session listed under ``author`` alone, loads the right program without the index rebuild.
+        """
+        if self._shell.active_author() == author:
+            return False
+        if self._listed is None or author not in self._listed:
+            return True
+        key = _match_key(plain)
+        return key not in self._listed[author] or any(
+            key in names for other, names in self._listed.items() if other != author
+        )
 
     def current_program(self) -> str | None:
         """Name of the loaded program: as loaded here, else the device's plain name."""
@@ -264,7 +289,7 @@ class Transport:
             author, plain = DEFAULT_AUTHOR, name
         shell, device = self._shell, self._device
         reply = shell.watch(f"loading {name}")
-        if slash or self._has_authors():
+        if (slash or self._has_authors()) and self._needs_enumerate(author, plain):
             shell.enumerate_author(author, reply)
         self._loaded = None
         with self._holding(name, hold) if hold is not None else nullcontext():
@@ -399,3 +424,8 @@ def _check_index(index: int) -> int:
     if not 1 <= index <= PARAM_COUNT:
         raise ValueError(f"parameter index must be 1..{PARAM_COUNT}, got {index}")
     return index
+
+
+def _match_key(name: str) -> str:
+    """A program name as ``program load`` matches it: case-insensitive, underscores as spaces."""
+    return name.replace("_", " ").casefold()

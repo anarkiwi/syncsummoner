@@ -23,7 +23,6 @@ from syncsummoner.device.recorder import (
     BlankTakeError,
     TakeReport,
     await_transmitting,
-    inspect_take,
     require_input,
     require_route,
     require_signal,
@@ -85,8 +84,8 @@ DRIVE_TICK_S = 1.0
 #: Playout writes the Pi's framebuffer and capture reads the card, so a session is
 #: whatever both ends already run at; 1080p30 is this rig, measured.
 SESSION_FORMATS = {"720p60": (1280, 720, 60.0), "1080p30": (1920, 1080, 30.0), "ntsc": (720, 480, 29.97)}
-#: Perceptual lead on top of the device latency (design 4.4): visuals may run early
-#: by far more than they may run late, so arrival is placed 10 to 20 ms ahead.
+#: Perceptual lead on top of the device latency: visuals may run early by far more than they may
+#: run late, so arrival is placed a little ahead (design 4.4).
 EARLY_BIAS_S = 0.015
 
 
@@ -353,8 +352,10 @@ def _attempt(
     rig.transport.verify_cc_map()
     require_route(rig.transport, program=program, route=config.route)
     require_signal(rig.transport, when="as the pass ended", **signal)
+    from syncsummoner.compose.judge import judge_take  # pylint: disable=import-outside-toplevel
+
     try:
-        found = attribute_take(out, config=config)
+        judged = judge_take(out, clip=clip, config=config, program=program)
     except LockError as err:
         from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
@@ -362,8 +363,7 @@ def _attempt(
         if lost:
             raise TakeFaultError(f"{program}: the capture driver lost {lost} frames: {err}") from err
         raise
-    proof = locktake.take_evidence(out, program=program, clip=clip, config=config)
-    locktake.evidence_path(out).write_text(proof.to_json(), encoding="utf-8")
+    proof = judged.proof
     locktake.add_schedule(Path(out).parent, proof.schedule())
     for line in proof.lines():
         LOG.info("%s", line)
@@ -371,8 +371,7 @@ def _attempt(
         LOG.warning(
             "%s: the take's parameters are not all proven; see %s", program, locktake.evidence_path(out)
         )
-    start_s = float(found.picked[0]) / (found.per_frame * config.fps)
-    return "take", inspect_take(out, ffmpeg=getattr(config, "ffmpeg", "ffmpeg"), start_s=start_s)
+    return "take", judged.report
 
 
 def verify_dark(
@@ -856,8 +855,14 @@ def checked_plan(
     the covered plan and, per take, the capture showing each clip frame, which :func:`splice` cuts by.
     """
     from syncsummoner.compose.takecheck import DeadTakeError, check_takes
+    from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
 
-    attributions = {name: attribute_take(take, config=config).picked for name, take in takes.items()}
+    ffmpeg, spec = getattr(config, "ffmpeg", "ffmpeg"), decoded.Spec.of(config)
+    features = {name: decoded.features(take, spec, ffmpeg=ffmpeg) for name, take in takes.items()}
+    attributions = {
+        name: attribute_take(take, config=config, features=features[name]).picked
+        for name, take in takes.items()
+    }
     with stage("check", takes=len(takes)):
         report = check_takes(
             score,
@@ -867,7 +872,9 @@ def checked_plan(
             strip_px=config.strip_px,
             bits=config.bits,
             attributions=attributions,
-            ffmpeg=getattr(config, "ffmpeg", "ffmpeg"),
+            features=features,
+            source=decoded.features(clip, spec, ffmpeg=ffmpeg),
+            ffmpeg=ffmpeg,
         )
     for line in report.lines():
         LOG.info("%s", line)
@@ -909,8 +916,7 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
 def source_stream(source: Any, config: RenderConfig, *, seconds: float | None = None, start: float = 0.0):
     """Yield ``(total, frames)``: how many session frames a take is, and them one at a time.
 
-    A long take is never held: 180s at 1080p30 is 134GB as a stack, and the pass
-    only ever looks at one frame.
+    A long take is never held as one stack, since the pass only ever looks at one frame.
     """
     from syncsummoner.compose.features import read_frames
 

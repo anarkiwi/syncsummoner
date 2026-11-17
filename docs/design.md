@@ -486,7 +486,8 @@ rather than only at the segmentation's boundaries. The score records `bar` and
 
 `render_cuts` runs `checked_plan` on every take before splicing, and `check`
 runs it standalone. Each recording is decoded once (body at 160x90 luma, strip at
-full width, times from the decoder's own `showinfo`). A locked take is attributed
+full width, times from the decoder's own `showinfo`) and the decode kept beside it
+([judging.md](judging.md)). A locked take is attributed
 exactly (§10) and `checked_plan` passes that attribution to `check_takes`;
 `check` reads it from `<take>.picked.npy`. Only a recording without one, an
 unlocked recording or a master, is traced by the strip clock and the motion
@@ -534,7 +535,7 @@ number its frames `-L..-1`, wrapped to the strip's 16 bits, so captures under th
 dry program, or before a program load, carry legible strips whatever the program
 does after it.
 
-`compose.lock.attribute_take(take, config=)` reads the take's strips, its sidecar
+`compose.lock.attribute_take(take, config=)` reads the take's strips from its decode, its sidecar
 and its lock record, and returns an `Attribution`:
 
 | Field | Meaning |

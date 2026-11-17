@@ -585,23 +585,21 @@ def _render_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
-def _evidence_cmd(args: argparse.Namespace) -> int:
-    """Prove each take's parameters were sent on their frames, read back, and moved the picture."""
-    from syncsummoner.compose import locktake
-    from syncsummoner.compose import render as render_mod
-    from syncsummoner.device.wire import load_wire
+def _judge_cmd(args: argparse.Namespace) -> int:
+    """Judge finished takes from their recordings and sidecars alone, ``--jobs`` at once; no device opened."""
+    from syncsummoner.compose import judge as judge_mod
+    from syncsummoner.compose.render import RenderConfig
 
-    config = render_mod.RenderConfig.for_format(args.format, strip_px=args.strip_px)
-    failed = 0
-    for take in args.takes:
-        program = args.program or str(load_wire(take).get("program", Path(take).stem))
-        proof = locktake.take_evidence(
-            take, program=program, clip=args.source, config=config, predict=args.predict
-        )
-        locktake.evidence_path(take).write_text(proof.to_json(), encoding="utf-8")
-        print("\n".join(proof.lines()))
-        failed += not proof.ok
-    return 1 if failed else 0
+    options = {k: getattr(args, k) for k in ("source", "program", "score", "predict")}
+    options["config"] = RenderConfig.for_format(args.format, strip_px=args.strip_px)
+    results = judge_mod.judge_takes(
+        args.takes, options, jobs=args.jobs, workers=args.workers, verbosity=args.verbose
+    )
+    for take, said in zip(args.takes, results):
+        print(f"{take}: {json.dumps(said)}")
+    if any(said.get("lock") != "ok" for said in results):
+        return 2
+    return 1 if any(not said["evidence_ok"] or said.get("check_failed") for said in results) else 0
 
 
 def _check_cmd(args: argparse.Namespace) -> int:
@@ -947,18 +945,27 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             node.add_argument("--seconds", type=float, default=30.0, help="excerpt length")
             node.add_argument("--start", type=float, default=0.0, help="where the excerpt begins")
 
-    proof = sub.add_parser(
-        "evidence", help="prove each take's parameters were sent on their frames, read back and acted upon"
+    judging = sub.add_parser(
+        "judge",
+        aliases=["evidence"],
+        help="judge finished takes offline: attribution, evidence, picture and the score's take check",
     )
-    proof.add_argument("takes", nargs="+", help="frame-locked takes, each with its .wire.npz and .lock.npz")
-    proof.add_argument("--source", required=True, help="the timecoded clip the takes were played from")
-    proof.add_argument("--program", help="the program the takes ran (default: as each wire record says)")
-    proof.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
-    proof.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
-    proof.add_argument(
+    judging.add_argument(
+        "takes", nargs="+", help="finished takes, each with its .v4l2, .lock.npz and .wire.npz"
+    )
+    judging.add_argument("--source", required=True, help="the timecoded clip the takes were played from")
+    judging.add_argument("--score", help="the score the takes played, to check every bar against the clip")
+    judging.add_argument("--program", help="the program the takes ran (default: as each wire record says)")
+    judging.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
+    judging.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
+    judging.add_argument("--jobs", type=int, default=1, help="takes judged at once, each in its own process")
+    judging.add_argument(
+        "--workers", type=int, help="decoders per take (default: the cores shared by the jobs)"
+    )
+    judging.add_argument(
         "--predict", action="store_true", help="set each verdict against the program model's prediction"
     )
-    proof.set_defaults(func=_evidence_cmd)
+    judging.set_defaults(func=_judge_cmd)
 
     check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")
     check.add_argument("score")

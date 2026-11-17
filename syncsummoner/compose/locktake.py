@@ -8,7 +8,6 @@ write is then sent midway between the ticks around its frame's. See docs/evidenc
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from contextlib import contextmanager
 import time
@@ -22,12 +21,12 @@ from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import live_attribution, read_live, save_lock
 from syncsummoner.device.profile import PARAM_MAX
 from syncsummoner.device.wire import Poller, Sender, save_wire
+from syncsummoner.probe import decoded
+from syncsummoner.probe.decoded import CALIBRATION_SIZE
 from syncsummoner.progress import LOG, meter
 
 #: Settings key the device counts its boots in.
 BOOT_COUNT_KEY = 9
-#: Size the lead-in's pictures are compared at to see where a calibration write landed.
-CALIBRATION_SIZE = (96, 54)
 #: Plan rows: target clip frame, 1-based parameter, device value.
 PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
 #: Interpreter thread switch interval during a take, well inside the tick a late wake-up must make.
@@ -116,20 +115,6 @@ def to_units(value: Any) -> int:
 def boot_count(shell: Any) -> int:
     """The device's boot count."""
     return int(json.loads(shell.get_setting(BOOT_COUNT_KEY))["value"])
-
-
-def small_frames(
-    path: str | Path, *, size: tuple[int, int], strip_px: int, ffmpeg: str = "ffmpeg"
-) -> np.ndarray:
-    """Every stored frame so far, strip cropped, area-scaled to ``size`` in planar YUV."""
-    width, height = size
-    argv = [ffmpeg, "-loglevel", "quiet", "-i", str(path), "-fps_mode", "passthrough", "-vf"]
-    argv += [f"crop=iw:ih-{strip_px}:0:0,scale={width}:{height}:flags=area", "-f", "rawvideo"]
-    argv += ["-pix_fmt", "yuv444p", "pipe:1"]
-    data = subprocess.run(argv, check=False, capture_output=True).stdout
-    stride = 3 * width * height
-    count = len(data) // stride
-    return np.frombuffer(data, np.uint8, count * stride).reshape(count, 3, height, width)
 
 
 def frame_starts(size: int, runs: Any, per_frame: int) -> np.ndarray:
@@ -584,25 +569,32 @@ def take_evidence(
     config: Any,
     names: Mapping[int, str] | None = None,
     predict: bool = False,
+    found: Any = None,
+    features: decoded.Features | None = None,
+    source: decoded.Features | None = None,
 ) -> ev.Evidence:
     """The three links for a recorded take, from its wire record, its attribution and its picture.
 
-    With ``predict``, each parameter's verdict is set against the program model's prediction.
+    ``found`` is the take's attribution and ``features`` and ``source`` the take's and the clip's
+    decodes, each made here when not given. With ``predict``, verdicts meet the program model's predictions.
     """
     from syncsummoner.compose.lock import attribute_take  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.wire import load_wire  # pylint: disable=import-outside-toplevel
 
+    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
+    spec = decoded.Spec.of(config)
+    features = decoded.features(take, spec, ffmpeg=ffmpeg) if features is None else features
+    source = decoded.features(clip, spec, ffmpeg=ffmpeg) if source is None else source
     wire = load_wire(take)
     if names is None:
         names = {int(k): v for k, v in json.loads(str(wire["names"])).items()} if "names" in wire else {}
-    found = attribute_take(take, config=config)
+    found = attribute_take(take, config=config, features=features) if found is None else found
     frames = read_log(take)
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, found.lead)
     sends = wire["sends"]
     calibration = sends[sends["target"] == ev.CALIBRATION]
-    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    images = small_frames(take, size=CALIBRATION_SIZE, strip_px=config.strip_px, ffmpeg=ffmpeg)
+    images = features.small
     used = json.loads(str(wire["latency"])) if "latency" in wire else {}
     if "lo" in used:
         lat = ev.Latency(lo=used["lo"], hi=used["hi"], samples=used.get("samples", 0), period=times.period)
@@ -631,8 +623,7 @@ def take_evidence(
         got = ev.received(ev.expected_messages(sends, wire["cc_map"]), receipts)
     count = found.picked.size
     out = images[found.picked].astype(np.float32)
-    src = small_frames(clip, size=CALIBRATION_SIZE, strip_px=config.strip_px, ffmpeg=ffmpeg)
-    src = src[found.lead : found.lead + count].astype(np.float32)
+    src = source.small[found.lead : found.lead + count].astype(np.float32)
     luma_range = np.ptp(out[:, 0].reshape(count, -1), axis=1)
     rows = landed_rows.rows
     sent = rows["sent"] >= 0

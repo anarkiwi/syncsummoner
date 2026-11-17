@@ -14,14 +14,12 @@ from typing import Any
 
 import numpy as np
 
-from syncsummoner.progress import LOG, track
+from syncsummoner.probe import decoded
+from syncsummoner.probe.patterns import read_codes
+from syncsummoner.progress import LOG
 
-#: Strip contrast below which a strip is unreadable, as :func:`~.render.read_timecode` has it.
-MIN_CONTRAST = 0.25
 #: A capture interval past the midpoint between one period and two is a lost frame or an outage.
 GAP_PERIODS = 1.5
-#: Frames decoded per read when scanning a recording's strips.
-CHUNK = 512
 
 
 class LockError(RuntimeError):
@@ -30,51 +28,6 @@ class LockError(RuntimeError):
 
 class LostTimecodeError(RuntimeError):
     """A take carries no lock record, so nothing says which capture shows which clip frame."""
-
-
-def read_codes(strips: np.ndarray, *, bits: int, min_contrast: float = MIN_CONTRAST) -> np.ndarray:
-    """Frame indices from ``(n, rows, width, 3)`` strips in ``[0, 1]``; -1 where unreadable.
-
-    Vectorised :func:`~syncsummoner.compose.render.read_timecode`: a marker cell, then ``bits``
-    Gray-coded cells, thresholded against the strip's own mean.
-    """
-    strip = np.asarray(strips, dtype=np.float64).mean(axis=(1, 3))
-    edges = np.round(np.linspace(0, strip.shape[1], bits + 2)).astype(int)
-    cells = np.add.reduceat(strip, edges[:-1], axis=1) / np.maximum(np.diff(edges), 1)
-    mean = cells.mean(axis=1, keepdims=True)
-    legible = (np.ptp(cells, axis=1) >= min_contrast) & (cells[:, 0] >= mean[:, 0])
-    binary = np.bitwise_xor.accumulate((cells[:, 1:] > mean).astype(np.int64), axis=1)
-    codes = (binary << np.arange(bits - 1, -1, -1)).sum(axis=1)
-    return np.where(legible, codes, -1)
-
-
-def strip_codes(
-    path: str | Path,
-    *,
-    width: int,
-    strip_px: int = 8,
-    bits: int = 16,
-    ffmpeg: str = "ffmpeg",
-    growing: bool = False,
-) -> np.ndarray:
-    """Every stored frame's strip code, in stream order, -1 where unreadable.
-
-    A ``growing`` recording is read as far as it has been written, its unfinished tail ignored.
-    """
-    argv = [ffmpeg, "-loglevel", "error", "-i", str(path), "-fps_mode", "passthrough"]
-    argv += ["-vf", f"crop=iw:{strip_px}:0:ih-{strip_px}", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    size = width * strip_px * 3
-    out = []
-    with subprocess.Popen(argv, stdout=subprocess.PIPE) as proc:
-        for _ in track(iter(int, 1), desc="strips", unit="chunk"):
-            data = proc.stdout.read(size * CHUNK)
-            if len(data) < size:
-                break
-            block = np.frombuffer(data[: len(data) - len(data) % size], np.uint8)
-            out.append(read_codes(block.reshape(-1, strip_px, width, 3) / np.float32(255.0), bits=bits))
-    if proc.returncode and not growing:
-        raise LockError(f"decoding the strips of {path} failed with exit {proc.returncode}")
-    return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
 
 
 @dataclass(frozen=True)
@@ -333,11 +286,18 @@ def save_lock(take: str | Path, flips: np.ndarray, *, hold: int, lead: int, coun
     np.savez(lock_path(take), flips=flips, hold=hold, lead=lead, count=count)
 
 
-def attribute_take(take: str | Path, *, config: Any, codes: np.ndarray | None = None) -> Attribution:
+def attribute_take(
+    take: str | Path,
+    *,
+    config: Any,
+    codes: np.ndarray | None = None,
+    features: decoded.Features | None = None,
+) -> Attribution:
     """The take's :class:`~syncsummoner.compose.lock.Attribution`, checked exact; ``picked`` saved beside it.
 
-    Every clip frame must have a capture, inside one gap-free run whose frame starts all
-    agree on its cadence; anything less is a :class:`~syncsummoner.compose.lock.LockError`.
+    Strips read as ``codes``, else as the take's :class:`~syncsummoner.probe.decoded.Features` hold them.
+    Every clip frame must have a capture, inside one gap-free run whose frame starts all agree on
+    its cadence; anything less is a :class:`~syncsummoner.compose.lock.LockError`.
     """
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
@@ -346,10 +306,11 @@ def attribute_take(take: str | Path, *, config: Any, codes: np.ndarray | None = 
     except FileNotFoundError as err:
         raise LostTimecodeError(f"{take}: no lock record, so it was not played by the locked player") from err
     if codes is None:
-        ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-        codes = strip_codes(
-            take, width=config.width, strip_px=config.strip_px, bits=config.bits, ffmpeg=ffmpeg
-        )
+        if features is None:
+            features = decoded.features(
+                take, decoded.Spec.of(config), ffmpeg=getattr(config, "ffmpeg", "ffmpeg")
+            )
+        codes = features.codes
     found = attribute(
         codes,
         read_log(take),
