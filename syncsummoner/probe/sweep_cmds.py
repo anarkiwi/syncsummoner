@@ -54,7 +54,7 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     if args.cover:
         states = recorded(json.loads(Path(args.cover).read_text(encoding="utf-8")), values)
     else:
-        states = levels(cover(m, gating=Gating(m, steps=not args.structural)))
+        states = levels(cover(m, gating=Gating(m)))
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         states = joint(states, selector, mover, values)
     states = carried(states, toggles)
@@ -182,7 +182,7 @@ def add_parsers(probe_sub: Any) -> None:
     plan.add_argument("--source", required=True, help="the timecoded clip the takes will play")
     plan.add_argument("--takes", required=True, help="the sweep's takes directory")
     plan.add_argument(
-        "--structural", action="store_true", help="cover by the folded cone alone, as program cover"
+        "--structural", action="store_true", help="accepted for scripts: every cover is by observability"
     )
     plan.add_argument("--cover", help="a cover as `program cover --json` wrote it, in place of searching one")
     plan.add_argument(

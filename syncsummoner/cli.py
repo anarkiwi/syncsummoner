@@ -667,7 +667,7 @@ def _program_cmd(args: argparse.Namespace) -> int:
         )
         return 0
     if args.program_cmd == "cover":
-        print(gates.report(m, state, args.timing, steps=not args.structural, as_json=args.json))
+        print(gates.report(m, state, args.timing, as_json=args.json))
         return 0
     print(json.dumps(rows(m, state, args.timing), indent=1) if args.json else table(m, state, args.timing))
     return 0
@@ -770,7 +770,9 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             "--source", choices=("rtl", "bitstream"), help="netlist source (default: rtl if published)"
         )
         node.add_argument("--json", action="store_true")
-        node.add_argument("--structural", action="store_true", help="cover: live by the folded cone alone")
+        node.add_argument(
+            "--structural", action="store_true", help="accepted for scripts: every cover is by observability"
+        )
     program.set_defaults(func=_program_cmd)
 
     probe = sub.add_parser("probe", help="measure device behaviour")

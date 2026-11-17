@@ -1,26 +1,29 @@
 """Per-program parameter model: the declarations, the bits each drives, and which bits a state leaves live.
 
-Results are cached per program id, version, package digest, netlist source and
-query under ``SYNCSUMMONER_PROGRAM_CACHE`` (default ``.program-cache``).
+The netlist, its gate-level form and its observability conditions are built once and cached per
+program id, version, package digest and netlist source under ``SYNCSUMMONER_PROGRAM_CACHE``
+(default ``.program-cache``); every liveness query is then answered in-process from them.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import threading
+import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
-from syncsummoner.progress import track
+from syncsummoner.progress import LOG, track
 
-from . import hdl
+from . import hdl, observe
 from .declared import (
     CORE_REGISTERS,
     LATCHED_REGISTERS,
@@ -39,6 +42,7 @@ from .declared import (
     registers,
 )
 from .library import Library, Program
+from .ternary import Ternary
 from .vmprog import ParamDecl, SectionType
 
 DEFAULT_CONFIG = "hd_hdmi"
@@ -46,6 +50,21 @@ PACKAGE = "tq144:4k"
 PCF = "fpga/hardware/rev_b/constraints/pin_map.pcf"
 TIMING = "timing"
 VIDEO_IN = "ADV7611_D"
+#: Name of the video input bits' joint observability condition.
+VIDEO = "video"
+#: ``registers_in`` bits held as BDD variables: words 0-7 (the controls) and 8 (timing).
+CONTROL_BITS = tuple(
+    flat_bit(r, b) for r in range(TIMING_REGISTER + 1) for b in reversed(range(REGISTER_BITS))
+)
+
+
+def timing_bits() -> tuple[int, ...]:
+    """``registers_in`` bits of the timing word."""
+    return tuple(flat_bit(TIMING_REGISTER, b) for b in range(REGISTER_BITS))
+
+
+#: Core-only words, free inputs of every query.
+LOOSE_BITS = tuple(flat_bit(r, b) for r in CORE_REGISTERS for b in range(REGISTER_BITS))
 
 
 @dataclass(frozen=True)
@@ -98,7 +117,14 @@ class ProgramModel:
         root = Path(cache or os.environ.get("SYNCSUMMONER_PROGRAM_CACHE") or ".program-cache").resolve()
         self.cache = root / program.key / f"{self.source}-{config}"
         self._net: hdl.Netlist | None = None
-        self._lock = threading.Lock()
+        self._circuit: observe.Circuit | None = None
+        self._conditions: dict[frozenset, observe.Conditions] = {}
+        self._ternary: Ternary | None = None
+        self.method: str | None = None
+        #: Bytes the BDDs may use; None for what the process may use when an analysis starts.
+        self.memory: int | None = None
+        self.timings: dict[str, float] = {}
+        self._lock = threading.RLock()
         self._recent: OrderedDict[str, hdl.Netlist] = OrderedDict()
         self.note = ""
 
@@ -209,21 +235,97 @@ class ProgramModel:
                     ties[k] = (words.get(reg, 0) >> bit) & 1 if reg < LATCHED_REGISTERS else 0
         return ties, named
 
+    @property
+    def circuit(self) -> observe.Circuit:
+        """The netlist in Yosys's gate library: one Yosys run per build, cached as ``gates.json``."""
+        with self._lock:
+            if self._circuit is None:
+                path = self.cache / "gates.json"
+                if not path.exists():
+                    start = time.monotonic()
+                    net = hdl.lower(self.tools, self.netlist, self.cache)
+                    net.save(path.with_suffix(".tmp")).replace(path)
+                    self.timings["lower"] = time.monotonic() - start
+                design = json.loads(path.read_text(encoding="utf-8"))
+                self._circuit = observe.Circuit.read(
+                    design, "program_top" if self.source == "rtl" else "chip"
+                )
+        return self._circuit
+
+    def _path(self, key: frozenset) -> Path:
+        return self.cache / f"observe-{'-'.join(sorted(map(str, key))) or 'tied'}.json"
+
+    def _job(self, key: frozenset) -> tuple:
+        """What one analysis needs, picklable: the circuit, its varying bits, its sources and its file."""
+        circuit = self.circuit
+        nets = circuit.controls()
+        video = "data_in" if self.source == "rtl" else VIDEO_IN
+        sources = {
+            f"c{k}": (f"c{k}", [nets[k]]) for p in key if p != TIMING for k in field(p).flat if k in nets
+        }
+        sources[VIDEO] = (None, [b for b, n in circuit.inputs_named().items() if n.startswith(video)])
+        varying = sorted(k for p in key for k in (timing_bits() if p == TIMING else field(p).flat))
+        return circuit, varying, sources, self._path(key), self.cache / "observe.exhausted", self.memory
+
+    def prepare(self, keys: Iterable[Iterable]) -> None:
+        """Build the missing analyses of several freed sets at once, one process per CPU."""
+        todo = [k for k in {frozenset(k) for k in keys} if not self._path(k).exists()]
+        if len(todo) < 2 or self.method == "ternary" or (self.cache / "observe.exhausted").exists():
+            return
+        start = time.monotonic()
+        jobs = [self._job(k) for k in todo]
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=min(hdl.cpus(), len(jobs)), mp_context=context) as pool:
+            list(track(pool.map(_analyse, *zip(*jobs)), total=len(jobs), desc="analyses", unit="set"))
+        self.timings["observe"] = self.timings.get("observe", 0.0) + time.monotonic() - start
+        self.timings["analyses"] = self.timings.get("analyses", 0) + len(jobs)
+
+    def conditions(self, free: Iterable = ()) -> observe.Conditions | None:
+        """Observability conditions over the controls, with those in ``free`` (and ``timing``) varying.
+
+        None once this program's BDDs have outgrown memory, so the ternary simulator answers (``method``).
+        """
+        key = frozenset(free)
+        circuit = self.circuit
+        with self._lock:
+            spent = self.cache / "observe.exhausted"
+            if self.method != "ternary" and key not in self._conditions and not spent.exists():
+                path = self._path(key)
+                if not path.exists():
+                    start = time.monotonic()
+                    _analyse(*self._job(key))
+                    self.timings["observe"] = self.timings.get("observe", 0.0) + time.monotonic() - start
+                    self.timings["analyses"] = self.timings.get("analyses", 0) + 1
+                if path.exists():
+                    self._conditions[key] = observe.Conditions.load(path, CONTROL_BITS)
+            method = "ternary" if spent.exists() else "bdd"
+            if method != self.method:
+                self.method = method
+                LOG.info("%s: liveness by %s", self.program.name, method)
+            if method == "ternary" and self._ternary is None:
+                self._ternary = Ternary(circuit)
+            return self._conditions.get(key) if method == "bdd" else None
+
     def _reach(self, state: np.ndarray, timing: int | None, free: Sequence) -> dict[int, list[int]]:
         """Live bits of each freed control, with everything else tied to ``state``."""
-        ties, named = self._ties(state, timing, free)
-        key = {"ties": sorted(ties.items()), "named": sorted((k, v) for k, v in named.items())}
+        return self._reach_many([state], timing, free)[0]
 
-        def compute():
-            reached = hdl.reaching(self._folded(state, timing, free))
-            out = {}
-            for name, ks in named.items():
-                pid = int(name[1:])
-                bits = field(pid).bits
-                out[pid] = [bits[i] for i in range(len(ks)) if f"{name}_b{i}" in reached]
-            return out
-
-        return {int(k): v for k, v in self._cached("reach", key, compute).items()}
+    def _reach_many(
+        self, states: Sequence[np.ndarray], timing: int | None, free: Sequence
+    ) -> list[dict[int, list[int]]]:
+        pids = [p for p in dict.fromkeys(free) if p != TIMING]
+        ties = [self._ties(np.asarray(s, dtype=np.int64), timing, free)[0] for s in states]
+        cond = self.conditions({*free, *([TIMING] if timing is None else [])})
+        if cond is not None:
+            seen = [{k: cond.live(f"c{k}", t) for p in pids for k in field(p).flat} for t in ties]
+        else:
+            lanes = self._ternary.live(_lanes(ties))
+            seen = [
+                {k: bool(lanes[f"c{k}"][i]) for p in pids for k in field(p).flat} for i in range(len(ties))
+            ]
+        return [
+            {p: [b for b, k in zip(field(p).bits, field(p).flat) if hit[k]] for p in pids} for hit in seen
+        ]
 
     def reach(
         self, state: np.ndarray, free: Sequence[int], timing: int | None = None
@@ -233,6 +335,26 @@ class ProgramModel:
         Dead is exact for every value of the freed controls; live means some value reaches the video.
         """
         return self._reach(np.asarray(state, dtype=np.int64), timing, list(free))
+
+    def revivable(
+        self, state: np.ndarray, param: int, free: Sequence[int], timing: int | None = None
+    ) -> bool:
+        """Whether some held setting of the controls in ``free`` makes ``param`` live, the rest at ``state``.
+
+        Exact from ``param``'s own conditions; the ternary simulator answers with ``free`` left as X.
+        """
+        state = np.asarray(state, dtype=np.int64)
+        cond = self.conditions({param, *([TIMING] if timing is None else [])})
+        if cond is None:
+            return bool(self._reach(state, timing, [param, *free])[param])
+        ties, _ = self._ties(state, timing, [param, *free])
+        return any(cond.live(f"c{k}", ties) for k in field(param).flat)
+
+    def reach_many(
+        self, states: Sequence[np.ndarray], free: Sequence[int], timing: int | None = None
+    ) -> list[dict[int, list[int]]]:
+        """:meth:`reach` at each of ``states``, in one pass where the ternary simulator answers."""
+        return self._reach_many(states, timing, list(free))
 
     def resolution(self) -> dict[int, tuple[int, ...]]:
         """Bits of each control the program reads at all, every register free."""
@@ -247,35 +369,18 @@ class ProgramModel:
         """
         state = self.initial() if state is None else np.asarray(state, dtype=np.int64)
         pids = [d.parameter_id for d in self.params]
-        with ThreadPoolExecutor(max_workers=hdl.cpus()) as pool:
-            reach = dict(
-                zip(
-                    pids,
-                    track(
-                        pool.map(lambda p: self._reach(state, timing, [p])[p], pids),
-                        total=len(pids),
-                        desc=f"{self.program.name} live",
-                        unit="param",
-                    ),
-                )
-            )
-            out = {p: Liveness(p, tuple(bits)) for p, bits in reach.items()}
-            if not gates:
-                return out
-            dead = [p for p, bits in reach.items() if not bits]
-            others = [*pids, *([TIMING] if timing is not None else [])]
-            jobs = [(p, q) for p in dead for q in others if q != p]
-            hits = list(
-                track(
-                    pool.map(lambda pq: bool(self._reach(state, timing, [pq[0], pq[1]])[pq[0]]), jobs),
-                    total=len(jobs),
-                    desc=f"{self.program.name} gates",
-                    unit="pair",
-                )
-            )
-        for p in dead:
+        self.prepare({p, *([TIMING] if timing is None else [])} for p in pids)
+        out = {p: Liveness(p, tuple(self._reach(state, timing, [p])[p])) for p in pids}
+        if not gates:
+            return out
+        others = [*pids, *([TIMING] if timing is not None else [])]
+        dead = [p for p in pids if not out[p].live]
+        self.prepare({p, q, *([TIMING] if timing is None else [])} for p in dead for q in others if q != p)
+        for p in track([p for p in pids if not out[p].live], desc=f"{self.program.name} gates", unit="param"):
             names = tuple(
-                f"P{q}" if q != TIMING else TIMING for (pp, q), hit in zip(jobs, hits) if pp == p and hit
+                f"P{q}" if q != TIMING else TIMING
+                for q in others
+                if q != p and self._reach(state, timing, [p, q])[p]
             )
             out[p] = Liveness(p, (), names)
         return out
@@ -345,12 +450,11 @@ class ProgramModel:
         """Whether any video input bit is still in the fan-in cone of the outputs at ``state``."""
         ties, _ = self._ties(np.asarray(state, dtype=np.int64), timing, [])
         prefix = "data_in" if self.source == "rtl" else VIDEO_IN
-
-        def compute():
-            reached = hdl.reaching(hdl.fold(self.tools, hdl.tie(self.netlist, ties, {}), self.cache))
-            return any(name.startswith(prefix) for name in reached)
-
-        return self._cached("carries", {"ties": sorted(ties.items())}, compute)
+        cond = self.conditions([TIMING] if timing is None else [])
+        if cond is not None:
+            return cond.live(VIDEO, ties)
+        lanes = self._ternary.live(_lanes([ties]))
+        return any(bool(v[0]) for name, v in lanes.items() if name.startswith(prefix))
 
     def bypass(self, state: np.ndarray | None = None, timing: int | None = None) -> int | None:
         """The declared switch that, turned on, leaves every other control dead and the input in the video.
@@ -409,6 +513,28 @@ def model(
     ]
     chip.note = "published source does not match the package: it reads " + "; ".join(differ)
     return chip
+
+
+def _analyse(
+    circuit: observe.Circuit, varying: list, sources: dict, path: Path, spent: Path, memory: int | None
+) -> None:
+    """One analysis into ``path``, or the reason it outgrew ``memory`` (bytes) into ``spent``."""
+    try:
+        analysis = observe.Analysis(circuit, CONTROL_BITS, LOOSE_BITS, limit=memory, varying=varying)
+        found = analysis.observe(sources)
+        found.save(path)
+    except observe.Exhausted as err:
+        spent.write_text(str(err))
+
+
+def _lanes(ties: Sequence[Mapping[int, int]]) -> np.ndarray:
+    """Tie sets as a lane-by-bit matrix of 0, 1 and -1 for an untied bit."""
+    out = np.full((len(ties), REGISTER_COUNT * REGISTER_BITS), -1, dtype=np.int8)
+    for i, t in enumerate(ties):
+        if t:
+            keys = np.fromiter(t, dtype=np.int64)
+            out[i, keys] = np.fromiter(t.values(), dtype=np.int8)
+    return out
 
 
 def _bits(bits: Sequence[int]) -> str:

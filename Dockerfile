@@ -33,9 +33,17 @@ RUN for spec in "videomancer-sdk ${VIDEOMANCER_SDK}" "videomancer-community-prog
         && git -C /opt/upstream/$1 checkout -q FETCH_HEAD && rm -rf /opt/upstream/$1/.git; \
     done
 
+# dd's Cython bindings to CUDD, built against the CUDD release dd pins and verifies.
+FROM base AS bdd
+ARG DD=0.6.0
+RUN pip install --no-cache-dir cython setuptools wheel \
+    && DD_FETCH=1 DD_CUDD=1 pip wheel --no-cache-dir --no-deps --no-binary dd --no-build-isolation \
+        "dd==${DD}" -w /wheels
+
 FROM base AS hdl
 RUN apt-get update && apt-get install -y --no-install-recommends zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=bdd /wheels /wheels
 COPY --from=hdl-tools /opt/oss-cad-suite /opt/oss-cad-suite
 COPY --from=upstream /opt/upstream /opt/upstream
 ENV SYNCSUMMONER_HDL_BIN=/opt/oss-cad-suite/bin \
@@ -52,7 +60,7 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
     && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
-        "pyvmancer[serial]>=0.6.5"
+        "pyvmancer[serial]>=0.6.5" /wheels/dd-*.whl
 
 # The seam check (design SS2.7): only the aesthetics extra, no device stack.
 FROM base AS deps-aesthetics
@@ -70,7 +78,7 @@ COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
-        "pyvmancer[all]>=0.6.5"
+        "pyvmancer[all]>=0.6.5" /wheels/dd-*.whl
 COPY . .
 RUN /venv/bin/pip install --no-deps -e .
 WORKDIR /work

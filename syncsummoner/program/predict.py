@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 
 from syncsummoner.progress import track
 
-from .hdl import cpus
 from .declared import PARAM_COUNT, field, register_value
 from .model import ProgramModel
 
@@ -99,10 +96,10 @@ def knob_gated(model: ProgramModel, reference: np.ndarray | None = None) -> froz
 def classify(
     model: ProgramModel, start: np.ndarray, rows: np.ndarray, timing: int | None = None
 ) -> np.ndarray:
-    """Each landed write's step as the model's folded cone predicts it from the state it was taken in.
+    """Each landed write's step as the model's observability predicts it from the state it was taken in.
 
     ``dead`` when no bit of the parameter reaches the video, ``no-op`` when the step changes only dead
-    bits, ``live`` otherwise. One fold per gating class (:func:`gating_class`), memoised on disk.
+    bits, ``live`` otherwise. One query per gating class (:func:`gating_class`).
     """
     pre, a, b = pre_states(start, rows)
     out = np.full(len(rows), UNSENT, dtype=object)
@@ -122,19 +119,7 @@ def classify(
             return ()
         return tuple(model.reach(pre[first[key]], free, timing)[param])
 
-    classes = list(first)
-    with ThreadPoolExecutor(max_workers=cpus()) as pool:
-        live = dict(
-            zip(
-                classes,
-                track(
-                    pool.map(query, classes),
-                    total=len(classes),
-                    desc=f"{model.program.name} classes",
-                    unit="class",
-                ),
-            )
-        )
+    live = {key: query(key) for key in track(list(first), desc=f"{model.program.name} classes", unit="class")}
     for i, key in track(list(zip(todo, keys)), desc=f"{model.program.name} steps", unit="step"):
         p, bits = int(rows["param"][i]), live[key]
         if not bits:

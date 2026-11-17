@@ -1,7 +1,7 @@
 """Which controls make each parameter live, and the fewest base states that step every one where it is.
 
-Live means a written bit reaches the video and the representative steps are not all proven no-ops;
-revivals are found by exact refutation with controls freed, then scans of each remaining control;
+Live means a written bit is observable at the video (:mod:`.observe`); revivals are found by exact
+refutation with controls freed, then by each remaining control's settings over its resolution classes;
 the states they reach are covered by a lexicographic 0-1 programme (fewest states, then steps).
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 import itertools
 import json
 from functools import cached_property
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
@@ -20,34 +19,24 @@ from scipy.sparse import coo_matrix
 
 from syncsummoner.progress import track
 
-from .hdl import cpus
-from .declared import VALUE_MAX, classes, registers
-from .model import ProgramModel, Step
+from . import declared
+from .declared import REGISTER_BITS, TIMING_REGISTER, VALUE_MAX, classes, flat_bit, register_value, registers
+from .model import TIMING, ProgramModel
 
-LIVE, NOOP, DEAD = "live", "no-op", "dead"
+LIVE, DEAD = "live", "dead"
 
 
 @dataclass(frozen=True)
 class Status:
-    """One parameter at one state: its live bits and its representative steps' verdicts."""
+    """One parameter at one state: the bits of it observable at the video."""
 
     param: int
     live_bits: tuple[int, ...]
-    steps: tuple[Step, ...] | None = ()
 
     @property
     def state(self) -> str:
-        """``live``; ``no-op`` if its bits reach the video but each checked step is proven inert; ``dead``."""
-        if not self.live_bits:
-            return DEAD
-        if self.steps is None:
-            return LIVE
-        return LIVE if any(s.matters is not False for s in self.steps) else NOOP
-
-    @property
-    def witnessed(self) -> bool:
-        """Whether a checked step has a concrete witness of changing the video."""
-        return any(s.matters is True for s in self.steps or ())
+        """``live`` or ``dead``."""
+        return LIVE if self.live_bits else DEAD
 
 
 @dataclass(frozen=True)
@@ -59,7 +48,6 @@ class Revival:
     """
 
     param: int
-    kind: str
     moves: tuple[tuple[int, int], ...]
     spans: tuple[tuple[int, int], ...] = ()
 
@@ -96,25 +84,6 @@ def tour(values: np.ndarray, base: int) -> np.ndarray:
     return walk[np.isin(walk, values)]
 
 
-def probe_steps(values: np.ndarray) -> list[tuple[int, int]]:
-    """Lowest to middle and middle to highest setting: two steps that between them span every bit."""
-    lo, mid, hi = int(values[0]), int(values[len(values) // 2]), int(values[-1])
-    return [(a, b) for a, b in ((lo, mid), (mid, hi)) if a != b]
-
-
-def status(
-    m: ProgramModel, state: np.ndarray, param: int, timing: int | None = None, *, steps: bool = True
-) -> Status:
-    """A parameter's live bits at ``state`` and, with ``steps``, its representative steps there."""
-    bits = tuple(m.reach(state, [param], timing)[param])
-    if not bits or not steps:
-        return Status(param, bits, None if bits else ())
-    values = representatives(m, param, bits)
-    return Status(
-        param, bits, tuple(m.step_matters(state, param, a, b, timing) for a, b in probe_steps(values))
-    )
-
-
 def intervals(ok: np.ndarray) -> list[tuple[int, int]]:
     """Maximal runs of consecutive indices where ``ok`` holds, as inclusive ``(lo, hi)``."""
     edges = np.diff(np.r_[0, ok.astype(np.int8), 0])
@@ -128,15 +97,80 @@ def _apply(state: np.ndarray, moves: Iterable[tuple[int, int]]) -> np.ndarray:
     return out
 
 
+def condition(m: ProgramModel, param: int, timing: int | None = None):
+    """Where some bit of ``param`` is observable, as a BDD over the other declared controls' bits.
+
+    The parameter itself (and, with no ``timing``, register 8) varies; undeclared bits are 0.
+    """
+    cond = m.conditions({param, *([TIMING] if timing is None else [])})
+    bdd = cond.bdd
+    named = {f"c{k}" for d in m.params for k in declared.field(d.parameter_id).flat}
+    clock = {f"c{flat_bit(TIMING_REGISTER, b)}": b for b in range(REGISTER_BITS)}
+    u = bdd.false
+    for k in declared.field(param).flat:
+        u |= cond.condition(f"c{k}")
+    own = {f"c{k}" for k in declared.field(param).flat}
+    fixed = {v: False for v in bdd.vars if v not in named | set(clock)}
+    if timing is not None:
+        fixed |= {v: bool((timing >> b) & 1) for v, b in clock.items() if v in bdd.vars}
+    return bdd, bdd.exist(own | (set(clock) if timing is None else set()), bdd.let(fixed, u))
+
+
+def branches(m: ProgramModel, bdd, u, gates: Sequence[int]) -> list[list[tuple[int, list[tuple[int, int]]]]]:
+    """``u`` as disjoint branches, each a list of ``(gate, manual-value intervals)`` over ``gates`` in order.
+
+    A gate's manual values are grouped by the condition left once its bits take their value, and each
+    group is stated as maximal intervals; gates outside the remaining support are skipped.
+    """
+    if u == bdd.false:
+        return []
+    if u == bdd.true or not gates:
+        return [[]]
+    gate, rest = gates[0], list(gates[1:])
+    names = [f"c{k}" for k in declared.field(gate).flat]
+    if not set(names) & bdd.support(u):
+        return branches(m, bdd, u, rest)
+    values = register_value(m.decl(gate), np.arange(VALUE_MAX + 1))
+    bits = declared.field(gate).bits
+    by_value: dict[int, object] = {}
+    cofactor = []
+    for v in values.tolist():
+        if v not in by_value:
+            word = v << bits[0] if len(bits) == 1 else v
+            by_value[v] = bdd.let({n: bool((word >> b) & 1) for n, b in zip(names, bits)}, u)
+        cofactor.append(by_value[v])
+    out = []
+    for f in dict.fromkeys(cofactor):
+        ok = np.array([c == f for c in cofactor])
+        for tail in branches(m, bdd, f, rest):
+            out.append([(gate, intervals(ok)), *tail])
+    return out
+
+
+def structure(m: ProgramModel, timing: int | None = None) -> dict[int, list[str]]:
+    """Per declared parameter, every setting of the others that makes it live, read off its condition."""
+    out = {}
+    for d in m.params:
+        p = d.parameter_id
+        others = [q.parameter_id for q in m.params if q.parameter_id != p]
+        found = branches(m, *condition(m, p, timing), others)
+        out[p] = [
+            " and ".join(
+                f"P{g} in " + ", ".join(f"{lo}" if lo == hi else f"{lo}..{hi}" for lo, hi in spans)
+                for g, spans in branch
+            )
+            or "always"
+            for branch in found
+        ] or ["never"]
+    return out
+
+
 @dataclass
 class Gating:
-    """The model queries a cover is built from, run in parallel and remembered per state."""
+    """The liveness queries a cover is built from, remembered per state."""
 
     m: ProgramModel
     timing: int | None = None
-    workers: int = field(default_factory=cpus)
-    #: Whether a parameter whose bits reach the video must also have a step not proven a no-op.
-    steps: bool = True
     _status: dict = field(default_factory=dict, repr=False)
 
     def key(self, state: np.ndarray) -> tuple:
@@ -148,64 +182,41 @@ class Gating:
         """Each declared parameter's bits the program reads at all; unread parameters are left out."""
         return {p: bits for p, bits in self.m.resolution().items() if bits}
 
-    def map(self, fn: Callable, jobs: Sequence, desc: str) -> list:
-        """``fn`` over ``jobs`` on the pool, in order, with progress."""
-        if not jobs:
-            return []
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            return list(track(pool.map(fn, jobs), total=len(jobs), desc=desc, unit="query"))
-
     def statuses(self, state: np.ndarray) -> dict[int, Status]:
         """Every read parameter's status at ``state``."""
         key = self.key(state)
         if key not in self._status:
-            params = sorted(self.read)
-            found = self.map(
-                lambda p: status(self.m, state, p, self.timing, steps=self.steps), params, "status"
-            )
-            self._status[key] = dict(zip(params, found))
+            self.m.prepare({p, *([TIMING] if self.timing is None else [])} for p in self.read)
+            self._status[key] = {
+                p: Status(p, tuple(self.m.reach(state, [p], self.timing)[p])) for p in sorted(self.read)
+            }
         return self._status[key]
 
-    def _alive(self, state: np.ndarray, param: int, kind: str) -> bool:
-        if kind == DEAD:
-            return bool(self.m.reach(state, [param], self.timing)[param])
-        return status(self.m, state, param, self.timing, steps=self.steps).state == LIVE
-
-    def _could(self, state: np.ndarray, param: int, kind: str, free: Sequence[int]) -> bool:
-        """False only when no values of ``free`` can revive ``param``: an exact refutation."""
-        if kind == DEAD:
-            return bool(self.m.reach(state, [param, *free], self.timing)[param])
-        values = representatives(self.m, param, self.read[param])
-        return any(
-            self.m.step_matters(state, param, a, b, self.timing, free=free).matters is not False
-            for a, b in probe_steps(values)
-        )
+    def _could(self, state: np.ndarray, param: int, free: Sequence[int]) -> bool:
+        """False only when no held values of ``free`` can revive ``param``: an exact refutation."""
+        return self.m.revivable(state, param, free, self.timing)
 
     def revivals(self, state: np.ndarray, st: Status) -> list[Revival]:
         """Every way of making ``st.param`` live by moving the fewest other controls from ``state``."""
-        p, kind = st.param, st.state
+        p = st.param
         others = [q for q in sorted(self.read) if q != p]
-        if not self._could(state, p, kind, others):
+        if not self._could(state, p, others):
             return []
         for size in range(1, len(others) + 1):
             sets = list(itertools.combinations(others, size))
-            hits = self.map(lambda qs: self._could(state, p, kind, list(qs)), sets, f"P{p} gates of {size}")
-            found = [r for qs, hit in zip(sets, hits) if hit for r in self.scan(state, p, kind, qs)]
+            hits = [self._could(state, p, list(qs)) for qs in track(sets, desc=f"P{p} gates of {size}")]
+            found = [r for qs, hit in zip(sets, hits) if hit for r in self.scan(state, p, qs)]
             if found:
                 return found
         return []
 
-    def scan(self, state: np.ndarray, param: int, kind: str, gates: Sequence[int]) -> list[Revival]:
+    def scan(self, state: np.ndarray, param: int, gates: Sequence[int]) -> list[Revival]:
         """Settings of ``gates`` that revive ``param``: intervals for one control, a witness for several."""
         gate, rest = gates[0], list(gates[1:])
         groups = classes(self.m.decl(gate), self.read[gate])
         reps = [int(g[len(g) // 2]) for g in groups]
-
-        def test(v: int) -> bool:
-            moved = _apply(state, [(gate, v)])
-            return self._could(moved, param, kind, rest) if rest else self._alive(moved, param, kind)
-
-        hits = self.map(test, reps, f"P{param} by P{gate}")
+        moved = [_apply(state, [(gate, v)]) for v in reps]
+        hits = [bool(r[param]) for r in self.m.reach_many(moved, [param, *rest], self.timing)]
         if not rest:
             ok = np.zeros(VALUE_MAX + 1, dtype=bool)
             for g, hit in zip(groups, hits):
@@ -214,11 +225,11 @@ class Gating:
             if not spans:
                 return []
             lo, hi = max(spans, key=lambda s: s[1] - s[0])
-            return [Revival(param, kind, ((gate, (lo + hi) // 2),), tuple(spans))]
+            return [Revival(param, ((gate, (lo + hi) // 2),), tuple(spans))]
         for v, hit in zip(reps, hits):
-            deeper = self.scan(_apply(state, [(gate, v)]), param, kind, rest) if hit else []
+            deeper = self.scan(_apply(state, [(gate, v)]), param, rest) if hit else []
             if deeper:
-                return [Revival(param, kind, ((gate, v), *deeper[0].moves))]
+                return [Revival(param, ((gate, v), *deeper[0].moves))]
         return []
 
 
@@ -234,6 +245,7 @@ class Cover:
     stepped: dict[int, list[int]]
     uncovered: list[tuple]
     read: dict[int, tuple[int, ...]]
+    timing: int | None = None
 
     @property
     def reference(self) -> np.ndarray:
@@ -279,8 +291,7 @@ class Cover:
             lines = [f"{self.status[0][p].state} at the reference"]
             for i, found in enumerate(self.revivals):
                 for r in found.get(p, []):
-                    verb = "live" if r.kind == DEAD else "steps matter"
-                    line = f"{verb} when {r}" + (f" from state {i}" if i else "")
+                    line = f"live when {r}" + (f" from state {i}" if i else "")
                     if line not in lines:
                         lines.append(line)
             out[p] = lines
@@ -312,6 +323,10 @@ class Cover:
         ]
         for p, said in self.gating().items():
             lines.append(f"  P{p:<2} {names.get(p, '')[:16]:16s} " + "; ".join(said))
+        if self.m.method == "bdd":
+            for p, where in structure(self.m, self.timing).items():
+                if p in self.read:
+                    lines.append(f"  P{p:<2} live where " + "; or ".join(where))
         for i in self.chosen:
             stepped = ", ".join(f"P{p}" for p in self.stepped.get(i, []))
             lines.append(f"  state {i}: {self.states[i].tolist()} steps {stepped or 'nothing'}")
@@ -415,17 +430,12 @@ def cover(m: ProgramModel, reference: np.ndarray | None = None, *, gating: Gatin
         elements(read, found_revivals),
         lambda s, p: len(representatives(m, p, found_status[s][p].live_bits)),
     )
-    return Cover(m, states, found_status, found_revivals, chosen, stepped, missed, read)
+    return Cover(m, states, found_status, found_revivals, chosen, stepped, missed, read, g.timing)
 
 
 def report(
-    m: ProgramModel,
-    reference: np.ndarray,
-    timing: int | None = None,
-    *,
-    steps: bool = True,
-    as_json: bool = False,
+    m: ProgramModel, reference: np.ndarray, timing: int | None = None, *, as_json: bool = False
 ) -> str:
     """The cover from ``reference`` as the CLI prints it: a table, or JSON."""
-    found = cover(m, reference, gating=Gating(m, timing, steps=steps))
+    found = cover(m, reference, gating=Gating(m, timing))
     return json.dumps(found.as_dict(), indent=1) if as_json else found.table()
