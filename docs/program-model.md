@@ -30,6 +30,9 @@ m.reach(state, [4, 9])        # live bits with P4 and P9 both free: dead here is
 from syncsummoner.program.gates import cover
 c = cover(m)                  # gating structure and covering base states, from the initial state
 c.gating()                    # {parameter_id: ["dead at the reference", "live when P9 in 0..511", ...]}
+
+from syncsummoner.program.gates import structure
+structure(m)                  # {parameter_id: ["P9 in 0..511", ...]}: every setting of the others that makes it live
 c.chosen, c.stepped           # the base states to sweep, and the parameters stepped in each
 c.vectors()                   # (from, to) full states in sweep order
 ```
@@ -89,27 +92,86 @@ bitstream latches. Otherwise the bitstream is used, and the mismatch is reported
 as the model's `note`. The same program id and version do not guarantee that the
 published VHDL is what was built.
 
-For a state, every register bit is tied to the constant the state writes,
-except the bits under question, which stay free inputs. Undefined constants also
-become free inputs, as do registers 9-11 (core-only) and register 8 unless a
-timing is given. Yosys then runs `opt`, `techmap` and `abc` to a fixpoint. Each
-round also replaces any FF whose next value is fixed, once its enables have
-fired, with that constant: a plain or enabled FF with a constant D, or a reset FF
-whose D equals its reset value. This is the steady state a held parameter
-vector reaches. A bit is **live** when it is still in the structural fan-in cone
-of a video output. Dead is exact: no output depends on the bit. Live is
-structural: the bit is wired to the picture, which does not by itself prove a
-step on it changes it.
+Yosys runs once more per build (`hdl.lower`): the same `opt`, `techmap`, `abc`
+flow, with every `registers_in` bit and every undefined bit made an input, to
+Yosys's gate library. The result is cached as `gates.json`. Every liveness
+question is then answered in-process from it (`program.observe`), with no tool
+process per query.
+
+**Symbolic values.** Each net's value is a partition of the control
+assignments into the leaf the net takes there: 0, 1, a literal (a video or
+other input bit, a register output or a black-box output, or its complement),
+or *any* function. Each part is a BDD (`dd` over CUDD, sifting reorder) over the
+`registers_in` bits of words 0-8, the only symbolic variables. Registers 9-11
+are free inputs and words 12-31 are zero. Gates combine leaves exactly where
+they can (`x & 0 = 0`, `x ^ 0 = x`, `s ? x : x = x`, `x & ~x = 0`), so constant
+propagation and the identity of a passed-through bit are both exact over every
+control setting at once. A function of two different free signals becomes
+*any*. This is the abstraction: it never claims a dependence is absent when it
+is not.
+
+**Queries.** A query frees some controls and ties the rest to a state. One
+analysis serves every query with the same freed set. The freed controls are
+*varying*: they may change while the rest are held, so no register settles on
+their value. Every control stays a BDD variable, so the analysis is exact in
+the freed controls too. Analyses are cached per freed set and built on demand,
+one process per CPU when a search needs several at once (`ProgramModel.prepare`).
+
+**Registers.** Every storage cell starts free, and the fixpoint below never
+lets a free output feed its own rule.
+- **Loads.** Where the next state, with every enable taken to fire, is the
+  same constant for every value of the free signals and varying controls,
+  the output is that constant. This is the steady state a held setting
+  reaches.
+- **Keeps.** Otherwise, where the next state only ever keeps the output or
+  gives its initial value, the output is the initial value.
+- **Otherwise** the output is free. It is a fresh BDD variable when its next
+  state reads only controls and itself, as a pipeline of a varying control
+  does, so the logic it feeds keeps its correlations. It is a literal
+  otherwise.
+
+A register settled under some controls stays settled there. The fixpoint is the
+least one, and rounds re-evaluate only the cones that changed. Taking a free
+register to hold any value is the sequential over-approximation. It errs
+toward live.
+
+**Observability.** A source is a control bit, or the video input bits
+together. A forward pass to a fixpoint marks, for each net, the controls under
+which flipping the source can change it:
+- where the net's two cofactors on the source take different leaves;
+- where they share a literal whose net can change;
+- where they are both *any* function and a pin the cell is sensitised to can
+  change. A pin is sensitised where its two values give different outputs with
+  the others held, each other *any* leaf standing for its own literal;
+- where it depends on a register variable that can change.
+
+A free register can change where its next state can, and a black box (memory,
+iCE40 RAM, a gate on a combinational loop) wherever any input can. The source's
+condition is the union over the outputs, with register variables quantified
+out. A select whose arms agree is dead there even when the arms are separate
+gates. **Live** bits of a parameter at a state are those whose condition holds
+for some value of the freed controls with the rest tied. That is one BDD
+restriction per bit. `ProgramModel.revivable` asks the same of a held setting
+of other controls, and the cover search uses it.
+
+**Fallback.** No condition may grow past one net's share of the memory the
+process may use: `MemAvailable` (cut to the cgroup's `memory.max`) over CUDD's
+node size and the net count. A program that exceeds it is answered by the
+vectorised ternary simulator (`program.ternary`), one lane per tie set. It uses
+the same register rules and exact local sensitisation, but every free signal is
+X. Dead there is a sound proof under that tie set. It loses only the identity of
+passed-through bits, so it can call live what the BDDs call dead. `ProgramModel.method`
+says which was used, and `observe.exhausted` in the cache records why.
 
 - **Resolution** is the live set with every register free.
 - **Gates** of a parameter dead in a state are the other controls (and timing)
   whose freeing brings it back.
-- **Step check** `a -> b`:
+- **Step check** `a -> b`, on demand for `program step` only:
   1. No change if the two values differ only in bits dead in that state.
-  2. Otherwise both states are folded, and the result is no change if the two
-     netlists are the same circuit. This is shown by an explicit cell mapping,
-     found by colour refinement anchored on port names and then checked on every
-     type, parameter, init value and connection.
+  2. Otherwise both states are folded by Yosys, and the result is no change if
+     the two netlists are the same circuit. This is shown by an explicit cell
+     mapping, found by colour refinement anchored on port names and then
+     checked on every type, parameter, init value and connection.
   3. Otherwise no change if Yosys proves them equivalent (`equiv_struct`,
      `equiv_simple`, and `equiv_induct` where no memory is left).
   4. Otherwise changes, if a shared random stimulus from power-up drives the
@@ -117,9 +179,10 @@ step on it changes it.
   5. Otherwise undetermined, said as such. Typical cases are effects that need
      structured frames rather than random sync, and slow accumulators.
 
-Results are cached under `SYNCSUMMONER_PROGRAM_CACHE` (default
-`.program-cache/`, gitignored), keyed by program id, version, package digest,
-netlist source and IO configuration, then by the exact ties of each query.
+The netlist, `gates.json` and the conditions (`observe.json`) are cached under
+`SYNCSUMMONER_PROGRAM_CACHE` (default `.program-cache/`, gitignored), keyed by
+program id, version, package digest, netlist source and IO configuration. Step
+verdicts are cached there by their exact ties.
 
 ## Finding programs
 
@@ -144,18 +207,22 @@ commits. The lint, test and runtime targets build on it. Outside Docker, set
 `program.gates.cover` answers, for every parameter the program reads, what makes
 it live, and picks the fewest base states that step every one where it is.
 
-- **Live** at a state: some bit of the parameter is in the folded cone, and its
-  two representative steps (lowest to middle and middle to highest distinct
-  setting) are not both proven no-ops by `step_matters`. A parameter whose bits
-  reach the video but whose steps are proven inert is a **no-op** there.
-- **Revival.** For a parameter that is dead or a no-op, freeing every other
-  control at once and still finding it dead (or its steps still proven inert)
-  rules out any revival. Otherwise single controls are tried freed beside it,
-  each refuted exactly when dead stays dead, and each control left is scanned
-  over every setting it can tell apart (its resolution classes). The settings
-  that revive it are merged into maximal intervals of manual values. Only when
-  no single control revives it are pairs tried, then triples, with a witness
-  setting found by tying one control at a time.
+- **Live** at a state: some bit of the parameter is observable there.
+- **Revival.** For a parameter that is dead, finding it dead for every held
+  setting of all the other controls rules out any revival
+  (`ProgramModel.revivable`). Otherwise single controls are tried, each
+  refuted exactly when no held setting of it revives the parameter. Each control left is evaluated over every setting it can tell apart
+  (its resolution classes): the condition restricted to the state, then to each
+  class. The settings that revive it are merged into maximal intervals of
+  manual values. Only when no single control revives it are pairs tried, then
+  triples, with a witness setting found by tying one control at a time.
+  A parameter that is live only while another control moves, such as
+  RamBend's Pot 6 Page with P6, has no held revival. `program show` names the
+  gate, and the cover lists the parameter's bits as never covered.
+- **Structure.** `gates.structure` states each parameter's condition as
+  disjoint branches over the other controls in parameter order. In each branch,
+  a control's manual values are grouped by the condition they leave, as
+  maximal intervals. The table form of `program cover` prints it.
 - **States.** Starting from the reference (the declared initial values), each
   revival's move gives a new state, and revivals are followed from every state
   reached, each control moved at most once along a path. Every query is cached.
@@ -176,8 +243,9 @@ ascending then odds descending from the base value, a closed walk that moves
 more than two settings at a step, so no step is a jump across the range. Every setpoint is the full declared state, and the archive's `schedule`
 records each setpoint's state together with the one it was stepped from. A
 `--schedule` focus steps its parameter in a base state where the cover makes it
-live. All HDL tool processes share one bound sized to the CPUs the process may
-use: the cgroup `cpu.max` quota, else its affinity (`hdl.cpus`).
+live. The HDL tool processes of a build and of `program step` share one bound
+sized to the CPUs the process may use: the cgroup `cpu.max` quota, else its
+affinity (`hdl.cpus`).
 
 ## Integration
 

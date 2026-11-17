@@ -4,7 +4,7 @@
 
 import numpy as np
 
-from syncsummoner.program.gates import DEAD, LIVE, Gating, Revival, cover, intervals, solve, Status
+from syncsummoner.program.gates import DEAD, LIVE, Gating, Revival, cover, intervals, solve, Status, structure
 
 
 def test_intervals_are_maximal_runs():
@@ -49,28 +49,20 @@ def test_the_sweep_steps_one_parameter_at_a_time_from_each_base(tiny):
 
 
 def test_a_revival_names_its_gate():
-    assert str(Revival(1, DEAD, ((7, 767),), ((512, 1023),))) == "P7 in 512..1023"
-    assert str(Revival(1, DEAD, ((7, 1023),), ((3, 3), (1023, 1023)))) == "P7 in 3, 1023"
-    assert Revival(1, DEAD, ((7, 767), (2, 600))).gate == (7, 2)
-    assert str(Revival(1, DEAD, ((7, 767), (2, 600)))) == "P7 = 767 and P2 = 600"
+    assert str(Revival(1, ((7, 767),), ((512, 1023),))) == "P7 in 512..1023"
+    assert str(Revival(1, ((7, 1023),), ((3, 3), (1023, 1023)))) == "P7 in 3, 1023"
+    assert Revival(1, ((7, 767), (2, 600))).gate == (7, 2)
+    assert str(Revival(1, ((7, 767), (2, 600)))) == "P7 = 767 and P2 = 600"
 
 
 def test_the_cover_is_exact_on_a_hand_made_instance():
-    live = Status(1, (0,), ())
     states = [np.zeros(12, dtype=np.int64)] * 3
     status = [{1: Status(1, ())}, {1: Status(1, (0, 1))}, {1: Status(1, (1,))}]
-    for s in status:
-        s[1] = Status(1, s[1].live_bits, () if not s[1].live_bits else (_Step(True),))
     chosen, stepped, missed = solve(
         states, status, [("bit", 1, 0), ("bit", 1, 1), ("bit", 1, 2)], lambda s, p: s
     )
     assert chosen == [1] and stepped == {1: [1]} and missed == [("bit", 1, 2)]
-    assert live.state in (DEAD, "no-op")
-
-
-class _Step:  # pylint: disable=too-few-public-methods
-    def __init__(self, matters):
-        self.matters = matters
+    assert status[0][1].state == DEAD and status[1][1].state == LIVE
 
 
 def test_gating_remembers_states(tiny):
@@ -92,9 +84,8 @@ def test_the_model_gate_pairs_a_gain_write_with_gain_on(tiny):
     assert gate.live(tiny.initial(), 7) and not gate.live(tiny.initial(), 1)
 
 
-def test_a_structural_cover_takes_live_bits_as_live(tiny):
-    found = cover(tiny, gating=Gating(tiny, steps=False))
-    assert all(st.steps is None for st in found.status[0].values() if st.live_bits)
+def test_a_cover_at_a_timing_holds_register_8(tiny):
+    found = cover(tiny, gating=Gating(tiny, timing=3))
     assert {p for ps in found.stepped.values() for p in ps} == {1, 2, 7, 8} and not found.uncovered
 
 
@@ -103,7 +94,7 @@ def test_the_report_is_the_cover_as_table_or_json(tiny):
 
     from syncsummoner.program.gates import report  # pylint: disable=import-outside-toplevel
 
-    assert "base states" in report(tiny, tiny.initial(), steps=False)
+    assert "base states" in report(tiny, tiny.initial())
     assert json.loads(report(tiny, tiny.initial(), as_json=True))["one_at_a_time"]["states"] == 1
 
 
@@ -121,3 +112,11 @@ def test_the_tour_moves_at_most_two_settings_and_no_more_than_any_closed_walk():
             assert steps.max(initial=0) <= 2
             moved = np.abs(np.diff(np.r_[base, walk, base])).sum()
             assert moved == 2 * (line[-1] - line[0]) or line.size == 1
+
+
+def test_the_structure_reads_every_reviving_setting_off_the_condition(tiny):
+    found = structure(tiny)
+    assert found[1] == ["P7 in 512..1023 and P8 in 0..511"]
+    assert any(line.startswith("P1 in 64..1023 and P2 in 513..527, 529..543") for line in found[8])
+    assert found[3] == ["never"] and found[2] == ["P7 in 0..511 and P8 in 0..511"]
+    assert "live where P7 in 512..1023 and P8 in 0..511" in cover(tiny).table()

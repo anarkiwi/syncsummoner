@@ -140,7 +140,7 @@ class ModelGate:
 def model_gate(program: str) -> ModelGate | None:
     """The gate for a program from its model and covering search; None when the model cannot be built."""
     from syncsummoner.program import model  # pylint: disable=import-outside-toplevel
-    from syncsummoner.program.gates import DEAD, cover  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program.gates import cover  # pylint: disable=import-outside-toplevel
 
     try:
         m = model(program)
@@ -152,6 +152,6 @@ def model_gate(program: str) -> ModelGate | None:
     for found_here in found.revivals:
         for p, rs in found_here.items():
             for r in rs:
-                if r.kind == DEAD and r.moves not in revivals.setdefault(p, []):
+                if r.moves not in revivals.setdefault(p, []):
                     revivals[p].append(r.moves)
     return ModelGate(m, revivals)

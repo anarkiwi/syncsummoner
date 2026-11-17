@@ -91,3 +91,22 @@ def test_a_folded_state_is_reused_by_the_next_step(tiny, monkeypatch):
     state = tiny.initial()
     first = tiny._folded(state, None)  # pylint: disable=protected-access
     assert tiny._folded(state.copy(), None) is first and len(calls) == 1  # pylint: disable=protected-access
+
+
+def test_bdds_beyond_memory_fall_back_to_the_ternary_simulator(tiny, tmp_path):
+    coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path)
+    coarse.memory = 0
+    found, exact = coarse.live(gates=False), tiny.live(gates=False)
+    assert coarse.method == "ternary" and (coarse.cache / "observe.exhausted").exists()
+    assert tiny.method == "bdd"
+    for p, liveness in exact.items():
+        assert set(liveness.live_bits) <= set(found[p].live_bits)
+    assert found[8].live and not exact[8].live, "the ternary simulator cannot see that both arms are data_in"
+    assert coarse.carries_input(coarse.initial())
+
+
+def test_conditions_are_cached_per_free_set(tiny):
+    first = tiny.conditions({1, "timing"})
+    assert tiny.conditions({1, "timing"}) is first
+    assert any(p.name.startswith("observe-1-timing") for p in tiny.cache.iterdir())
+    assert tiny.reach(tiny.preset("Gain"), [1], timing=0)[1] == [6, 7, 8, 9]

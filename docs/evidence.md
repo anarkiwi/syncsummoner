@@ -177,16 +177,16 @@ so a hue change counts); the source change is the same measure on the clip
 **Steps judged by the program model.** Each sent write is a step from the state the
 take's parameter stream held when it landed: every write landing on the same frame
 applied, its own parameter at its value before the frame
-(`program.predict.pre_states`). The model's folded cone judges each step
+(`program.predict.pre_states`). The model's observability conditions judge each step
 (`program.predict.classify`): **dead** (no bit of the parameter reaches the video
 there), **no-op** (its two values differ only in bits that do not reach it) or
 **live**. A step that writes the value already held is **unchanged** and not tested.
 No step is simulated: that is `program step`'s job, on demand.
 
-The cone is folded once per gating class, and the fold is memoised in
-`.program-cache`. A parameter the model finds dead at its reference state and
-revived by a knob is folded with every other control tied, at each state its
-steps start from. Any other parameter is folded with every knob free, so only the
+The model is queried once per gating class. A parameter the model finds dead at
+its reference state and revived by a knob is queried with every other control
+tied, at each state its steps start from. Any other parameter is queried with
+every knob free, so only the
 switches tie it and a take has a handful of classes. Dead with knobs free holds
 for every knob value; live with knobs free means some knob value reaches the
 video, so a knob that kills it elsewhere can leave a dead step in the live pool,

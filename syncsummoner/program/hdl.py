@@ -262,6 +262,20 @@ def fold(tools: Tools, net: Netlist, work: Path | None = None) -> Netlist:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def lower(tools: Tools, net: Netlist, work: Path | None = None) -> Netlist:
+    """The design in Yosys's gate library, once: every ``registers_in`` bit and undefined bit an input.
+
+    The same ``opt``/``techmap``/``abc`` flow as :func:`fold`, with nothing tied.
+    """
+    tmp = _scratch(work)
+    try:
+        tie(net, {}, {}).save(tmp / "in.json")
+        tools.yosys(f"read_json in.json; hierarchy -top {net.top}; {FOLD}; write_json out.json", tmp)
+        return Netlist.load(tmp / "out.json", net.top)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _rename(module: dict) -> None:
     """Number cells afresh and drop hidden uninitialised wires, so a new pass's names cannot collide."""
     module["cells"] = {f"$fold${i}": c for i, c in enumerate(module["cells"].values())}

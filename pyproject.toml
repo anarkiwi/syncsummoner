@@ -29,6 +29,7 @@ dependencies = [
     "tqdm>=4.66",
     "threadpoolctl>=3.1",
     "linuxpy>=0.25",
+    "dd>=0.6",
 ]
 
 [project.optional-dependencies]
@@ -74,7 +75,7 @@ omit = ["syncsummoner/cli.py"]
 
 [tool.pylint.main]
 jobs = 0
-extension-pkg-allow-list = ["cv2"]
+extension-pkg-allow-list = ["cv2", "dd.cudd"]
 disable = [
     "duplicate-code",
     "too-few-public-methods",
