@@ -611,7 +611,7 @@ def plan_rows(
     wet_frame: int,
     dry_frame: int | None = None,
 ) -> np.ndarray:
-    """The take's writes: its dry control to its take value at ``wet_frame``, the plan, then dry at ``dry_frame``."""
+    """The take's writes: dry control to the take value at ``wet_frame``, the plan, dry at ``dry_frame``."""
     if dry is None:
         return plan
     ((slot, value),) = dry.items()
@@ -739,6 +739,8 @@ def take_latency(
             lat = read_latency(Path(take).parent)
         except NoLatencyError:
             lat = None
+        except LeadInTimeError as err:
+            raise ev.EvidenceError(f"{take}: {err}") from err
     if lat is None:
         raise ev.EvidenceError(
             f"{take}: no CC-to-picture latency, measured or on file, to land its writes by"
