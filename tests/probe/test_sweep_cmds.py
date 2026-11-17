@@ -116,7 +116,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
         assert cli.main(["probe", "sweep", "collect", str(plan), "--chunk", str(k)]) == 0
     monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(100))
 
-    def concat(videos, out, **_kw):
+    def concat(_videos, out, **_kw):
         out.write_bytes(b"joined")
 
     monkeypatch.setattr(L, "concat", concat)

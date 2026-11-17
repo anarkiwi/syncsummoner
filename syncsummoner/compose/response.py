@@ -16,6 +16,7 @@ import numpy as np
 from scipy.stats import norm, wilcoxon
 
 from syncsummoner.compose import evidence as ev
+from syncsummoner.compose import matched
 
 __all__ = ["MEASURED", "POOLED", "Response", "differences", "response", "steps_of", "take_scores"]
 
@@ -77,7 +78,7 @@ class Response:
     takes: tuple[str, ...] = field(default_factory=tuple)
 
     def moving(self, row: int) -> int:
-        """The last lag ``row`` departs at, tested in a fixed sequence: the landing lags, then each next in turn.
+        """The last lag ``row`` departs at, in a fixed sequence: the landing lags, then each next in turn.
 
         The evidence's landing lags are one step, since the change shows on either; past them each
         lag is tested only if the one before departed, so no lag spends the error rate. -1 if none.
@@ -179,7 +180,7 @@ def response(
             if np.count_nonzero(d):
                 steps[r, k] = d.size
                 z[r, k] = float(norm.isf(wilcoxon(d).pvalue / 2))
-    return Response(program, params, z, steps, ev.critical(len(rows)), tuple(takes))
+    return Response(program, params, z, steps, matched.critical(len(rows)), tuple(takes))
 
 
 def take_scores(judged: Any, start: Sequence[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -192,7 +193,7 @@ def take_scores(judged: Any, start: Sequence[int]) -> tuple[np.ndarray, np.ndarr
     count = found.picked.size
     out = judged.features.small[found.picked].astype(np.float32)
     src = judged.source.small[found.lead : found.lead + count].astype(np.float32)
-    d_out, d_src = ev.frame_change(out), ev.frame_change(src)
+    d_out, d_src = matched.frame_change(out), matched.frame_change(src)
     frames, params = steps_of(proof.landed.rows, start)
     keep = (frames >= 0) & (frames < count)
     frames, params = frames[keep], params[keep]
@@ -203,7 +204,7 @@ def take_scores(judged: Any, start: Sequence[int]) -> tuple[np.ndarray, np.ndarr
     controls = np.flatnonzero(~stepped & measured)
     scores = np.full(count, np.nan)
     at = np.flatnonzero(measured)
-    scores[at] = ev.matched_scores(d_out, d_src, at, controls, 1.0 / float(np.prod(out.shape[1:])))
+    scores[at] = matched.matched_scores(d_out, d_src, at, controls, 1.0 / float(np.prod(out.shape[1:])))
     return scores, frames, params
 
 
