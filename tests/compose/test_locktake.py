@@ -482,7 +482,7 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
     lost = [] if lose is None else [lose]
     boots, said, loads = list(boots), [], []
     offsets = [0] * 12
-    shell = types.SimpleNamespace(log_lines=[], said=said)
+    shell = types.SimpleNamespace(log_lines=[], said=said, loads=[])
 
     def status():
         values = sim.state(sim.now)
@@ -528,6 +528,7 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
 
     def load(name):
         loads.append((name, sim.now))
+        shell.loads.append((len(said), sim.poller is None and sim.sender is None))
         return info
 
     return rig, types.SimpleNamespace(recording=held), load, loads
@@ -771,10 +772,13 @@ def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch
         )
     assert not rig.transport.device.shell.said
     LT.write_latency(tmp_path, lat_for(width=0.0, samples=1), "Other")
-    _, _, record, proof, loads = take_and_prove(
+    _, rig, record, proof, loads = take_and_prove(
         monkeypatch, simulate, tmp_path, dry=None, working={3: 1.0, 4: 100}
     )
     assert [name for name, _ in loads] == ["Teletext", "Passthru", "Teletext", "Passthru"]
+    shell = rig.transport.device.shell
+    at, quiet = shell.loads[-1]
+    assert quiet and shell.said[at - 1] == ("midi", "monitor", "off")
     assert loads[-1][1] >= T0 + (120 + 30) * P
     assert record.dry is None and record.delta == pytest.approx(DELTA)
     assert not (record.sends["target"] == ev.CALIBRATION).any()
