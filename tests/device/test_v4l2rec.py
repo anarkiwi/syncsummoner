@@ -137,3 +137,40 @@ def test_arguments_default_to_the_session_card_and_pass_ffmpegs_through():
     assert args.seconds is None and args.out_args == []
     args = vr.parse_args(["--seconds", "3", "take.mkv", "--", "-c:v", "ffv1", "-level", "3"])
     assert args.seconds == 3.0 and args.out_args == ["-c:v", "ffv1", "-level", "3"]
+
+
+def test_a_stalled_sink_does_not_stop_frames_being_dequeued():
+    gate, pulled = threading.Event(), []
+
+    class Stalled:
+        """A sink that blocks until every frame has been dequeued."""
+
+        def __init__(self):
+            self.got = []
+
+        def write(self, data):
+            gate.wait()
+            self.got.append(data)
+
+    def frames():
+        for k in range(5):
+            pulled.append(k)
+            yield capture(k, 10, k * 33_333, bytes([k]) * 4)
+        gate.set()
+
+    sink, log = Stalled(), io.BytesIO()
+    assert vr.record(frames(), sink, log, stop=lambda: False, backlog=8) == 5
+    assert pulled == list(range(5)) and sink.got == [bytes([k]) * 4 for k in range(5)]
+    assert np.frombuffer(log.getvalue(), dtype=vr.FRAME)["sequence"].tolist() == list(range(5))
+
+
+def test_a_failed_write_is_raised_and_stops_the_recording():
+    class Broken:
+        """A sink whose encoder has gone."""
+
+        def write(self, data):
+            raise BrokenPipeError("encoder gone")
+
+    frames = (capture(k, 10, k, b"x") for k in range(1000))
+    with pytest.raises(BrokenPipeError):
+        vr.record(frames, Broken(), io.BytesIO(), stop=lambda: False, backlog=2)
