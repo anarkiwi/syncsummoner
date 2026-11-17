@@ -69,30 +69,49 @@ drops any write that repeats the value its slot already holds, the take's start 
 included (`locktake.schedule`). Automation before the clip clamps onto frame 0, which
 the start state already sets.
 
-The link then bounds every frame. The budget, `--cc-budget` writes per second, times the
-messages a write takes (docs/hardware.md) is the sustained message rate; over one frame
-period that is the frame's capacity (`session.frame_capacity`). A frame needing more
-moves its excess to the latest earlier frames with room, the most constrained write
-first, never onto or before its slot's previous write and never before the lead-in
-turns wet (`locktake.pace`). A plan that cannot be placed is an
-`InfeasibleScheduleError` before anything plays. The start state goes out a frame's
-capacity at a time, skipping slots already parked at their value.
-`syncsummoner score plan SCORE --program NAME` prints a pass's schedule against the
-capacity without a device.
+Nothing bounds a frame's writes ahead of time: the device's drain rate depends on what
+it and the program are doing (docs/hardware.md). Every write instead waits for the
+previous one's `midi monitor` echo, and none goes before its frame's send instant
+(`wire.Echoes`, `wire.Sender`); the start state goes out the same way, skipping slots
+already parked at their value. A write with no echo once the take's longest echo has
+passed is written once more, and the copy's row is kept in the wire record's `resent`.
+`syncsummoner score plan SCORE --program NAME` prints a pass's writes and messages per
+frame without a device.
 
-The k-th send of a `(frame, parameter)` pair answers its k-th planned write
-(`evidence.landed`):
+**Realized, not planned.** A message's echo comes with the first poll or command
+reply the device writes after taking it. So it was taken after the request of the
+reply before that one left, and after its write began, and no later than its own
+reply came back (`wire.echoed`); a write is taken once its last message is. Its
+landing is the first tick after that bracket, and `landed` is the frame it is in effect
+from; `clear_ns` is how far the nearer end of the bracket clears a tick, negative when a
+tick's bracket overlaps it, so the write may be in effect a tick either side. A take
+without receipts falls back to the send interval. `evidence.realized` is the state every
+clip frame actually held, from those landings and the wire values.
+
+The k-th send of a `(frame, parameter)` pair answers its k-th planned write, resent
+copies aside (`evidence.landed`):
 
 | Count | Meaning |
 | --- | --- |
 | missing | planned, never sent |
+| never echoed | sent, but some message of it, and of its copy, never came back |
 | duplicated | sent with nothing planned for it |
 | out of order | sent before a write planned ahead of it |
-| late, early | landed on a frame other than its target |
-| on a tick | its landing tick could not be told from the next: inside the tick bracket, or read back a tick later than predicted |
+| late, early | in effect from a frame other than its target, measured from its echo |
+| on a tick | its landing tick could not be told from the next: a tick inside its bracket, or read back a tick from where its echo puts it |
 
-A write whose send falls inside the latency band of a frame's instant is counted as
-on a tick: the picture cannot say which side of it the write fell.
+The least slack, echo to the target's tick, is reported too. The CC-to-picture latency
+of a dry take is calibrated on the same brackets, so the tick grid and the landings are
+in one time base. A take without a dry control uses a latency on file; one measured
+before echoes were used was timed from the send's return, earlier than the device took
+it, which leans its landings late.
+
+Re-judged this way, the 11 frame-locked takes with receipts (rc4/takes and full/takes)
+have no write unambiguously late or early, and no readback disagreement. 94 writes are
+on a tick and count late: their echo bracket overlaps the tick they targeted, almost all
+because the echo came with a poll reply stalled 25 to 37 ms, the others because the send
+itself woke late. The Bit Rotator rc.4 take's 31 writes lost in the 124-message burst were
+never echoed, and its readback agrees they never took effect.
 
 The cyclic garbage collector is off while a take plays. A full collection over the
 poller's growing records holds the interpreter lock for longer than the half frame a send
@@ -112,9 +131,10 @@ exactly; the CC-to-readback mapping is exact for all 1024 values.
 receipts are aligned against the messages the sends put on the wire
 (`evidence.received`), as a common subsequence (difflib's matching blocks), so a run of
 lost messages costs only those messages. Each run is reported with the sends that
-carried it, their parameters, target frames and send times. The monitor's output travels device to host only and is read
-by the polling thread, which never has more than one command queued at the device,
-so it cannot build the serial backlog that reboots it.
+carried it, their parameters, target frames and send times. The monitor's output travels
+device to host only and is read by the polling thread, which never has more than one
+command queued at the device, so it cannot build the serial backlog that reboots it.
+Readbacks are checked against the realized landings: a write never echoed held nothing.
 
 ## Link 3: applied vs acted upon
 

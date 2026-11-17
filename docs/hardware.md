@@ -70,20 +70,45 @@ Measured with pyvmancer 0.6.0 (`vmancer latency`, `syncsummoner device doctor
 | Backlog, six parameters | none at 40 sets/s each, 240 sets/s (about 480 messages/s) |
 
 A set is one parameter write: two CC messages at high resolution (14-bit), one
-at low. The render budget, `--cc-budget`, is in sets per second at whatever
-resolution the transport runs; its default of 200 sits inside the measured
-clean range. To re-derive it, run `device doctor --latency` with
-`--latency-params` naming as many knobs as a score drives and take the
-`midi.backlog` finding's fastest clean rate times the parameter count.
+at low. Only `Session`, which runs without `midi monitor` (probe sweeps, parking),
+still paces open loop at `CC_BUDGET_HZ`, inside that clean range: an unpaced park
+burst drops the LSB of 14-bit pairs.
 
-The budget bounds bursts as well as the rate: a frame carries at most the budget's
-message rate over one frame period, 13 messages at 1080p30 by default
-(`session.frame_capacity`). On firmware 1.0.2-rc.4 at 1080p30, with `midi monitor on`:
+A locked take has no rate or capacity. How fast the device drains MIDI depends on
+what the firmware and the loaded program are doing, so a fitted rate is a guess
+that breaks with the program. Unbounded bursts do lose messages; on firmware
+1.0.2-rc.4 at 1080p30, with `midi monitor on`:
 
 | Burst | Received |
 | --- | --- |
 | 62 writes, 124 messages, within 2 ms, all for one frame | the first 62 messages; the other 62 never, so the slot held the ramp's midpoint |
 | 12 writes, 24 messages, within 1.1 ms | all, but the last 20 applied a tick after the first 4 |
+
+So the take is flow controlled by the device's own echoes (`wire.Echoes`): one
+write in flight, the next sent once the last one's messages come back from
+`midi monitor`, and none before its frame's send instant. A write is overdue once
+the longest echo the take has acknowledged has passed and a reply asked for after
+that has come back without it; it is written once more, and the copy is recorded
+(`resent` in the wire record). Lateness is then measured per write (docs/evidence.md).
+
+Over the 11 frame-locked takes with receipts (rc4/takes, full/takes), the echo of
+a write came 4.2 to 5.4 ms (median per take) after the write returned, at worst
+9.7 to 37 ms when a poll reply stalled. The receipts cannot say when within that
+bracket the device took a message; polling back to back while a write waits
+narrows it to one poll round trip.
+
+The serial link stays far from the backlog that reboots the device (about 11 KB
+of commands queued while the shell is busy, captures/HANDOFF.md): the poller has
+one command in flight, `modulation status` at 18 bytes, and with one write in
+flight a reply carries at most two monitor lines of at most 36 bytes each beside
+its 279-byte status, about 350 bytes, where the 124-message burst put 62 lines
+(about 2.2 KB) on one reply.
+
+Every write keeps its MSB/LSB pair. The serial guide documents the CC map (MSB,
+LSB and auto-pair per slot) but not how the firmware combines CC n with n+32,
+nor whether an MSB or LSB alone updates a slot; MIDI 1.0 resets the LSB on an
+MSB, so an MSB alone would be safe only for a new LSB of 0. Untested on the
+device, so no message is dropped.
 
 ## CCs latch on the device's frame tick
 

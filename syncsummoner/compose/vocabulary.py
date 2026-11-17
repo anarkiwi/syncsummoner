@@ -84,13 +84,6 @@ class Automation:
         m = (self.times >= t0) & (self.times < t1)
         return Automation(self.times[m], self.indices[m], self.values[m])
 
-    def max_rate(self, window_s: float = 1.0) -> float:
-        """Peak event rate over any sliding window, in parameter writes per second."""
-        if len(self) == 0:
-            return 0.0
-        counts = np.searchsorted(self.times, self.times + window_s, side="left") - np.arange(len(self))
-        return float(counts.max() / window_s)
-
     def hold(self, times: np.ndarray, n_params: int = PARAM_COUNT) -> np.ndarray:
         """Zero-order-hold onto a time grid as ``(len(times), n_params)`` raw values."""
         out = np.full((times.size, n_params), PARAM_MAX // 2, dtype=np.float64)

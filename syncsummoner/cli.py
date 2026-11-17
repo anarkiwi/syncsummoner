@@ -15,11 +15,8 @@ from typing import Any
 
 import numpy as np
 
-from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.probe import sweep_cmds
 from syncsummoner.progress import LOG, configure
-
-BUDGET_HELP = "parameter writes per second, within `device doctor --latency`'s midi.backlog"
 
 
 def _doctor_cmd(args: argparse.Namespace) -> int:
@@ -375,14 +372,13 @@ def _score_cmd(args: argparse.Namespace) -> int:
 
 
 def _score_plan_cmd(args: argparse.Namespace) -> int:
-    """Print one program's take schedule against the MIDI link's capacity; 1 when it cannot be carried."""
+    """Print one program's take schedule: the writes and messages each frame carries."""
     from syncsummoner.compose.judge import schedule_report
     from syncsummoner.compose.render import RenderConfig
 
-    config = RenderConfig.for_format(args.format, cc_budget_hz=args.cc_budget)
-    ok, said = schedule_report(Path(args.score), _profiles_in(Path(args.profiles)), args.program, config)
-    print(said)
-    return 0 if ok else 1
+    config = RenderConfig.for_format(args.format)
+    print(schedule_report(Path(args.score), _profiles_in(Path(args.profiles)), args.program, config))
+    return 0
 
 
 def _analyze_cmd(args: argparse.Namespace) -> int:
@@ -511,7 +507,6 @@ def _render_cmd(args: argparse.Namespace) -> int:
     profiles = _profiles_in(Path(args.profiles))
     timing = {
         "source_host": args.source_host,
-        "cc_budget_hz": args.cc_budget,
         "stall_s": args.stall,
         "route": args.route,
     }
@@ -857,12 +852,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     show.add_argument("score")
     show.add_argument("--profiles", default="profiles/")
     show.set_defaults(func=_score_cmd)
-    planned = score_sub.add_parser("plan", help="one program's take schedule against the MIDI link")
+    planned = score_sub.add_parser("plan", help="one program's take schedule: writes and messages per frame")
     planned.add_argument("score")
     planned.add_argument("--program", required=True, help="the program whose pass is planned")
     planned.add_argument("--profiles", default="profiles/")
     planned.add_argument("--format", default="1080p30", help="session format the take runs at")
-    planned.add_argument("--cc-budget", type=float, default=CC_BUDGET_HZ, help=BUDGET_HELP)
     planned.set_defaults(func=_score_plan_cmd)
 
     analyze = sub.add_parser("analyze", help="extract audio and video features")
@@ -921,7 +915,6 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         node.add_argument("--fade-in", type=float, help="override the fade in")
         node.add_argument("--fade-out", type=float, help="override the fade out")
         node.add_argument("--no-master", action="store_true", help="stop at the raw take")
-        node.add_argument("--cc-budget", type=float, default=CC_BUDGET_HZ, help=BUDGET_HELP)
         _add_route_arg(node)
         node.set_defaults(func=_render_cmd, render_cmd=name)
         if name == "audition":

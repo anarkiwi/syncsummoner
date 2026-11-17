@@ -552,11 +552,10 @@ def test_render_timing_flags_reach_the_config(monkeypatch, tmp_path):
     ]
     assert cli.main(argv + ["--format", "1080p30"]) == 0
     config = seen["render"][3]["config"]
-    assert config.fps == 30.0 and config.cc_budget_hz == session_mod.CC_BUDGET_HZ
-    assert cli.main(argv + ["--cc-budget", "150"]) == 0
-    assert seen["render"][3]["config"].cc_budget_hz == 150.0
-    with pytest.raises(SystemExit):
-        cli.main(argv + ["--latency-ms", "25"])
+    assert config.fps == 30.0 and not hasattr(config, "cc_budget_hz")
+    for retired in (["--cc-budget", "150"], ["--latency-ms", "25"]):
+        with pytest.raises(SystemExit):
+            cli.main(argv + retired)
 
 
 def test_evidence_is_judging_by_another_name():
@@ -800,18 +799,13 @@ def _planned(monkeypatch, tmp_path, times, indices):
     return ["score", "plan", _score_file(tmp_path), "--program", "g"]
 
 
-def test_score_plan_prints_the_take_schedule_against_capacity(monkeypatch, tmp_path, capsys):
-    argv = _planned(monkeypatch, tmp_path, [5.0] * 8 + [6.0], list(range(1, 9)) + [1])
-    assert cli.main(argv) == 0
-    said = capsys.readouterr().out
-    assert said.startswith("g: 9 automation writes, 9 frame-plan rows, 9 sent; ")
-    assert "of 13 messages a frame" in said
-
-
-def test_score_plan_fails_a_schedule_the_link_cannot_carry(monkeypatch, tmp_path, capsys):
+def test_score_plan_prints_the_messages_each_frame_carries(monkeypatch, tmp_path, capsys):
+    """No capacity verdict: a frame of twelve writes is printed as it will be sent, one ack at a time."""
     import numpy as np
 
     frames = np.repeat(np.arange(1, 40) / 30.0 + 0.02, 12)
     argv = _planned(monkeypatch, tmp_path, frames, np.tile(np.arange(1, 13), 39))
-    assert cli.main(argv) == 1
-    assert "infeasible: frame" in capsys.readouterr().out
+    assert cli.main(argv) == 0
+    said = capsys.readouterr().out
+    assert said.startswith("g: 468 automation writes, 468 frame-plan rows, 468 sent; 39 frames carry writes")
+    assert "busiest frame 2 with 24, median 24 a frame" in said
