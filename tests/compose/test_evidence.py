@@ -210,6 +210,18 @@ def test_writes_sent_on_schedule_land_on_their_targets():
     assert np.isnan(ev.landed(plan, undue, TICKS, TIMES, DELTA).wake_ms)
 
 
+def test_a_window_widened_by_the_lines_spread_holds_every_landing_it_admits():
+    """A write echoed clear of its tick lands on one frame; the line's spread opens the window either side."""
+    plan = np.array([(4, 1, 10)], dtype=PLAN)
+    sends = sends_at(plan.tolist())
+    tight = ev.landed(plan, sends, TICKS, TIMES, DELTA)
+    assert tight.rows[["first", "last"]].tolist() == [(4, 4)] and tight.ambiguous == 0
+    wide = ev.landed(plan, sends, TICKS, TIMES, DELTA, spread=(-0.6 * PERIOD, 0.6 * PERIOD))
+    assert wide.rows[["first", "last"]].tolist() == [(3, 5)] and wide.ambiguous == 1 and wide.ok
+    late = ev.landed(plan, sends_at(plan.tolist(), sends["t1_ns"] + 2 * PERIOD), TICKS, TIMES, DELTA)
+    assert late.late == 1 and not late.ok
+
+
 def test_late_early_missing_duplicated_and_out_of_order_writes_are_counted():
     plan = np.array([(2, 1, 10), (2, 2, 20), (5, 1, 30), (9, 3, 40), (12, 4, 50)], dtype=PLAN)
     on_time = ev.send_time(plan["target"], TICKS, TIMES, DELTA) + WAKE + WRITE
@@ -229,8 +241,9 @@ def test_a_write_on_a_tick_or_read_back_off_its_predicted_tick_is_ambiguous():
     )
     seen = np.array([-1, 6])
     got = ev.landed(plan, sends, TICKS, TIMES, DELTA, seen)
-    assert got.ambiguous == 2
-    assert got.rows["landed"][1] == 6 and got.late >= 1
+    assert got.ambiguous == 2 and got.ok
+    assert got.rows["landed"][1] == 6
+    assert got.rows[["first", "last"]].tolist() == [(2, 3), (5, 6)]
 
 
 def test_readbacks_agree_with_the_writes_landed_before_them():
@@ -339,7 +352,8 @@ def test_a_write_lands_where_its_echo_says_late_unechoed_or_on_a_tick():
     assert rows["landed"].tolist()[:3] == [5, 7, 8] and rows["landed"][3] == ev.CALIBRATION
     assert min(rows["clear_ns"][:2]) > 0 > rows["clear_ns"][2]
     assert rows["echo_ns"].tolist() == [int(v) for v in echo[:3, 1]] + [-1]
-    assert (got.late, got.early, got.ambiguous, got.unechoed, got.missing) == (2, 0, 1, 1, 0)
+    assert rows[["first", "last"]].tolist()[:3] == [(5, 5), (7, 7), (7, 8)]
+    assert (got.late, got.early, got.ambiguous, got.unechoed, got.missing) == (1, 0, 1, 1, 0)
     assert got.slack_ms == pytest.approx((TICKS.lo + 6 * PERIOD - tick[1] - 3e6) / 1e6)
     assert not got.ok and "1 never echoed" in got.summary()
     copy = np.r_[sends, sends[[0]]]
@@ -775,3 +789,27 @@ def test_one_regime_is_the_null_of_every_step_free_frame():
     assert ev.acted_upon(out, src, luma, frames, params, {}, kinds=kinds, regime=one) == ev.acted_upon(
         out, src, luma, frames, params, {}, kinds=kinds
     )
+
+
+def test_a_step_is_tested_over_its_landing_window_not_on_one_frame():
+    """A jump anywhere in the window shows across it; its last frame alone misses an early landing."""
+    rng = np.random.default_rng(21)
+    last = spaced(rng, 240, 15) + 2
+    true = last - rng.integers(1, 3, size=15)
+    out, src = picture(21, true)
+    spans = np.full(15, 3)
+    wide = ev.acted_upon(out, src, np.zeros(240), last, np.ones(15, int), {}, lags=(0,), spans=spans)[0]
+    point = ev.acted_upon(out, src, np.zeros(240), last, np.ones(15, int), {}, lags=(0,))[0]
+    assert wide.moved and wide.steps == 15 and not point.moved
+
+
+def test_windows_that_overlap_make_partners_and_clear_ones_stand_alone():
+    rng = np.random.default_rng(3)
+    a = spaced(rng, 240, 10)
+    out, src = picture(3, a)
+    frames, params = np.r_[a, a + 1], np.r_[np.ones(10, int), np.full(10, 2)]
+    point = {v.param: v for v in ev.acted_upon(out, src, np.zeros(240), frames, params, {})}
+    assert point[1].partners == () and point[2].partners == ()
+    spans = np.r_[np.ones(10, int), np.full(10, 2)]
+    wide = {v.param: v for v in ev.acted_upon(out, src, np.zeros(240), frames, params, {}, spans=spans)}
+    assert wide[1].partners == (2,) and wide[2].partners == (1,) and wide[1].jointly == 10

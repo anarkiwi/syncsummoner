@@ -21,7 +21,7 @@ import numpy as np
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import frameline
 from syncsummoner.compose.lock import capture_times, changes, live_attribution, read_live, save_lock
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, snap_toggles
 from syncsummoner.device import wire as W
 from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
 from syncsummoner.probe import decoded
@@ -295,7 +295,8 @@ def read_latency(directory: str | Path) -> ev.Latency:
 
     Each dry take bounds the device's latency whichever line its captures admit
     (:attr:`~syncsummoner.compose.evidence.Latency.bounds`), so it lies where they all meet. Only takes
-    measured to the frame line count; a band of half a frame or more cannot name a landing frame.
+    measured to the frame line count. However wide the band, it only widens each write's landing window
+    (:func:`~syncsummoner.compose.evidence.window`); bands that do not meet contradict each other.
     """
     path = Path(directory, LATENCY_FILE)
     held = json.loads(path.read_text(encoding="utf-8"))["takes"] if path.is_file() else []
@@ -308,10 +309,10 @@ def read_latency(directory: str | Path) -> ev.Latency:
     lo = max(t["lo"] + t.get("line_lo", 0.0) for t in takes)
     hi = min(t["hi"] + t.get("line_hi", 0.0) for t in takes)
     period = float(np.median([t["period"] for t in takes]))
-    if hi < lo or hi - lo >= period / 2:
+    if hi < lo:
         raise LeadInTimeError(
             f"dry takes in {path} put the CC-to-picture latency over {lo / 1e6:.2f}..{hi / 1e6:.2f} ms, "
-            "empty or half a frame or more, so it cannot say which frame a write lands on"
+            "an empty band, so the dry takes contradict each other"
         )
     found = ev.Latency(lo=lo, hi=hi, samples=0, period=period)
     LOG.info(
@@ -381,9 +382,12 @@ def locked_take(
         read_latency(Path(out).parent)
         load("Passthru")
     start_state = {**initial, **(dry or {})}
-    start_vector = np.array([start_state.get(i, int(park[i - 1])) for i in range(1, PARAM_COUNT + 1)])
+    slots = np.arange(1, PARAM_COUNT + 1)
+    start_vector = snap_toggles(slots, [start_state.get(i, int(park[i - 1])) for i in slots])
     wet = wet_at(lead_in, fps)
-    rows = schedule(plan_rows(plan, dry, initial, wet_frame=wet, dry_frame=count), start_vector)
+    asked = plan_rows(plan, dry, initial, wet_frame=wet, dry_frame=count).copy()
+    asked["value"] = snap_toggles(asked["param"], asked["value"])
+    rows = schedule(asked, start_vector)
     echoes = Echoes()
     sender = Sender(write, echoes=echoes, encode=encode)
     poller = Poller(shell, interval_s=lead_in.poll_s, echoes=echoes)
@@ -787,7 +791,9 @@ def take_evidence(
     lat = take_latency(take, wire, (images, frames, found, times), echo)
     ticks, delta = ev.grid(times, lat), lat.delta
     plan = wire["plan"]
-    landed_rows = ev.landed(plan, sends, ticks, times, delta, echo=echo, resent=resent)
+    landed_rows = ev.landed(
+        plan, sends, ticks, times, delta, echo=echo, resent=resent, spread=line_spread(found)
+    )
     applied_rows = ev.applied(
         wire["reads"], sends, wire["initial"], ticks, times, delta, echo=echo, resent=resent
     )
@@ -805,11 +811,12 @@ def take_evidence(
         out,
         src,
         luma_range,
-        rows["landed"][sent],
+        rows["last"][sent],
         rows["param"][sent],
         names,
         kinds=None if kinds is None else kinds[sent],
         regime=regime,
+        spans=rows["last"][sent] - rows["first"][sent] + 1,
     )
     return ev.Evidence(
         program=program,
@@ -822,6 +829,14 @@ def take_evidence(
         loaded=loaded_before(program, wire, ticks, times, delta),
         predicted=step_counts(rows, kinds),
     )
+
+
+def line_spread(found: Any) -> tuple[float, float]:
+    """How far before and after its frame line the take's captures admit its clip frames' starts."""
+    n = np.arange(found.lead, found.lead + found.picked.size)
+    least, most = found.line.polygon.at(n)
+    line = found.line.origin + n * found.line.period
+    return float(np.min(least - line, initial=0.0)), float(np.max(most - line, initial=0.0))
 
 
 def take_echo(wire: Mapping[str, Any]) -> np.ndarray | None:

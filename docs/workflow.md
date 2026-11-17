@@ -216,6 +216,8 @@ render plays, as frame-locked takes ([evidence.md](evidence.md)):
 
 ```sh
 ss probe hold takes/take-*.mkv --source clip.mkv --out holds/      # settle and hold per program
+ss probe sweep regions NAME --cover cover-NAME.json --hold holds/hold-NAME.json --source clip.mkv \
+  --audio track.m4a --takes sweep/ --budget-s 1500 [--joint 11:6] [--seed N]
 ss probe sweep plan NAME --structural --hold holds/hold-NAME.json --source clip.mkv --takes sweep/
 ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi   # rig, one take
 ss probe sweep collect sweep/sweep-NAME.json --chunk K   # judge it, keep its archive rows
@@ -242,13 +244,35 @@ settles or reads back per setpoint. `capture` records one take on the rig (exit
 2 on a take fault, with the device state in `<take>.meta.json`). `collect`
 judges it and writes `<take>.rows.parquet`: one row per capture, under the
 parameter state the take realized on that frame from the landed writes. A
-frame keeps its setpoint only once every write of it has landed, one frame more
-for a write on a tick, plus the settle, until the next setpoint's first write
-lands, and only where the realized state is that setpoint's; frames a readback
+frame keeps its setpoint only once every write of it has landed, the end of
+each write's landing window, plus the settle, until the next setpoint's first
+write may have landed, and only where the realized state is that setpoint's; frames a readback
 disagreed on keep none. `commit` joins the takes' card MJPEG streams with no
 re-encode into one archive, keyed on name and firmware, with the clip linked
 beside it and each row naming the clip frame it shows, so the survival metrics
 need no clock fit.
+
+`probe sweep regions` plans for what the profiles predict, picture and motion survival on
+moving footage, rather than stepping every level. In each regime the cover chose, the
+parameters it steps there are sampled together by a scrambled Sobol design
+(`scipy.stats.qmc.Sobol`, `--seed`), each coordinate picking among the settings the
+program's read bits tell apart by the stratum it falls in, so interactions are seen, a
+switch or a few-setting control comes up in equal shares, and no unread bit is spent;
+other parameters keep the regime's base. Each setting is held long enough for the
+follow test (`survival.follow_z`) to see the least follow the planner's dead-bar test
+resolves over the bar it plays in (`regions.effect_sizes`, bars from the track's
+downbeats, the clip played from the track's start), with a miss as rare as a false call:
+`atanh(r) * sqrt(n_eff - 3)` reaching `critical_z() + SIGMA`, `n_eff` the footage TI's
+own effective samples over the window (`regions.hold_at`). Holds so vary with the
+footage under them. Each setting first waits a guard: its writes' landing window, from
+the take directory's latency band, then the program's settle. Settings fill the clip
+one after another and a new take starts whenever it runs out, each take paying its
+lead-in and lead-out; `--budget-s` caps the rig time, and each regime gets the largest
+power of two settings its share (by dimensions sampled) allows, a Sobol design being
+balanced only there. The plan's `regions` record has the settings, the capacity the
+budget held, the per-regime counts, the guard and the hold range. `--joint` adds the
+selector moves below, each held the same way. A take plays the clip once, since its
+strips name each clip frame once, so a program's sweep is several takes.
 
 `--cover FILE` plans from a cover `program cover --json` already wrote, each stepped
 parameter's settings taken from the bits the program reads, so no cover is searched.

@@ -151,6 +151,22 @@ each: parameters are patch-specific, and no slot means the same in every program
 Bypass; the four with one pass the strip with it on. The rest load inside a
 Passthru lead-in.
 
+## Toggle slots switch at 512
+
+The firmware reads a toggle slot (P7 to P11) as on from device value 512, and off below
+it. On firmware 1.0.2-rc.4, raw 14-bit CCs sent past pyvmancer to Pinwheel's Luma Invert
+(slot 8) across the range read back `o=0` with the off picture for 0..511 and `o=1023`
+with the on picture for 512..1023, the edge bisected to 511/512; YUV Bit Rotator's
+Direction (slot 7) read back the same way, off at 496 and on at 512 (its picture was not
+live in that state). Evidence: `captures/archive-rc4/toggle/*.json`, tool
+`captures/diag/togglethreshold.py`.
+
+pyvmancer's `set_param` coerces any nonzero toggle value to on, so a value in 1..511 went
+out on while the firmware, and `BOOL_THRESHOLD`, read it as off. Every toggle value is now
+snapped as the firmware reads it before it is planned, sent, echoed or recorded
+(`profile.snap_toggles`, in `Transport.set_param`, `locked_take`'s schedule and
+`locked.carried`).
+
 ## The MIDI CC map must be checked
 
 On firmware 1.0.1 a program load with the source HDMI link dropped, which is how

@@ -32,6 +32,18 @@ lines other than the one fitted, frame starts lie within `line_lo..line_hi` of i
 the device's own latency lies in `Latency.bounds`, the band widened by them; each record
 says its basis (`"basis": "start"`).
 
+A landing is a window, not a frame (`evidence.window`). The device took a write somewhere
+in its echo bracket and applies it on the first tick after; a tick lies in its band
+widened by how far the take's captures admit frame starts either side of its line
+(`locktake.line_spread`). The window runs from the first frame any such tick can land it
+on (`first`) to the last (`last`); `landed` is the point estimate inside it. Nothing
+depends on the window being one frame: a write is late only if its window starts after
+its target, early only if it ends before, and windows wider than a frame are counted
+(`ambiguous`) without failing the take. A setting is measured only once its writes'
+windows have closed and the program has settled, so a frame either way costs guard
+frames, not attribution. A program the CC acts on a frame or two later than the write
+lands gains nothing from a narrower window.
+
 ## Frame-locked sends
 
 1. The program is loaded before playout and held dry for the lead-in: its bypass
@@ -62,7 +74,9 @@ A program with no bypass switch keeps the old lead-in: Passthru
 under the strips, the program loaded inside it, the outage bridged by the Pi's flip
 log; Passthru is loaded again for the lead-out. Its latency band is where every dry
 take's `Latency.bounds` meet (`ccpicture.json`, start-basis records only; a judged dry take
-records its own); `render --cut-programs` renders such programs after a dry one.
+records its own); `render --cut-programs` renders such programs after a dry one. However
+wide that band, it only widens such a take's landing windows; bands that do not meet at all
+contradict each other and stop the take.
 
 The boot count (settings key 9) is read before and after every take; any rise is a
 `RebootError`.
@@ -150,7 +164,12 @@ capture from the previous frame's, over all three planes at 96x54 (chroma includ
 so a hue change counts); the source change is the same measure on the clip
 (`matched.frame_change`).
 
-- **Controls** are frames with no write landing on them or the frame before.
+- **Landing windows.** A step is scored by the picture's change across its landing
+  window, from the frame before `first` to `last` plus the lag (`matched.frame_change`
+  over the window's span), so it is caught wherever in the window it landed. A window
+  of one frame is the frame-to-frame change.
+- **Controls** are spans as long as the step's window with no window of any write
+  reaching into them, nor the lags after one; each span length has its own null.
 - **Matched score.** Each frame's output change is scored against the `sqrt(n)`
   controls nearest it in source change: its departure from their median in units of
   their MAD (Loftsgaarden and Quesenberry's neighbour count; the measure's resolution
@@ -195,8 +214,9 @@ where it can only fail to move.
 A parameter's steps are then tested in two pools: those the model leaves live
 (live), and those it proves cannot change the picture (dead and
 no-op). A live step is tested on frames where no other live step lands, so a proven
-no-op beside it is not a partner. A dead step is tested only more than the longest
-lag from every live step, its own parameter's included, and where nothing else lands. Steps
+no-op beside it is not a partner. Steps stand alone when no other parameter's landing
+window meets theirs. A dead step is tested only more than the longest
+lag from every live step's window, its own parameter's included, and where nothing else lands. Steps
 that never land alone are tested with their partners. Every pool tested counts
 toward the family-wise bound.
 

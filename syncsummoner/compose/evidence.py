@@ -252,15 +252,13 @@ class Landed:
 
     @property
     def ok(self) -> bool:
-        """Every write sent once, in order, taken by the device and in effect from its target."""
+        """Every write sent once, in order, taken by the device, and its landing window holding its target.
+
+        A window wider than one frame (``ambiguous``) is counted, not failed: a setting's measured
+        frames start after the window's end.
+        """
         return not (
-            self.missing
-            or self.duplicated
-            or self.out_of_order
-            or self.late
-            or self.early
-            or self.ambiguous
-            or self.unechoed
+            self.missing or self.duplicated or self.out_of_order or self.late or self.early or self.unechoed
         )
 
     def summary(self) -> str:
@@ -268,7 +266,8 @@ class Landed:
         return (
             f"{len(self.rows)} writes scheduled: {self.missing} missing, {self.unechoed} never echoed, "
             f"{self.duplicated} duplicated, {self.out_of_order} out of order, {self.late} late, "
-            f"{self.early} early, {self.ambiguous} on a tick; sends woke at worst {self.wake_ms:.2f} ms "
+            f"{self.early} early, {self.ambiguous} over more than one frame; "
+            f"sends woke at worst {self.wake_ms:.2f} ms "
             f"after due; least slack, echo to its target's tick, {self.slack_ms:.2f} ms"
         )
 
@@ -286,6 +285,8 @@ LANDED = np.dtype(
         ("clear_ns", "<f8"),
         ("landed", "<i8"),
         ("echo_ns", "<i8"),
+        ("first", "<i8"),
+        ("last", "<i8"),
     ]
 )
 
@@ -308,6 +309,27 @@ def landing(bracket: np.ndarray, ticks: Ticks) -> tuple[np.ndarray, np.ndarray]:
     return n, np.minimum(after, before)
 
 
+def window(
+    bracket: np.ndarray,
+    ticks: Ticks,
+    times: FrameTimes,
+    delta: float,
+    spread: tuple[float, float] = (0.0, 0.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """The earliest and latest clip frame each bracketed write may take effect on.
+
+    The device takes it somewhere in its bracket and applies it on the first tick after. A tick lies
+    in its bracket widened by ``spread``, how far the frame starts the take's captures admit lie
+    either side of its line, so the window holds every landing the echo and the line allow.
+    """
+    lo, hi = ticks.lo + spread[0], ticks.hi + spread[1]
+    early = np.ceil((bracket[:, 0] - hi) / ticks.period)
+    late = np.ceil((bracket[:, 1] - lo) / ticks.period)
+    return frame_of_tick(early, ticks, times, delta), frame_of_tick(
+        np.maximum(late, early), ticks, times, delta
+    )
+
+
 def landed(
     plan: np.ndarray,
     sends: np.ndarray,
@@ -318,16 +340,20 @@ def landed(
     *,
     echo: np.ndarray | None = None,
     resent: np.ndarray | None = None,
+    spread: tuple[float, float] = (0.0, 0.0),
 ) -> Landed:
     """Match scheduled ``(target, param, value)`` rows to sends in order, and land each where it took effect.
 
     The k-th send of a ``(target, param)`` pair answers its k-th scheduled row, resent copies aside; a
     send nothing scheduled is a duplicate. ``echo`` (``wire.echoed``) brackets when the device took each
     send, else its send interval does; ``seen`` is each send's tick as read back, which lands it when known.
+    ``first`` and ``last`` are each write's landing window (:func:`window`, widened by ``spread``); a write
+    is late only when its window starts after its target, early only when it ends before.
     """
     rows = np.zeros(len(plan), dtype=LANDED)
     rows["target"], rows["param"], rows["value"] = plan["target"], plan["param"], plan["value"]
     rows["sent"], rows["wire"], rows["tick"], rows["seen"], rows["landed"] = -1, -1, -1, -1, CALIBRATION
+    rows["first"], rows["last"] = CALIBRATION, CALIBRATION
     rows["clear_ns"], rows["echo_ns"] = np.nan, -1
     keep = sends["target"] > START
     copy = np.isin(np.arange(len(sends)), [] if resent is None else resent)[keep]
@@ -360,6 +386,9 @@ def landed(
     rows["tick"][ok], rows["clear_ns"][ok], rows["echo_ns"][ok] = n, clear, took[heard, 1]
     seen_ok = rows["seen"][ok]
     rows["landed"][ok] = frame_of_tick(np.where(seen_ok >= 0, seen_ok, n), ticks, times, delta)
+    first, last = window(took[heard], ticks, times, delta, spread)
+    rows["first"][ok] = np.minimum(first, rows["landed"][ok])
+    rows["last"][ok] = np.maximum(last, rows["landed"][ok])
     due = np.rint((times.at(rows["target"][ok]) - delta - ticks.phase) / ticks.period)
     slack = ticks.lo + due * ticks.period - took[heard, 1]
     order = rows["sent"][sent]
@@ -368,9 +397,9 @@ def landed(
         missing=int((~sent).sum()),
         duplicated=duplicated,
         out_of_order=int(np.count_nonzero(np.diff(order) < 0)),
-        late=int(np.count_nonzero(rows["landed"][ok] > rows["target"][ok])),
-        early=int(np.count_nonzero(rows["landed"][ok] < rows["target"][ok])),
-        ambiguous=int(np.count_nonzero((clear < 0) | ((seen_ok >= 0) & (seen_ok != n)))),
+        late=int(np.count_nonzero(rows["first"][ok] > rows["target"][ok])),
+        early=int(np.count_nonzero(rows["last"][ok] < rows["target"][ok])),
+        ambiguous=int(np.count_nonzero(rows["last"][ok] > rows["first"][ok])),
         unechoed=int((~heard).sum()),
         slack_ms=float(slack.min()) / 1e6 if slack.size else float("nan"),
         wake_ms=(
@@ -545,40 +574,115 @@ class Moved:
         return int(math.ceil(need * self.steps / max(self.effective, 1.0)))
 
 
-def _groups(frames: np.ndarray, params: np.ndarray, kinds: np.ndarray | None, reach: int) -> list[tuple]:
-    """``(param, pool, frames, alone, partners)`` for every pool of steps to test.
+def _cover(first: np.ndarray, last: np.ndarray, count: int) -> np.ndarray:
+    """How many of the windows ``[first, last]`` cover each of ``count`` frames."""
+    marks = np.zeros(count + 1, dtype=np.int64)
+    np.add.at(marks, np.clip(first, 0, count), 1)
+    np.add.at(marks, np.clip(last + 1, 0, count), -1)
+    return np.cumsum(marks)[:count]
 
-    A live step is tested on frames where no other step the model leaves live lands, so proven
-    no-ops beside it do not count as partners. A dead pool keeps only frames more than ``reach``
-    from every live step, its own parameter's included, so no live step's picture can reach it.
-    Steps that never land alone are tested with their partners.
+
+def _within(cover: np.ndarray, first: np.ndarray, last: np.ndarray) -> np.ndarray:
+    """The total of ``cover`` over each window ``[first, last]``."""
+    total = np.r_[0, np.cumsum(cover)]
+    return total[np.clip(last + 1, 0, cover.size)] - total[np.clip(first, 0, cover.size)]
+
+
+def _groups(
+    frames: np.ndarray, spans: np.ndarray, params: np.ndarray, kinds: np.ndarray | None, reach: int
+) -> list[tuple]:
+    """``(param, pool, steps, alone, partners)`` for every pool of steps to test, steps as ``(last, span)``.
+
+    A step takes effect somewhere in its window, the ``span`` frames ending at ``last``. A live step is
+    tested where no other parameter's live step's window meets its own, so proven no-ops beside it do
+    not count as partners. A dead pool keeps only windows more than ``reach`` from every live window,
+    its own parameter's included, so no live step's picture can reach it. Steps that never land alone
+    are tested with their partners.
     """
+    count = int((frames.max() if frames.size else 0) + reach + 2)
+    first = frames - spans + 1
     tested = np.ones(frames.size, dtype=bool) if kinds is None else np.isin(kinds, TESTED)
     proven = np.zeros(frames.size, dtype=bool) if kinds is None else np.isin(kinds, (NOOP, DEAD))
-    live = np.unique(frames[tested])
-    near_live = np.zeros(frames.size, dtype=bool)
-    if live.size:
-        at = np.clip(np.searchsorted(live, frames), 1, live.size) - 1
-        gap = np.minimum(np.abs(frames - live[at]), np.abs(frames - live[np.clip(at + 1, 0, live.size - 1)]))
-        near_live = gap <= reach
+    near_live = _within(_cover(first[tested] - reach, frames[tested] + reach, count), first, frames) > 0
     out = []
     for param in sorted(set(int(p) for p in params[tested | proven])):
         for pool, mask, rivals in (
             (ALL_POOL if kinds is None else LIVE_POOL, tested, tested),
             (DEAD_POOL, proven & ~near_live, tested | proven),
         ):
-            mine = np.unique(frames[mask & (params == param)])
-            if not mine.size:
+            pick = mask & (params == param)
+            if not pick.any():
                 continue
-            others = {(int(f), int(p)) for f, p in zip(frames[rivals], params[rivals]) if p != param}
-            busy = np.array(sorted({f for f, _ in others}), dtype=np.int64)
-            alone = mine[~np.isin(mine, busy)]
+            mine = np.unique(np.c_[frames[pick], spans[pick]], axis=0)
+            other = rivals & (params != param)
+            busy = _cover(first[other], frames[other], count)
+            lo, hi = mine[:, 0] - mine[:, 1] + 1, mine[:, 0]
+            free = _within(busy, lo, hi) == 0
+            alone = mine[free]
             partners: tuple[int, ...] = ()
             if not alone.size:
-                alone, near = mine, set(mine.tolist())
-                partners = tuple(sorted({p for f, p in others if f in near}))
+                alone = mine
+                near = _within(_cover(lo, hi, count), first[other], frames[other]) > 0
+                partners = tuple(sorted({int(p) for p in params[other][near]}))
             out.append((param, pool, mine, alone, partners))
     return out
+
+
+class _Scorer:
+    """Steps' picture changes across their windows, scored against step-free spans as long, per regime."""
+
+    def __init__(self, out: np.ndarray, src: np.ndarray, stepped: np.ndarray, regime: Regime):
+        self.out, self.src, self.stepped, self.regime = out, src, stepped.astype(np.int64), regime
+        self.quantum = 1.0 / float(np.prod(np.shape(out)[1:]))
+        self.changes: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        self.nulls: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray, float]] = {}
+
+    def change(self, span: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Output and source change over ``span`` frames, where both are measured, and the step-free ends."""
+        if span not in self.changes:
+            d_out, d_src = frame_change(self.out, span), frame_change(self.src, span)
+            measured = np.isfinite(d_out) & np.isfinite(d_src)
+            end = np.arange(self.stepped.size)
+            clear = _within(self.stepped, end - span + 1, end) == 0
+            self.changes[span] = (d_out, d_src, measured, np.flatnonzero(clear & measured))
+        return self.changes[span]
+
+    def null_of(self, param: int, key: int, span: int) -> tuple[np.ndarray, np.ndarray, float]:
+        """The step-free controls of a regime and span, their matched scores and their scatter."""
+        mask = self.regime.own.get(param, 0)
+        if (mask, key, span) not in self.nulls:
+            d_out, d_src, _, controls = self.change(span)
+            mine = controls[self.regime.of(param, controls) == key]
+            res, spread = (
+                matched_change(d_out, d_src, mine, mine, self.quantum) if mine.size > 1 else (mine, mine)
+            )
+            scatter = float(np.std(res, ddof=1)) if res.size > 1 else math.nan
+            self.nulls[mask, key, span] = (mine, res / spread, scatter)
+        return self.nulls[mask, key, span]
+
+    def tested(
+        self, param: int, x: np.ndarray, span: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, float, int]:
+        """Each step ending at ``x``: its tail p, its residual, the pooled scatter and the steps measured."""
+        p_e, residual, weight, var, kept = [], [], 0, 0.0, 0
+        for s in np.unique(span):
+            d_out, d_src, measured, _ = self.change(int(s))
+            at = x[span == s]
+            at = at[measured[at]]
+            kept += at.size
+            keys = self.regime.of(param, at)
+            for key in np.unique(keys):
+                mine, null, scatter = self.null_of(param, int(key), int(s))
+                here = at[keys == key]
+                if null.size:
+                    r, spread = matched_change(d_out, d_src, here, mine, self.quantum)
+                    p_e.append(tail_p(r / spread, null))
+                    residual.append(r)
+                    weight, var = weight + here.size, var + here.size * scatter**2
+        p_e = np.concatenate(p_e) if p_e else np.zeros(0)
+        residual = np.concatenate(residual) if residual else np.zeros(0)
+        ok = np.isfinite(p_e)
+        return p_e[ok], residual[ok], math.sqrt(var / weight) if weight else math.nan, kept
 
 
 def acted_upon(
@@ -592,69 +696,45 @@ def acted_upon(
     lags: Sequence[int] = LAGS,
     kinds: Sequence[str] | None = None,
     regime: Regime | None = None,
+    spans: np.ndarray | None = None,
 ) -> list[Moved]:
     """Test every parameter's steps against frames of matched source motion with no step.
 
     ``out`` and ``src`` are per clip frame; ``landed_frames``, ``params`` and ``kinds`` give each
-    write's frame and the model's verdict on its step. With ``kinds``, a parameter's steps the
-    model leaves live and those it proves no-ops are tested apart; steps that change no value are
-    not tested. With ``regime``, each step is scored against the step-free frames of its own regime
-    (:class:`Regime`), each regime's controls forming its own null. Family-wise over all tests.
+    write's frame and the model's verdict on its step, and ``spans`` its landing window's length in
+    frames, ending at its frame (one each when not given). A step is scored by the picture's change
+    across its window, from the frame before it to its end plus the lag, against step-free spans as
+    long. With ``kinds``, a parameter's steps the model leaves live and those it proves no-ops are
+    tested apart; steps that change no value are not tested. With ``regime``, each step is scored
+    against the step-free frames of its own regime (:class:`Regime`), each regime's controls forming
+    its own null. Family-wise over all tests.
     """
-    d_out, d_src = frame_change(out), frame_change(src)
-    count = d_out.size
-    quantum = 1.0 / float(np.prod(np.shape(out)[1:]))
+    count = len(out)
     frames = np.asarray(landed_frames, dtype=np.int64)
+    spans = (
+        np.ones(frames.size, dtype=np.int64) if spans is None else np.maximum(np.asarray(spans, np.int64), 1)
+    )
     kinds = None if kinds is None else np.asarray(kinds, dtype=object)
-    inside = (frames >= 1) & (frames < count - max(lags))
-    stepped = np.zeros(count, dtype=bool)
-    for lag in (0, *lags):
-        stepped[np.clip(frames[inside] + lag, 0, count - 1)] = True
+    inside = (frames - spans >= 0) & (frames < count - max(lags))
+    stepped = _cover(frames[inside] - spans[inside] + 1, frames[inside] + max(0, *lags), count) > 0
     if kinds is not None:
         inside &= kinds != UNCHANGED
         kinds = kinds[inside]
-    frames, params = frames[inside], np.asarray(params)[inside]
-    measured = np.isfinite(d_out) & np.isfinite(d_src)
-    controls = np.flatnonzero(~stepped & measured)
-    regime = Regime(np.zeros(count, dtype=np.int64)) if regime is None else regime
-    nulls: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, float]] = {}
-
-    def null_of(param: int, key: int) -> tuple[np.ndarray, np.ndarray, float]:
-        mask = regime.own.get(param, 0)
-        if (mask, key) not in nulls:
-            mine = controls[regime.of(param, controls) == key]
-            res, spread = matched_change(d_out, d_src, mine, mine, quantum) if mine.size > 1 else (mine, mine)
-            nulls[mask, key] = (mine, res / spread, float(np.std(res, ddof=1)) if res.size > 1 else math.nan)
-        return nulls[mask, key]
-
-    def tested(param: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-        keys = regime.of(param, x)
-        p_e, residual, weight, var = np.full(x.size, np.nan), np.full(x.size, np.nan), 0, 0.0
-        for key in np.unique(keys):
-            mine, null, scatter = null_of(param, int(key))
-            at = keys == key
-            if null.size:
-                r, spread = matched_change(d_out, d_src, x[at], mine, quantum)
-                p_e[at], residual[at] = tail_p(r / spread, null), r
-                weight, var = weight + int(at.sum()), var + int(at.sum()) * scatter**2
-        ok = np.isfinite(p_e)
-        return p_e[ok], residual[ok], math.sqrt(var / weight) if weight else math.nan
-
-    groups = _groups(frames, params, kinds, max(lags))
+    frames, params, spans = frames[inside], np.asarray(params)[inside], spans[inside]
+    scored = _Scorer(out, src, stepped, Regime(np.zeros(count, dtype=np.int64)) if regime is None else regime)
+    groups = _groups(frames, spans, params, kinds, max(lags))
     limit = critical(len(groups) * len(lags))
     verdicts = []
     for param, pool, mine, alone, partners in groups:
         best = (np.zeros(0), 0.0, -math.inf, lags[0], np.zeros(0), math.nan, 0)
         for lag in lags:
-            x = alone + lag
-            x = x[measured[x]]
-            p_e, residual, scatter = tested(param, x)
+            p_e, residual, scatter, kept = scored.tested(param, alone[:, 0] + lag, alone[:, 1])
             if not p_e.size:
-                best = best if best[0].size else (*best[:6], x.size)
+                best = best if best[0].size else (*best[:6], kept)
                 continue
             z, n_eff = fisher_z(p_e)
             if z > best[2]:
-                best = (p_e, n_eff, z, lag, residual, scatter, x.size - p_e.size)
+                best = (p_e, n_eff, z, lag, residual, scatter, kept - p_e.size)
         p_e, n_eff, z, lag, residual, scatter, unmatched = best
         verdicts.append(
             Moved(
@@ -666,8 +746,8 @@ def acted_upon(
                 z=float(z) if p_e.size else 0.0,
                 lag=int(lag),
                 critical=limit,
-                flat=float(np.mean(luma_range[alone] <= FLAT_CODES)) if alone.size else float("nan"),
-                jointly=int(mine.size - alone.size) if not partners else int(mine.size),
+                flat=float(np.mean(luma_range[alone[:, 0]] <= FLAT_CODES)) if alone.size else float("nan"),
+                jointly=int(len(mine) - len(alone)) if not partners else int(len(mine)),
                 partners=partners,
                 effect=float(residual.mean()) if residual.size else float("nan"),
                 scatter=scatter,

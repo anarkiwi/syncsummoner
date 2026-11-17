@@ -31,10 +31,12 @@ class Regime:
         return self.code[frames] & ~self.own.get(param, 0)
 
 
-def frame_change(stack: np.ndarray) -> np.ndarray:
-    """Mean absolute difference of every frame from the one before, all planes; NaN for the first."""
+def frame_change(stack: np.ndarray, span: int = 1) -> np.ndarray:
+    """Mean absolute difference of every frame from the one ``span`` before, all planes; NaN before that."""
     flat = np.asarray(stack, dtype=np.float32).reshape(len(stack), -1)
-    return np.r_[np.nan, np.abs(np.diff(flat, axis=0)).mean(axis=1)]
+    out = np.full(len(flat), np.nan)
+    out[span:] = np.abs(flat[span:] - flat[:-span]).mean(axis=1)
+    return out
 
 
 def matched_change(
