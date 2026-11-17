@@ -712,6 +712,7 @@ def test_has_resumes_only_against_the_same_stimulus(tmp_path, stored, asked, hel
 
 
 def test_a_row_names_the_clip_frame_it_shows_and_old_rows_name_none():
+    """A locked take names each capture's clip frame; a sidecar from before names none."""
     row = FrameRow(frame=1, program="p", params=(0,) * 12, setpoint=2, captured=1.5, shown=40)
     assert FrameRow.from_row(row.as_row()) == row
     old = {k: v for k, v in row.as_row().items() if k != "shown"}

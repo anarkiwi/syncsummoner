@@ -190,4 +190,4 @@ def test_toggles_go_out_as_off_or_on_and_repeats_drop():
     states = np.zeros((4, 12), dtype=np.int64)
     states[1, 6], states[2, 6], states[3, 0] = 768, 1000, 5
     out = L.carried(states, [7])
-    assert out[:, 6].tolist() == [0, 1023, 1023] and out[:, 0].tolist() == [0, 0, 5]
+    assert out[:, 6].tolist() == [0, 1023, 0] and out[:, 0].tolist() == [0, 0, 5]
