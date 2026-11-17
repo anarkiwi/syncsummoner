@@ -44,6 +44,36 @@ def pre_states(start: np.ndarray, rows: np.ndarray) -> tuple[np.ndarray, np.ndar
     return pre, a, b
 
 
+def frame_states(start: np.ndarray, rows: np.ndarray, count: int) -> np.ndarray:
+    """Every clip frame's manual state, ``0..count-1``: the start state, each sent write from its landing."""
+    state = np.zeros((count, PARAM_COUNT), dtype=np.int64)
+    state[:, : np.size(start)] = np.asarray(start, dtype=np.int64)[:PARAM_COUNT]
+    sent = rows[rows["sent"] >= 0]
+    sent = sent[np.argsort(sent["landed"], kind="stable")]
+    frame = np.arange(count)
+    for param in np.unique(sent["param"]):
+        mine = sent[sent["param"] == param]
+        at = np.searchsorted(mine["landed"], frame, side="right") - 1
+        state[:, param - 1] = np.where(at >= 0, mine["wire"][np.maximum(at, 0)], state[:, param - 1])
+    return state
+
+
+def regimes(
+    model: ProgramModel, start: np.ndarray, rows: np.ndarray, count: int
+) -> tuple[np.ndarray, dict[int, int]]:
+    """Each clip frame's switch regime as a bit code, and the bit each switch holds in it.
+
+    The switches are the controls a one-bit field drives: the ones a non-knob-gated
+    parameter's gating class ties (:func:`gating_class`). No switches leave one regime.
+    """
+    switches = [d for d in model.params if len(field(d.parameter_id).bits) == 1]
+    state = frame_states(start, rows, count)
+    code = np.zeros(count, dtype=np.int64)
+    for bit, decl in enumerate(switches):
+        code |= register_value(decl, state[:, decl.parameter_id - 1]).astype(np.int64) << bit
+    return code, {d.parameter_id: 1 << bit for bit, d in enumerate(switches)}
+
+
 def gating_class(model: ProgramModel, state: np.ndarray, param: int, gated: frozenset[int]) -> tuple:
     """The controls a step's liveness query ties, and their register values there.
 

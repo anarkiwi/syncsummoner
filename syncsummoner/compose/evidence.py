@@ -14,9 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.stats import chi2, norm
 
-from syncsummoner.aesthetics.survival import SIGMA
+from syncsummoner.compose.matched import Regime, critical, fisher_z, frame_change, matched_change, tail_p
 from syncsummoner.device.session import LSB_OFFSET, wire_messages
 from syncsummoner.program.predict import DEAD, LIVE, NOOP, UNCHANGED
 
@@ -574,6 +573,8 @@ class Moved:
     effect: float = float("nan")
     scatter: float = float("nan")
     pool: str = ALL_POOL
+    #: Steps left untested because their regime has too few step-free frames for a null.
+    unmatched: int = 0
 
     @property
     def moved(self) -> bool:
@@ -599,82 +600,6 @@ class Moved:
             return 0
         need = (self.critical * self.scatter / self.effect) ** 2
         return int(math.ceil(need * self.steps / max(self.effective, 1.0)))
-
-
-def frame_change(stack: np.ndarray) -> np.ndarray:
-    """Mean absolute difference of every frame from the one before, all planes; NaN for the first."""
-    flat = np.asarray(stack, dtype=np.float32).reshape(len(stack), -1)
-    return np.r_[np.nan, np.abs(np.diff(flat, axis=0)).mean(axis=1)]
-
-
-def matched_change(
-    d_out: np.ndarray, d_src: np.ndarray, frames: np.ndarray, controls: np.ndarray, quantum: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Each frame's output change less the median of the controls nearest it in source change, and their MAD.
-
-    The ``sqrt(n)`` nearest controls (Loftsgaarden and Quesenberry), the frame itself left out;
-    ``quantum``, the measure's resolution, stands in for a MAD of zero.
-    """
-    k = max(1, int(round(math.sqrt(controls.size))))
-    order = np.argsort(d_src[controls], kind="stable")
-    ranked, values = controls[order], d_src[controls][order]
-    residual, spread = np.full(frames.size, np.nan), np.full(frames.size, np.nan)
-    for i, frame in enumerate(frames):
-        at = int(np.searchsorted(values, d_src[frame]))
-        lo, hi = max(0, at - k - 1), min(values.size, at + k + 1)
-        window = ranked[lo:hi]
-        window = window[window != frame]
-        near = window[np.argsort(np.abs(d_src[window] - d_src[frame]), kind="stable")[:k]]
-        ref = d_out[near]
-        centre = float(np.median(ref))
-        residual[i] = d_out[frame] - centre
-        spread[i] = max(1.4826 * float(np.median(np.abs(ref - centre))), quantum)
-    return residual, spread
-
-
-def matched_scores(
-    d_out: np.ndarray, d_src: np.ndarray, frames: np.ndarray, controls: np.ndarray, quantum: float
-) -> np.ndarray:
-    """Each frame's output change against the controls nearest it in source change, in robust units."""
-    residual, spread = matched_change(d_out, d_src, frames, controls, quantum)
-    return residual / spread
-
-
-def tail_p(scores: np.ndarray, null: np.ndarray) -> np.ndarray:
-    """One-sided p of each score in the empirical distribution of the null scores (mid-p)."""
-    ordered = np.sort(null)
-    above = null.size - np.searchsorted(ordered, scores, side="left")
-    ties = np.searchsorted(ordered, scores, side="right") - np.searchsorted(ordered, scores, side="left")
-    return (above - 0.5 * ties + 0.5) / (null.size + 1)
-
-
-def fisher_z(p: np.ndarray) -> tuple[float, float]:
-    """Fisher's combination of one-sided p values as a z score, and the independent samples behind it.
-
-    Serial dependence shrinks the statistic and its degrees of freedom by ``n_eff / n`` (Brown).
-    """
-    if not p.size:
-        return 0.0, 0.0
-    terms = -2.0 * np.log(p)
-    n_eff = effective(terms)
-    stat = float(terms.sum()) * n_eff / p.size
-    return float(norm.isf(chi2.sf(stat, 2.0 * n_eff))), n_eff
-
-
-def effective(u: np.ndarray) -> float:
-    """Independent samples behind a mean of a first-order autoregressive series."""
-    if u.size < 3:
-        return float(u.size)
-    if np.ptp(u) == 0:
-        return float(u.size)
-    d = u - u.mean()
-    rho = float(d[:-1] @ d[1:] / float(d @ d))
-    return float(np.clip(u.size * (1 - rho) / (1 + rho), 1.0, u.size))
-
-
-def critical(tests: int, sigma: float = SIGMA) -> float:
-    """The one-sided z a test must pass for a family-wise error of the ``sigma`` tail over ``tests``."""
-    return float(norm.isf(norm.sf(sigma) / max(1, int(tests))))
 
 
 def _groups(frames: np.ndarray, params: np.ndarray, kinds: np.ndarray | None, reach: int) -> list[tuple]:
@@ -723,13 +648,15 @@ def acted_upon(
     *,
     lags: Sequence[int] = LAGS,
     kinds: Sequence[str] | None = None,
+    regime: Regime | None = None,
 ) -> list[Moved]:
     """Test every parameter's steps against frames of matched source motion with no step.
 
     ``out`` and ``src`` are per clip frame; ``landed_frames``, ``params`` and ``kinds`` give each
     write's frame and the model's verdict on its step. With ``kinds``, a parameter's steps the
     model leaves live and those it proves no-ops are tested apart; steps that change no value are
-    not tested. Family-wise over all tests.
+    not tested. With ``regime``, each step is scored against the step-free frames of its own regime
+    (:class:`Regime`), each regime's controls forming its own null. Family-wise over all tests.
     """
     d_out, d_src = frame_change(out), frame_change(src)
     count = d_out.size
@@ -746,29 +673,46 @@ def acted_upon(
     frames, params = frames[inside], np.asarray(params)[inside]
     measured = np.isfinite(d_out) & np.isfinite(d_src)
     controls = np.flatnonzero(~stepped & measured)
-    null_res, null_spread = (
-        matched_change(d_out, d_src, controls, controls, quantum)
-        if controls.size > 1
-        else (np.zeros(0), np.zeros(0))
-    )
-    null = null_res / null_spread if null_res.size else np.zeros(0)
+    regime = Regime(np.zeros(count, dtype=np.int64)) if regime is None else regime
+    nulls: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, float]] = {}
+
+    def null_of(param: int, key: int) -> tuple[np.ndarray, np.ndarray, float]:
+        mask = regime.own.get(param, 0)
+        if (mask, key) not in nulls:
+            mine = controls[regime.of(param, controls) == key]
+            res, spread = matched_change(d_out, d_src, mine, mine, quantum) if mine.size > 1 else (mine, mine)
+            nulls[mask, key] = (mine, res / spread, float(np.std(res, ddof=1)) if res.size > 1 else math.nan)
+        return nulls[mask, key]
+
+    def tested(param: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        keys = regime.of(param, x)
+        p_e, residual, weight, var = np.full(x.size, np.nan), np.full(x.size, np.nan), 0, 0.0
+        for key in np.unique(keys):
+            mine, null, scatter = null_of(param, int(key))
+            at = keys == key
+            if null.size:
+                r, spread = matched_change(d_out, d_src, x[at], mine, quantum)
+                p_e[at], residual[at] = tail_p(r / spread, null), r
+                weight, var = weight + int(at.sum()), var + int(at.sum()) * scatter**2
+        ok = np.isfinite(p_e)
+        return p_e[ok], residual[ok], math.sqrt(var / weight) if weight else math.nan
+
     groups = _groups(frames, params, kinds, max(lags))
     limit = critical(len(groups) * len(lags))
-    scatter = float(np.std(null_res, ddof=1)) if null_res.size > 1 else float("nan")
     verdicts = []
     for param, pool, mine, alone, partners in groups:
-        best = (np.zeros(0), 0.0, -math.inf, lags[0], np.zeros(0))
+        best = (np.zeros(0), 0.0, -math.inf, lags[0], np.zeros(0), math.nan, 0)
         for lag in lags:
             x = alone + lag
             x = x[measured[x]]
-            if not (x.size and null.size):
+            p_e, residual, scatter = tested(param, x)
+            if not p_e.size:
+                best = best if best[0].size else (*best[:6], x.size)
                 continue
-            residual, spread = matched_change(d_out, d_src, x, controls, quantum)
-            p_e = tail_p(residual / spread, null)
             z, n_eff = fisher_z(p_e)
             if z > best[2]:
-                best = (p_e, n_eff, z, lag, residual)
-        p_e, n_eff, z, lag, residual = best
+                best = (p_e, n_eff, z, lag, residual, scatter, x.size - p_e.size)
+        p_e, n_eff, z, lag, residual, scatter, unmatched = best
         verdicts.append(
             Moved(
                 param=param,
@@ -785,6 +729,7 @@ def acted_upon(
                 effect=float(residual.mean()) if residual.size else float("nan"),
                 scatter=scatter,
                 pool=pool,
+                unmatched=int(unmatched),
             )
         )
     return verdicts
@@ -801,6 +746,10 @@ def why_not(moved: Moved, name: str, applied_ok: bool, landed_ok: bool) -> str:
         (not landed_ok, "not sent on time"),
         (not applied_ok, "the firmware did not take it"),
         (name.strip() in ("-", ""), "the program leaves the slot unused"),
+        (
+            moved.steps == 0 and moved.unmatched > 0,
+            f"its {moved.unmatched} steps' switch regimes have too few step-free frames for a null",
+        ),
         (moved.steps == 0, "no step landed inside the clip's measured frames"),
         (2 * moved.flat > 1, f"the picture was a uniform field at {moved.flat:.0%} of its steps"),
     )
@@ -908,6 +857,7 @@ class Evidence:
                     "readback": "agrees" if agree else "disagrees",
                     "model_steps": counts,
                     "steps_tested": test.steps if test else 0,
+                    "steps_unmatched": test.unmatched if test else 0,
                     "z": round(test.z, 2) if test else None,
                     "critical_z": round(test.critical, 2) if test else None,
                     "lag": test.lag if test else None,
@@ -919,6 +869,7 @@ class Evidence:
                     "steps_needed": test.steps_needed if test else 0,
                     "with": list(test.partners) if test else [],
                     "dead_steps_tested": dead.steps if dead else 0,
+                    "dead_steps_unmatched": dead.unmatched if dead else 0,
                     "dead_z": round(dead.z, 2) if dead else None,
                     "why_not": self._why(verdict, test, dead, counts, (agree, on_time)),
                 }
@@ -969,6 +920,11 @@ class Evidence:
                 + (
                     f", z {row['z']:+.2f} (lag {row['lag']}, critical {row['critical_z']:.2f})"
                     if row["z"] is not None
+                    else ""
+                )
+                + (
+                    f", {row['steps_unmatched'] + row['dead_steps_unmatched']} steps with no regime null"
+                    if row["steps_unmatched"] + row["dead_steps_unmatched"]
                     else ""
                 )
                 + f": {verdict}"

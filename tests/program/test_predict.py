@@ -49,9 +49,25 @@ def test_a_take_of_an_unknown_program_gets_no_verdicts(monkeypatch, tmp_path):
 
     monkeypatch.setenv("SYNCSUMMONER_CARD", str(tmp_path))
     monkeypatch.setenv("SYNCSUMMONER_FIRMWARE", str(tmp_path))
-    assert judged_steps("nobody/Nothing", np.zeros(12, dtype=int), rows_of()) is None
+    assert judged_steps("nobody/Nothing", np.zeros(12, dtype=int), rows_of(), 10) is None
     rows = rows_of((1, 1, 4), (2, 1, 5), (None, 2, 3))
     assert step_counts(rows, np.array([P.DEAD, P.LIVE, P.UNSENT], dtype=object)) == {
         1: {P.DEAD: 1, P.LIVE: 1}
     }
     assert not step_counts(rows, None)
+
+
+def test_every_clip_frame_holds_the_start_state_and_each_write_from_its_landing():
+    rows = rows_of((2, 1, 9), (2, 1, 7), (4, 2, 5), (None, 1, 3), (-1, 3, 6))
+    state = P.frame_states(np.arange(12), rows, 6)
+    assert state[:, 0].tolist() == [0, 0, 7, 7, 7, 7], "the later write of a frame wins"
+    assert state[:, 1].tolist() == [1, 1, 1, 1, 5, 5]
+    assert state[:, 2].tolist() == [6] * 6, "a lead-in write holds from frame 0"
+    assert (state[:, 3:] == np.arange(3, 12)).all()
+
+
+def test_the_switch_regime_codes_each_frames_switches(tiny):
+    rows = rows_of((2, 8, 1023), (3, 1, 900), (4, 7, 1023), (5, 8, 0))
+    code, own = P.regimes(tiny, tiny.initial(), rows, 7)
+    assert own == {7: 1, 8: 2}, "the knobs are no part of the regime"
+    assert code.tolist() == [0, 0, 2, 2, 3, 1, 1]

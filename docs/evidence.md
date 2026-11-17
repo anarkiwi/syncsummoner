@@ -121,16 +121,27 @@ so it cannot build the serial backlog that reboots it.
 Per clip frame, the output change is the mean absolute difference of the frame's
 capture from the previous frame's, over all three planes at 96x54 (chroma included,
 so a hue change counts); the source change is the same measure on the clip
-(`evidence.frame_change`).
+(`matched.frame_change`).
 
 - **Controls** are frames with no write landing on them or the frame before.
 - **Matched score.** Each frame's output change is scored against the `sqrt(n)`
   controls nearest it in source change: its departure from their median in units of
   their MAD (Loftsgaarden and Quesenberry's neighbour count; the measure's resolution
   stands in for a MAD of zero).
-- **Per-step p.** A step's score is placed among the scores of every control (an
-  empirical mid-p), so no distribution is assumed.
-- **Per parameter.** The steps' p values are combined by Fisher's method, its
+- **Switch regimes.** With the program model, every clip frame's parameter state is
+  replayed from the take's start state and the sent writes from their landing frames
+  (`program.predict.frame_states`), and its regime is the register values of the
+  program's switches, the one-bit controls a non-knob-gated parameter's gating class
+  ties (`program.predict.regimes`). A step is tested only against controls whose
+  switches equal its frame's, its own switch aside (`matched.Regime`): with Bypass on
+  the output follows the source, so its change at equal source change is not the
+  processed frames'. Each regime's controls form its own null, scored against
+  themselves. A regime with fewer than two controls has no null, and its steps are
+  left untested and counted (`steps_unmatched`, `dead_steps_unmatched`). Without the
+  model, or with no switches, all controls form one regime.
+- **Per-step p.** A step's score is placed among the scores of every control of its
+  regime (an empirical mid-p), so no distribution is assumed.
+- **Per parameter.** The steps' p values, across every regime, are combined by Fisher's method, its
   statistic and degrees of freedom shrunk by the effective sample fraction of the
   series (Brown), and tested at lags 0 and 1 frame after the modelled landing.
 - **Error rate.** The critical z is the one-sided three-sigma tail divided across
@@ -168,7 +179,8 @@ toward the family-wise bound.
 - **live, not seen**: they did not. The report gives the minimum detectable effect in
   the measure's own units, `critical * scatter / sqrt(effective steps)`, where
   `scatter` is the spread of the step-free controls' change about their matched
-  median: the null the z score is taken against. It never compares against another
+  median: the null the z score is taken against, its variance weighted by the steps
+  each regime's null scored. It never compares against another
   parameter. With a positive observed mean change, it also gives the steps at which
   that change would clear the bound; these go to the take directory's
   `schedule.json`.

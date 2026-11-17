@@ -10,6 +10,7 @@ import pytest
 from scipy.stats import chi2, norm
 
 from syncsummoner.compose import evidence as ev
+from syncsummoner.compose import matched as mt
 from syncsummoner.device.wire import READ, RECEIPT, SEND
 
 PERIOD = 33_333_333.0
@@ -371,7 +372,7 @@ def test_matched_scores_use_the_quantum_where_controls_do_not_vary():
     d_src = np.arange(20, dtype=np.float64)
     d_out = np.ones(20)
     d_out[5] = 3.0
-    scores = ev.matched_scores(d_out, d_src, np.array([5, 6]), np.arange(20), 0.25)
+    scores = mt.matched_scores(d_out, d_src, np.array([5, 6]), np.arange(20), 0.25)
     assert scores.tolist() == [8.0, 0.0]
 
 
@@ -410,9 +411,9 @@ def test_effective_samples_of_an_ar1_series():
     x = np.zeros(n)
     for i in range(1, n):
         x[i] = rho * x[i - 1] + e[i]
-    assert ev.effective(x) == pytest.approx(n * (1 - rho) / (1 + rho), rel=0.15)
-    assert ev.effective(rng.normal(size=n)) == pytest.approx(n, rel=0.05)
-    assert ev.effective(np.ones(10)) == 10.0 and ev.effective(np.ones(2)) == 2.0
+    assert mt.effective(x) == pytest.approx(n * (1 - rho) / (1 + rho), rel=0.15)
+    assert mt.effective(rng.normal(size=n)) == pytest.approx(n, rel=0.05)
+    assert mt.effective(np.ones(10)) == 10.0 and mt.effective(np.ones(2)) == 2.0
 
 
 def test_critical_z_holds_the_family_wise_tail():
@@ -656,3 +657,53 @@ def test_a_proven_no_op_next_to_a_live_step_is_not_tested_for_a_contradiction():
     kinds = np.r_[np.full(12, ev.LIVE, dtype=object), np.full(12, ev.NOOP, dtype=object)]
     pools = {v.pool for v in ev.acted_upon(out, src, np.full(240, 100.0), frames, params, {}, kinds=kinds)}
     assert pools == {ev.LIVE_POOL}
+
+
+def bypassed_picture(seed, wet=180, dead=10):
+    """Output follows the source, its change amplified from ``wet`` on (bypass), where P5's dead steps lie."""
+    rng = np.random.default_rng(seed)
+    out, src = picture(seed, [])
+    gain = np.where(np.arange(240) >= wet, 4.0, 1.0)[:, None, None, None]
+    out = src * gain + rng.normal(0, 0.3, size=src.shape)
+    dead = spaced(rng, 240, dead, avoid=np.arange(0, wet + 3))
+    frames = np.r_[wet, dead]
+    params = np.r_[11, np.full(dead.size, 5)]
+    kinds = np.r_[np.array([ev.LIVE], dtype=object), np.full(dead.size, ev.DEAD, dtype=object)]
+    regime = ev.Regime((np.arange(240) >= wet).astype(np.int64), {11: 1})
+    return out, src, frames, params, kinds, regime
+
+
+def test_dead_steps_are_tested_against_the_step_free_frames_of_their_own_switch_regime():
+    out, src, frames, params, kinds, regime = bypassed_picture(31)
+    luma = np.full(240, 100.0)
+    blind = {v.param: v for v in ev.acted_upon(out, src, luma, frames, params, {}, kinds=kinds)}
+    assert blind[5].moved, "against processed frames the bypassed picture's change looks like a step"
+    matched = {
+        v.param: v for v in ev.acted_upon(out, src, luma, frames, params, {}, kinds=kinds, regime=regime)
+    }
+    assert not matched[5].moved and matched[5].steps == 10 and matched[5].unmatched == 0
+    assert matched[11].critical == blind[11].critical
+
+
+def test_steps_whose_regime_has_no_null_are_left_untested_and_said_so():
+    out, src, frames, params, kinds, _ = bypassed_picture(32, dead=1)
+    regime = ev.Regime(np.isin(np.arange(240), frames[1] + np.r_[0, 1]).astype(np.int64), {11: 1})
+    got = {
+        v.param: v
+        for v in ev.acted_upon(out, src, np.full(240, 100.0), frames, params, {}, kinds=kinds, regime=regime)
+    }
+    assert got[5].steps == 0 and got[5].unmatched > 0 and not got[5].moved
+    assert "too few step-free frames" in ev.why_not(got[5], "Posterize", True, True)
+    proof = evidence_of(list(got.values()), {5: {ev.DEAD: 1}, 11: {ev.LIVE: 1}})
+    row = {r["param"]: r for r in proof.table()}[5]
+    assert row["dead_steps_unmatched"] == got[5].unmatched and row["verdict"] == "never live"
+    assert any("with no regime null" in line for line in proof.lines())
+
+
+def test_one_regime_is_the_null_of_every_step_free_frame():
+    out, src, frames, params, kinds, _ = bypassed_picture(33)
+    luma = np.full(240, 100.0)
+    one = ev.Regime(np.zeros(240, dtype=np.int64))
+    assert ev.acted_upon(out, src, luma, frames, params, {}, kinds=kinds, regime=one) == ev.acted_upon(
+        out, src, luma, frames, params, {}, kinds=kinds
+    )
