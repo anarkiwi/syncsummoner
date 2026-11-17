@@ -144,8 +144,10 @@ class Clock:
         """Host time to send a write that should land on ``target``."""
         return int(ev.send_time(np.array([target]), self.ticks, self.times, self.delta)[0])
 
-    def extend(self, t_ns: np.ndarray, sequence: np.ndarray) -> None:
-        """Carry the frame clock on through captures the anchored run has gained since."""
+    def extend(self, t_ns: np.ndarray, sequence: np.ndarray, reads: np.ndarray | None = None) -> None:
+        """Carry the clock on: the frame line over every frame start the anchored run has, the tick grid
+        over every readback change so far. A grid the readback cannot hold leaves the last one standing.
+        """
         run = self.run
         if run is None:
             return
@@ -154,11 +156,16 @@ class Clock:
         k = np.arange(run.first, last + 1)
         start = k[(run.slot + k - run.first) % self.per_frame == 0]
         frame = (run.slot + start - run.first) // self.per_frame - self.times.lead
-        recent = start[-min(start.size, 600) :], frame[-min(start.size, 600) :]
-        if recent[0].size > 2:
-            slope, icept = np.polyfit(recent[1], t_ns[recent[0]].astype(np.float64), 1)
+        if start.size > 2:
+            slope, icept = np.polyfit(frame, t_ns[start].astype(np.float64), 1)
             self.times = ev.FrameTimes(self.times.ns, self.times.lead, float(icept), float(slope))
             self.ticks = ev.Ticks(self.ticks.lo, self.ticks.hi, float(slope), self.ticks.count)
+        if reads is not None and reads.size > 1:
+            moves = ev.transitions(reads)
+            try:
+                self.ticks = ev.tick_bracket(moves["a"], moves["b"], self.times.period)
+            except ev.EvidenceError as err:
+                LOG.warning("tick grid kept from %d changes: %s", self.ticks.count, err)
 
 
 @dataclass
@@ -458,7 +465,7 @@ def _run(
         out, rig.playout.flips(), codes, config=config, hold=hold, lead=lead, count=count
     )
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, lead)
-    moves = ev.transitions(np.array([(a, b, tuple(o)) for a, b, o in list(poller.reads)], dtype=READ))
+    moves = ev.transitions(_reads(poller))
     ticks = ev.tick_bracket(moves["a"], moves["b"], times.period)
     calibration = sender.array()
     calibration = calibration[calibration["target"] == ev.CALIBRATION]
@@ -486,7 +493,7 @@ def _run(
             "first write was due; lengthen the lead-in"
         )
     log = _read_sidecar(out)
-    clock.extend(log["t_ns"], log["sequence"])
+    clock.extend(log["t_ns"], log["sequence"], _reads(poller))
     sender.when = clock.when
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
@@ -497,7 +504,7 @@ def _run(
         while (now := time.monotonic_ns()) < end:
             time.sleep(min(1.0, (end - now) / 1e9))
             log = _read_sidecar(out)
-            clock.extend(log["t_ns"], log["sequence"])
+            clock.extend(log["t_ns"], log["sequence"], _reads(poller))
             progress.to((time.monotonic_ns() - began) / 1e9)
     sender.drain(timeout_s=1.0)
 
@@ -524,6 +531,11 @@ def _monitored(shell: Any, poller: Poller, sender: Sender) -> Iterator[None]:
             shell.command("midi", "monitor", "off")
         except Exception as err:  # pylint: disable=broad-exception-caught
             LOG.warning("midi monitor left on: %s", err)
+
+
+def _reads(poller: Poller) -> np.ndarray:
+    """The poller's readbacks so far, as :data:`~syncsummoner.device.wire.READ` records."""
+    return np.array([(a, b, tuple(o)) for a, b, o in list(poller.reads)], dtype=READ)
 
 
 def _read_sidecar(take: str | Path) -> np.ndarray:

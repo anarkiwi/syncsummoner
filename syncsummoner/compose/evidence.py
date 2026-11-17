@@ -24,6 +24,8 @@ CALIBRATION = int(np.iinfo(np.int64).min)
 START = CALIBRATION + 1
 #: Lags, in frames after the modelled landing, at which a step's picture is tested.
 LAGS = (0, 1)
+#: Most two host clocks' rates can differ: the kernel's frequency correction limit, 500 ppm (MAXFREQ).
+MAX_RATE = 500e-6
 #: Luma range, in 8-bit codes, at or below which a frame is a uniform field (docs/hardware.md).
 FLAT_CODES = 1
 
@@ -137,7 +139,8 @@ def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
 
     The grid keeps ``period``, measured from the captures, while every interval admits it; only
     readback that rules it out, which takes a long span, sets the period itself, as the Chebyshev
-    centre of ``a_i < phase + n_i period <= b_i``. No feasible grid is an :class:`EvidenceError`.
+    centre of ``a_i < phase + n_i period <= b_i`` within :data:`MAX_RATE` of ``period``. No
+    feasible grid is an :class:`EvidenceError`.
     """
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     if not a.size:
@@ -153,7 +156,7 @@ def tick_bracket(a: np.ndarray, b: np.ndarray, period: float) -> Ticks:
             [0.0, 0.0, -1.0],
             A_ub=np.r_[np.c_[-ones, -n / scale, ones], np.c_[ones, n / scale, ones]],
             b_ub=np.r_[n * period - lo_s, hi_s - n * period],
-            bounds=[(None, None)] * 3,
+            bounds=[(None, None), (-MAX_RATE * period * scale, MAX_RATE * period * scale), (None, None)],
             method="highs",
         )
         if not solved.success:

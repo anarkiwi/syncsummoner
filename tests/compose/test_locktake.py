@@ -647,3 +647,28 @@ def test_measured_latency_comes_from_where_each_toggle_showed(simulate):
     ticks = ev.tick_bracket(moves["a"], moves["b"], times.period)
     got = LT.measure_latency(images, frames, found, toggles, moves, times, ticks)
     assert got.samples == 4 and got.delta == pytest.approx(DELTA, abs=ticks.width)
+
+
+def reads_around(ticks_at, slot=1):
+    """Readbacks 4 ms apart in which ``slot`` steps once at each of ``ticks_at``."""
+    t = np.arange(ticks_at[0] - 20e6, ticks_at[-1] + 20e6, 4e6)
+    o = np.zeros((t.size, 12), dtype=np.int64)
+    o[:, slot - 1] = np.searchsorted(ticks_at, t + 1e6)
+    reads = np.zeros(t.size, dtype=READ)
+    reads["t0_ns"], reads["t1_ns"], reads["o"] = t, t + 2e6, o
+    return reads
+
+
+def test_extending_the_clock_measures_the_tick_grid_from_the_readback_so_far():
+    """Readback on the device's own grid replaces the lead-in's bracket; contradictory readback leaves it."""
+    lead, size = 10, 400
+    k = np.arange(size)
+    t, sequence = (T0 + k * P / 2).astype(np.int64), k
+    true = TAU + 0.004e9 + np.array([3, 40, 90, 150]) * P
+    clock = LT.Clock(times=times_for(lead), ticks=ticks_for(), delta=DELTA, run=run_of(0, 99))
+    clock.extend(t, sequence, reads_around(true))
+    assert clock.ticks.count == 4 and clock.ticks.lo < true[0] <= clock.ticks.hi
+    kept = clock.ticks
+    bad = reads_around(np.r_[true[:2], true[2] + P / 2])
+    clock.extend(t, sequence, bad)
+    assert clock.ticks.lo == kept.lo and clock.ticks.hi == kept.hi
