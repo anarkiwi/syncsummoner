@@ -90,3 +90,18 @@ def test_the_model_gate_pairs_a_gain_write_with_gain_on(tiny):
     out = gate(plan)
     assert out.indices.tolist() == [7, 1] and out.values[0] >= 512
     assert gate.live(tiny.initial(), 7) and not gate.live(tiny.initial(), 1)
+
+
+def test_a_structural_cover_takes_live_bits_as_live(tiny):
+    found = cover(tiny, gating=Gating(tiny, steps=False))
+    assert all(st.steps is None for st in found.status[0].values() if st.live_bits)
+    assert {p for ps in found.stepped.values() for p in ps} == {1, 2, 7, 8} and not found.uncovered
+
+
+def test_the_report_is_the_cover_as_table_or_json(tiny):
+    import json  # pylint: disable=import-outside-toplevel
+
+    from syncsummoner.program.gates import report  # pylint: disable=import-outside-toplevel
+
+    assert "base states" in report(tiny, tiny.initial(), steps=False)
+    assert json.loads(report(tiny, tiny.initial(), as_json=True))["one_at_a_time"]["states"] == 1

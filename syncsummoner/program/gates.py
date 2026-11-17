@@ -8,6 +8,7 @@ the states they reach are covered by a lexicographic 0-1 programme (fewest state
 from __future__ import annotations
 
 import itertools
+import json
 from functools import cached_property
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -32,19 +33,21 @@ class Status:
 
     param: int
     live_bits: tuple[int, ...]
-    steps: tuple[Step, ...] = ()
+    steps: tuple[Step, ...] | None = ()
 
     @property
     def state(self) -> str:
         """``live``; ``no-op`` if its bits reach the video but each checked step is proven inert; ``dead``."""
         if not self.live_bits:
             return DEAD
+        if self.steps is None:
+            return LIVE
         return LIVE if any(s.matters is not False for s in self.steps) else NOOP
 
     @property
     def witnessed(self) -> bool:
         """Whether a checked step has a concrete witness of changing the video."""
-        return any(s.matters is True for s in self.steps)
+        return any(s.matters is True for s in self.steps or ())
 
 
 @dataclass(frozen=True)
@@ -85,11 +88,13 @@ def probe_steps(values: np.ndarray) -> list[tuple[int, int]]:
     return [(a, b) for a, b in ((lo, mid), (mid, hi)) if a != b]
 
 
-def status(m: ProgramModel, state: np.ndarray, param: int, timing: int | None = None) -> Status:
-    """A parameter's live bits at ``state`` and its representative steps there."""
+def status(
+    m: ProgramModel, state: np.ndarray, param: int, timing: int | None = None, *, steps: bool = True
+) -> Status:
+    """A parameter's live bits at ``state`` and, with ``steps``, its representative steps there."""
     bits = tuple(m.reach(state, [param], timing)[param])
-    if not bits:
-        return Status(param, ())
+    if not bits or not steps:
+        return Status(param, bits, None if bits else ())
     values = representatives(m, param, bits)
     return Status(
         param, bits, tuple(m.step_matters(state, param, a, b, timing) for a, b in probe_steps(values))
@@ -116,6 +121,8 @@ class Gating:
     m: ProgramModel
     timing: int | None = None
     workers: int = field(default_factory=cpus)
+    #: Whether a parameter whose bits reach the video must also have a step not proven a no-op.
+    steps: bool = True
     _status: dict = field(default_factory=dict, repr=False)
 
     def key(self, state: np.ndarray) -> tuple:
@@ -139,14 +146,16 @@ class Gating:
         key = self.key(state)
         if key not in self._status:
             params = sorted(self.read)
-            found = self.map(lambda p: status(self.m, state, p, self.timing), params, "status")
+            found = self.map(
+                lambda p: status(self.m, state, p, self.timing, steps=self.steps), params, "status"
+            )
             self._status[key] = dict(zip(params, found))
         return self._status[key]
 
     def _alive(self, state: np.ndarray, param: int, kind: str) -> bool:
         if kind == DEAD:
             return bool(self.m.reach(state, [param], self.timing)[param])
-        return status(self.m, state, param, self.timing).state == LIVE
+        return status(self.m, state, param, self.timing, steps=self.steps).state == LIVE
 
     def _could(self, state: np.ndarray, param: int, kind: str, free: Sequence[int]) -> bool:
         """False only when no values of ``free`` can revive ``param``: an exact refutation."""
@@ -390,3 +399,16 @@ def cover(m: ProgramModel, reference: np.ndarray | None = None, *, gating: Gatin
         lambda s, p: len(representatives(m, p, found_status[s][p].live_bits)),
     )
     return Cover(m, states, found_status, found_revivals, chosen, stepped, missed, read)
+
+
+def report(
+    m: ProgramModel,
+    reference: np.ndarray,
+    timing: int | None = None,
+    *,
+    steps: bool = True,
+    as_json: bool = False,
+) -> str:
+    """The cover from ``reference`` as the CLI prints it: a table, or JSON."""
+    found = cover(m, reference, gating=Gating(m, timing, steps=steps))
+    return json.dumps(found.as_dict(), indent=1) if as_json else found.table()
