@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from pyvmancer.const import ROUTE_HDMI_IN
@@ -28,10 +28,12 @@ from syncsummoner.device.recorder import (
     require_signal,
     rig_state,
 )
+from syncsummoner.compose import timecode
 from syncsummoner.compose.cut import Cut
 from syncsummoner.compose.master import DEFAULT_CRF, X264
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
+from syncsummoner.compose.timecode import source_stream  # pylint: disable=unused-import
 from syncsummoner.compose.vocabulary import Automation
 from syncsummoner.compose.lock import (  # pylint: disable=unused-import
     LockError,
@@ -42,8 +44,8 @@ from syncsummoner.compose.lock import (  # pylint: disable=unused-import
     save_lock,
     take_start,
 )
-from syncsummoner.probe.patterns import burn_timecode
-from syncsummoner.progress import LOG, human, meter, stage, track
+from syncsummoner.probe.patterns import burn_timecode  # pylint: disable=unused-import
+from syncsummoner.progress import LOG, human, meter, stage
 
 
 class UnknownProgramError(RuntimeError):
@@ -166,86 +168,14 @@ def write_timecoded(
     start: float = 0.0,
     lead: int | None = None,
     tail: int | None = None,
+    cache: str | Path | None = None,
 ) -> int:
-    """Write the source at session geometry, each frame's index burnt in, between a lead-in and a lead-out.
-
-    The lead-in is ``lead`` copies of the first frame numbered ``-lead..-1``, wrapped to the strip's
-    width, and the lead-out ``tail`` copies of the last numbered on from it, a locked take's
-    (:func:`lead_frames`, :func:`tail_frames`) unless given. Returns the clip frames, neither included.
-
-    A clip the playout can identify frame by frame is what lets the source be
-    played from the other end, where it can run at rate. ``start`` skips into it,
-    which is how an excerpt gets the footage it was composed against. An encoder
-    that dies takes its own diagnosis with it, so that is what is raised rather
-    than the broken pipe writing to it produces.
-    """
-    total, frames = source_stream(source, config, seconds=seconds, start=start)
+    """:func:`.timecode.write_timecoded`, with a locked take's lead-in and -out unless given."""
     lead = lead_frames(config) if lead is None else int(lead)
     tail = tail_frames(config) if tail is None else int(tail)
-    argv = [
-        getattr(config, "ffmpeg", "ffmpeg"),
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{config.width}x{config.height}",
-        "-r",
-        str(config.fps),
-        "-i",
-        "pipe:0",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "14",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        str(out),
-    ]
-    proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    return timecode.write_timecoded(
+        source, out, config=config, seconds=seconds, start=start, lead=lead, tail=tail, cache=cache
     )
-    written = 0
-    wrap = (1 << config.bits) - 1
-
-    def stamp(frame: np.ndarray, index: int) -> bytes:
-        stamped = burn_timecode(frame, index & wrap, bits=config.bits, strip_px=config.strip_px)
-        return np.ascontiguousarray((np.clip(stamped, 0, 1) * 255).astype(np.uint8)).data
-
-    last = None
-    try:
-        for index, frame in enumerate(track(frames, desc="timecoding", total=total or None, unit="frame")):
-            try:
-                for before in range(-lead, 0) if index == 0 else ():
-                    proc.stdin.write(stamp(frame, before))
-                proc.stdin.write(stamp(frame, index))
-            except BrokenPipeError:
-                break
-            written, last = index + 1, frame
-        for after in range(written, written + tail) if last is not None else ():
-            proc.stdin.write(stamp(last, after))
-    finally:
-        proc.stdin.close()
-        said = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
-        proc.stderr.close()
-        proc.wait()
-    if proc.returncode:
-        raise RuntimeError(f"timecoding {out} failed: {said.splitlines()[-1] if said else 'no output'}")
-    size = f"{config.width}x{config.height}"
-    LOG.info(
-        "timecoded %d frames between a %d and a %d frame lead-in and -out into %s at %s",
-        written or total,
-        lead,
-        tail,
-        out,
-        size,
-    )
-    return written or total
 
 
 def _wait_until(target: float, *, clock, sleep, tick_s: float, report=None) -> None:
@@ -922,63 +852,6 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
         playout=playout_mod.ClipPlayer(*host, width=config.width, height=config.height),
         link=link_mod.Link(*host),
     )
-
-
-def source_stream(source: Any, config: RenderConfig, *, seconds: float | None = None, start: float = 0.0):
-    """Yield ``(total, frames)``: how many session frames a take is, and them one at a time.
-
-    A long take is never held as one stack, since the pass only ever looks at one frame.
-    """
-    from syncsummoner.compose.features import read_frames
-
-    probe, rate = [], config.fps
-    for rate, frame in read_frames(source):
-        probe.append(frame)
-        break
-    if not probe:
-        return 0, iter(())
-    src_fps = rate if rate > 0 else config.fps
-    total = int(round((seconds or 0.0) * config.fps)) if seconds else 0
-    skip = max(0, int(round(start * src_fps)))
-
-    def frames() -> Iterator[np.ndarray]:
-        held, index = None, 0
-        source_index = -1
-        for _, frame in read_frames(source):
-            source_index += 1
-            if source_index < skip:
-                continue
-            held = frame
-            while index * src_fps / config.fps + skip <= source_index:
-                yield _conform(np.asarray(held, dtype=np.float32)[None], config)[0]
-                index += 1
-                if total and index >= total:
-                    return
-
-    return total, frames()
-
-
-def _conform(stack: np.ndarray, config: RenderConfig) -> np.ndarray:
-    """Fit the source into the session raster, padding rather than stretching it.
-
-    Playout takes the session geometry and nothing else, and the aspect a source
-    was shot at is not the rig's to change: it is centred, and the rest is black.
-    """
-    # pylint: disable=no-member
-    import cv2
-
-    if not stack.shape[0] or stack.shape[1:3] == (config.height, config.width):
-        return stack
-    height, width = stack.shape[1:3]
-    scale = min(config.width / width, config.height / height)
-    fit = (max(1, round(width * scale)), max(1, round(height * scale)))
-    left, top = (config.width - fit[0]) // 2, (config.height - fit[1]) // 2
-    out = np.zeros((stack.shape[0], config.height, config.width, stack.shape[3]), dtype=np.float32)
-    for i, frame in enumerate(stack):
-        out[i, top : top + fit[1], left : left + fit[0]] = cv2.resize(
-            frame, fit, interpolation=cv2.INTER_AREA
-        )
-    return out
 
 
 def enforce_safety(frames: np.ndarray, *, fps: float, mitigate: bool = True) -> np.ndarray:

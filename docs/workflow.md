@@ -567,7 +567,15 @@ What happens, in order:
 
 1. The source is conformed to the session raster, a gray-code frame index is burnt
    into a croppable edge strip, and the result is written to `--scratch` **once**;
-   every pass replays that same file.
+   every pass replays that same file. ffmpeg decodes and encodes; the source is
+   area-resized to fit, padded and held to the session rate as `uint8`, and only
+   the strip rows are written per frame. The clip is kept under
+   `SYNCSUMMONER_TIMECODE_CACHE` (default `.timecode-cache/`, gitignored), named by
+   the SHA-256 of the source's path, size and mtime and of every setting it depends
+   on (raster, rate, strip, span, lead-in and -out, encoder), and `--scratch` is a
+   hard link to it, or a copy across filesystems. A render whose key matches reuses
+   it under any `--scratch` name and logs so; any other key, or an entry changed
+   since it was built, is encoded afresh.
 2. Per program: the scratch is pushed over ssh into the Pi's `/dev/shm` and played
    from there by the locked player ([rig.md](rig.md#playout)). Nothing is copied
    to the Pi by hand — the source stays on the workstation, and the timecoded clip
