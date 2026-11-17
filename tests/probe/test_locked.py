@@ -191,3 +191,18 @@ def test_toggles_go_out_as_off_or_on_and_repeats_drop():
     states[1, 6], states[2, 6], states[3, 0] = 768, 1000, 5
     out = L.carried(states, [7])
     assert out[:, 6].tolist() == [0, 1023, 0] and out[:, 0].tolist() == [0, 0, 5]
+
+
+def test_a_recorded_cover_walks_each_stepped_parameter_off_its_base_and_back():
+    record = {"states": [[0] * 12, [5] + [0] * 11], "chosen": [1], "stepped": {"1": [2]}}
+    out = L.recorded(record, {2: np.array([0, 3, 6])})
+    assert out[:, 0].tolist() == [5, 5, 5, 5] and out[:, 1].tolist() == [0, 6, 3, 0]
+    assert L.recorded({"states": [[1] * 12], "chosen": [0], "stepped": {}}, {}).shape == (1, 12)
+
+
+def test_a_selector_is_held_at_each_setting_with_a_mover_move_under_each():
+    base = np.zeros((1, 12), dtype=np.int64)
+    base[0, 5] = 300
+    out = L.joint(base, 11, 6, {11: np.array([0, 1023]), 6: np.array([0, 300, 1023])})
+    assert out[:, 10].tolist() == [0, 0, 0, 1023, 1023, 1023, 0]
+    assert out[:, 5].tolist() == [300, 1023, 300, 300, 1023, 300, 300]

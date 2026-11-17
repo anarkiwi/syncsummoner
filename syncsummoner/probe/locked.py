@@ -21,6 +21,7 @@ from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
 from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameRow
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import atomic_write
+from syncsummoner.program.gates import tour
 
 __all__ = [
     "Chunk",
@@ -31,11 +32,13 @@ __all__ = [
     "commit_sweep",
     "concat",
     "disagreeing",
+    "joint",
     "levels",
     "owners",
     "plan_sweep",
     "read_plan",
     "realized",
+    "recorded",
     "rows_path",
     "save_rows",
     "settled_rows",
@@ -92,6 +95,46 @@ class Chunk:
 def levels(found: Any) -> np.ndarray:
     """Every setpoint of the cover's sweep in order, as full states: the first base state, then each move."""
     return np.array([after for _, after in found.vectors()], dtype=np.int64).reshape(-1, PARAM_COUNT)
+
+
+def recorded(record: dict, values: dict[int, np.ndarray]) -> np.ndarray:
+    """The sweep of a cover as ``program cover --json`` records it, in :meth:`Cover.vectors` order.
+
+    Each chosen base state, then each parameter stepped there walked through ``values[p]`` by
+    :func:`gates.tour` and back to the base.
+    """
+    states = np.asarray(record["states"], dtype=np.int64)
+    out: list[np.ndarray] = []
+    for i in record["chosen"]:
+        base = states[i]
+        out.append(base)
+        for p in record["stepped"].get(str(i), []):
+            for v in tour(values[p], int(base[p - 1])):
+                out.append(out[-1].copy())
+                out[-1][p - 1] = v
+            if not np.array_equal(out[-1], base):
+                out.append(base)
+    return np.array(out, dtype=np.int64).reshape(-1, PARAM_COUNT)
+
+
+def joint(states: np.ndarray, selector: int, mover: int, values: dict[int, np.ndarray]) -> np.ndarray:
+    """``states`` then ``selector`` held at each of its settings, a ``mover`` move under each.
+
+    For a control that acts only on what another's moves write, such as a page select: the move
+    goes to the mover's setting farthest from its base and back, and the selector returns last.
+    """
+    base = np.asarray(states[-1], dtype=np.int64)
+    far = values[mover][np.argmax(np.abs(values[mover] - base[mover - 1]))]
+    out = [np.asarray(s, dtype=np.int64) for s in states]
+    for v in np.r_[base[selector - 1], tour(values[selector], int(base[selector - 1]))]:
+        held = base.copy()
+        held[selector - 1] = v
+        moved = held.copy()
+        moved[mover - 1] = far
+        out += [held, moved, held]
+    out.append(base)
+    keep = np.r_[True, np.any(np.diff(np.array(out), axis=0) != 0, axis=1)]
+    return np.array(out, dtype=np.int64)[keep]
 
 
 def carried(states: np.ndarray, toggles: Sequence[int]) -> np.ndarray:

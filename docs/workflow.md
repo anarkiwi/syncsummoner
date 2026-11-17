@@ -250,6 +250,13 @@ re-encode into one archive, keyed on name and firmware, with the clip linked
 beside it and each row naming the clip frame it shows, so the survival metrics
 need no clock fit.
 
+`--cover FILE` plans from a cover `program cover --json` already wrote, each stepped
+parameter's settings taken from the bits the program reads, so no cover is searched.
+`--joint SELECTOR:MOVER` adds, from the sweep's last state, SELECTOR held at each of its
+settings with a MOVER move under each (to the mover's farthest setting and back): the only
+way to test a control that acts on nothing held, only on what another's moves write, such as
+a page select the cover reports as never live.
+
 A refit of a footage archive adds three survival curves to each parameter:
 `si_ratio` and `ti_ratio`, the share of the source's spatial and temporal
 information kept, and `motion_follow`, how far the output's motion follows the
