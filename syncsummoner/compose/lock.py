@@ -86,6 +86,34 @@ class Attribution:
         return self.read - self.agreed - self.ahead
 
     @property
+    def first_capture(self) -> int:
+        """The first capture showing clip frame 0."""
+        return int(np.flatnonzero(self.shown == 0)[0])
+
+    def record(self) -> dict:
+        """The frame line and how the take bears it out, JSON-ready."""
+        least, most = self.drift_range_ppm
+        return {
+            "drift_ppm": self.drift_ppm,
+            "drift_range_ppm": [least, most],
+            "period_ns": self.period_ns,
+            "capture_ns": self.capture_ns,
+            "residual_ms": self.line.residual / 1e6,
+            "jitter_ms": self.jitter_ns / 1e6,
+            "frame0_spread_ms": self.spread_ms,
+            "runs": self.runs,
+            "slips": self.slips,
+            "uncertain": self.uncertain,
+            "tied": self.tied,
+            "strips_read": self.read,
+            "strips_agree": self.agreed,
+            "strips_ahead": self.ahead,
+            "strips_behind": self.behind,
+            "faults": self.faults,
+            "strays": self.strays,
+        }
+
+    @property
     def complete(self) -> bool:
         """Whether every clip frame has a capture."""
         return bool(self.picked.size) and bool(np.all(self.picked >= 0))
@@ -489,5 +517,4 @@ def live_attribution(
 def take_start(take: str | Path, *, config: Any) -> float:
     """Seconds into a take at which clip frame 0's first capture lands, from its attribution."""
     found = attribute_take(take, config=config)
-    rate = found.per_frame * config.fps
-    return float(found.picked[0] - found.per_frame // 2) / rate
+    return float(found.first_capture) / (found.per_frame * config.fps)

@@ -8,11 +8,11 @@ capture log's jitter; the line is the least-squares fit inside the polygon every
 from __future__ import annotations
 
 from bisect import bisect_left, insort
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
-__all__ = ["Line", "LineError", "Polygon", "capture_line", "fit", "segments"]
+__all__ = ["Line", "LineError", "Polygon", "capture_line", "extend", "fit", "segments"]
 
 #: A capture interval past the midpoint between one capture period and two is a lost capture or an outage.
 GAP_PERIODS = 1.5
@@ -161,6 +161,7 @@ class Line:
     frame: np.ndarray
     polygon: Polygon
     tied: int = 0
+    mid: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     @property
     def strays(self) -> np.ndarray:
@@ -227,28 +228,72 @@ def fit(
     order, tied = sorted(int(i) for i in named), 0
     for i in rest:
         at = bisect_left(order, int(i))
-        low = frame[order[at - 1]] if at else np.iinfo(np.int64).min
-        high = frame[order[at]] if at < len(order) else np.iinfo(np.int64).max
-        u, p = poly.vertices.mean(axis=0)
-        guess = poly.ref + int(np.rint((0.5 * (lo[i] + hi[i]) - u) / p))
-        near = np.arange(guess - 1, guess + 2)
-        near = near[(near > low) & (near < high)]
-        least, most = poly.at(near)
-        gap = np.maximum(np.maximum(lo[i] - most, least - hi[i]), 0.0)
-        fits = near[(most > lo[i]) & (least <= hi[i])]
-        if not fits.size:
-            if not near.size or gap.min() > jitter:
-                frame[i] = -1
-                continue
-            fits = near[gap == gap.min()]
-        side = low if at and (at == len(order) or i - order[at - 1] <= order[at] - i) else high
-        frame[i] = fits[np.argmin(np.abs(fits - side))]
-        tied += fits.size > 1
-        worst = max(worst, poly.meet(int(frame[i]), float(lo[i]), float(hi[i])))
-        insort(order, int(i))
+        low = int(frame[order[at - 1]]) if at else None
+        high = int(frame[order[at]]) if at < len(order) else None
+        nearer_low = at and (at == len(order) or i - order[at - 1] <= order[at] - i)
+        frame[i], tie, miss = _name(poly, float(lo[i]), float(hi[i]), (low, high), bool(nearer_low), jitter)
+        if frame[i] >= 0:
+            tied, worst = tied + tie, max(worst, miss)
+            insort(order, int(i))
+    return _line(poly, frame, 0.5 * (lo + hi), worst, tied, lo, hi)
+
+
+def extend(line: Line, lo: np.ndarray, hi: np.ndarray, jitter: float) -> Line:
+    """``line`` carried on over brackets later in capture order than every one it named, as :func:`fit` names them."""
+    poly = Polygon(line.polygon.ref, line.polygon.vertices.copy())
+    frame = np.full(np.size(lo), -1, dtype=np.int64)
+    low = int(line.frame.max()) if line.frame.size else None
+    worst, tied = line.slack, line.tied
+    for i, (a, b) in enumerate(zip(np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64))):
+        frame[i], tie, miss = _name(poly, float(a), float(b), (low, None), True, jitter)
+        if frame[i] >= 0:
+            low, tied, worst = int(frame[i]), tied + tie, max(worst, miss)
+    mid = np.r_[line.mid, 0.5 * (np.asarray(lo, dtype=np.float64) + np.asarray(hi, dtype=np.float64))]
+    return _line(poly, np.r_[line.frame, frame], mid, worst, tied)
+
+
+def _name(
+    poly: Polygon, lo: float, hi: float, between: tuple[int | None, int | None], from_low: bool, jitter: float
+) -> tuple[int, bool, float]:
+    """``(frame, tied, widened)`` for one start: the frame the polygon admits strictly ``between`` two.
+
+    Two that fit take the one nearer the neighbour it is named from; none that fits within ``jitter``
+    of widening is a stray, -1. The polygon is clipped to the bracket named.
+    """
+    low, high = between
+    u, p = poly.vertices.mean(axis=0)
+    guess = poly.ref + int(np.rint((0.5 * (lo + hi) - u) / p))
+    near = np.arange(guess - 1, guess + 2)
+    near = near[((low is None) | (near > (low or 0))) & ((high is None) | (near < (high or 0)))]
+    least, most = poly.at(near)
+    gap = np.maximum(np.maximum(lo - most, least - hi), 0.0)
+    fits = near[(most > lo) & (least <= hi)]
+    if not fits.size:
+        if not near.size or gap.min() > jitter:
+            return -1, False, 0.0
+        fits = near[gap == gap.min()]
+    side = low if from_low and low is not None else (high if high is not None else low)
+    chosen = int(fits[np.argmin(np.abs(fits - side))]) if side is not None else int(fits[0])
+    return chosen, fits.size > 1, poly.meet(chosen, lo, hi)
+
+
+def _line(
+    poly: Polygon,
+    frame: np.ndarray,
+    mid: np.ndarray,
+    worst: float,
+    tied: int,
+    lo: np.ndarray | None = None,
+    hi: np.ndarray | None = None,
+) -> Line:
+    """The least-squares line in ``poly`` through the named brackets' midpoints."""
     ok = frame >= 0
-    u, p = poly.least_squares(frame[ok], 0.5 * (lo[ok] + hi[ok]))
+    u, p = poly.least_squares(frame[ok], mid[ok])
     origin = u - poly.ref * p
-    at_ok = origin + frame[ok] * p
-    residual = max(float(np.max(np.maximum(lo[ok] - at_ok, at_ok - hi[ok]))), worst)
-    return Line(origin=origin, period=p, slack=worst, residual=residual, frame=frame, polygon=poly, tied=int(tied))
+    residual = worst
+    if lo is not None and hi is not None and ok.any():
+        at = origin + frame[ok] * p
+        residual = max(float(np.max(np.maximum(lo[ok] - at, at - hi[ok]))), worst)
+    return Line(
+        origin=origin, period=p, slack=worst, residual=residual, frame=frame, polygon=poly, tied=int(tied), mid=mid
+    )

@@ -124,7 +124,7 @@ def judge_take(
         source=source,
     )
     locktake.evidence_path(take).write_text(proof.to_json(), encoding="utf-8")
-    report = inspect_luma(features.luma, start=int(found.picked[0]) - found.per_frame // 2)
+    report = inspect_luma(features.luma, start=found.first_capture)
     check = None
     if score is not None:
         played, cuts = one_program(score, program)
@@ -185,6 +185,7 @@ def recorded(take: str | Path, options: dict) -> dict:
         meta["judged"] = {
             "lock": "ok",
             "per_frame": int(judged.found.per_frame),
+            "frame_line": judged.found.record(),
             "clip_frames": int(judged.found.picked.size),
             "evidence_ok": bool(judged.proof.ok),
             "picture": str(judged.report),

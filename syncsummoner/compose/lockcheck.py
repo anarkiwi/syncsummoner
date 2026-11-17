@@ -1,8 +1,8 @@
 """Acceptance check of the locked frame clock: a timecoded take judged capture by capture.
 
 Every flip must land on its vblank, every clip frame must have its captures in one gap-free
-run on the card's cadence, every legible strip must read the frame the cadence says, and,
-under Passthru, no capture may show a neighbouring frame in its upper bands.
+run, every picture change must fall on a frame start of the frame line, every legible strip must
+read the frame the line says, and, under Passthru, no capture may show a neighbour in its upper bands.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from syncsummoner.compose import render
-from syncsummoner.compose.lock import Run, signed
+from syncsummoner.compose.lock import signed
 from syncsummoner.probe import decoded
 from syncsummoner.progress import LOG, stage
 
@@ -25,7 +25,7 @@ BANDS = ((0.0, 1 / 3), (1 / 3, 2 / 3))
 
 @dataclass(frozen=True)
 class LockReport:
-    """What a locked take shows: cadence, drops and tears over its clip frames."""
+    """What a locked take shows: frame starts, drops and tears over its clip frames."""
 
     frames: int
     attributed: int
@@ -37,11 +37,11 @@ class LockReport:
     agreed: int
     judged: int
     torn: int
-    run: Run
+    line: str = ""
 
     @property
     def ok(self) -> bool:
-        """Whether the take is exact: every frame attributed, nothing missed, dropped, off cadence or torn."""
+        """Whether the take is exact: every frame attributed, nothing missed, dropped, off a frame start or torn."""
         return (
             self.attributed == self.frames
             and self.flips["missed"] == 0
@@ -60,7 +60,7 @@ class LockReport:
             f"{'LOCKED' if self.ok else 'NOT LOCKED'}: {self.attributed}/{self.frames} clip frames "
             f"attributed; Pi {flips['flips']} flips, {flips['missed']} missed vblanks, "
             f"{flips['out_of_cadence']} off cadence; card {self.drops} lost frames, {self.gaps} gaps and "
-            f"{self.off_cadence} frame changes off cadence in the clip; strips {self.agreed}/{self.read} "
+            f"{self.off_cadence} picture changes off a frame start in the clip; strips {self.agreed}/{self.read} "
             f"agree; {self.torn}/{self.judged} torn"
         )
 
@@ -104,13 +104,12 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
     found = render.attribute_take(take, config=config, features=features)
     record = np.load(render.lock_path(take))
     frames = read_log(take)
-    m, run = found.per_frame, found.run
-    first = int(found.picked[0]) - m // 2
-    last = int(found.picked[-1]) - m // 2 + m - 1
+    shown = found.shown
+    inside = np.flatnonzero((shown >= 0) & (shown < found.picked.size))
+    first, last = int(inside[0]), int(inside[-1])
     span = np.arange(first, last + 1)
     new = np.r_[False, frames["digest"][1:] != frames["digest"][:-1]][span]
-    on_cadence = (run.slot + span - run.first) % m == 0
-    gaps = sum(1 for r in found.runs if first < r.first <= last)
+    gaps = int(np.count_nonzero(np.diff(frames["sequence"][first : last + 1]) != 1))
     clip_codes = signed(codes[span], config.bits)
     readable = (codes[span] >= 0) & (clip_codes >= 0) & (clip_codes < found.picked.size)
     judged = torn = 0
@@ -127,21 +126,21 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
         flips=flip_summary(record["flips"], int(record["hold"])),
         drops=int(np.clip(np.diff(frames["sequence"][first : last + 1]) - 1, 0, None).sum()),
         gaps=gaps,
-        off_cadence=int(np.count_nonzero(new & ~on_cadence)),
+        off_cadence=int(np.count_nonzero(new & ~found.starts[span])),
         read=int(readable.sum()),
         agreed=int(np.count_nonzero(readable & (clip_codes == found.shown[span]))),
         judged=judged,
         torn=torn,
-        run=run,
+        line=found.summary(),
     )
 
 
 def clip_seconds(clip: str | Path, config: Any) -> float:
-    """A prepared clip's length after its lead-in, from its frame count."""
+    """A prepared clip's length between its lead-in and lead-out, from its frame count."""
     argv = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets"]
     argv += ["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(clip)]
     packets = int(subprocess.run(argv, check=True, capture_output=True, text=True).stdout.strip())
-    return (packets - render.lead_frames(config)) / config.fps
+    return (packets - render.lead_frames(config) - render.tail_frames(config)) / config.fps
 
 
 def lockcheck(
