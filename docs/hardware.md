@@ -351,7 +351,28 @@ its period. A take with no slip bounds its drift to about one capture period ove
 
 | Take | Frame line drift, ppm (range the captures admit) | Slips | Frame 0's start known to |
 | --- | --- | --- | --- |
-DRIFT_TABLE
+| param-evidence full Pinwheel | -0.0 (-42.5 to +42.5) | 0 | 16.67 ms |
+| param-evidence full boneoh_YUV_Bit_Rotator-1473b2c4 | +0.0 (-42.0 to +42.0) | 0 | 16.67 ms |
+| param-evidence full czartroniks_Quilt-803bc8ea | -42.7 (-54.2 to -30.0) | 1 | 1.11 ms |
+| param-evidence rc4 Pinwheel | -78.5 (-78.5 to -30.0) | 2 | 8.40 ms |
+| param-evidence rc4 YUV_Amplifier-6b88e9be | +0.0 (-43.0 to +43.0) | 0 | 16.67 ms |
+| param-evidence rc4 boneoh_YUV_Bit_Rotator-1473b2c4 | -0.0 (-41.9 to +41.9) | 0 | 16.67 ms |
+| param-evidence rc4 homegrownvhs_Pigment-fde77c40 | +0.0 (-42.5 to +42.5) | 0 | 16.67 ms |
+| param-evidence rc4 czartroniks_Fray-fad121db | +0.0 (-44.1 to +44.1) | 0 | 16.67 ms |
+| param-evidence rc4 czartroniks_Porthole-9444a020 | +0.0 (-44.1 to +44.1) | 0 | 16.67 ms |
+| param-evidence rc4 czartroniks_Quilt-803bc8ea | -0.0 (-44.6 to +44.6) | 0 | 16.67 ms |
+| param-evidence rc4 teletect_Teletect_RamBend-3c9af621 | +0.0 (-43.2 to +43.2) | 0 | 16.67 ms |
+| param-evidence short YUV_Amplifier-6b88e9be | +0.0 (-316.8 to +316.8) | 0 | 16.67 ms |
+| param-evidence short boneoh_YUV_Bit_Rotator-1473b2c4 | +0.0 (-239.0 to +239.0) | 0 | 16.67 ms |
+| param-evidence short homegrownvhs_Pigment-fde77c40 | -0.0 (-257.5 to +257.5) | 0 | 16.67 ms |
+| param-evidence short teletect_Teletect_RamBend-3c9af621 | -0.0 (-235.7 to +235.7) | 0 | 16.67 ms |
+| param-evidence short czartroniks_Fray-fad121db | not attributed: the driver lost frames in the clip | | |
+| param-evidence short czartroniks_Porthole-9444a020 | +0.0 (-283.6 to +283.6) | 0 | 16.67 ms |
+| param-evidence short czartroniks_Quilt-803bc8ea | -0.0 (-285.7 to +285.7) | 0 | 16.67 ms |
+| param-evidence Pinwheel | -0.0 (-320.3 to +320.3) | 0 | 16.67 ms |
+| archive-rc4 failed YUV_Amplifier-6b88e9be-00 | -59.9 (-71.8 to -30.0) | 1 | 5.06 ms |
+| fw-upgrade lock-passthru (lockcheck) | +0.0 (-153.5 to +153.5) | 0 | 16.67 ms |
+| fw-upgrade lock-passthru-2 (lockcheck) | +0.0 (-150.2 to +150.2) | 0 | 16.67 ms |
 
 ## A program load breaks the capture
 

@@ -264,7 +264,7 @@ def attribute(
         jitter_ns=jitter,
         frame0_ns=float(main.origin + lead * main.period),
         runs=int(runs.size),
-        slips=_slips(shown, seg, per_frame),
+        slips=_slips(lines, tau, seg, per_frame),
         uncertain=int(uncertain.sum()),
         tied=int(tied),
         drops=int(np.clip(np.diff(frames["sequence"]) - 1, 0, None).sum()),
@@ -426,15 +426,13 @@ def _pick(
     return picked
 
 
-def _slips(shown: np.ndarray, seg: np.ndarray, per_frame: int) -> int:
-    """Frames inside a run captured other than ``per_frame`` times: where the card's clock slipped one."""
-    key = np.r_[True, (shown[1:] != shown[:-1]) | (seg[1:] != seg[:-1])]
-    edges = np.flatnonzero(np.r_[key, True])
-    lengths, owner = np.diff(edges), seg[edges[:-1]]
-    inner = np.r_[False, owner[1:-1] == owner[:-2], False] & np.r_[False, owner[1:-1] == owner[2:], False]
-    if lengths.size < 3:
-        return 0
-    return int(np.count_nonzero(inner[: lengths.size] & (lengths != per_frame)))
+def _slips(lines: dict, tau: np.ndarray, seg: np.ndarray, per_frame: int) -> int:
+    """Frames a run's line captures other than ``per_frame`` times, its end frames aside: the card's slips."""
+    total = 0
+    for s, line in lines.items():
+        _, counts = np.unique(line.frame_of(tau[seg == s]), return_counts=True)
+        total += int(np.count_nonzero(counts[1:-1] != per_frame))
+    return total
 
 
 def lock_path(take: str | Path) -> Path:
