@@ -7,8 +7,7 @@ import contextlib
 import numpy as np
 import pytest
 from pyvmancer import CcMapError, ReplyShapeError, ShellError, VmancerError
-from pyvmancer.ccmap import encode_setting
-from pyvmancer.const import CC_MAP_UNASSIGNED, ShellErrorCode
+from pyvmancer.const import ShellErrorCode
 from pyvmancer.shell import Reply
 
 from syncsummoner.device import transport as tr
@@ -83,7 +82,7 @@ def test_program_info_loads_when_not_current(device):
     port.program_info("Isotherm")
     assert device.shell.loads == ["Isotherm"]
     assert device.program == "Isotherm"
-    assert device.calls[-3:] == [("sink",), ("parameters", True), ("assign", "load")]
+    assert device.calls[-2:] == [("parameters", True), ("verify",)]
 
 
 def test_program_info_skips_load_when_current(device):
@@ -294,45 +293,50 @@ def settings_writes(shell):
     return [c[1:] for c in shell.calls if c[0] == "setting"]
 
 
-def test_every_load_rewrites_the_whole_cc_map_even_when_it_is_already_right():
-    """A key can hold its target while its live slot differs, so no load trusts the map."""
+def sent_ccs(shell):
+    return [c[1] for c in shell.calls if c[0] == "cc"]
+
+
+def test_a_load_reads_the_cc_map_back_and_never_rewrites_it_or_sends_a_sink_cc():
+    """The map is persistent settings and CC119 is a MIDI reset, so a load only checks."""
     port = tr.Transport(videomancer())
     shell = port.device.shell
     for program in ("Isotherm", "Colorbars"):
-        before = len(settings_writes(shell))
         port.load_program(program)
-        writes = settings_writes(shell)[before:]
-        assert writes[::2] == [(key, CC_MAP_UNASSIGNED) for key in range(200, 200 + PARAM_COUNT)]
-        assert writes[1::2] == [(200 + i, encode_setting(i)) for i in range(PARAM_COUNT)]
-        assert port.cc_assignment.summary() == "cc-map: assigned P1..P12 -> CC0..11 (was: ok)"
-    assert shell.live == list(range(PARAM_COUNT))
+    assert not settings_writes(shell)
+    assert not [cc for cc in sent_ccs(shell) if 102 <= cc <= 119]
+    assert shell.live == list(range(PARAM_COUNT)) and not port.cc_faults
 
 
-def test_a_load_repairs_a_live_map_its_settings_keys_do_not_show():
-    port = tr.Transport(videomancer())
-    port.device.shell.live[11] = 0
-    port.load_program("Isotherm")
-    assert port.device.shell.live == list(range(PARAM_COUNT))
-    assert port.cc_assignment.before.mismatched == (12,)
-    port.verify_cc_map()
-
-
-def test_a_map_that_does_not_take_after_the_write_raises():
+def test_a_live_map_off_the_sent_ccs_fails_the_load_and_is_recorded():
     port = tr.Transport(videomancer())
     shell = port.device.shell
-    shell.live[3], shell.stuck = 50, True
-    with pytest.raises(CcMapError, match="P4 CC50"):
+    shell.live[11] = 0
+    with pytest.raises(CcMapError, match="P12 CC0"):
         port.load_program("Isotherm")
-    with pytest.raises(CcMapError):
-        port.verify_cc_map()
+    assert shell.live[11] == 0 and not settings_writes(shell)
+    assert [f["when"] for f in port.cc_faults] == ["after loading Isotherm"]
+    assert "P12 CC0" in port.cc_faults[0]["error"] and port.cc_faults[0]["time"] > 0
 
 
-def test_the_sink_cc_is_one_no_slot_listens_on():
+def test_the_take_end_check_is_recorded_as_such():
     port = tr.Transport(videomancer())
-    port.consume_midi_assign()
-    sink = port.device.shell.calls[-1]
-    assert sink == ("cc", 119) and 119 not in port.device.shell.live
-    assert port.reassert_cc_map() is None
+    port.verify_cc_map()
+    assert not port.cc_faults
+    port.device.shell.live[3] = 50
+    with pytest.raises(CcMapError, match="P4 CC50"):
+        port.verify_cc_map()
+    assert [f["when"] for f in port.cc_faults] == ["at the end of a take"]
+
+
+def test_check_cc_map_returns_what_the_device_reads_back():
+    device = FakeDevice()
+    port = tr.Transport(device)
+    assert port.check_cc_map("now") is None and device.calls == [("verify",)]
+    device.cc_error = CcMapError("device CC map differs (P2 CC9)")
+    with pytest.raises(CcMapError):
+        port.check_cc_map("after parking")
+    assert port.cc_faults[0]["when"] == "after parking"
 
 
 @pytest.mark.parametrize(
@@ -377,7 +381,7 @@ def test_a_link_gated_load_restores_the_link_on_the_reply_then_waits_for_the_run
     assert ("load", "Passthru", False) in device.shell.calls, "the command runs with the link down"
     assert link.calls == ["down", "up"] and device.shell.program == "Passthru"
     assert port.current_program() == "Passthru"
-    assert device.calls[-2:] == [("parameters", True), ("assign", "load")]
+    assert device.calls[-2:] == [("parameters", True), ("verify",)]
 
 
 def test_waiting_for_the_run_inside_the_hold_never_ends():

@@ -445,67 +445,58 @@ def journalled(session, verb):
     return [e for e in session.journal.events if e.get("verb") == verb]
 
 
-def test_park_sends_the_sink_cc_before_its_first_parameter_cc():
+def test_neither_a_load_nor_a_park_sends_any_cc_from_102_to_119():
     session, shell = rig_session()
-    session.load_program("Isotherm", park=False)
-    start = len(shell.calls)
+    session.load_program("Isotherm")
     session.park()
-    ccs = [c[1] for c in shell.calls[start:] if c[0] == "cc"]
-    assert ccs[0] == 119 and ccs[1:3] == [0, 32]
+    session.load_program("Colorbars", link=FakeLink([]))
+    ccs = [c[1] for c in shell.calls if c[0] == "cc"]
+    assert ccs and not [cc for cc in ccs if 102 <= cc <= 119]
+    assert shell.live == list(range(PARAM_COUNT)) and not session.transport.cc_faults
 
 
-def test_park_on_a_fake_transport_sinks_first_and_reasserts_after_readback():
+def test_park_on_a_fake_transport_checks_the_map_after_readback_settles():
     session, port, _ = make_session()
     session.park()
     verbs = [c[0] for c in port.calls]
-    assert verbs[0] == "sink" and verbs[-1] == "reassert" and verbs.count("cc") == PARAM_COUNT
+    assert verbs[: PARAM_COUNT * 2].count("cc") == PARAM_COUNT
+    assert port.calls[-1] == ("check", "after parking") and verbs.count("check") == 1
 
 
-def test_an_armed_midi_assign_after_a_link_dropped_load_is_reassigned_and_recorded(caplog):
+def test_a_failed_map_check_after_parking_propagates():
+    session, port, _ = make_session()
+    port.cc_error = CcMapError("device CC map differs from the CCs sent (P5 CC9)")
+    with pytest.raises(CcMapError, match="P5 CC9"):
+        session.park()
+
+
+def test_an_armed_midi_assign_capturing_a_park_cc_is_a_recorded_fault():
+    """Nothing sinks the capture any more, so the slot learns a parameter's CC and the check fails."""
     session, shell = rig_session()
     session.load_program("Isotherm", park=False, link=FakeLink([]))
     shell.armed = 12
-    with caplog.at_level("WARNING", logger="syncsummoner"):
+    with pytest.raises(CcMapError, match="P12 CC0"):
         session.park()
-    assert shell.live == list(range(PARAM_COUNT)), "the slot that captured the sink is reassigned"
-    assert len(session.assign_events) == 1
-    event = session.assign_events[0]
-    assert (event["program"], event["params"], event["link"]) == ("Isotherm", [12], True)
-    assert event["time"] > 0
-    assert "MIDI Assign was armed on P12" in caplog.text
-    (noted,) = journalled(session, "midi_assign")
-    assert noted["params"] == [12] and noted["link"] is True and "was: P12 CC119" in noted["summary"]
-
-
-def test_a_capture_without_a_link_drop_is_recorded_as_such():
-    session, shell = rig_session()
-    session.load_program("Isotherm", park=False)
-    shell.armed = 3
-    session.park()
-    assert [(e["program"], e["params"], e["link"]) for e in session.assign_events] == [
-        ("Isotherm", [3], False)
-    ]
+    assert shell.live[11] == 0, "never repaired"
+    assert [f["when"] for f in session.transport.cc_faults] == ["after parking"]
 
 
 @pytest.mark.parametrize("slot,cc", [(12, 0), (4, 50)])
-def test_any_change_after_park_other_than_a_sink_capture_raises(slot, cc):
-    """A slot on P1's CC is what an unsunk park would teach; it must not be quietly repaired."""
+def test_any_change_to_the_map_before_a_park_raises_after_it(slot, cc):
     session, shell = rig_session()
     session.load_program("Isotherm", park=False)
     shell.live[slot - 1] = cc
     with pytest.raises(CcMapError, match=f"P{slot} CC{cc}"):
         session.park()
-    assert not session.assign_events
+    assert session.transport.cc_faults[-1]["when"] == "after parking"
 
 
-def test_every_load_journals_its_cc_map_assignment():
+def test_a_load_journals_no_cc_map_assignment():
     session, _ = rig_session()
     session.load_program("Isotherm")
     session.load_program("Colorbars")
-    noted = journalled(session, "cc_map")
-    assert [e["program"] for e in noted] == ["Isotherm", "Colorbars"]
-    assert all(e["summary"].startswith("cc-map: assigned P1..P12 -> CC0..11") for e in noted)
-    assert not session.assign_events
+    assert not journalled(session, "cc_map") and not journalled(session, "midi_assign")
+    assert [e["program"] for e in journalled(session, "load_program")] == ["Isotherm", "Colorbars"]
 
 
 def test_a_load_whose_cc_map_does_not_take_raises():

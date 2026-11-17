@@ -264,26 +264,19 @@ class FakeDevice:
         self.has_shell = True
         self.calls = []
         self.closed = False
-        self.cc_assignment = None
         self.program = None
-
-    def consume_midi_assign(self):
-        self.calls.append(("sink",))
-
-    def reassert_cc_map(self, phase="park"):
-        self.calls.append(("reassert", phase))
+        self.cc_error = None
 
     def verify_cc_map(self):
         self.calls.append(("verify",))
+        if self.cc_error is not None:
+            raise self.cc_error
 
     def programs(self):
         return ["Colorbars", "Isotherm", "Passthru"]
 
     def parameters(self, refresh=False):
         self.calls.append(("parameters", refresh))
-
-    def assign_cc_map(self, phase="assign"):
-        self.calls.append(("assign", phase))
 
     def set_param(self, index, value):
         self.calls.append(("set_param", index, value))
@@ -318,18 +311,15 @@ class FakeTransport(Live):
         self.sources = {}
         self.resyncs = 0
         self.source_locked = source_locked
-        self.cc_assignment = None
-        self.reasserted = None
+        self.cc_error = None
 
-    def consume_midi_assign(self):
-        self.calls.append(("sink",))
-
-    def reassert_cc_map(self):
-        self.calls.append(("reassert",))
-        return self.reasserted
+    def check_cc_map(self, when):
+        self.calls.append(("check", when))
+        if self.cc_error is not None:
+            raise self.cc_error
 
     def verify_cc_map(self):
-        self.calls.append(("verify",))
+        self.check_cc_map("at the end of a take")
 
     def video_status(self):
         self.calls.append(("video_status",))
