@@ -26,7 +26,7 @@ from syncsummoner.program.library import Library
 from syncsummoner.program.vmprog import ProgramConfig
 
 from .declared import declaration, initial_value, specs
-from .profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+from .profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, snap_toggles, toggle_slots
 
 #: Combined (Manual + Modulation + MIDI) output keys, in order of preference.
 COMBINED_KEYS = ("o", "out", "output", "combined")
@@ -347,8 +347,14 @@ class Transport:
         return dict(self._shell.program_info())
 
     def set_param(self, index: int, value: float | bool) -> None:
-        """Send a MIDI CC for one parameter; the device adds it to the manual value."""
-        self._device.set_param(_check_index(index), value)
+        """Send a MIDI CC for one parameter; the device adds it to the manual value.
+
+        A toggle slot's value is sent as the firmware reads it (:func:`~.profile.snap_toggles`).
+        """
+        index = _check_index(index)
+        if index in toggle_slots():
+            value = int(snap_toggles(index, PARAM_MAX if value is True else int(value)))
+        self._device.set_param(index, value)
 
     def set_manual(self, index: int, value: int) -> None:
         """Set a slot's manual value; the serial verb is absolute, unlike a CC, which is an offset onto it."""

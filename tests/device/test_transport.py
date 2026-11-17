@@ -524,3 +524,14 @@ def test_another_authors_program_skips_enumeration_only_when_its_name_is_unique(
 def test_an_unlisted_session_enumerates_another_author(device):
     tr.Transport(device, DECLARED).load_program("czartroniks/Fray")
     assert _enumerations(device) == ["czartroniks"]
+
+
+@pytest.mark.parametrize(
+    "index, value, sent",
+    [(8, 511, 0), (8, 512, 1023), (8, 1, 0), (8, True, 1023), (8, False, 0), (1, 300, 300)],
+    ids=["below", "threshold", "least", "true", "false", "knob"],
+)
+def test_a_toggle_slot_is_sent_as_the_firmware_reads_it(device, index, value, sent):
+    """The firmware switches at 512, so a toggle below it goes out off however nonzero it is."""
+    tr.Transport(device, DECLARED).set_param(index, value)
+    assert device.calls[-1] == ("set_param", index, sent)

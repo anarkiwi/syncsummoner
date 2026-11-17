@@ -31,16 +31,12 @@ def landed_from(chunk, *, late=(), unsent=(), ambiguous=()):
     rows = np.zeros(plan.size, dtype=ev.LANDED)
     for name in ("target", "param", "value"):
         rows[name] = plan[name]
-    rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = (
-        plan["value"],
-        np.arange(plan.size),
-        plan["target"],
-        1.0,
-    )
+    rows["wire"], rows["sent"], rows["landed"] = plan["value"], np.arange(plan.size), plan["target"]
     for i, by in late:
         rows["landed"][i] += by
+    rows["first"], rows["last"] = rows["landed"], rows["landed"]
     rows["sent"][list(unsent)] = -1
-    rows["clear_ns"][list(ambiguous)] = -1.0
+    rows["last"][list(ambiguous)] += 1
     return rows
 
 
@@ -191,6 +187,8 @@ def test_toggles_go_out_as_off_or_on_and_repeats_drop():
     states[1, 6], states[2, 6], states[3, 0] = 768, 1000, 5
     out = L.carried(states, [7])
     assert out[:, 6].tolist() == [0, 1023, 0] and out[:, 0].tolist() == [0, 0, 5]
+    states[1, 6], states[2, 6] = 511, 512
+    assert L.carried(states, [7])[:, 6].tolist() == [0, 1023, 0]
 
 
 def test_a_recorded_cover_walks_each_stepped_parameter_off_its_base_and_back():

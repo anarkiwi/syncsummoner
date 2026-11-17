@@ -73,6 +73,108 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def clip_ti(luma: Any, lead: int, tail: int) -> Any:
+    """TI of each clip frame against the frame played before it, the lead-in's last for the first."""
+    from syncsummoner.aesthetics.survival import information
+
+    return information(luma[lead - 1 : len(luma) - tail])[1][1:]
+
+
+def downbeat_frames(audio: str, fps: float) -> Any:
+    """The track's downbeats as clip frames, the clip played from the track's start."""
+    import numpy as np
+
+    from syncsummoner.compose.features import beat_track, downbeat_times, load_audio, onset_strength
+
+    y, sr = load_audio(audio)
+    hop = 512
+    env = onset_strength(y, sr, hop=hop)
+    beats, _ = beat_track(env, sr / hop)
+    return np.rint(downbeat_times(beats, env, sr / hop) * fps).astype(np.int64)
+
+
+def _sweep_regions_cmd(args: argparse.Namespace) -> int:
+    """Plan a program's region sweep: Sobol settings in each regime, each held as the follow test needs."""
+    import numpy as np
+    from pyvmancer.midi import ParamKind, param_kind
+
+    from syncsummoner.compose.locktake import read_latency
+    from syncsummoner.compose.render import RenderConfig, lead_frames, tail_frames
+    from syncsummoner.device.profile import PARAM_COUNT
+    from syncsummoner.probe import decoded
+    from syncsummoner.probe.locked import joint, plan_path, write_plan
+    from syncsummoner.probe.regions import allot, chunks_of, design, guard_frames, slots
+    from syncsummoner.probe.store import slug
+    from syncsummoner.program import model
+    from syncsummoner.program.gates import representatives
+
+    config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
+    held = json.loads(Path(args.hold).read_text(encoding="utf-8"))
+    if held["program"] != args.program:
+        raise ValueError(f"{args.hold} measured {held['program']}, not {args.program}")
+    record = json.loads(Path(args.cover).read_text(encoding="utf-8"))
+    clip = decoded.features(args.source, decoded.Spec.of(config), workers=args.workers)
+    ti = clip_ti(clip.luma, lead_frames(config), tail_frames(config))
+    edges = downbeat_frames(args.audio, config.fps)
+    lat = read_latency(args.latency or args.takes)
+    guard = guard_frames(int(held["settle"]), lat.hi - lat.lo, 1e9 / config.fps)
+    placed = slots(
+        ti,
+        edges,
+        guard=guard,
+        budget_s=args.budget_s,
+        overhead_s=2 * config.lead_in_s + config.tail_s,
+        fps=config.fps,
+    )
+    m = model(args.program)
+    values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
+    states = np.asarray(record["states"], dtype=np.int64)
+    chosen = [int(i) for i in record["chosen"]]
+    dims = [[p for p in record["stepped"].get(str(i), []) if p in values] for i in chosen]
+    extra = np.zeros((0, PARAM_COUNT), dtype=np.int64)
+    for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
+        extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
+    counts = allot(max(len(placed) - len(extra), 0), [len(d) for d in dims])
+    sampled = [
+        design(states[i], d, values, n, args.seed + k)
+        for k, (i, d, n) in enumerate(zip(chosen, dims, counts))
+    ]
+    every = np.concatenate([*sampled, extra]) if sampled else extra
+    capacity, placed = len(placed), placed[: len(every)]
+    toggles = [p for p in range(1, PARAM_COUNT + 1) if param_kind(p) is ParamKind.TOGGLE]
+    chunks = chunks_of(every, placed, settle=int(held["settle"]), toggles=toggles)
+    hold = np.array([s.hold for s in placed])
+    regions = {
+        "settings": int(len(every)),
+        "capacity": capacity,
+        "per_regime": dict(zip((str(i) for i in chosen), counts)),
+        "dims": dict(zip((str(i) for i in chosen), dims)),
+        "joint": int(len(extra)),
+        "guard_frames": guard,
+        "hold_frames": {"min": int(hold.min()), "median": float(np.median(hold)), "max": int(hold.max())},
+        "budget_s": args.budget_s,
+        "rig_s": float(
+            sum(c.frames for c in chunks) / config.fps + len(chunks) * (2 * config.lead_in_s + config.tail_s)
+        ),
+        "seed": args.seed,
+    }
+    path = write_plan(
+        plan_path(args.takes, slug(args.program)),
+        chunks,
+        program=args.program,
+        response=held,
+        source=args.source,
+        regions=regions,
+    )
+    print(
+        f"{args.program}: {regions['settings']} settings ({regions['per_regime']} by regime, "
+        f"{len(extra)} joint) of {capacity} the budget holds, "
+        f"hold {regions['hold_frames']} frames after a guard of {guard}, {len(chunks)} takes, "
+        f"{regions['rig_s']:.0f} s of rig time; plan in {path}"
+    )
+    return 0
+
+
 def _sweep_take(directory: str, program: str, chunk: int) -> Path:
     from syncsummoner.probe.store import slug
 
@@ -193,6 +295,24 @@ def add_parsers(probe_sub: Any) -> None:
         help="also hold SELECTOR at each setting with a MOVER move under each (repeatable)",
     )
     plan.set_defaults(func=_sweep_plan_cmd)
+    regions = sweep_sub.add_parser(
+        "regions", help="plan a region sweep: Sobol settings per regime, held to judge motion"
+    )
+    regions.add_argument("program")
+    regions.add_argument("--cover", required=True, help="a cover as `program cover --json` wrote it")
+    regions.add_argument("--hold", required=True, help="the program's hold-<program>.json")
+    regions.add_argument("--source", required=True, help="the timecoded clip the takes will play")
+    regions.add_argument("--audio", required=True, help="the track the clip is scored to, for its bars")
+    regions.add_argument("--takes", required=True, help="the sweep's takes directory")
+    regions.add_argument(
+        "--latency", help="where the dry takes' ccpicture.json is; the takes directory by default"
+    )
+    regions.add_argument(
+        "--budget-s", type=float, required=True, help="rig seconds the program's takes may use"
+    )
+    regions.add_argument("--seed", type=int, default=0, help="seed of the scrambled Sobol design")
+    regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")
+    regions.set_defaults(func=_sweep_regions_cmd)
     run = sweep_sub.add_parser("capture", help="capture one take of a plan on the rig")
     run.add_argument("plan")
     run.add_argument("--chunk", type=int, required=True)
@@ -207,7 +327,7 @@ def add_parsers(probe_sub: Any) -> None:
     commit.add_argument("plan")
     commit.add_argument("--archive", required=True)
     commit.set_defaults(func=_sweep_commit_cmd)
-    for node in (hold, plan, run, gather, commit):
+    for node in (hold, plan, regions, run, gather, commit):
         node.add_argument("--format", default="1080p30", help="the session format")
         node.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
         node.add_argument("--workers", type=int, help="decoders at once")

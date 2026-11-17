@@ -18,6 +18,24 @@ PARAM_MAX = 1023
 BOOL_THRESHOLD = 512
 
 
+def toggle_slots() -> tuple[int, ...]:
+    """The 1-based slots the link carries as switches (pyvmancer's toggle slots)."""
+    from pyvmancer.midi import ParamKind as Control, param_kind  # pylint: disable=import-outside-toplevel
+
+    return tuple(p for p in range(1, PARAM_COUNT + 1) if param_kind(p) is Control.TOGGLE)
+
+
+def snap_toggles(params: Any, values: Any, toggles: Sequence[int] | None = None) -> np.ndarray:
+    """Each value as the firmware reads it on its slot: a switch's at or past :data:`BOOL_THRESHOLD` is on.
+
+    Values on toggle slots go out as off (0) or on (:data:`PARAM_MAX`), so what is sent, echoed and
+    recorded is what the device switches on; other slots keep their value.
+    """
+    p, v = np.broadcast_arrays(np.asarray(params, dtype=np.int64), np.asarray(values, dtype=np.int64))
+    on = np.isin(p, toggle_slots() if toggles is None else toggles)
+    return np.where(on, np.where(v >= BOOL_THRESHOLD, PARAM_MAX, 0), v)
+
+
 class ParamKind(enum.Enum):
     """Parameter type, as the program declares it. Determines how a plan samples it."""
 

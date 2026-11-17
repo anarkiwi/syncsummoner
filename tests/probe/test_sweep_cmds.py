@@ -88,6 +88,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
         for name in ("target", "param", "value"):
             rows[name] = body[name]
         rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = body["value"], 0, body["target"], 1.0
+        rows["first"], rows["last"] = body["target"], body["target"]
         n = chunk.frames
         L.save_rows(
             take,
@@ -136,6 +137,7 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     for name in ("target", "param", "value"):
         rows[name] = body[name]
     rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = body["value"], 0, body["target"], 1.0
+    rows["first"], rows["last"] = body["target"], body["target"]
     n = chunk.frames
     proof = SimpleNamespace(
         ok=True,

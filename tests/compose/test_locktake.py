@@ -261,17 +261,13 @@ def test_a_programs_latency_is_replaced_and_takes_measured_otherwise_ignored(tmp
     assert LT.read_latency(tmp_path).delta == pytest.approx(DELTA + 3e5)
 
 
-@pytest.mark.parametrize(
-    "second, said",
-    [((DELTA + 3e5,), "empty"), ((DELTA, (-0.3 * P, 0.3 * P)), "half a frame")],
-    ids=["disjoint", "wide"],
-)
-def test_dry_takes_that_cannot_name_a_landing_frame_are_refused(tmp_path, second, said):
-    """Bands that do not meet, or one half a frame wide, say nothing of which frame a write lands on."""
-    LT.write_latency(tmp_path, latency_of(*second), "Other")
-    if said == "empty":
-        LT.write_latency(tmp_path, latency_of(DELTA), "Teletext")
-    with pytest.raises(LT.LeadInTimeError, match=said):
+def test_dry_takes_that_contradict_are_refused_and_a_wide_band_only_widens(tmp_path):
+    """Bands that do not meet say nothing; a band of any width is the band every take admits."""
+    LT.write_latency(tmp_path, latency_of(DELTA, (-0.3 * P, 0.3 * P)), "Other")
+    wide = LT.read_latency(tmp_path)
+    assert wide.hi - wide.lo == pytest.approx(0.6 * P + 2e5)
+    LT.write_latency(tmp_path, latency_of(DELTA + 0.4 * P), "Teletext")
+    with pytest.raises(LT.LeadInTimeError, match="empty"):
         LT.read_latency(tmp_path)
 
 
@@ -281,9 +277,9 @@ def test_dry_takes_that_cannot_name_a_landing_frame_are_refused(tmp_path, second
         ({"lo": 1.0, "hi": 3.0, "basis": ev.BASIS}, None, (1.0, 3.0)),
         ({"lo": 1.0, "hi": 3.0}, None, "no CC-to-picture latency"),
         ({"lo": 1.0, "hi": 3.0}, latency_of(DELTA, (-1e5, 1e5)), (DELTA - 2e5, DELTA + 2e5)),
-        ({}, latency_of(DELTA, (-0.3 * P, 0.3 * P)), "half a frame"),
+        ({}, latency_of(DELTA, (-0.3 * P, 0.3 * P)), (DELTA - 1e5 - 0.3 * P, DELTA + 1e5 + 0.3 * P)),
     ],
-    ids=["live", "unmeasured", "on-file", "too-wide"],
+    ids=["live", "unmeasured", "on-file", "wide"],
 )
 def test_a_take_without_a_dry_control_lands_its_writes_by_a_start_basis_band(tmp_path, live, kept, want):
     """The band it was sent by when measured to frame starts, else what the dry takes on file admit."""
@@ -608,7 +604,17 @@ PLAN_ROWS = np.array(
 
 
 def take_and_prove(
-    monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7), drop=None, config=None, lose=None
+    monkeypatch,
+    simulate,
+    tmp_path,
+    *,
+    dry,
+    working,
+    boots=(7, 7),
+    drop=None,
+    config=None,
+    lose=None,
+    plan=None,
 ):
     """A whole simulated take, then its evidence from the files it left."""
     sim = simulate(lead=120, count=30, drop=drop)
@@ -621,7 +627,7 @@ def take_and_prove(
         program="Teletext",
         seconds=1.0,
         config=config_for(4.0) if config is None else config,
-        plan=PLAN_ROWS,
+        plan=PLAN_ROWS if plan is None else plan,
         working=lambda info: working,
         load=load,
         lead_in=LEAD_IN,
@@ -641,6 +647,18 @@ def take_and_prove(
     return sim, rig, record, proof, loads
 
 
+def test_a_take_sends_and_records_toggle_slots_as_the_firmware_reads_them(monkeypatch, simulate, tmp_path):
+    """A toggle planned below the threshold goes out, echoes and is recorded off; at it, on."""
+    plan = np.r_[PLAN_ROWS, np.array([(10, 8, 300), (15, 8, 512)], dtype=LT.PLAN)]
+    _, _, record, proof, _ = take_and_prove(
+        monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 8: 1}, plan=plan
+    )
+    toggled = record.plan[record.plan["param"] == 8]
+    assert toggled[["target", "value"]].tolist() == [(15, PARAM_MAX)]
+    assert record.sends[record.sends["param"] == 8]["value"].tolist() == [PARAM_MAX]
+    assert proof.landed.ok and proof.received.ok
+
+
 def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypatch, simulate, tmp_path):
     """Calibrated on its bypass, every planned write lands on its frame, reads back and is received."""
     sim, rig, record, proof, loads = take_and_prove(
@@ -654,8 +672,10 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert kept["line_lo"] == pytest.approx(-P / 4, abs=2.0) and kept["line_hi"] == pytest.approx(
         P / 4, abs=2.0
     )
-    with pytest.raises(LT.LeadInTimeError, match="half a frame"):
-        LT.read_latency(tmp_path)
+    wide = LT.read_latency(tmp_path)
+    assert wide.lo == pytest.approx(kept["lo"] + kept["line_lo"]) and wide.hi == pytest.approx(
+        kept["hi"] + kept["line_hi"]
+    )
     assert record.plan[0].tolist() == (-15, 1, 0) and record.plan[-1].tolist() == (30, 1, PARAM_MAX)
     lock = np.load(tmp_path / "take.mkv.lock.npz")
     assert (int(lock["lead"]), int(lock["count"]), int(lock["tail"])) == (120, 30, 120)

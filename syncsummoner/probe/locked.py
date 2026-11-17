@@ -17,7 +17,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from syncsummoner.compose.locktake import PLAN
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
+from syncsummoner.device.profile import PARAM_COUNT, snap_toggles
 from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameRow
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import atomic_write
@@ -140,11 +140,10 @@ def joint(states: np.ndarray, selector: int, mover: int, values: dict[int, np.nd
 def carried(states: np.ndarray, toggles: Sequence[int]) -> np.ndarray:
     """``states`` as the link carries them, with any setpoint that then repeats the one before dropped.
 
-    A toggle slot is sent as off or on, so each of its values goes to the end of the half it reads as.
+    A toggle slot is sent as off or on, as the firmware reads it (:func:`~.profile.snap_toggles`).
     """
-    out = np.asarray(states, dtype=np.int64).copy()
-    slots = np.asarray(toggles, dtype=np.int64) - 1
-    out[:, slots] = np.where(out[:, slots] > PARAM_MAX // 2, PARAM_MAX, 0)
+    states = np.asarray(states, dtype=np.int64)
+    out = snap_toggles(np.arange(1, PARAM_COUNT + 1)[None, :], states, toggles)
     return out[np.r_[True, np.any(np.diff(out, axis=0) != 0, axis=1)]]
 
 
@@ -223,9 +222,9 @@ def settled_rows(
 ) -> list[FrameRow]:
     """One archive row per capture, under the state the take realized: its settled setpoint, else :data:`GAP`.
 
-    A frame belongs to the setpoint whose writes landed last by then, once ``chunk.settle`` frames
-    have passed since the latest (one more for a write on a tick), and only where the realized state
-    is that setpoint's. Frames in ``bad_frames`` keep no setpoint.
+    A frame belongs to the setpoint whose writes may have started landing last by then, once
+    ``chunk.settle`` frames have passed since the end of its writes' latest landing window, and only
+    where the realized state is that setpoint's. Frames in ``bad_frames`` keep no setpoint.
     """
     rows = landed[landed["target"] > 0]
     owner = owners(chunk, rows)
@@ -234,8 +233,8 @@ def settled_rows(
     sent = rows["sent"] >= 0
     first, last = np.full(n, count, dtype=np.int64), np.zeros(n, dtype=np.int64)
     first[0] = 0
-    np.minimum.at(first, owner[sent], rows["landed"][sent])
-    np.maximum.at(last, owner[sent], rows["landed"][sent] + (rows["clear_ns"][sent] < 0))
+    np.minimum.at(first, owner[sent], rows["first"][sent])
+    np.maximum.at(last, owner[sent], rows["last"][sent])
     order = np.argsort(first, kind="stable")
     frame = np.arange(count)
     k = order[np.clip(np.searchsorted(first[order], frame, side="right") - 1, 0, n - 1)]
