@@ -199,7 +199,7 @@ def fit(
     Named brackets clip the polygon a ``group`` at a time, the largest first; a later group missing it
     past ``jitter`` is unnamed again, the first a :class:`LineError`. The rest are named outward, each by
     the one frame the polygon admits between its named neighbours'; one missing it by less than
-    ``jitter`` is widened to meet it, by more a stray, -1. A start lies a timestamp ``resolution`` past ``lo``.
+    ``jitter`` is widened to meet it, by more a stray, -1. A start lies a ``resolution`` past ``lo``.
     """
     lo, hi = np.asarray(lo, dtype=np.float64) + resolution, np.asarray(hi, dtype=np.float64)
     frame = np.asarray(frame, dtype=np.int64).copy()
@@ -222,14 +222,16 @@ def fit(
     worst, rejected = 0.0, 0
     for index, g in enumerate(order_groups):
         members = named[group[named] == g]
-        before, misses = poly.vertices.copy(), [poly.meet(int(frame[i]), float(lo[i]), float(hi[i])) for i in members]
+        before, misses = poly.vertices.copy(), [
+            poly.meet(int(frame[i]), float(lo[i]), float(hi[i])) for i in members
+        ]
         if max(misses) <= jitter:
             worst = max(worst, *misses)
             continue
         if not index:
             miss = max(misses)
             raise LineError(
-                f"frame {frame[members[int(np.argmax(misses))]]}'s start misses every line through the starts "
+                f"frame {frame[members[int(np.argmax(misses))]]}'s start misses every line through those "
                 f"before it by {miss / 1e6:.3f} ms, past the capture jitter of {jitter / 1e6:.3f} ms",
                 miss=miss,
             )
@@ -254,7 +256,7 @@ def fit(
 
 
 def extend(line: Line, lo: np.ndarray, hi: np.ndarray, jitter: float, resolution: float = 0.0) -> Line:
-    """``line`` carried on over brackets later in capture order than every one it named, as :func:`fit` names them."""
+    """``line`` carried on over brackets after all it named in capture order, named as :func:`fit` does."""
     lo = np.asarray(lo, dtype=np.float64) + resolution
     poly = Polygon(line.polygon.ref, line.polygon.vertices.copy())
     frame = np.full(np.size(lo), -1, dtype=np.int64)

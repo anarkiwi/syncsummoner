@@ -164,14 +164,14 @@ def write_timecoded(
     config: RenderConfig,
     seconds: float | None = None,
     start: float = 0.0,
-    lead: int = 0,
-    tail: int = 0,
+    lead: int | None = None,
+    tail: int | None = None,
 ) -> int:
-    """Write the source at session geometry with each frame's index burnt in, between a lead-in and a lead-out.
+    """Write the source at session geometry, each frame's index burnt in, between a lead-in and a lead-out.
 
     The lead-in is ``lead`` copies of the first frame numbered ``-lead..-1``, wrapped to the strip's
-    width, and the lead-out ``tail`` copies of the last numbered on from it (a locked take's are
-    :func:`lead_frames` and :func:`tail_frames`). Returns the clip frames written, neither included.
+    width, and the lead-out ``tail`` copies of the last numbered on from it, a locked take's
+    (:func:`lead_frames`, :func:`tail_frames`) unless given. Returns the clip frames, neither included.
 
     A clip the playout can identify frame by frame is what lets the source be
     played from the other end, where it can run at rate. ``start`` skips into it,
@@ -180,7 +180,8 @@ def write_timecoded(
     than the broken pipe writing to it produces.
     """
     total, frames = source_stream(source, config, seconds=seconds, start=start)
-    lead = int(lead)
+    lead = lead_frames(config) if lead is None else int(lead)
+    tail = tail_frames(config) if tail is None else int(tail)
     argv = [
         getattr(config, "ffmpeg", "ffmpeg"),
         "-loglevel",
@@ -235,14 +236,14 @@ def write_timecoded(
         proc.wait()
     if proc.returncode:
         raise RuntimeError(f"timecoding {out} failed: {said.splitlines()[-1] if said else 'no output'}")
+    size = f"{config.width}x{config.height}"
     LOG.info(
-        "timecoded %d frames between a %d frame lead-in and a %d frame lead-out into %s at %dx%d",
+        "timecoded %d frames between a %d and a %d frame lead-in and -out into %s at %s",
         written or total,
         lead,
         tail,
         out,
-        config.width,
-        config.height,
+        size,
     )
     return written or total
 
@@ -309,10 +310,9 @@ def play_take(
                     rig.session.load_program(PASSTHRU, link=rig.link)
                     await_transmitting(rig.transport, program=PASSTHRU, timing=config.timing)
                     if time.monotonic() - end >= tail / config.fps:
-                        raise LeadInError(f"{program}: Passthru loaded past the {tail / config.fps:.1f}s lead-out")
-                _wait_until(
-                    end + tail / config.fps + config.tail_s, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S
-                )
+                        raise LeadInError(f"{program}: Passthru loaded past the lead-out; raise lead_in_s")
+                end += tail / config.fps + config.tail_s
+                _wait_until(end, clock=time.monotonic, sleep=time.sleep, tick_s=DRIVE_TICK_S)
                 hold = int(player.status().get("hold", 1))
         save_lock(out, rig.playout.flips(), hold=hold, lead=lead, count=count, tail=tail)
     return loaded
@@ -433,15 +433,7 @@ def render_played(
     owned = rig is None
     rig = open_rig(config, capture=False) if owned else rig
     if not prepared:
-        write_timecoded(
-            source,
-            scratch,
-            config=config,
-            seconds=score.duration,
-            start=start,
-            lead=lead_frames(config),
-            tail=tail_frames(config),
-        )
+        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
     if recorder is None:
         from syncsummoner.device.recorder import Recorder
 
@@ -783,15 +775,7 @@ def render_cuts(
         human(len(fresh) * score.duration),
     )
     if (fresh or not Path(scratch).is_file()) and not prepared:
-        write_timecoded(
-            source,
-            scratch,
-            config=config,
-            seconds=score.duration,
-            start=start,
-            lead=lead_frames(config),
-            tail=tail_frames(config),
-        )
+        write_timecoded(source, scratch, config=config, seconds=score.duration, start=start)
         prepared = True
     _passes(
         ordered,

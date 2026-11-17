@@ -484,7 +484,7 @@ def _play(
     lead_in: LeadIn,
     reload: Callable[[str], Any] | None = None,
 ) -> None:
-    """The take from playout start: lead-in writes, calibration, the live clock, every planned write, the lead-out.
+    """The take from playout start: lead-in writes, calibration, the live clock, the plan, the lead-out.
 
     The cyclic collector is off meanwhile: a full collection holds the interpreter lock for longer
     than the half frame a send has to make its tick, stalling the sender and the poller together.
@@ -611,7 +611,7 @@ def plan_rows(
     wet_frame: int,
     dry_frame: int | None = None,
 ) -> np.ndarray:
-    """The take's writes: the dry control to its take value at ``wet_frame``, the plan, and dry again at ``dry_frame``."""
+    """The take's writes: its dry control to its take value at ``wet_frame``, the plan, then dry at ``dry_frame``."""
     if dry is None:
         return plan
     ((slot, value),) = dry.items()

@@ -41,7 +41,7 @@ class LockReport:
 
     @property
     def ok(self) -> bool:
-        """Whether the take is exact: every frame attributed, nothing missed, dropped, off a frame start or torn."""
+        """Whether the take is exact: every frame attributed, nothing missed, dropped, off a start or torn."""
         return (
             self.attributed == self.frames
             and self.flips["missed"] == 0
@@ -60,7 +60,8 @@ class LockReport:
             f"{'LOCKED' if self.ok else 'NOT LOCKED'}: {self.attributed}/{self.frames} clip frames "
             f"attributed; Pi {flips['flips']} flips, {flips['missed']} missed vblanks, "
             f"{flips['out_of_cadence']} off cadence; card {self.drops} lost frames, {self.gaps} gaps and "
-            f"{self.off_cadence} picture changes off a frame start in the clip; strips {self.agreed}/{self.read} "
+            f"{self.off_cadence} picture changes off a frame start in the clip; "
+            f"strips {self.agreed}/{self.read} "
             f"agree; {self.torn}/{self.judged} torn"
         )
 
