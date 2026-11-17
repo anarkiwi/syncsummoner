@@ -7,6 +7,8 @@ write is then sent midway between the ticks around its frame's. See docs/evidenc
 
 from __future__ import annotations
 
+import gc
+import heapq
 import json
 import sys
 from contextlib import contextmanager
@@ -19,7 +21,8 @@ import numpy as np
 
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import live_attribution, read_live, save_lock
-from syncsummoner.device.profile import PARAM_MAX
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
+from syncsummoner.device.session import CC_BUDGET_HZ, frame_capacity, wire_messages
 from syncsummoner.device.wire import Poller, Sender, save_wire
 from syncsummoner.probe import decoded
 from syncsummoner.probe.decoded import CALIBRATION_SIZE
@@ -43,8 +46,40 @@ class LeadInTimeError(RuntimeError):
     """The lead-in ended before the take's clock and latency were known."""
 
 
+class InfeasibleScheduleError(RuntimeError):
+    """A frame's writes exceed the link's capacity and cannot move earlier past their slot's last write."""
+
+
 class NoLatencyError(LeadInTimeError):
     """A program with no dry control needs a CC-to-picture latency no dry take has measured yet."""
+
+
+@dataclass(frozen=True)
+class Pacing:
+    """What the MIDI link carries: messages a frame, and messages each slot's write takes."""
+
+    capacity: int
+    per_write: np.ndarray
+
+    @classmethod
+    def of(cls, cc_map: Any, config: Any, *, high_resolution: bool = True) -> "Pacing":
+        """The pacing of a CC map's encoding at the config's write budget and frame rate."""
+        per_write = wire_messages(cc_map, high_resolution=high_resolution)
+        budget = getattr(config, "cc_budget_hz", CC_BUDGET_HZ)
+        return cls(frame_capacity(budget, float(config.fps), per_write), per_write)
+
+    def batches(self, slots: Any) -> list[list[int]]:
+        """``slots`` in send order, cut into runs one frame's capacity holds."""
+        out: list[list[int]] = [[]]
+        room = self.capacity
+        for slot in slots:
+            cost = int(self.per_write[int(slot) - 1])
+            if cost > room:
+                out.append([])
+                room = self.capacity
+            out[-1].append(int(slot))
+            room -= cost
+        return [batch for batch in out if batch]
 
 
 @dataclass(frozen=True)
@@ -87,12 +122,127 @@ def dry_state(info: Any, bypass: Callable[[Any], int | None] = program_bypass) -
 
 
 def frame_plan(auto: Any, *, fps: float, early_bias_s: float) -> np.ndarray:
-    """Each automation write's target frame: the first frame starting at or after its time less the bias."""
+    """Each automation write's target frame: the first frame starting at or after its time less the bias.
+
+    The device applies a slot's value once a frame, so only the last write per slot and frame is kept,
+    and one that repeats the slot's previous value is dropped.
+    """
     times = np.asarray(auto.times, dtype=np.float64)
     target = np.ceil(np.round((times - early_bias_s) * fps, 6)).astype(np.int64)
     plan = np.zeros(times.size, dtype=PLAN)
     plan["target"], plan["param"], plan["value"] = np.maximum(target, 0), auto.indices, auto.values
-    return plan[np.argsort(plan["target"], kind="stable")]
+    return schedule(plan[np.argsort(plan["target"], kind="stable")])
+
+
+def schedule(plan: np.ndarray, state: np.ndarray | None = None) -> np.ndarray:
+    """One write per slot and frame, the last asked for, none repeating the value its slot holds.
+
+    ``plan`` is in send order; ``state`` is the 12 slot values before it, unknown when not given.
+    The result is in target order, slots in their send order within a frame.
+    """
+    if not plan.size:
+        return plan
+    order = np.lexsort((np.arange(plan.size), plan["target"], plan["param"]))
+    rows = plan[order]
+    same_slot = rows["param"][1:] == rows["param"][:-1]
+    last = np.r_[~(same_slot & (rows["target"][1:] == rows["target"][:-1])), True]
+    rows, order = rows[last], order[last]
+    first = np.r_[True, rows["param"][1:] != rows["param"][:-1]]
+    held = np.r_[-1, rows["value"][:-1]]
+    if state is not None:
+        held[first] = np.asarray(state, dtype=np.int64)[rows["param"][first] - 1]
+    else:
+        held[first] = -1
+    keep = rows["value"] != held
+    rows, order = rows[keep], order[keep]
+    return rows[np.lexsort((order, rows["target"]))]
+
+
+def pace(plan: np.ndarray, capacity: int, per_write: np.ndarray, *, floor: int) -> np.ndarray:
+    """``plan`` with no frame carrying more than ``capacity`` messages.
+
+    A frame's excess moves to the latest earlier frames with room, never to or before its slot's previous
+    write nor before ``floor``. The most constrained write is placed first, which finds a placement
+    whenever one exists for writes of one size. :class:`InfeasibleScheduleError` when none does.
+    """
+    if not plan.size:
+        return plan
+    cost = np.asarray(per_write, dtype=np.int64)[plan["param"] - 1]
+    by_slot = np.lexsort((np.arange(plan.size), plan["target"], plan["param"]))
+    target = plan["target"][by_slot]
+    first = np.r_[True, plan["param"][by_slot][1:] != plan["param"][by_slot][:-1]]
+    earliest = np.empty(plan.size, dtype=np.int64)
+    earliest[by_slot] = np.where(first, np.minimum(floor, target), np.r_[0, target[:-1]] + 1)
+    out = plan.copy()
+    order = np.argsort(-plan["target"], kind="stable")
+    pending: list[tuple[int, int, int]] = []
+    i, frame = 0, int(plan["target"][order[0]])
+    while i < order.size or pending:
+        if not pending:
+            frame = min(frame, int(plan["target"][order[i]]))
+        while i < order.size and plan["target"][order[i]] >= frame:
+            k = int(order[i])
+            heapq.heappush(pending, (-int(earliest[k]), -int(plan["target"][k]), k))
+            i += 1
+        room = int(capacity)
+        while pending and cost[pending[0][2]] <= room and -pending[0][0] <= frame:
+            k = heapq.heappop(pending)[2]
+            out["target"][k], room = frame, room - int(cost[k])
+        if pending and -pending[0][0] >= frame:
+            k = pending[0][2]
+            raise InfeasibleScheduleError(
+                f"frame {int(plan['target'][k])} needs more than the link's {capacity} messages a frame, "
+                f"and P{int(plan['param'][k])}'s write there cannot move before frame {int(earliest[k])}"
+            )
+        frame -= 1
+    moved = int(np.count_nonzero(out["target"] != plan["target"]))
+    if moved:
+        LOG.info(
+            "%d writes moved earlier, at most %d frames, to keep within %d messages a frame",
+            moved,
+            int((plan["target"] - out["target"]).max()),
+            capacity,
+        )
+    return out[np.lexsort((np.arange(out.size), out["target"]))]
+
+
+def wet_at(lead_in: LeadIn, fps: float) -> int:
+    """The lead-in frame a take's dry control returns to its take value on; later frames are wet."""
+    return -int(round(lead_in.wet_s * fps))
+
+
+def frame_load(rows: np.ndarray, per_write: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each frame that carries writes, and the messages it carries."""
+    if not rows.size:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    frames, inverse = np.unique(rows["target"], return_inverse=True)
+    return frames, np.bincount(inverse, weights=np.asarray(per_write)[rows["param"] - 1]).astype(np.int64)
+
+
+def describe_load(auto: Any, plan: np.ndarray, rows: np.ndarray, pacing: Pacing) -> str:
+    """Automation writes, frame-plan rows, the rows a take sends, and its busiest frame against capacity."""
+    frames, messages = frame_load(rows, pacing.per_write)
+    said = f"{len(auto)} automation writes, {plan.size} frame-plan rows, {rows.size} sent; "
+    if not messages.size:
+        return said + "nothing to send"
+    busiest, full = int(np.argmax(messages)), int(np.count_nonzero(messages == pacing.capacity))
+    return said + (
+        f"busiest frame {int(frames[busiest])} carries {int(messages[busiest])} of "
+        f"{pacing.capacity} messages a frame, {full} at capacity"
+    )
+
+
+def clip_plan(auto: Any, seconds: float, config: Any) -> np.ndarray:
+    """A layer's automation as frame-targeted writes inside a clip of ``seconds``."""
+    plan = frame_plan(auto, fps=config.fps, early_bias_s=config.early_bias_s)
+    return plan[plan["target"] < int(round(seconds * config.fps))]
+
+
+def take_schedule(
+    rows: np.ndarray, start: np.ndarray, *, capacity: int, per_write: np.ndarray, floor: int
+) -> np.ndarray:
+    """A take's rows as sent: one write per slot and frame, none repeating its slot, paced to the link."""
+    return pace(schedule(rows, start), capacity, per_write, floor=floor)
 
 
 def initial_state(working: Mapping[int, Any], plan: np.ndarray) -> dict[int, int]:
@@ -276,7 +426,8 @@ def locked_take(
     info = load(program)
     dry = dry_state(info, bypass)
     initial = initial_state(working(info), plan)
-    park = rig.session.park_values
+    park = np.asarray(rig.session.park_values, dtype=np.int64)
+    pacing = Pacing.of(midi.cc_map, config, high_resolution=getattr(midi, "high_resolution", True))
 
     def write(param: int, value: int) -> int:
         offset = int(np.clip(value - park[param - 1], 0, PARAM_MAX))
@@ -287,9 +438,17 @@ def locked_take(
         read_latency(Path(out).parent)
         load("Passthru")
     start_state = {**initial, **(dry or {})}
-    start_vector = [start_state.get(i, int(park[i - 1])) for i in range(1, 13)]
+    start_vector = np.array([start_state.get(i, int(park[i - 1])) for i in range(1, PARAM_COUNT + 1)])
+    wet = wet_at(lead_in, fps)
+    rows = take_schedule(
+        plan_rows(plan, dry, initial, wet_frame=wet),
+        start_vector,
+        capacity=pacing.capacity,
+        per_write=pacing.per_write,
+        floor=wet + 1,
+    )
     sender, poller = Sender(write), Poller(shell, interval_s=lead_in.poll_s)
-    held: dict[str, Any] = {"rows": plan, "delta": float("nan"), "loaded": None}
+    held: dict[str, Any] = {"rows": rows, "delta": float("nan"), "loaded": None}
     try:
         with (
             recorder.recording(out),
@@ -312,7 +471,9 @@ def locked_take(
                 count=count,
                 dry=dry,
                 initial=initial,
-                start_state=start_state,
+                start=start_vector,
+                park=park,
+                pacing=pacing,
                 lead_in=lead_in,
             )
             hold = int(player.status().get("hold", 1))
@@ -323,7 +484,7 @@ def locked_take(
             out,
             plan=held["rows"],
             initial=np.asarray(park, dtype=np.int64),
-            start=np.array(start_vector, dtype=np.int64),
+            start=start_vector.astype(np.int64),
             sends=sender.array(),
             delta=np.float64(held["delta"]),
             latency=np.array(json.dumps(held.get("latency", {}))),
@@ -377,14 +538,22 @@ def _play(
     count: int,
     dry: Mapping[int, int] | None,
     initial: Mapping[int, int],
-    start_state: Mapping[int, int],
+    start: np.ndarray,
+    park: np.ndarray,
+    pacing: Pacing,
     lead_in: LeadIn,
 ) -> None:
-    """The take from playout start: lead-in writes, calibration, the live clock, then every planned write."""
+    """The take from playout start: lead-in writes, calibration, the live clock, then every planned write.
+
+    The cyclic collector is off meanwhile: a full collection holds the interpreter lock for longer
+    than the half frame a send has to make its tick, stalling the sender and the poller together.
+    """
     began = time.monotonic_ns()
     fps = float(config.fps)
     switch = sys.getswitchinterval()
     sys.setswitchinterval(SWITCH_S)
+    collecting = gc.isenabled()
+    gc.disable()
     try:
         _run(
             rig,
@@ -400,13 +569,17 @@ def _play(
             count=count,
             dry=dry,
             initial=initial,
-            start_state=start_state,
+            start=start,
+            park=park,
+            pacing=pacing,
             lead_in=lead_in,
             began=began,
             fps=fps,
         )
     finally:
         sys.setswitchinterval(switch)
+        if collecting:
+            gc.enable()
 
 
 def _run(
@@ -424,17 +597,24 @@ def _run(
     count: int,
     dry: Mapping[int, int] | None,
     initial: Mapping[int, int],
-    start_state: Mapping[int, int],
+    start: np.ndarray,
+    park: np.ndarray,
+    pacing: Pacing,
     lead_in: LeadIn,
     began: int,
     fps: float,
 ) -> None:
-    """The take's body, run with the interpreter switching threads often enough for the sender."""
+    """The take's body, run with the interpreter switching threads often enough for the sender.
+
+    The start state is sent a frame's capacity at a time, each slot not already parked at its value.
+    """
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
     poller.start()
-    for slot, value in sorted(start_state.items()):
-        sender.send(slot, value, ev.START)
+    for batch in pacing.batches(np.flatnonzero(start != park) + 1):
+        for slot in batch:
+            sender.send(slot, int(start[slot - 1]), ev.START)
+        time.sleep(1.0 / fps)
     time.sleep(lead_in.settle_s)
     if dry is not None:
         calibrate(sender, dry, initial, lead_in)
@@ -457,8 +637,7 @@ def _run(
         lat = read_latency(Path(out).parent)
     held["delta"], held["latency"] = lat.delta, lat.as_dict()
     clock = Clock(times=times, lat=lat, run=found.runs[-1], per_frame=found.per_frame)
-    rows = plan_rows(held["rows"], dry, initial, wet_frame=-int(round(lead_in.wet_s * fps)))
-    held["rows"] = rows
+    rows = held["rows"]
     first_due = clock.when(int(rows["target"][0])) if rows.size else clock.when(0)
     if time.monotonic_ns() >= first_due:
         raise LeadInTimeError(
@@ -620,7 +799,7 @@ def take_evidence(
     receipts = wire.get("receipts")
     got = None
     if receipts is not None and receipts.size:
-        got = ev.received(ev.expected_messages(sends, wire["cc_map"]), receipts)
+        got = ev.received(ev.expected_messages(sends, wire["cc_map"]), receipts, sends)
     count = found.picked.size
     out = images[found.picked].astype(np.float32)
     src = source.small[found.lead : found.lead + count].astype(np.float32)

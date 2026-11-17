@@ -326,10 +326,7 @@ def _attempt(
     layer = min(score.layers, key=lambda item: item.index)
     program = layer.program
     signal = {"program": program, "timing": config.timing}
-    plan = locktake.frame_plan(
-        autos.get(layer.index, Automation.empty()), fps=config.fps, early_bias_s=config.early_bias_s
-    )
-    plan = plan[plan["target"] < int(round(score.duration * config.fps))]
+    plan = locktake.clip_plan(autos.get(layer.index, Automation.empty()), score.duration, config)
 
     def load(name: str) -> Any:
         rig.session.load_program(name, link=rig.link)

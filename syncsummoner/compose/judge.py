@@ -12,7 +12,9 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+import numpy as np
 
 from syncsummoner.compose import locktake
 from syncsummoner.compose.cut import Cut
@@ -61,6 +63,39 @@ def one_program(score: Score, program: str) -> tuple[Score, list[Cut]]:
     spans = [(s.start, s.end) for s in score.sections] or [(0.0, score.duration)]
     played = replace(score, layers=[Layer(index=0, program=program, gestures=gestures)])
     return played, [Cut(start, end, program) for start, end in spans]
+
+
+def schedule_report(
+    score: str | Path, profiles: Mapping[str, Any], program: str, config: Any
+) -> tuple[bool, str]:
+    """Whether ``program``'s pass of the score at ``score`` fits the MIDI link, and its load against capacity.
+
+    Offline, the CC map is pyvmancer's default and the start state frame 0's writes over a parked panel.
+    """
+    from pyvmancer.const import DEFAULT_CC_MSB  # pylint: disable=import-outside-toplevel
+
+    from syncsummoner.compose.planner import plan_automation  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose.vocabulary import Automation  # pylint: disable=import-outside-toplevel
+
+    played = one_program(Score.load(Path(score)), program)[0]
+    auto = plan_automation(played, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
+    auto = auto.get(0, Automation.empty())
+    plan = locktake.clip_plan(auto, played.duration, config)
+    pacing = locktake.Pacing.of(DEFAULT_CC_MSB, config)
+    start = np.zeros(len(DEFAULT_CC_MSB), dtype=np.int64)
+    for slot, value in locktake.initial_state({}, plan).items():
+        start[slot - 1] = value
+    try:
+        rows = locktake.take_schedule(
+            plan,
+            start,
+            capacity=pacing.capacity,
+            per_write=pacing.per_write,
+            floor=locktake.wet_at(locktake.LeadIn(), config.fps) + 1,
+        )
+    except locktake.InfeasibleScheduleError as err:
+        return False, f"{program}: infeasible: {err}"
+    return True, f"{program}: {locktake.describe_load(auto, plan, rows, pacing)}"
 
 
 def judge_take(

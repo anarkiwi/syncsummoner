@@ -21,6 +21,8 @@ DEFAULT_TOLERANCE = 8
 #: Parameter writes per second the host sends; each is ``msgs_per_param`` CC
 #: messages on the wire. docs/hardware.md records the measured backlog limit.
 CC_BUDGET_HZ = 200.0
+#: Controllers below this carry an MSB whose LSB partner is 32 higher (MIDI 1.0 14-bit pairs).
+LSB_OFFSET = 32
 
 #: A freshly loaded program keeps applying its defaults after the source returns.
 LOCK_POLLS = 40
@@ -35,6 +37,28 @@ def default_park() -> np.ndarray:
     the bottom of its range.
     """
     return np.full(PARAM_COUNT, PARK_REFERENCE, dtype=int)
+
+
+def wire_messages(cc_map: Sequence[int], *, high_resolution: bool = True) -> np.ndarray:
+    """CC messages one write of each slot puts on the wire: an MSB/LSB pair, or one 7-bit message."""
+    cc = np.asarray(cc_map, dtype=np.int64)
+    return np.where(high_resolution & (cc < LSB_OFFSET), 2, 1)
+
+
+def frame_capacity(cc_budget_hz: float, fps: float, per_write: Sequence[int]) -> int:
+    """Messages the link carries in one frame period at the budget's sustained rate.
+
+    The budget is in writes per second at the transport's resolution, so its message rate is the
+    budget times the messages a write takes. A frame that holds less than one write is an error.
+    """
+    widest = int(np.max(per_write))
+    capacity = int(np.floor(float(cc_budget_hz) * widest / float(fps)))
+    if capacity < widest:
+        raise ValueError(
+            f"{cc_budget_hz:g} writes/s carries {capacity} messages a frame at {fps:g} fps, "
+            f"less than one {widest}-message write"
+        )
+    return capacity
 
 
 class DeviceError(RuntimeError):

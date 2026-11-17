@@ -18,6 +18,8 @@ import numpy as np
 from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, configure
 
+BUDGET_HELP = "parameter writes per second, within `device doctor --latency`'s midi.backlog"
+
 
 def _doctor_cmd(args: argparse.Namespace) -> int:
     from pyvmancer.diagnose import format_finding, report
@@ -391,6 +393,17 @@ def _score_cmd(args: argparse.Namespace) -> int:
     layers = audit(score, _profiles_in(Path(args.profiles)))
     print(format_audit(layers))
     return 1 if any(layer.flags or any(p.flags for p in layer.params) for layer in layers) else 0
+
+
+def _score_plan_cmd(args: argparse.Namespace) -> int:
+    """Print one program's take schedule against the MIDI link's capacity; 1 when it cannot be carried."""
+    from syncsummoner.compose.judge import schedule_report
+    from syncsummoner.compose.render import RenderConfig
+
+    config = RenderConfig.for_format(args.format, cc_budget_hz=args.cc_budget)
+    ok, said = schedule_report(Path(args.score), _profiles_in(Path(args.profiles)), args.program, config)
+    print(said)
+    return 0 if ok else 1
 
 
 def _analyze_cmd(args: argparse.Namespace) -> int:
@@ -868,6 +881,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     show.add_argument("score")
     show.add_argument("--profiles", default="profiles/")
     show.set_defaults(func=_score_cmd)
+    planned = score_sub.add_parser("plan", help="one program's take schedule against the MIDI link")
+    planned.add_argument("score")
+    planned.add_argument("--program", required=True, help="the program whose pass is planned")
+    planned.add_argument("--profiles", default="profiles/")
+    planned.add_argument("--format", default="1080p30", help="session format the take runs at")
+    planned.add_argument("--cc-budget", type=float, default=CC_BUDGET_HZ, help=BUDGET_HELP)
+    planned.set_defaults(func=_score_plan_cmd)
 
     analyze = sub.add_parser("analyze", help="extract audio and video features")
     analyze.add_argument("clip")
@@ -915,30 +935,17 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         node.add_argument("-o", "--output", default=f"{name}.mp4", help="the finished clip")
         node.add_argument("--take", help="raw capture path (default: alongside --output)")
         node.add_argument("--format", help="session format the rig runs at, e.g. 1080p30")
-        node.add_argument(
-            "--played", action="store_true", help="play the source from the rig, at rate, for one pass"
-        )
+        node.add_argument("--played", action="store_true", help="play the source from the rig, one pass")
         node.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
-        node.add_argument(
-            "--prepared", action="store_true", help="take --scratch as an already timecoded clip"
-        )
-        node.add_argument(
-            "--cut-programs", help="cut between these programs on the score's sections, one pass each"
-        )
+        node.add_argument("--prepared", action="store_true", help="take --scratch as timecoded already")
+        node.add_argument("--cut-programs", help="cut between these programs on the score's sections")
         node.add_argument("--takes", default=".", help="where the per-program passes are written")
-        node.add_argument(
-            "--reuse-takes", action="store_true", help="cut from takes already on disk instead of a pass"
-        )
+        node.add_argument("--reuse-takes", action="store_true", help="cut from takes already on disk")
         node.add_argument("--fade", type=float, help="seconds of fade at each edge (default: 1)")
         node.add_argument("--fade-in", type=float, help="override the fade in")
         node.add_argument("--fade-out", type=float, help="override the fade out")
         node.add_argument("--no-master", action="store_true", help="stop at the raw take")
-        node.add_argument(
-            "--cc-budget",
-            type=float,
-            default=CC_BUDGET_HZ,
-            help="parameter writes per second, within `device doctor --latency`'s midi.backlog",
-        )
+        node.add_argument("--cc-budget", type=float, default=CC_BUDGET_HZ, help=BUDGET_HELP)
         _add_route_arg(node)
         node.set_defaults(func=_render_cmd, render_cmd=name)
         if name == "audition":
@@ -950,21 +957,15 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         aliases=["evidence"],
         help="judge finished takes offline: attribution, evidence, picture and the score's take check",
     )
-    judging.add_argument(
-        "takes", nargs="+", help="finished takes, each with its .v4l2, .lock.npz and .wire.npz"
-    )
+    judging.add_argument("takes", nargs="+", help="finished takes, each with its .v4l2 and .npz sidecars")
     judging.add_argument("--source", required=True, help="the timecoded clip the takes were played from")
     judging.add_argument("--score", help="the score the takes played, to check every bar against the clip")
     judging.add_argument("--program", help="the program the takes ran (default: as each wire record says)")
     judging.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
     judging.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
     judging.add_argument("--jobs", type=int, default=1, help="takes judged at once, each in its own process")
-    judging.add_argument(
-        "--workers", type=int, help="decoders per take (default: the cores shared by the jobs)"
-    )
-    judging.add_argument(
-        "--predict", action="store_true", help="set each verdict against the program model's prediction"
-    )
+    judging.add_argument("--workers", type=int, help="decoders per take (default: the jobs' share)")
+    judging.add_argument("--predict", action="store_true", help="meet each verdict with the program model's")
     judging.set_defaults(func=_judge_cmd)
 
     check = sub.add_parser("check", help="judge takes against the clip they were fed, before mastering")
@@ -974,9 +975,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     check.add_argument("--cut-programs", help="the programs the cut rotates through, as rendered")
     check.add_argument("--master", help="judge one spliced clip, frame for frame the source's, instead")
     check.add_argument("--splice", metavar="OUT", help="splice the covered cut plan into OUT")
-    check.add_argument(
-        "--as-planned", action="store_true", help="splice the plan as rendered, dead spans and all"
-    )
+    check.add_argument("--as-planned", action="store_true", help="splice the plan as rendered, dead and all")
     check.add_argument("--format", default="1080p30", help="the session format the takes were captured at")
     check.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
     check.add_argument("--ffmpeg", default="ffmpeg")

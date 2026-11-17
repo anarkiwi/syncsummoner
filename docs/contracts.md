@@ -260,7 +260,10 @@ render.unknown_programs(programs, available) -> list[str]   # named but not offe
 score.Score  # timeline IR, YAML round-trip
 render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
-locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias
+locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias, one per slot and frame
+locktake.schedule(plan, state=None) -> PLAN array   # last write per (frame, slot), none repeating its slot's value
+locktake.pace(plan, capacity, per_write, *, floor) -> PLAN array   # no frame over capacity messages; InfeasibleScheduleError otherwise
+session.frame_capacity(cc_budget_hz, fps, per_write) -> int   # messages a frame the budget's rate carries
 locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
 locktake.take_evidence(take, *, program, clip, config, names=None, predict=False, found=None, features=None, source=None) -> evidence.Evidence   # the three links; .ok is the hard check
 judge.judge_take(take, *, clip, config, program=None, score=None, source=None, features=None, predict=False, workers=None) -> judge.Judged   # one attribution handed to evidence, picture and take check
