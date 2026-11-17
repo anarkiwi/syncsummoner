@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from syncsummoner.compose import frameline
+from syncsummoner.compose import frameline, relock
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import read_codes
 from syncsummoner.progress import LOG
@@ -35,7 +35,8 @@ class Attribution:
     ``picked[j]`` is the capture nearest clip frame ``j``'s centre on the line (the later on a tie),
     -1 where none shows it; ``shown[k]`` is the clip frame capture ``k`` shows, negative in the lead-in.
     ``faults`` are legible strips a frame off where a boundary may cross: what attribution can get wrong.
-    ``span`` is the first and last capture of the run ``line`` is fitted to.
+    ``span`` is the first and last capture of the run ``line`` is fitted to. ``ambiguity`` is, per capture,
+    how many frames earlier than ``shown`` the clock also admits (:mod:`relock`), per run in ``clock``.
     """
 
     picked: np.ndarray
@@ -60,6 +61,8 @@ class Attribution:
     rejected: int = 0
     span: tuple[int, int] = (0, -1)
     resolution: float = 0.0
+    ambiguity: np.ndarray | None = None
+    clock: tuple = ()
 
     @property
     def period_ns(self) -> float:
@@ -116,6 +119,7 @@ class Attribution:
             "faults": self.faults,
             "strays": self.strays,
             "rejected": self.rejected,
+            "clock": list(self.clock),
         }
 
     @property
@@ -243,7 +247,7 @@ def attribute(
     digest = frames["digest"]
     k = np.flatnonzero(np.r_[False, seg[1:] == seg[:-1]] & (changes(digest) | (named >= 0)))
     runs = np.unique(seg)
-    lines = _lines(tau, k, seg, (named, group), (jitter, resolution), (shown_at, hold * vblank))
+    lines, clocks = _lines(tau, k, seg, (named, group), (jitter, resolution), (shown_at, hold * vblank))
     main_run = max(lines, key=lambda s: int(np.count_nonzero(seg == s)))
     main, mine = lines[main_run], np.flatnonzero(seg == main_run)
     shown = np.full(tau.size, -1 - lead, dtype=np.int64)
@@ -282,7 +286,17 @@ def attribute(
         rejected=int(sum(line.rejected for line in lines.values())),
         span=(int(mine[0]), int(mine[-1])),
         resolution=resolution,
+        ambiguity=_ambiguity(seg, clocks),
+        clock=tuple(clocks.values()),
     )
+
+
+def _ambiguity(seg: np.ndarray, clocks: dict) -> np.ndarray:
+    """Per capture, how far below its run's numbering, the highest candidate, the lowest one lies."""
+    out = np.zeros(seg.size, dtype=np.int64)
+    for s, said in clocks.items():
+        out[seg == s] = max(said["candidates"]) - min(said["candidates"])
+    return out
 
 
 def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, error: tuple, pi: tuple) -> dict:
@@ -325,6 +339,7 @@ def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, err
         if s not in lines:
             own[s] = np.full_like(own[s], -1)
             lines[s] = fitted(s, period)
+    between = [s for s in runs if s not in fixed and min(fixed) < s < max(fixed)]
     rate = min(lines.values(), key=lambda line: np.ptp(line.polygon.periods)).period / pi_period
     lag = _lag(lines[fixed[0]], shown_at, rate)
     for s in fixed[1:]:
@@ -332,19 +347,83 @@ def _lines(tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, err
         if max(lag[0], mine[0]) <= min(lag[1], mine[1]):
             lag = (max(lag[0], mine[0]), min(lag[1], mine[1]))
             continue
+        if between:
+            LOG.warning(
+                "captures in run %d carry strips off the Pi lag of the rest; the clock numbers the take", s
+            )
+            continue
         LOG.warning(
             "captures in run %d carry strips off the Pi lag of the rest; counting its frames instead", s
         )
         own[s] = np.full_like(own[s], -1)
         lines[s] = fitted(s, period)
+    clocks = _clocked(lines, between, fixed, [tau, k, seg, own], resolution)
     for s in runs:
-        if not (own[s] >= 0).any():
+        if not (own[s] >= 0).any() and s not in clocks:
             try:
                 lines[s] = _bridge(lines[s], lag, rate, shown_at)
             except LockError as err:
                 LOG.warning("captures in run %d are left unattributed: %s", s, err)
                 del lines[s]
-    return lines
+    return lines, clocks
+
+
+def _clocked(lines: dict, between: list[int], fixed: list[int], seen: list, resolution: float) -> dict:
+    """Number each strip-less run between strip-fixed ones by the capture clock (:mod:`relock`).
+
+    ``seen`` is ``[tau, k, seg, own]``: capture times, frame starts, runs, strip-named frames. The period
+    range is the take's, every run's admitted range intersected. Each run is numbered by its highest
+    candidate; its record says every candidate, the latencies at the middle period, and the frame a gap's
+    rounding would have named, which is reported only. A run no shift fits fails the take if it is the
+    longest such run, and is otherwise left unattributed.
+    """
+    tau, k, seg, own = seen
+    lows, highs = zip(*(lines[s].polygon.periods for s in [*fixed, *between]))
+    periods = (max(lows), min(highs))
+    if periods[0] > periods[1]:
+        raise LockError("the runs' frame lines admit no common period")
+    t = 0.5 * (periods[0] + periods[1])
+
+    def brackets(s: int, n: np.ndarray) -> relock.Brackets:
+        mine = k[seg[k] == s]
+        return relock.Brackets.of(tau[mine - 1] + resolution, tau[mine], n)
+
+    out = {}
+    longest = max(between, key=lambda s: int(np.count_nonzero(seg == s)), default=None)
+    for s in between:
+        ends = [brackets(f, own[f]) for f in (max(f for f in fixed if f < s), min(f for f in fixed if f > s))]
+        line = lines[s]
+        mid = brackets(s, line.frame)
+        found = relock.candidates(ends, mid, periods)
+        said = {
+            "run": s,
+            "candidates": found,
+            "periods_ns": list(periods),
+            "latency_before_ns": list(relock.latency(ends[0], t)),
+            "latency_after_ns": list(relock.latency(ends[1], t)),
+            "latency_ns": list(relock.latency(mid, t)),
+            "gap_count": int(ends[0].n.max() + np.rint((mid.lo.min() - ends[0].hi.max()) / t)),
+        }
+        if not found:
+            if s == longest:
+                raise LockError(f"the capture clock numbers run {s} no way: {said}")
+            LOG.warning("captures in run %d are left unattributed: the capture clock numbers it no way", s)
+            del lines[s]
+            continue
+        shift = max(found)
+        said["latency_ns"] = list(relock.latency(mid, t, shift))
+        ok = line.frame >= 0
+        lines[s] = frameline.Line(
+            origin=line.origin - shift * line.period,
+            period=line.period,
+            slack=line.slack,
+            residual=line.residual,
+            frame=np.where(ok, line.frame + shift, line.frame),
+            polygon=frameline.Polygon(line.polygon.ref + shift, line.polygon.vertices),
+            tied=line.tied,
+        )
+        out[s] = said
+    return out
 
 
 def _lag(line: frameline.Line, shown_at: np.ndarray, rate: float) -> tuple[float, float]:

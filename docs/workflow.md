@@ -294,7 +294,12 @@ A refit of a footage archive adds three survival curves to each parameter:
 `si_ratio` and `ti_ratio`, the share of the source's spatial and temporal
 information kept, and `motion_follow`, how far the output's motion follows the
 source's. Each program logs `footage clock from strip`, `motion` or `none`; with
-`none` it has no survival. Codeframe archives still refit as before, without
+`none` it has no survival. A setting whose rows a take's clock left `ambiguity` frames
+uncertain (docs/hardware.md, a program load breaks the capture) searches the leads every
+candidate allows in one search, at the bound `survival.critical_z` sets for that many; where the
+candidates' own lead sets disagree on whether it follows, it is `attribution_ambiguous` and left
+out of the fit. Its best lead, a program-delay measurement, is kept as the interval
+`motion_lead_lo..motion_lead_hi` in source frames the candidates allow. Codeframe archives still refit as before, without
 survival, and the loop behaviour fits run only on them. See
 [design.md](design.md#9-footage-and-survival).
 

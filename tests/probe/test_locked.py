@@ -10,7 +10,7 @@ import pytest
 
 from syncsummoner.compose import evidence as ev
 from syncsummoner.probe import locked as L
-from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameArchive
+from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameArchive, FrameRow
 from syncsummoner.probe.fit import load_measurements
 from syncsummoner.probe.store import KeyKind, ProgramKey
 
@@ -242,3 +242,24 @@ def test_a_write_never_taken_fails_the_take():
     chunk = L.plan_sweep(sweep_states(4), settle=0, hold=3, frames=20)[0]
     got = L.verdict(chunk, judged(landed_from(chunk), unechoed=1), np.zeros(0), chunk.frames)
     assert not got.ok and got.untaken == 1
+
+
+def test_rows_carry_how_many_frames_earlier_the_clock_also_admits():
+    chunk = L.plan_sweep(sweep_states(4), settle=0, hold=3, frames=20)[0]
+    count = chunk.frames
+    late = np.r_[np.zeros(count // 2, dtype=np.int64), np.ones(count - count // 2, dtype=np.int64)]
+    rows = L.settled_rows(
+        chunk,
+        landed_from(chunk),
+        picked=np.arange(count),
+        shown=np.arange(count),
+        captured=np.zeros(count),
+        lead=0,
+        program="p",
+        ambiguity=late,
+    )
+    assert [r.ambiguity for r in rows] == late.tolist()
+    back = FrameRow.from_row(rows[-1].as_row())
+    assert back.ambiguity == 1
+    old = {k: v for k, v in rows[-1].as_row().items() if k != "ambiguity"}
+    assert FrameRow.from_row(old).ambiguity == 0

@@ -331,3 +331,45 @@ def test_the_refit_reads_each_played_clip_once_for_every_footage_program(clip, m
     assert all(out[name].records[0].metrics["ti_ratio"] == pytest.approx(1.0, abs=1e-6) for name in "ab")
     result = R.replay_program(archive, "a", analyzer=FakeAnalyzer())
     assert len(seen) == 2 and "si_ratio" in result.records[0].metrics
+
+
+def delayed(delay, count=150, seed=3):
+    """A moving source and an output showing it ``delay`` frames late, as 8-bit planes and source SI/TI."""
+    rng = np.random.default_rng(seed)
+    steps = rng.normal(0.0, 1.0, (count, 16, 16)) * rng.uniform(0.2, 3.0, count)[:, None, None]
+    source = np.clip(128 + np.cumsum(steps, axis=0), 0, 255).astype(np.uint8)
+    out = [source[max(n - delay, 0)] for n in range(count)]
+    return out, aesthetics.information(source.astype(np.float32) / 255.0)
+
+
+def kept_of(delay, ambiguity):
+    frames, series = delayed(delay)
+    n = np.arange(len(frames))
+    return R._kept(frames, n, n, series, len(frames), ambiguity)  # pylint: disable=protected-access
+
+
+def test_a_delay_every_candidate_lead_finds_is_kept_with_its_lead_as_an_interval():
+    got = kept_of(1, 1)
+    assert got["motion_follow"] > 0.99 and (got["motion_lead_lo"], got["motion_lead_hi"]) == (0.0, 1.0)
+    sure = kept_of(1, 0)
+    assert (sure["motion_lead_lo"], sure["motion_lead_hi"]) == (1.0, 1.0)
+
+
+def test_a_delay_only_one_candidate_can_reach_is_attribution_ambiguous():
+    assert kept_of(2, 1) == {"attribution_ambiguous": 1.0}
+    unique = kept_of(2, 0)
+    assert "attribution_ambiguous" not in unique and unique["motion_lead_lo"] == unique["motion_lead_hi"]
+
+
+def test_the_union_of_candidate_leads_is_searched_at_a_bound_sized_to_it(monkeypatch):
+    asked = []
+    real = aesthetics.critical_z
+
+    def spy(*args, **kwargs):
+        asked.append(args[0] if args else kwargs["leads"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(R.aesthetics, "critical_z", spy)
+    kept_of(1, 0)
+    kept_of(1, 2)
+    assert asked == [len(aesthetics.LEADS), len(aesthetics.LEADS) + 2]
