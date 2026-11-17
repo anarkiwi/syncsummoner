@@ -206,7 +206,7 @@ def toggle_landings(
     toggles: np.ndarray,
     until: float | None = None,
 ) -> np.ndarray:
-    """The clip frame each calibration write first shows in, :data:`CALIBRATION` where the picture does not say.
+    """The clip frame each calibration write first shows in; :data:`CALIBRATION` where the picture can't say.
 
     Each write's window runs to the next; a state's picture is the mean of its windows' second
     halves, every capture goes to the nearer state, and a window must switch once, on a frame start.
@@ -767,7 +767,8 @@ class Evidence:
                 verdict += f" only together with P{', P'.join(map(str, row['with']))}"
             said.append(
                 f"{self.program}:   P{row['param']:<2} {row['name'][:16]:16s} "
-                f"{row['sent']}/{row['writes']} sent, {row['on_target']} on target, readback {row['readback']}, z {row['z']:+.2f} "
+                f"{row['sent']}/{row['writes']} sent, {row['on_target']} on target, "
+                f"readback {row['readback']}, z {row['z']:+.2f} "
                 f"(lag {row['lag']}, critical {row['critical_z']:.2f}): {verdict}"
             )
         return said

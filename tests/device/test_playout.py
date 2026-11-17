@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring
 
+import hashlib
 from fractions import Fraction
 
 import numpy as np
@@ -151,3 +152,37 @@ def test_a_player_allows_a_whole_clip_to_go_up(monkeypatch):
     po.Playout("pi@rig")
     assert seen[0] == po.UPLOAD_TIMEOUT >= 300.0
     assert seen[1] < seen[0], "a still frame does not need a clip's budget"
+
+
+class ClipHost:
+    """A Pi holding at most one clip, answering ``sha256sum`` of it; ``corrupt`` mangles what it stores."""
+
+    def __init__(self, corrupt=False):
+        self.held, self.corrupt, self.sent = None, corrupt, 0
+
+    def __call__(self, command, data=None):
+        if command.startswith("sha256sum"):
+            return "" if self.held is None else f"{hashlib.sha256(self.held).hexdigest()}  clip.mkv"
+        if "cat >" in command:
+            self.sent += len(data)
+            self.held = data[::-1] if self.corrupt else data
+        return ""
+
+
+def test_a_clip_the_pi_already_holds_is_not_sent_again(tmp_path):
+    clip = tmp_path / "clip.mkv"
+    clip.write_bytes(b"frames" * 1000)
+    host = ClipHost()
+    player = po.ClipPlayer(runner=host)
+    assert player.upload(str(clip)) == 6000 and host.sent == 6000
+    assert player.upload(str(clip)) == 0 and host.sent == 6000
+    clip.write_bytes(b"other" * 10)
+    assert player.upload(str(clip)) == 50 and host.sent == 6050
+
+
+def test_a_clip_that_arrives_different_is_a_playout_error(tmp_path):
+    clip = tmp_path / "clip.mkv"
+    clip.write_bytes(b"abc")
+    with pytest.raises(po.PlayoutError, match="hashes"):
+        po.ClipPlayer(runner=ClipHost(corrupt=True)).upload(str(clip))
+    assert po.file_digest(clip, chunk=1) == hashlib.sha256(b"abc").hexdigest()
