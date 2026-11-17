@@ -63,8 +63,25 @@ The boot count (settings key 9) is read before and after every take; any rise is
 ## Link 1: intended vs sent
 
 The plan is the score's automation, each write targeting the first frame that starts
-at or after its time less the early bias. The k-th send of a `(frame, parameter)`
-pair answers its k-th planned write (`evidence.landed`):
+at or after its time less the early bias. The device applies a slot's value once a
+frame, so the plan keeps one write per `(frame, parameter)`, the last asked for, and
+drops any write that repeats the value its slot already holds, the take's start state
+included (`locktake.schedule`). Automation before the clip clamps onto frame 0, which
+the start state already sets.
+
+The link then bounds every frame. The budget, `--cc-budget` writes per second, times the
+messages a write takes (docs/hardware.md) is the sustained message rate; over one frame
+period that is the frame's capacity (`session.frame_capacity`). A frame needing more
+moves its excess to the latest earlier frames with room, the most constrained write
+first, never onto or before its slot's previous write and never before the lead-in
+turns wet (`locktake.pace`). A plan that cannot be placed is an
+`InfeasibleScheduleError` before anything plays. The start state goes out a frame's
+capacity at a time, skipping slots already parked at their value.
+`syncsummoner score plan SCORE --program NAME` prints a pass's schedule against the
+capacity without a device.
+
+The k-th send of a `(frame, parameter)` pair answers its k-th planned write
+(`evidence.landed`):
 
 | Count | Meaning |
 | --- | --- |
@@ -77,6 +94,11 @@ pair answers its k-th planned write (`evidence.landed`):
 A write whose send falls inside the latency band of a frame's instant is counted as
 on a tick: the picture cannot say which side of it the write fell.
 
+The cyclic garbage collector is off while a take plays. A full collection over the
+poller's growing records holds the interpreter lock for longer than the half frame a send
+has: on an rc.4 take one stalled a send and the read in flight together for 30 ms and
+landed the write a frame late.
+
 ## Link 2: sent vs applied
 
 Each readback is bounded by when its request left and its reply came back. Widened by
@@ -87,8 +109,10 @@ every manual value at zero with no modulation, so the combined value must equal 
 exactly; the CC-to-readback mapping is exact for all 1024 values.
 
 `midi monitor on` makes the firmware log every channel message it receives. The
-receipts are matched in order against the messages the sends put on the wire
-(`evidence.received`). The monitor's output travels device to host only and is read
+receipts are aligned against the messages the sends put on the wire
+(`evidence.received`), as a common subsequence (difflib's matching blocks), so a run of
+lost messages costs only those messages. Each run is reported with the sends that
+carried it, their parameters, target frames and send times. The monitor's output travels device to host only and is read
 by the polling thread, which never has more than one command queued at the device,
 so it cannot build the serial backlog that reboots it.
 

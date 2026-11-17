@@ -791,3 +791,36 @@ def test_several_takes_are_judged_in_parallel_processes(monkeypatch, tmp_path):
         json.loads(Path(f"{t}.meta.json").read_text(encoding="utf-8"))["judged"]["lock"] == "ok"
         for t in takes
     )
+
+
+def _planned(monkeypatch, tmp_path, times, indices):
+    """A score whose only layer plans the given writes, and the argv that schedules it."""
+    import numpy as np
+
+    from syncsummoner.compose.vocabulary import Automation
+
+    auto = Automation(
+        np.asarray(times, float), np.asarray(indices, np.int32), np.arange(len(times), dtype=np.int32) + 1
+    )
+    monkeypatch.setattr(cli, "_profiles_in", lambda directory: {})
+    monkeypatch.setattr(
+        "syncsummoner.compose.planner.plan_automation", lambda score, profiles, **kw: {0: auto}
+    )
+    return ["score", "plan", _score_file(tmp_path), "--program", "g"]
+
+
+def test_score_plan_prints_the_take_schedule_against_capacity(monkeypatch, tmp_path, capsys):
+    argv = _planned(monkeypatch, tmp_path, [5.0] * 8 + [6.0], list(range(1, 9)) + [1])
+    assert cli.main(argv) == 0
+    said = capsys.readouterr().out
+    assert said.startswith("g: 9 automation writes, 9 frame-plan rows, 9 sent; ")
+    assert "of 13 messages a frame" in said
+
+
+def test_score_plan_fails_a_schedule_the_link_cannot_carry(monkeypatch, tmp_path, capsys):
+    import numpy as np
+
+    frames = np.repeat(np.arange(1, 40) / 30.0 + 0.02, 12)
+    argv = _planned(monkeypatch, tmp_path, frames, np.tile(np.arange(1, 13), 39))
+    assert cli.main(argv) == 1
+    assert "infeasible: frame" in capsys.readouterr().out

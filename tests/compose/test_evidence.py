@@ -296,18 +296,26 @@ def test_expected_messages_follow_the_cc_encoding():
     sends = np.zeros(3, dtype=SEND)
     sends["param"], sends["value"] = [1, 2, 2], [1023, 0, 512]
     msgs = ev.expected_messages(sends, [16, 40])
-    assert msgs[:2].tolist() == [[16, 127], [48, 127]]
-    assert msgs[2].tolist() == [40, 0] and msgs[3].tolist() == [40, 64]
+    assert msgs[["cc", "value"]].tolist() == [(16, 127), (48, 127), (40, 0), (40, 64)]
+    assert msgs["send"].tolist() == [0, 0, 1, 2]
     lo = ev.expected_messages(sends[:1], [16], high_resolution=False)
-    assert lo.tolist() == [[16, 127]]
-    word = ev.expected_messages(sends[[2]], [3, 3])
-    assert abs(((word[0, 1] << 7) | word[1, 1]) / 16383 * 1023 - 512) < 0.5
+    assert lo[["cc", "value", "send"]].tolist() == [(16, 127, 0)]
+    word = ev.expected_messages(sends[[2]], [3, 3])["value"]
+    assert abs(((word[0] << 7) | word[1]) / 16383 * 1023 - 512) < 0.5
 
 
 def receipts(pairs):
     out = np.zeros(len(pairs), dtype=RECEIPT)
     if pairs:
         out["cc"], out["value"] = np.array(pairs).T
+    return out
+
+
+def messages(pairs):
+    """Expected messages, one send each."""
+    out = np.zeros(len(pairs), dtype=ev.MESSAGE)
+    out["cc"], out["value"] = np.array(pairs).T
+    out["send"] = np.arange(len(pairs))
     return out
 
 
@@ -321,10 +329,37 @@ def receipts(pairs):
         ([], 0, False),
     ],
 )
-def test_receipts_are_matched_in_order_against_what_was_sent(got, matched, ok):
-    result = ev.received(np.array([(1, 10), (33, 5), (2, 7)]), receipts(got))
+def test_receipts_are_aligned_in_order_against_what_was_sent(got, matched, ok):
+    result = ev.received(messages([(1, 10), (33, 5), (2, 7)]), receipts(got))
     assert (result.sent, result.received, result.matched, result.ok) == (3, len(got), matched, ok)
-    assert f"{matched} matched" in result.summary()
+    assert result.extra == len(got) - matched
+    assert f"{matched} aligned" in result.summary()
+
+
+def test_a_lost_burst_costs_only_its_own_messages():
+    """A ramp lost mid-burst whose values recur later must not drag the rest of the take out of line."""
+    ramp = [(0, v) for v in range(40)]
+    sent = ramp + ramp[::-1] + [(5, 1), (5, 2)] * 20
+    lost = set(range(40, 60))
+    got = [m for i, m in enumerate(sent) if i not in lost]
+    sends = np.zeros(len(sent), dtype=SEND)
+    sends["t0_ns"] = 1000 * np.arange(len(sent))
+    sends["param"], sends["target"] = 1, np.arange(len(sent)) // 10
+    result = ev.received(messages(sent), receipts(got), sends)
+    assert result.matched == len(got) and result.sent - result.matched == len(lost)
+    assert result.missing["send"].tolist() == sorted(lost)
+    assert result.missing["t0_ns"].tolist() == [1000 * i for i in sorted(lost)]
+    assert result.gaps() == [
+        {"messages": 20, "sends": [40, 59], "params": [1], "targets": [4, 5], "t0_ns": [40000, 59000]}
+    ]
+    assert "20 missing from sends 40..59 (P1 for frames 4..5, sent over 0.02 ms)" in result.summary()
+
+
+def test_separate_gaps_are_reported_apart():
+    sent = [(1, v) for v in range(10)]
+    result = ev.received(messages(sent), receipts([m for i, m in enumerate(sent) if i not in (2, 3, 7)]))
+    assert [gap["sends"] for gap in result.gaps()] == [[2, 3], [7, 7]]
+    assert ev.Received(sent=1, received=1, matched=1).gaps() == []
 
 
 def test_frame_change_is_the_mean_absolute_difference_from_the_frame_before():

@@ -7,6 +7,7 @@ sent, so sends, readbacks and pictures are joined on one clip-frame index (docs/
 
 from __future__ import annotations
 
+import difflib
 import json
 import math
 from dataclasses import dataclass, field, replace
@@ -16,6 +17,7 @@ import numpy as np
 from scipy.stats import chi2, norm
 
 from syncsummoner.aesthetics.survival import SIGMA
+from syncsummoner.device.session import LSB_OFFSET, wire_messages
 
 #: Target of a calibration write, which no clip frame schedules.
 CALIBRATION = int(np.iinfo(np.int64).min)
@@ -434,56 +436,111 @@ def applied(
     )
 
 
+#: One CC message put on the wire: controller, 7-bit value, and the index of the send that carried it.
+MESSAGE = np.dtype([("cc", "<i8"), ("value", "<i8"), ("send", "<i8")])
+#: A sent message no receipt answers: the send's index, interval start, parameter, target and the message.
+MISSING = np.dtype(
+    [("send", "<i8"), ("t0_ns", "<i8"), ("param", "<i8"), ("target", "<i8"), ("cc", "<i8"), ("value", "<i8")]
+)
+
+
 def expected_messages(
     sends: np.ndarray, cc_map: Sequence[int], *, high_resolution: bool = True
 ) -> np.ndarray:
-    """The ``(cc, value)`` messages the sends put on the wire, in order, as pyvmancer encodes them."""
-    out = []
-    for param, value in zip(sends["param"], sends["value"]):
-        msb_cc = int(cc_map[int(param) - 1])
-        word = int(round(int(value) * 16383 / 1023))
-        if high_resolution and msb_cc < 32:
-            out += [(msb_cc, word >> 7), (msb_cc + 32, word & 0x7F)]
-        else:
-            out.append((msb_cc, int(round(int(value) * 127 / 1023))))
-    return np.array(out, dtype=np.int64).reshape(-1, 2)
+    """The :data:`MESSAGE` records the sends put on the wire, in order, as pyvmancer encodes them."""
+    cc = np.asarray(cc_map, dtype=np.int64)
+    per = wire_messages(cc, high_resolution=high_resolution)
+    param = np.asarray(sends["param"], dtype=np.int64) - 1
+    value = np.asarray(sends["value"], dtype=np.int64)
+    pair = per[param] == 2
+    word = np.rint(value * 16383 / 1023).astype(np.int64)
+    out = np.zeros(int(per[param].sum()), dtype=MESSAGE)
+    out["send"] = np.repeat(np.arange(value.size), per[param])
+    head = np.r_[0, np.cumsum(per[param])[:-1]].astype(np.int64)
+    out["cc"][head] = cc[param]
+    out["value"][head] = np.where(pair, word >> 7, np.rint(value * 127 / 1023).astype(np.int64))
+    tail = head[pair] + 1
+    out["cc"][tail] = cc[param][pair] + LSB_OFFSET
+    out["value"][tail] = word[pair] & 0x7F
+    return out
 
 
 @dataclass(frozen=True)
 class Received:
-    """Sent against received: the firmware's monitor receipts matched to the messages put on the wire."""
+    """Sent against received: the firmware's monitor receipts aligned to the messages put on the wire."""
 
     sent: int
     received: int
     matched: int
+    missing: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=MISSING))
 
     @property
     def ok(self) -> bool:
         """Every message received, in order, and nothing else."""
         return self.sent == self.received == self.matched
 
+    @property
+    def extra(self) -> int:
+        """Receipts no sent message answers."""
+        return self.received - self.matched
+
+    def gaps(self) -> list[dict]:
+        """Runs of consecutive missing messages: how many, the sends that carried them and when."""
+        miss = self.missing
+        if not miss.size:
+            return []
+        cut = np.flatnonzero(np.diff(miss["send"]) > 1) + 1
+        return [
+            {
+                "messages": int(run.size),
+                "sends": [int(run["send"][0]), int(run["send"][-1])],
+                "params": sorted({int(p) for p in run["param"]}),
+                "targets": sorted({int(t) for t in run["target"]}),
+                "t0_ns": [int(run["t0_ns"][0]), int(run["t0_ns"][-1])],
+            }
+            for run in np.split(miss, cut)
+        ]
+
     def summary(self) -> str:
-        """One line of counts."""
-        return f"{self.sent} messages sent, {self.received} received, {self.matched} matched in order"
+        """One line of counts, and each run of missing messages."""
+        said = (
+            f"{self.sent} messages sent, {self.received} received, {self.matched} aligned, "
+            f"{self.sent - self.matched} missing, {self.extra} unexpected"
+        )
+        for gap in self.gaps():
+            span = (gap["t0_ns"][1] - gap["t0_ns"][0]) / 1e6
+            said += (
+                f"; {gap['messages']} missing from sends {gap['sends'][0]}..{gap['sends'][1]} "
+                f"(P{', P'.join(map(str, gap['params']))} for frames "
+                f"{gap['targets'][0]}..{gap['targets'][-1]}, sent over {span:.2f} ms)"
+            )
+        return said
 
 
-def received(expected: np.ndarray, got: np.ndarray) -> Received:
-    """Longest in-order match of receipts against expected messages (a common subsequence)."""
-    exp = [tuple(r) for r in np.asarray(expected).reshape(-1, 2)]
-    rec = [tuple(r) for r in np.c_[got["cc"], got["value"]]] if len(got) else []
-    i = j = matched = 0
-    while i < len(exp) and j < len(rec):
-        if exp[i] == rec[j]:
-            matched += 1
-            i += 1
-            j += 1
-        else:
-            look = next((d for d in range(1, len(rec) - j) if rec[j + d] == exp[i]), None)
-            if look is None:
-                i += 1
-            else:
-                j += look
-    return Received(sent=len(exp), received=len(rec), matched=matched)
+def received(expected: np.ndarray, got: np.ndarray, sends: np.ndarray | None = None) -> Received:
+    """Receipts aligned against the expected messages, so a gap costs only the messages it lost.
+
+    The alignment is difflib's matching blocks over ``(cc, value)``, a common subsequence in which
+    every receipt answers at most one message in order. ``sends`` names the missing messages' writes.
+    """
+    exp = np.asarray(expected["cc"], dtype=np.int64) * 128 + np.asarray(expected["value"], dtype=np.int64)
+    rec = np.asarray(got["cc"], dtype=np.int64) * 128 + np.asarray(got["value"], dtype=np.int64)
+    blocks = difflib.SequenceMatcher(None, exp.tolist(), rec.tolist(), autojunk=False).get_matching_blocks()
+    hit = np.zeros(exp.size, dtype=bool)
+    for block in blocks:
+        hit[block.a : block.a + block.size] = True
+    lost = np.flatnonzero(~hit)
+    missing = np.zeros(lost.size, dtype=MISSING)
+    missing["cc"], missing["value"] = expected["cc"][lost], expected["value"][lost]
+    missing["send"] = expected["send"][lost]
+    if sends is not None and lost.size:
+        carried = sends[missing["send"]]
+        missing["t0_ns"], missing["param"], missing["target"] = (
+            carried["t0_ns"],
+            carried["param"],
+            carried["target"],
+        )
+    return Received(sent=int(exp.size), received=int(rec.size), matched=int(hit.sum()), missing=missing)
 
 
 @dataclass(frozen=True)
@@ -842,6 +899,7 @@ class Evidence:
                 "landed": self.landed.summary(),
                 "applied": self.applied.summary(),
                 "received": None if self.received is None else self.received.summary(),
+                "missing": [] if self.received is None else self.received.gaps(),
                 "disagree": self.applied.disagree.tolist(),
                 "late": self.landed.rows[self.landed.rows["landed"] > self.landed.rows["target"]].tolist(),
                 "parameters": self.table(),

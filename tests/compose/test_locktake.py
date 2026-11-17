@@ -1,6 +1,7 @@
 """Locked takes: plans, clocks, calibration and a whole take against a simulated device."""
 
 import contextlib
+import gc
 import json
 import types
 
@@ -70,6 +71,93 @@ def test_a_frame_plan_targets_the_first_frame_at_or_after_its_time_less_the_bias
     assert plan["target"].tolist() == [0, 0, 0, 2, 3, 3]
     assert plan["param"].tolist() == [3, 4, 6, 5, 1, 2]
     assert plan["value"].tolist() == [30, 40, 60, 50, 10, 20]
+
+
+def test_a_frame_plan_keeps_one_write_per_slot_and_frame_and_drops_repeats():
+    """A pre-roll ramp clamped onto frame 0 leaves its last value; a write repeating its slot goes."""
+    times = np.r_[np.linspace(-1.0, -0.1, 30), 0.2, 0.3, 0.3]
+    auto = types.SimpleNamespace(
+        times=times,
+        indices=np.r_[np.full(30, 1), 1, 1, 2],
+        values=np.r_[np.arange(30) * 10, 290, 7, 7],
+    )
+    plan = LT.frame_plan(auto, fps=FPS, early_bias_s=0.015)
+    assert plan.tolist() == [(0, 1, 290), (9, 1, 7), (9, 2, 7)]
+
+
+def rows_of(*rows):
+    """Plan rows."""
+    return np.array(list(rows), dtype=LT.PLAN)
+
+
+def test_a_schedule_drops_writes_the_slots_already_hold():
+    """Against a known state the first write per slot is dropped when it repeats it; order is by target."""
+    plan = rows_of((3, 2, 5), (0, 1, 9), (3, 1, 4), (3, 2, 6), (4, 1, 4), (5, 2, 6))
+    state = np.zeros(12, dtype=np.int64)
+    state[0] = 9
+    assert LT.schedule(plan, state).tolist() == [(3, 1, 4), (3, 2, 6)]
+    assert LT.schedule(plan).tolist() == [(0, 1, 9), (3, 1, 4), (3, 2, 6)]
+    assert LT.schedule(rows_of()).size == 0
+
+
+TWO = np.full(12, 2)
+
+
+def test_pacing_moves_a_frames_excess_to_the_latest_earlier_frames_with_room():
+    """Four writes on frame 10 at two a frame: two stay, two go to frame 9; nothing else moves."""
+    plan = rows_of((2, 5, 1), (10, 1, 1), (10, 2, 1), (10, 3, 1), (10, 4, 1), (12, 1, 2))
+    out = LT.pace(plan, 4, TWO, floor=-5)
+    assert np.bincount(out["target"] - out["target"].min()).max() <= 2
+    assert out["target"].tolist() == [2, 9, 9, 10, 10, 12]
+    assert sorted(out["param"][out["target"] == 9].tolist()) == [3, 4]
+
+
+def test_pacing_never_moves_a_write_onto_or_before_its_slots_previous_write():
+    """P1's frame-10 write keeps its frame, as P1 writes on 9; the rest fill the frames before it."""
+    plan = rows_of((9, 1, 1), (10, 1, 2), (10, 2, 1), (10, 3, 1))
+    out = LT.pace(plan, 2, TWO, floor=0)
+    assert out.tolist() == [(7, 1, 1), (8, 3, 1), (9, 2, 1), (10, 1, 2)]
+    unlimited = LT.pace(plan, 24, TWO, floor=0)
+    assert unlimited.tolist() == plan.tolist()
+
+
+def test_a_plan_no_earlier_frame_can_absorb_is_infeasible():
+    """Both slots already written on the frame before, and nothing allowed before it."""
+    plan = rows_of((4, 1, 1), (4, 2, 1), (5, 1, 2), (5, 2, 2))
+    with pytest.raises(LT.InfeasibleScheduleError, match="frame 5 needs more than the link's 2 messages"):
+        LT.pace(plan, 2, TWO, floor=4)
+    with pytest.raises(LT.InfeasibleScheduleError, match="frame 0"):
+        LT.pace(rows_of((0, 1, 1), (0, 2, 1)), 2, TWO, floor=0)
+    assert LT.pace(rows_of(), 2, TWO, floor=0).size == 0
+    assert LT.pace(rows_of((-9, 1, 1)), 2, TWO, floor=0).tolist() == [(-9, 1, 1)]
+
+
+def test_pacing_follows_the_budget_and_the_encoding():
+    """Messages a frame from writes a second, and START batches cut at that capacity."""
+    config = types.SimpleNamespace(fps=30.0, cc_budget_hz=60.0)
+    pacing = LT.Pacing.of(list(range(12)), config)
+    assert pacing.capacity == 4 and pacing.per_write.tolist() == [2] * 12
+    assert pacing.batches([1, 2, 3, 4, 5]) == [[1, 2], [3, 4], [5]]
+    mixed = LT.Pacing.of([40] + list(range(1, 12)), config)
+    assert mixed.batches([1, 2, 3]) == [[1, 2], [3]]
+    assert LT.Pacing.of(list(range(12)), config, high_resolution=False).per_write.tolist() == [1] * 12
+
+
+def test_a_take_schedule_reports_its_load_against_capacity():
+    """Rows sent per frame, the busiest against capacity, and the frame the lead-in turns wet on."""
+    pacing = LT.Pacing(capacity=4, per_write=TWO)
+    plan = rows_of((0, 1, 5), (3, 1, 6), (3, 2, 6), (3, 3, 6))
+    rows = LT.take_schedule(plan, np.zeros(12, dtype=np.int64), capacity=4, per_write=TWO, floor=-3)
+    assert rows.tolist() == [(0, 1, 5), (2, 3, 6), (3, 1, 6), (3, 2, 6)]
+    frames, carried = LT.frame_load(rows, TWO)
+    assert frames.tolist() == [0, 2, 3] and carried.tolist() == [2, 2, 4]
+    said = LT.describe_load(np.zeros(9), plan, rows, pacing)
+    assert said == (
+        "9 automation writes, 4 frame-plan rows, 4 sent; busiest frame 3 carries 4 of 4 messages a frame, "
+        "1 at capacity"
+    )
+    assert LT.describe_load([], rows_of(), rows_of(), pacing).endswith("nothing to send")
+    assert LT.wet_at(LT.LeadIn(wet_s=0.5), 30.0) == -15
 
 
 def test_the_initial_state_is_the_working_point_then_frame_zeros_writes():
@@ -483,10 +571,10 @@ def fixture_simulate(monkeypatch):
     return build
 
 
-def config_for(lead_in_s):
+def config_for(lead_in_s, **kw):
     """A session's settings as the take reads them."""
     return types.SimpleNamespace(
-        fps=FPS, lead_in_s=lead_in_s, strip_px=8, bits=16, tail_s=0.2, ffmpeg="ffmpeg"
+        fps=FPS, lead_in_s=lead_in_s, strip_px=8, bits=16, tail_s=0.2, ffmpeg="ffmpeg", **kw
     )
 
 
@@ -496,7 +584,7 @@ PLAN_ROWS = np.array(
 )
 
 
-def take_and_prove(monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7), drop=None):
+def take_and_prove(monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7), drop=None, config=None):
     """A whole simulated take, then its evidence from the files it left."""
     sim = simulate(lead=120, count=30, drop=drop)
     rig, recorder, load, loads = rigged(sim, info_with(dry), boots=boots)
@@ -507,7 +595,7 @@ def take_and_prove(monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7
         out,
         program="Teletext",
         seconds=1.0,
-        config=config_for(4.0),
+        config=config_for(4.0) if config is None else config,
         plan=PLAN_ROWS,
         working=lambda info: working,
         load=load,
@@ -546,11 +634,43 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert proof.ok, proof.lines()
     assert proof.landed.ok and proof.applied.ok and proof.received.ok and proof.loaded["ok"]
     assert proof.latency["frames"] == pytest.approx(1.7, abs=0.06)
-    assert len(proof.landed.rows) == PLAN_ROWS.size + 1
+    assert len(proof.landed.rows) == np.count_nonzero(PLAN_ROWS["target"] > 0) + 1
+    assert 0 not in record.plan["target"].tolist()
     assert proof.received.sent == 2 * record.sends.size
     assert {m.param for m in proof.moved} == {3, 4, 5}
     assert json.loads(proof.to_json())["ok"]
     assert sim.sender is None and sim.poller is None
+
+
+def test_a_take_paced_to_one_write_a_frame_moves_its_excess_earlier_and_still_proves(
+    monkeypatch, simulate, tmp_path
+):
+    """Start state a write a frame, unparked slots only; frame 20's second write lands on frame 19."""
+    collecting, original = [], Sim.write
+
+    def watched(self, param, value):
+        collecting.append(gc.isenabled())
+        original(self, param, value)
+
+    monkeypatch.setattr(Sim, "write", watched)
+    sim, _, record, proof, _ = take_and_prove(
+        monkeypatch,
+        simulate,
+        tmp_path,
+        dry=1,
+        working={1: 0, 3: 0.5, 4: 100, 6: 0},
+        config=config_for(4.0, cc_budget_hz=30.0),
+    )
+    start = record.sends[record.sends["target"] == ev.START]
+    assert start["param"].tolist() == [1, 3, 4]
+    assert np.diff(start["t0_ns"]).min() >= int(P)
+    assert sorted(record.plan[record.plan["target"] >= 19][["target", "param"]].tolist()) == [
+        (19, 5),
+        (20, 3),
+    ]
+    assert proof.ok, proof.lines()
+    assert collecting and not any(collecting) and gc.isenabled()
+    assert sim.sender is None
 
 
 def test_a_write_the_device_drops_fails_the_readback(monkeypatch, simulate, tmp_path):

@@ -76,6 +76,15 @@ clean range. To re-derive it, run `device doctor --latency` with
 `--latency-params` naming as many knobs as a score drives and take the
 `midi.backlog` finding's fastest clean rate times the parameter count.
 
+The budget bounds bursts as well as the rate: a frame carries at most the budget's
+message rate over one frame period, 13 messages at 1080p30 by default
+(`session.frame_capacity`). On firmware 1.0.2-rc.4 at 1080p30, with `midi monitor on`:
+
+| Burst | Received |
+| --- | --- |
+| 62 writes, 124 messages, within 2 ms, all for one frame | the first 62 messages; the other 62 never, so the slot held the ramp's midpoint |
+| 12 writes, 24 messages, within 1.1 ms | all, but the last 20 applied a tick after the first 4 |
+
 ## CCs latch on the device's frame tick
 
 Measured on firmware 1.0.1 at 1080p30 with the locked player, a still strip-coded
