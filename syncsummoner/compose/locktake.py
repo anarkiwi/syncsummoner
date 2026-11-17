@@ -8,7 +8,6 @@ write is then sent midway between the ticks around its frame's. See docs/evidenc
 from __future__ import annotations
 
 import gc
-import heapq
 import json
 import sys
 from contextlib import contextmanager
@@ -22,8 +21,8 @@ import numpy as np
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import live_attribution, read_live, save_lock
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
-from syncsummoner.device.session import CC_BUDGET_HZ, frame_capacity, wire_messages
-from syncsummoner.device.wire import Poller, Sender, save_wire
+from syncsummoner.device import wire as W
+from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
 from syncsummoner.probe import decoded
 from syncsummoner.probe.decoded import CALIBRATION_SIZE
 from syncsummoner.progress import LOG, meter
@@ -46,40 +45,8 @@ class LeadInTimeError(RuntimeError):
     """The lead-in ended before the take's clock and latency were known."""
 
 
-class InfeasibleScheduleError(RuntimeError):
-    """A frame's writes exceed the link's capacity and cannot move earlier past their slot's last write."""
-
-
 class NoLatencyError(LeadInTimeError):
     """A program with no dry control needs a CC-to-picture latency no dry take has measured yet."""
-
-
-@dataclass(frozen=True)
-class Pacing:
-    """What the MIDI link carries: messages a frame, and messages each slot's write takes."""
-
-    capacity: int
-    per_write: np.ndarray
-
-    @classmethod
-    def of(cls, cc_map: Any, config: Any, *, high_resolution: bool = True) -> "Pacing":
-        """The pacing of a CC map's encoding at the config's write budget and frame rate."""
-        per_write = wire_messages(cc_map, high_resolution=high_resolution)
-        budget = getattr(config, "cc_budget_hz", CC_BUDGET_HZ)
-        return cls(frame_capacity(budget, float(config.fps), per_write), per_write)
-
-    def batches(self, slots: Any) -> list[list[int]]:
-        """``slots`` in send order, cut into runs one frame's capacity holds."""
-        out: list[list[int]] = [[]]
-        room = self.capacity
-        for slot in slots:
-            cost = int(self.per_write[int(slot) - 1])
-            if cost > room:
-                out.append([])
-                room = self.capacity
-            out[-1].append(int(slot))
-            room -= cost
-        return [batch for batch in out if batch]
 
 
 @dataclass(frozen=True)
@@ -158,54 +125,6 @@ def schedule(plan: np.ndarray, state: np.ndarray | None = None) -> np.ndarray:
     return rows[np.lexsort((order, rows["target"]))]
 
 
-def pace(plan: np.ndarray, capacity: int, per_write: np.ndarray, *, floor: int) -> np.ndarray:
-    """``plan`` with no frame carrying more than ``capacity`` messages.
-
-    A frame's excess moves to the latest earlier frames with room, never to or before its slot's previous
-    write nor before ``floor``. The most constrained write is placed first, which finds a placement
-    whenever one exists for writes of one size. :class:`InfeasibleScheduleError` when none does.
-    """
-    if not plan.size:
-        return plan
-    cost = np.asarray(per_write, dtype=np.int64)[plan["param"] - 1]
-    by_slot = np.lexsort((np.arange(plan.size), plan["target"], plan["param"]))
-    target = plan["target"][by_slot]
-    first = np.r_[True, plan["param"][by_slot][1:] != plan["param"][by_slot][:-1]]
-    earliest = np.empty(plan.size, dtype=np.int64)
-    earliest[by_slot] = np.where(first, np.minimum(floor, target), np.r_[0, target[:-1]] + 1)
-    out = plan.copy()
-    order = np.argsort(-plan["target"], kind="stable")
-    pending: list[tuple[int, int, int]] = []
-    i, frame = 0, int(plan["target"][order[0]])
-    while i < order.size or pending:
-        if not pending:
-            frame = min(frame, int(plan["target"][order[i]]))
-        while i < order.size and plan["target"][order[i]] >= frame:
-            k = int(order[i])
-            heapq.heappush(pending, (-int(earliest[k]), -int(plan["target"][k]), k))
-            i += 1
-        room = int(capacity)
-        while pending and cost[pending[0][2]] <= room and -pending[0][0] <= frame:
-            k = heapq.heappop(pending)[2]
-            out["target"][k], room = frame, room - int(cost[k])
-        if pending and -pending[0][0] >= frame:
-            k = pending[0][2]
-            raise InfeasibleScheduleError(
-                f"frame {int(plan['target'][k])} needs more than the link's {capacity} messages a frame, "
-                f"and P{int(plan['param'][k])}'s write there cannot move before frame {int(earliest[k])}"
-            )
-        frame -= 1
-    moved = int(np.count_nonzero(out["target"] != plan["target"]))
-    if moved:
-        LOG.info(
-            "%d writes moved earlier, at most %d frames, to keep within %d messages a frame",
-            moved,
-            int((plan["target"] - out["target"]).max()),
-            capacity,
-        )
-    return out[np.lexsort((np.arange(out.size), out["target"]))]
-
-
 def wet_at(lead_in: LeadIn, fps: float) -> int:
     """The lead-in frame a take's dry control returns to its take value on; later frames are wet."""
     return -int(round(lead_in.wet_s * fps))
@@ -219,16 +138,17 @@ def frame_load(rows: np.ndarray, per_write: np.ndarray) -> tuple[np.ndarray, np.
     return frames, np.bincount(inverse, weights=np.asarray(per_write)[rows["param"] - 1]).astype(np.int64)
 
 
-def describe_load(auto: Any, plan: np.ndarray, rows: np.ndarray, pacing: Pacing) -> str:
-    """Automation writes, frame-plan rows, the rows a take sends, and its busiest frame against capacity."""
-    frames, messages = frame_load(rows, pacing.per_write)
+def describe_load(auto: Any, plan: np.ndarray, rows: np.ndarray, per_write: np.ndarray) -> str:
+    """Automation writes, frame-plan rows, the rows a take sends, and the messages its frames carry."""
+    frames, messages = frame_load(rows, per_write)
     said = f"{len(auto)} automation writes, {plan.size} frame-plan rows, {rows.size} sent; "
     if not messages.size:
         return said + "nothing to send"
-    busiest, full = int(np.argmax(messages)), int(np.count_nonzero(messages == pacing.capacity))
+    busiest = int(np.argmax(messages))
     return said + (
-        f"busiest frame {int(frames[busiest])} carries {int(messages[busiest])} of "
-        f"{pacing.capacity} messages a frame, {full} at capacity"
+        f"{frames.size} frames carry writes, {int(messages.sum())} messages, "
+        f"busiest frame {int(frames[busiest])} with {int(messages[busiest])}, "
+        f"median {float(np.median(messages)):g} a frame"
     )
 
 
@@ -236,13 +156,6 @@ def clip_plan(auto: Any, seconds: float, config: Any) -> np.ndarray:
     """A layer's automation as frame-targeted writes inside a clip of ``seconds``."""
     plan = frame_plan(auto, fps=config.fps, early_bias_s=config.early_bias_s)
     return plan[plan["target"] < int(round(seconds * config.fps))]
-
-
-def take_schedule(
-    rows: np.ndarray, start: np.ndarray, *, capacity: int, per_write: np.ndarray, floor: int
-) -> np.ndarray:
-    """A take's rows as sent: one write per slot and frame, none repeating its slot, paced to the link."""
-    return pace(schedule(rows, start), capacity, per_write, floor=floor)
 
 
 def initial_state(working: Mapping[int, Any], plan: np.ndarray) -> dict[int, int]:
@@ -321,6 +234,7 @@ class Record:
     dry: dict | None
     loaded: dict
     cc_map: np.ndarray
+    resent: np.ndarray
 
 
 def measure_latency(
@@ -330,14 +244,18 @@ def measure_latency(
     toggles: np.ndarray,
     times: ev.FrameTimes,
     until: float | None = None,
+    taken: np.ndarray | None = None,
 ) -> ev.Latency:
-    """The send-to-capture latency from where each calibration write showed in the lead-in's picture."""
+    """The latency from when the device took each calibration write to where it showed in the picture.
+
+    ``taken`` brackets each toggle's taking (:func:`wire.echoed`), else its send interval does.
+    """
     size = min(images.shape[0], frames.size, found.shown.size)
     starts = frame_starts(size, found.runs, found.per_frame)
     landed = ev.toggle_landings(
         images[:size], frames["t_ns"][:size], starts, found.shown[:size], toggles, until
     )
-    return ev.latency(toggles["t1_ns"], landed, times)
+    return ev.latency(ev.taken(toggles, taken), landed, times)
 
 
 def write_latency(directory: str | Path, measured: ev.Latency, program: str) -> None:
@@ -427,7 +345,7 @@ def locked_take(
     dry = dry_state(info, bypass)
     initial = initial_state(working(info), plan)
     park = np.asarray(rig.session.park_values, dtype=np.int64)
-    pacing = Pacing.of(midi.cc_map, config, high_resolution=getattr(midi, "high_resolution", True))
+    encode = encoder(midi.cc_map, high_resolution=getattr(midi, "high_resolution", True))
 
     def write(param: int, value: int) -> int:
         offset = int(np.clip(value - park[param - 1], 0, PARAM_MAX))
@@ -440,14 +358,10 @@ def locked_take(
     start_state = {**initial, **(dry or {})}
     start_vector = np.array([start_state.get(i, int(park[i - 1])) for i in range(1, PARAM_COUNT + 1)])
     wet = wet_at(lead_in, fps)
-    rows = take_schedule(
-        plan_rows(plan, dry, initial, wet_frame=wet),
-        start_vector,
-        capacity=pacing.capacity,
-        per_write=pacing.per_write,
-        floor=wet + 1,
-    )
-    sender, poller = Sender(write), Poller(shell, interval_s=lead_in.poll_s)
+    rows = schedule(plan_rows(plan, dry, initial, wet_frame=wet), start_vector)
+    echoes = Echoes()
+    sender = Sender(write, echoes=echoes, encode=encode)
+    poller = Poller(shell, interval_s=lead_in.poll_s, echoes=echoes)
     held: dict[str, Any] = {"rows": rows, "delta": float("nan"), "loaded": None}
     try:
         with (
@@ -473,7 +387,6 @@ def locked_take(
                 initial=initial,
                 start=start_vector,
                 park=park,
-                pacing=pacing,
                 lead_in=lead_in,
             )
             hold = int(player.status().get("hold", 1))
@@ -486,6 +399,7 @@ def locked_take(
             initial=np.asarray(park, dtype=np.int64),
             start=start_vector.astype(np.int64),
             sends=sender.array(),
+            resent=sender.resent(),
             delta=np.float64(held["delta"]),
             latency=np.array(json.dumps(held.get("latency", {}))),
             cc_map=np.asarray(midi.cc_map, dtype=np.int64),
@@ -520,6 +434,7 @@ def locked_take(
         dry=dry,
         loaded={} if held["loaded"] is None else {"fpga": held["loaded"].payload},
         cc_map=np.asarray(midi.cc_map, dtype=np.int64),
+        resent=sender.resent(),
     )
 
 
@@ -540,7 +455,6 @@ def _play(
     initial: Mapping[int, int],
     start: np.ndarray,
     park: np.ndarray,
-    pacing: Pacing,
     lead_in: LeadIn,
 ) -> None:
     """The take from playout start: lead-in writes, calibration, the live clock, then every planned write.
@@ -549,7 +463,6 @@ def _play(
     than the half frame a send has to make its tick, stalling the sender and the poller together.
     """
     began = time.monotonic_ns()
-    fps = float(config.fps)
     switch = sys.getswitchinterval()
     sys.setswitchinterval(SWITCH_S)
     collecting = gc.isenabled()
@@ -571,10 +484,8 @@ def _play(
             initial=initial,
             start=start,
             park=park,
-            pacing=pacing,
             lead_in=lead_in,
             began=began,
-            fps=fps,
         )
     finally:
         sys.setswitchinterval(switch)
@@ -599,22 +510,19 @@ def _run(
     initial: Mapping[int, int],
     start: np.ndarray,
     park: np.ndarray,
-    pacing: Pacing,
     lead_in: LeadIn,
     began: int,
-    fps: float,
 ) -> None:
     """The take's body, run with the interpreter switching threads often enough for the sender.
 
-    The start state is sent a frame's capacity at a time, each slot not already parked at its value.
+    Every write is acknowledged before the next goes: the start state, each slot not already parked
+    at its value, then the calibration toggles and the plan.
     """
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
     poller.start()
-    for batch in pacing.batches(np.flatnonzero(start != park) + 1):
-        for slot in batch:
-            sender.send(slot, int(start[slot - 1]), ev.START)
-        time.sleep(1.0 / fps)
+    for slot in np.flatnonzero(start != park) + 1:
+        sender.send(int(slot), int(start[slot - 1]), ev.START)
     time.sleep(lead_in.settle_s)
     if dry is not None:
         calibrate(sender, dry, initial, lead_in)
@@ -627,10 +535,12 @@ def _run(
         out, rig.playout.flips(), codes, config=config, hold=hold, lead=lead, count=count
     )
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, lead)
-    calibration = sender.array()
-    calibration = calibration[calibration["target"] == ev.CALIBRATION]
+    sends, wire = sender.array(), poller.arrays()
+    toggled = sends["target"] == ev.CALIBRATION
     if dry is not None:
-        lat = measure_latency(images, frames, found, calibration, times)
+        cc_map = rig.transport.device.midi.cc_map
+        echo = W.echoed(sends, wire["receipts"], wire["reads"], cc_map)
+        lat = measure_latency(images, frames, found, sends[toggled], times, taken=echo[toggled])
         write_latency(Path(out).parent, lat, program)
         LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
     else:
@@ -758,6 +668,39 @@ def step_counts(rows: np.ndarray, kinds: np.ndarray | None) -> dict[int, dict[st
     return out
 
 
+def take_latency(
+    take: str | Path, wire: Mapping[str, Any], seen: tuple, echo: np.ndarray | None
+) -> ev.Latency:
+    """A take's CC-to-picture latency: its calibration's when its picture shows it, else the one it used.
+
+    ``seen`` is the take's ``(images, frames, attribution, frame times)``; ``echo`` brackets its sends.
+    """
+    images, frames, found, times = seen
+    sends = wire["sends"]
+    toggled = sends["target"] == ev.CALIBRATION
+    calibration = sends[toggled]
+    used = json.loads(str(wire["latency"])) if "latency" in wire else {}
+    if "lo" in used:
+        lat = ev.Latency(lo=used["lo"], hi=used["hi"], samples=used.get("samples", 0), period=times.period)
+    else:
+        lat = read_latency(Path(take).parent) if Path(take).parent.joinpath(LATENCY_FILE).is_file() else None
+    if json.loads(str(wire["dry"])) is not None and calibration.size:
+        later = sends["t0_ns"][(sends["target"] > ev.START) & (sends["t0_ns"] > calibration["t1_ns"].max())]
+        until = float(later.min()) if later.size else None
+        try:
+            taken = None if echo is None else echo[toggled]
+            lat = measure_latency(images, frames, found, calibration, times, until, taken)
+        except ev.EvidenceError as err:
+            if lat is None:
+                raise
+            LOG.warning("%s: %s; using the band measured live in the lead-in", take, err)
+    if lat is None:
+        raise ev.EvidenceError(
+            f"{take}: no CC-to-picture latency, measured or on file, to land its writes by"
+        )
+    return lat
+
+
 def take_evidence(
     take: str | Path,
     *,
@@ -791,40 +734,25 @@ def take_evidence(
     frames = read_log(take)
     times = ev.frame_times(frames["t_ns"], found.shown, found.runs, found.per_frame, found.lead)
     sends = wire["sends"]
-    calibration = sends[sends["target"] == ev.CALIBRATION]
+    echo = take_echo(wire)
+    resent = wire.get("resent")
     images = features.small
-    used = json.loads(str(wire["latency"])) if "latency" in wire else {}
-    if "lo" in used:
-        lat = ev.Latency(lo=used["lo"], hi=used["hi"], samples=used.get("samples", 0), period=times.period)
-    else:
-        lat = read_latency(Path(take).parent) if Path(take).parent.joinpath(LATENCY_FILE).is_file() else None
-    if json.loads(str(wire["dry"])) is not None and calibration.size:
-        later = sends["t0_ns"][(sends["target"] > ev.START) & (sends["t0_ns"] > calibration["t1_ns"].max())]
-        until = float(later.min()) if later.size else None
-        try:
-            lat = measure_latency(images, frames, found, calibration, times, until)
-        except ev.EvidenceError as err:
-            if lat is None:
-                raise
-            LOG.warning("%s: %s; using the band measured live in the lead-in", take, err)
-    if lat is None:
-        raise ev.EvidenceError(
-            f"{take}: no CC-to-picture latency, measured or on file, to land its writes by"
-        )
+    lat = take_latency(take, wire, (images, frames, found, times), echo)
     ticks, delta = ev.grid(times, lat), lat.delta
     plan = wire["plan"]
-    landed_rows = ev.landed(plan, sends, ticks, times, delta)
-    applied_rows = ev.applied(wire["reads"], sends, wire["initial"], ticks, times, delta)
-    receipts = wire.get("receipts")
+    landed_rows = ev.landed(plan, sends, ticks, times, delta, echo=echo, resent=resent)
+    applied_rows = ev.applied(
+        wire["reads"], sends, wire["initial"], ticks, times, delta, echo=echo, resent=resent
+    )
     got = None
-    if receipts is not None and receipts.size:
-        got = ev.received(ev.expected_messages(sends, wire["cc_map"]), receipts, sends)
+    if echo is not None:
+        got = W.received(W.expected_messages(sends, wire["cc_map"]), wire["receipts"], sends)
     count = found.picked.size
     out = images[found.picked].astype(np.float32)
     src = source.small[found.lead : found.lead + count].astype(np.float32)
     luma_range = np.ptp(out[:, 0].reshape(count, -1), axis=1)
     rows = landed_rows.rows
-    sent = rows["sent"] >= 0
+    sent = (rows["sent"] >= 0) & (rows["landed"] != ev.CALIBRATION)
     kinds, regime = (judged_steps(program, wire["start"], rows, count) if predict else None) or (None, None)
     moved = ev.acted_upon(
         out,
@@ -846,6 +774,20 @@ def take_evidence(
         moved=moved,
         loaded=loaded_before(program, wire, ticks, times, delta),
         predicted=step_counts(rows, kinds),
+    )
+
+
+def take_echo(wire: Mapping[str, Any]) -> np.ndarray | None:
+    """When the device took each of a take's sends, from its receipts; None for a take without any."""
+    receipts = wire.get("receipts")
+    if receipts is None or not receipts.size:
+        return None
+    return W.echoed(
+        wire["sends"],
+        receipts,
+        wire["reads"],
+        wire["cc_map"],
+        read_errors=wire.get("read_errors"),
     )
 
 

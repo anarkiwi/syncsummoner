@@ -11,7 +11,8 @@ from scipy.stats import chi2, norm
 
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import matched as mt
-from syncsummoner.device.wire import READ, RECEIPT, SEND
+from syncsummoner.device import wire as W
+from syncsummoner.device.wire import MESSAGE, READ, RECEIPT, SEND
 
 PERIOD = 33_333_333.0
 TRUE_TICK = 5_000_000.0
@@ -293,16 +294,95 @@ def test_applied_lands_a_write_on_its_given_tick():
     assert late.disagree[["read", "want", "got"]].tolist() == [(1, 0, 100)]
 
 
-def test_expected_messages_follow_the_cc_encoding():
-    sends = np.zeros(3, dtype=SEND)
-    sends["param"], sends["value"] = [1, 2, 2], [1023, 0, 512]
-    msgs = ev.expected_messages(sends, [16, 40])
-    assert msgs[["cc", "value"]].tolist() == [(16, 127), (48, 127), (40, 0), (40, 64)]
-    assert msgs["send"].tolist() == [0, 0, 1, 2]
-    lo = ev.expected_messages(sends[:1], [16], high_resolution=False)
-    assert lo[["cc", "value", "send"]].tolist() == [(16, 127, 0)]
-    word = ev.expected_messages(sends[[2]], [3, 3])["value"]
-    assert abs(((word[0] << 7) | word[1]) / 16383 * 1023 - 512) < 0.5
+def echo_record(t0s, polls, heard):
+    """Sends of P1 at ``t0s`` (1 ms each), polls as ``(t0, t1)``, and each send's messages heard at a poll."""
+    sends = np.zeros(len(t0s), dtype=SEND)
+    sends["t0_ns"], sends["t1_ns"], sends["param"] = t0s, np.asarray(t0s) + 1_000_000, 1
+    sends["value"] = np.arange(len(t0s)) * 100
+    reads = np.zeros(len(polls), dtype=READ)
+    reads["t0_ns"], reads["t1_ns"] = np.array(polls).T
+    expected = W.expected_messages(sends, [0])
+    got = [(reads["t1_ns"][k], m["cc"], m["value"]) for m, k in zip(expected, heard) if k is not None]
+    return sends, reads, np.array(got, dtype=RECEIPT)
+
+
+def test_an_echo_brackets_when_the_device_took_a_write_between_two_replies():
+    """After the previous reply's request and the write's start, by the reply it came with."""
+    polls = [(0, 2_000_000), (10_000_000, 12_000_000), (20_000_000, 22_000_000)]
+    sends, reads, got = echo_record([1_000_000, 15_000_000, 16_000_000], polls, [1, 1, 2, 2, 2, None])
+    echo = W.echoed(sends, got, reads, [0])
+    assert echo[0].tolist() == [1_000_000, 12_000_000]
+    assert echo[1].tolist() == [15_000_000, 22_000_000]
+    assert np.isnan(echo[2]).all()
+    assert np.isnan(W.echoed(sends, got[:3], reads, [0])[1]).all(), "an MSB alone does not take a write"
+
+
+def test_a_resent_writes_echo_aligns_to_its_first_copy():
+    polls = [(0, 2_000_000), (10_000_000, 12_000_000), (20_000_000, 22_000_000)]
+    sends, reads, got = echo_record([1_000_000, 15_000_000, 16_000_000], polls, [1, 1, None, None, 2, 2])
+    sends["value"][2] = sends["value"][1]
+    got["value"][2:] = W.expected_messages(sends[[1]], [0])["value"]
+    echo = W.echoed(sends, got, reads, [0])
+    assert echo[1].tolist() == [15_000_000, 22_000_000] and np.isnan(echo[2]).all()
+    errors = W.echoed(sends, got, reads[:0], [0], read_errors=np.array([12_000_000]))
+    assert errors[0].tolist() == [1_000_000, 12_000_000]
+
+
+def test_latency_from_brackets_uses_their_far_ends():
+    t = true_tick(np.arange(3)) - 5e6
+    bracket = np.c_[t, t + 2e6]
+    shown = TIMES.frame_of(true_tick(np.arange(3)) + DELTA)
+    point = ev.latency(t, shown, TIMES)
+    wide = ev.latency(bracket, shown, TIMES)
+    assert wide.lo == pytest.approx(point.lo - 2e6) and wide.hi == pytest.approx(point.hi)
+    assert ev.latency(np.c_[t, np.r_[np.nan, t[1:]]], shown, TIMES).samples == 2
+
+
+def test_a_write_lands_where_its_echo_says_late_unechoed_or_on_a_tick():
+    """Echoed before its tick: on target; after it: late; across it: on a tick; never: unechoed."""
+    plan = np.array([(5, 1, 10), (6, 1, 20), (7, 1, 30), (8, 1, 40)], dtype=PLAN)
+    sends = sends_at(plan.tolist())
+    tick = true_tick(plan["target"])
+    echo = np.c_[sends["t0_ns"], [tick[0] - 3e6, tick[1] + 3e6, tick[2] + 3e6, np.nan]]
+    echo[1, 0] = tick[1] + 1e6
+    echo[3, 0] = np.nan
+    got = ev.landed(plan, sends, TICKS, TIMES, DELTA, echo=echo)
+    rows = got.rows
+    assert rows["landed"].tolist()[:3] == [5, 7, 8] and rows["landed"][3] == ev.CALIBRATION
+    assert min(rows["clear_ns"][:2]) > 0 > rows["clear_ns"][2]
+    assert rows["echo_ns"].tolist() == [int(v) for v in echo[:3, 1]] + [-1]
+    assert (got.late, got.early, got.ambiguous, got.unechoed, got.missing) == (2, 0, 1, 1, 0)
+    assert got.slack_ms == pytest.approx((TICKS.lo + 6 * PERIOD - tick[1] - 3e6) / 1e6)
+    assert not got.ok and "1 never echoed" in got.summary()
+    copy = np.r_[sends, sends[[0]]]
+    copy[-1]["t0_ns"] += 1
+    again = ev.landed(plan[:1], copy[[0, 4]], TICKS, TIMES, DELTA, resent=np.array([1]))
+    assert again.duplicated == 0 and again.rows["sent"].tolist() == [0]
+
+
+def test_readbacks_hold_only_what_was_echoed():
+    sends = sends_at([(5, 1, 100)])
+    n = int(TICKS.after(sends["t1_ns"])[0][0])
+    reads = np.zeros(1, dtype=READ)
+    reads["t0_ns"] = TICKS.at(n + 1) + 5e6
+    reads["t1_ns"] = reads["t0_ns"] + 1e6
+    lost = np.full((1, 2), np.nan)
+    assert ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA, echo=lost).ok
+    assert not ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).ok
+    copy = ev.applied(reads, np.r_[sends, sends], np.zeros(12), TICKS, TIMES, DELTA, resent=np.array([1]))
+    assert not copy.ok and copy.confirmed == 0
+
+
+def test_the_realized_state_holds_each_slot_from_the_frame_its_write_took_effect():
+    rows = np.zeros(4, dtype=ev.LANDED)
+    rows["param"], rows["wire"], rows["sent"] = [1, 1, 2, 3], [5, 9, 7, 8], [0, 1, 2, 3]
+    rows["landed"] = [-3, 2, 3, ev.CALIBRATION]
+    rows["sent"][3] = 3
+    state = ev.realized(rows, np.arange(12), 5)
+    assert state.shape == (5, 12)
+    assert state[:, 0].tolist() == [5, 5, 9, 9, 9]
+    assert state[:, 1].tolist() == [1, 1, 1, 7, 7]
+    assert state[:, 2].tolist() == [2] * 5 and (state[:, 3:] == np.arange(3, 12)).all()
 
 
 def receipts(pairs):
@@ -314,7 +394,7 @@ def receipts(pairs):
 
 def messages(pairs):
     """Expected messages, one send each."""
-    out = np.zeros(len(pairs), dtype=ev.MESSAGE)
+    out = np.zeros(len(pairs), dtype=MESSAGE)
     out["cc"], out["value"] = np.array(pairs).T
     out["send"] = np.arange(len(pairs))
     return out
@@ -331,7 +411,7 @@ def messages(pairs):
     ],
 )
 def test_receipts_are_aligned_in_order_against_what_was_sent(got, matched, ok):
-    result = ev.received(messages([(1, 10), (33, 5), (2, 7)]), receipts(got))
+    result = W.received(messages([(1, 10), (33, 5), (2, 7)]), receipts(got))
     assert (result.sent, result.received, result.matched, result.ok) == (3, len(got), matched, ok)
     assert result.extra == len(got) - matched
     assert f"{matched} aligned" in result.summary()
@@ -346,7 +426,7 @@ def test_a_lost_burst_costs_only_its_own_messages():
     sends = np.zeros(len(sent), dtype=SEND)
     sends["t0_ns"] = 1000 * np.arange(len(sent))
     sends["param"], sends["target"] = 1, np.arange(len(sent)) // 10
-    result = ev.received(messages(sent), receipts(got), sends)
+    result = W.received(messages(sent), receipts(got), sends)
     assert result.matched == len(got) and result.sent - result.matched == len(lost)
     assert result.missing["send"].tolist() == sorted(lost)
     assert result.missing["t0_ns"].tolist() == [1000 * i for i in sorted(lost)]
@@ -358,9 +438,9 @@ def test_a_lost_burst_costs_only_its_own_messages():
 
 def test_separate_gaps_are_reported_apart():
     sent = [(1, v) for v in range(10)]
-    result = ev.received(messages(sent), receipts([m for i, m in enumerate(sent) if i not in (2, 3, 7)]))
+    result = W.received(messages(sent), receipts([m for i, m in enumerate(sent) if i not in (2, 3, 7)]))
     assert [gap["sends"] for gap in result.gaps()] == [[2, 3], [7, 7]]
-    assert ev.Received(sent=1, received=1, matched=1).gaps() == []
+    assert W.Received(sent=1, received=1, matched=1).gaps() == []
 
 
 def test_frame_change_is_the_mean_absolute_difference_from_the_frame_before():
@@ -626,14 +706,14 @@ def test_evidence_is_ok_only_when_every_link_holds():
     good.loaded = {"ok": False}
     assert not good.ok
     assert not evidence().ok
-    bad = evidence(received=ev.Received(sent=2, received=1, matched=1))
+    bad = evidence(received=W.Received(sent=2, received=1, matched=1))
     bad.applied = good.applied
     bad.loaded = {"ok": True}
     assert not bad.ok
 
 
 def test_evidence_reports_per_parameter_verdicts():
-    proof = evidence(received=ev.Received(sent=4, received=4, matched=4))
+    proof = evidence(received=W.Received(sent=4, received=4, matched=4))
     table = proof.table()
     assert [row["readback"] for row in table] == ["agrees", "disagrees"]
     assert table[0]["acted_upon"] and table[0]["with"] == [2] and table[0]["why_not"] is None

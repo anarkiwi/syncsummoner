@@ -124,7 +124,7 @@ class Transport:                     # wraps pyvmancer; the only module that imp
     def close(self) -> None: ...
 
 class Session:                       # settle timing, write rate limiting, state cache
-    def __init__(self, transport, *, cc_budget_hz=CC_BUDGET_HZ): ...  # parameter writes per second
+    def __init__(self, transport, *, cc_budget_hz=CC_BUDGET_HZ): ...  # open-loop writes per second, no monitor to ack them
     def set_params(self, values: Mapping[int, float | bool]) -> None: ...  # one write per 1/cc_budget_hz, cached
     def park(self) -> None: ...      # drive every parameter to a known reference
     def load_program(self, name, *, park=True, link=None) -> None: ...  # returns once the device runs it
@@ -263,8 +263,12 @@ render.render(score, source, out, *, passes=1) -> None
 render.Rig(session, capture, playout, link=None)   # link is dropped across every program change
 locktake.frame_plan(auto, *, fps, early_bias_s) -> PLAN array   # (target frame, param, value), first frame at or after t - bias, one per slot and frame
 locktake.schedule(plan, state=None) -> PLAN array   # last write per (frame, slot), none repeating its slot's value
-locktake.pace(plan, capacity, per_write, *, floor) -> PLAN array   # no frame over capacity messages; InfeasibleScheduleError otherwise
-session.frame_capacity(cc_budget_hz, fps, per_write) -> int   # messages a frame the budget's rate carries
+wire.Echoes()   # monitor receipts as acks: wait(want, since_ns) -> echo ns, or None once overdue
+wire.Sender(write, *, echoes=None, encode=None)   # with echoes, one write in flight; an overdue one resent once, its row in resent()
+wire.Poller(shell, *, interval_s, echoes=None)   # feeds echoes every reply; polls back to back while a write waits
+wire.echoed(sends, receipts, reads, cc_map, *, read_errors=None) -> (n, 2) ns   # when the device took each write; NaN unechoed
+evidence.landed(plan, sends, ticks, times, delta, seen=None, *, echo=None, resent=None) -> Landed   # landed = realized frame
+evidence.realized(rows, start, frames) -> (frames, 12)   # the state each clip frame actually held
 locktake.locked_take(rig, recorder, out, *, program, seconds, config, plan, working, load) -> Record  # every write sent for its frame
 locktake.take_evidence(take, *, program, clip, config, names=None, predict=True, found=None, features=None, source=None) -> evidence.Evidence   # the three links; steps judged by the program model; .ok is the hard check
 judge.judge_take(take, *, clip, config, program=None, score=None, source=None, features=None, predict=True, workers=None) -> judge.Judged   # one attribution handed to evidence, picture and take check

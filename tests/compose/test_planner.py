@@ -27,7 +27,7 @@ def dense_automation(n=600, span=1.0):
     return Automation.of(np.linspace(0, span, n), 2, np.arange(n) % 1024)
 
 
-def test_reachable_rejects_a_cc_budget_overrun():
+def test_reachable_rejects_a_dense_ramp_no_parameter_can_settle_between():
     profile = make_profile()
     assert not P.reachable(dense_automation(), profile, fps=FPS)
     assert P.reachable(Automation.empty(), profile, fps=FPS)
@@ -50,10 +50,10 @@ def test_reachable_ignores_repeated_values():
 def test_thin_enforces_the_hard_constraint():
     profile = make_profile()
     auto = dense_automation()
-    thinned = P.thin(auto, profile, fps=FPS, cc_budget_hz=50.0)
+    thinned = P.thin(auto, profile, fps=FPS)
     assert len(thinned) < len(auto)
-    assert thinned.max_rate() <= 50.0
-    assert P.reachable(thinned, profile, fps=FPS, cc_budget_hz=50.0)
+    assert thinned.values[-1] == auto.values[-1]
+    assert P.reachable(thinned, profile, fps=FPS)
     assert len(P.thin(Automation.empty(), profile, fps=FPS)) == 0
 
 
@@ -271,10 +271,11 @@ def test_search_accepts_an_injected_evaluator(features):
     assert out.layers[0].program == "a"
 
 
-def test_infeasible_candidates_score_minus_infinity(features):
+def test_infeasible_candidates_score_minus_infinity(features, monkeypatch):
     profiles = {"glitch": make_profile()}
-    score = P.search(profiles, features, rng=np.random.default_rng(0), budget=4, fps=FPS, cc_budget_hz=0.0)
-    assert P.plan_automation(score, profiles, fps=FPS, cc_budget_hz=0.0)
+    monkeypatch.setattr(P, "reachable", lambda *a, **k: False)
+    score = P.search(profiles, features, rng=np.random.default_rng(0), budget=4, fps=FPS)
+    assert P.plan_automation(score, profiles, fps=FPS)
 
 
 def test_anchor_times_cover_every_anchor(features):

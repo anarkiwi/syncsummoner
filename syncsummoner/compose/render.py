@@ -28,7 +28,6 @@ from syncsummoner.device.recorder import (
     require_signal,
     rig_state,
 )
-from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.compose.cut import Cut
 from syncsummoner.compose.master import DEFAULT_CRF, X264
 from syncsummoner.compose.planner import plan_automation
@@ -102,8 +101,6 @@ class RenderConfig:
     bits: int = 16
     #: Automation is shown from the first frame starting at or after its time less this bias.
     early_bias_s: float = EARLY_BIAS_S
-    #: Parameter writes per second, shared by the planner and the session's pacing.
-    cc_budget_hz: float = CC_BUDGET_HZ
     #: The card's budget to deliver a probe once the transmitter drives the session timing.
     probe_timeout_s: float = 40.0
     #: The input the session feeds the device, verified after every load; None skips the check.
@@ -424,7 +421,7 @@ def render_played(
         from syncsummoner.device.recorder import Recorder
 
         recorder = Recorder(width=config.width, height=config.height, fps=config.fps)
-    autos = plan_automation(score, profiles, fps=config.fps, cc_budget_hz=config.cc_budget_hz)
+    autos = plan_automation(score, profiles, fps=config.fps)
     try:
         require_route(rig.transport, program=program, route=config.route)
         with stage("upload", clip=str(scratch)) as sent:
@@ -899,7 +896,7 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         transport=transport,
-        session=session_mod.Session(transport, cc_budget_hz=config.cc_budget_hz),
+        session=session_mod.Session(transport),
         capture=(
             capture_mod.Capture(width=config.width, height=config.height, fps=int(config.fps)).open()
             if capture

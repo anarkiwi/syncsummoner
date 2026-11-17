@@ -1,13 +1,12 @@
 """Frame-indexed evidence that every parameter of a take was sent, applied and acted upon.
 
-The device latches CCs on a frame tick, which its own readback shows; capture timestamps say
-when each clip frame reached the card. A CC lands on the frame of the first tick after it is
-sent, so sends, readbacks and pictures are joined on one clip-frame index (docs/evidence.md).
+The device latches CCs on a frame tick; capture timestamps say when each clip frame reached the
+card. A CC lands on the first tick after the device took it, as its echo bounds, so sends,
+readbacks and pictures are joined on one clip-frame index (docs/evidence.md).
 """
 
 from __future__ import annotations
 
-import difflib
 import json
 import math
 from dataclasses import dataclass, field
@@ -16,7 +15,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.compose.matched import Regime, critical, fisher_z, frame_change, matched_change, tail_p
-from syncsummoner.device.session import LSB_OFFSET, wire_messages
+from syncsummoner.device.wire import Received
 from syncsummoner.program.predict import DEAD, LIVE, NOOP, UNCHANGED
 
 #: Target of a calibration write, which no clip frame schedules.
@@ -223,17 +222,19 @@ class Latency:
 def latency(sent: np.ndarray, shown_at: np.ndarray, times: FrameTimes) -> Latency:
     """The send-to-capture latency from where each calibration write first showed in the picture.
 
-    A write sent at ``t`` and first shown in frame ``F`` puts the latency in ``(T(F-1) - t, T(F) - t]``.
+    A write taken at ``t`` and first shown in frame ``F`` puts it in ``(T(F-1) - t, T(F) - t]``; with
+    ``(n, 2)`` brackets on ``t`` (``wire.echoed``) the later end bounds it below and the earlier above.
     Bounds that cross by more than half a frame mean no single latency holds, which is an error.
     """
-    ok = shown_at >= -times.lead
+    t = np.asarray(sent, dtype=np.float64)
+    first, last = (t, t) if t.ndim == 1 else (t[:, 0], t[:, 1])
+    ok = (shown_at >= -times.lead) & np.isfinite(last)
     if not ok.any():
         raise EvidenceError(
             "no calibration write showed in the picture, so the CC-to-picture latency is unknown"
         )
-    t = np.asarray(sent, dtype=np.float64)[ok]
-    lo = float((times.at(shown_at[ok] - 1) - t).max())
-    hi = float((times.at(shown_at[ok]) - t).min())
+    lo = float((times.at(shown_at[ok] - 1) - last[ok]).max())
+    hi = float((times.at(shown_at[ok]) - first[ok]).min())
     if lo - hi >= times.period / 2:
         raise EvidenceError(
             f"calibration writes disagree on the CC-to-picture latency by {(lo - hi) / 1e6:.2f} ms, "
@@ -252,7 +253,7 @@ def grid(times: FrameTimes, lat: Latency) -> Ticks:
 
 @dataclass(frozen=True)
 class Landed:
-    """Intended against sent: every scheduled write matched to its send and the frame it landed on."""
+    """Intended against realized: each scheduled write matched to its send and the frame it took effect on."""
 
     rows: np.ndarray
     missing: int
@@ -262,20 +263,29 @@ class Landed:
     early: int
     ambiguous: int
     wake_ms: float = float("nan")
+    unechoed: int = 0
+    slack_ms: float = float("nan")
 
     @property
     def ok(self) -> bool:
-        """Every write sent once, in order, landing unambiguously on its target."""
+        """Every write sent once, in order, taken by the device and in effect from its target."""
         return not (
-            self.missing or self.duplicated or self.out_of_order or self.late or self.early or self.ambiguous
+            self.missing
+            or self.duplicated
+            or self.out_of_order
+            or self.late
+            or self.early
+            or self.ambiguous
+            or self.unechoed
         )
 
     def summary(self) -> str:
         """One line of counts."""
         return (
-            f"{len(self.rows)} writes scheduled: {self.missing} missing, {self.duplicated} duplicated, "
-            f"{self.out_of_order} out of order, {self.late} late, {self.early} early, "
-            f"{self.ambiguous} on a tick; sends woke at worst {self.wake_ms:.2f} ms after due"
+            f"{len(self.rows)} writes scheduled: {self.missing} missing, {self.unechoed} never echoed, "
+            f"{self.duplicated} duplicated, {self.out_of_order} out of order, {self.late} late, "
+            f"{self.early} early, {self.ambiguous} on a tick; sends woke at worst {self.wake_ms:.2f} ms "
+            f"after due; least slack, echo to its target's tick, {self.slack_ms:.2f} ms"
         )
 
 
@@ -291,8 +301,27 @@ LANDED = np.dtype(
         ("seen", "<i8"),
         ("clear_ns", "<f8"),
         ("landed", "<i8"),
+        ("echo_ns", "<i8"),
     ]
 )
+
+
+def taken(sends: np.ndarray, echo: np.ndarray | None) -> np.ndarray:
+    """``(n, 2)`` brackets on when the device took each write: its echo's, else the send interval's."""
+    if echo is None:
+        return np.c_[sends["t0_ns"], sends["t1_ns"]].astype(np.float64)
+    return np.asarray(echo, dtype=np.float64).reshape(len(sends), 2)
+
+
+def landing(bracket: np.ndarray, ticks: Ticks) -> tuple[np.ndarray, np.ndarray]:
+    """The tick each bracketed write takes effect on, and the least clearance of either end from a tick.
+
+    The tick is the first after the bracket's end; a negative clearance means a tick's bracket
+    overlaps the write's, so it may have taken effect a tick earlier or later.
+    """
+    n, after = ticks.after(bracket[:, 1])
+    before = bracket[:, 0] - (ticks.hi + (n - 1) * ticks.period)
+    return n, np.minimum(after, before)
 
 
 def landed(
@@ -302,50 +331,64 @@ def landed(
     times: FrameTimes,
     delta: float,
     seen: np.ndarray | None = None,
+    *,
+    echo: np.ndarray | None = None,
+    resent: np.ndarray | None = None,
 ) -> Landed:
-    """Match scheduled ``(target, param, value)`` rows to sends in order, and land each on its frame.
+    """Match scheduled ``(target, param, value)`` rows to sends in order, and land each where it took effect.
 
-    The k-th send of a ``(target, param)`` pair answers its k-th scheduled row; a send nothing
-    scheduled is a duplicate. ``seen`` is each send's tick as read back, which lands it when known.
+    The k-th send of a ``(target, param)`` pair answers its k-th scheduled row, resent copies aside; a
+    send nothing scheduled is a duplicate. ``echo`` (``wire.echoed``) brackets when the device took each
+    send, else its send interval does; ``seen`` is each send's tick as read back, which lands it when known.
     """
     rows = np.zeros(len(plan), dtype=LANDED)
     rows["target"], rows["param"], rows["value"] = plan["target"], plan["param"], plan["value"]
     rows["sent"], rows["wire"], rows["tick"], rows["seen"], rows["landed"] = -1, -1, -1, -1, CALIBRATION
-    rows["clear_ns"] = np.nan
+    rows["clear_ns"], rows["echo_ns"] = np.nan, -1
     keep = sends["target"] > START
-    live = sends[keep]
+    copy = np.isin(np.arange(len(sends)), [] if resent is None else resent)[keep]
+    live, bracket = sends[keep], taken(sends, echo)[keep]
     live_seen = np.full(len(live), -1, dtype=np.int64) if seen is None else np.asarray(seen)[keep]
     keys = {}
     for i, (target, param) in enumerate(zip(plan["target"], plan["param"])):
         keys.setdefault((int(target), int(param)), []).append(i)
     used = {key: 0 for key in keys}
     duplicated = 0
+    hit = np.full(len(plan), -1, dtype=np.int64)
     for j, (target, param) in enumerate(zip(live["target"], live["param"])):
         key = (int(target), int(param))
         slots = keys.get(key, [])
+        if copy[j]:
+            continue
         if used.get(key, 0) >= len(slots):
             duplicated += 1
             continue
         i = slots[used[key]]
         used[key] += 1
+        hit[i] = j
         rows["sent"][i], rows["wire"][i], rows["t1_ns"][i] = j, live["value"][j], live["t1_ns"][j]
         rows["seen"][i] = live_seen[j]
-    sent = rows["sent"] >= 0
-    n, clear = ticks.after(rows["t1_ns"][sent].astype(np.float64))
-    rows["tick"][sent], rows["clear_ns"][sent] = n, clear
-    at = np.where(rows["seen"][sent] >= 0, rows["seen"][sent], n)
-    rows["landed"][sent] = frame_of_tick(at, ticks, times, delta)
+    sent = hit >= 0
+    took = bracket[hit[sent]]
+    heard = np.isfinite(took[:, 1])
+    ok = np.flatnonzero(sent)[heard]
+    n, clear = landing(took[heard], ticks)
+    rows["tick"][ok], rows["clear_ns"][ok], rows["echo_ns"][ok] = n, clear, took[heard, 1]
+    seen_ok = rows["seen"][ok]
+    rows["landed"][ok] = frame_of_tick(np.where(seen_ok >= 0, seen_ok, n), ticks, times, delta)
+    due = np.rint((times.at(rows["target"][ok]) - delta - ticks.phase) / ticks.period)
+    slack = ticks.lo + due * ticks.period - took[heard, 1]
     order = rows["sent"][sent]
     return Landed(
         rows=rows,
         missing=int((~sent).sum()),
         duplicated=duplicated,
         out_of_order=int(np.count_nonzero(np.diff(order) < 0)),
-        late=int(np.count_nonzero(rows["landed"][sent] > rows["target"][sent])),
-        early=int(np.count_nonzero(rows["landed"][sent] < rows["target"][sent])),
-        ambiguous=int(
-            np.count_nonzero((clear < 0) | ((rows["seen"][sent] >= 0) & (rows["seen"][sent] != n)))
-        ),
+        late=int(np.count_nonzero(rows["landed"][ok] > rows["target"][ok])),
+        early=int(np.count_nonzero(rows["landed"][ok] < rows["target"][ok])),
+        ambiguous=int(np.count_nonzero((clear < 0) | ((seen_ok >= 0) & (seen_ok != n)))),
+        unechoed=int((~heard).sum()),
+        slack_ms=float(slack.min()) / 1e6 if slack.size else float("nan"),
         wake_ms=(
             float((live["t0_ns"] - live["due_ns"]).max()) / 1e6
             if "due_ns" in (live.dtype.names or ()) and live.size
@@ -390,22 +433,27 @@ def applied(
     times: FrameTimes,
     delta: float,
     seen: np.ndarray | None = None,
+    *,
+    echo: np.ndarray | None = None,
+    resent: np.ndarray | None = None,
 ) -> Applied:
     """Check every readback slot against the values its frames held while the read was in flight.
 
     A read's request interval, widened by a frame each side for the readback's own lag, spans the
     frames it can report; any value the slot held over them agrees. A write lands on its ``seen``
-    tick where one is given, else on the first tick at or after it.
+    tick where one is given, else where :func:`landing` puts it; one never echoed held nothing.
     """
     o = np.asarray(reads["o"], dtype=np.int64)
     t0, t1 = reads["t0_ns"].astype(np.float64), reads["t1_ns"].astype(np.float64)
     disagree, checked, ambiguous, confirmed, unconfirmed = [], 0, 0, 0, 0
-    n_send, _ = ticks.after(sends["t1_ns"].astype(np.float64))
+    bracket = taken(sends, echo)
+    took = np.isfinite(bracket[:, 1]) & ~np.isin(np.arange(len(sends)), [] if resent is None else resent)
+    n_send, _ = landing(np.where(took[:, None], bracket, 0.0), ticks)
     if seen is not None:
         n_send = np.where(np.asarray(seen) >= 0, seen, n_send)
     lands = ticks.at(n_send)
     for slot in range(1, 13):
-        mine = np.flatnonzero(sends["param"] == slot)
+        mine = np.flatnonzero((sends["param"] == slot) & took)
         values = np.r_[int(initial[slot - 1]), sends["value"][mine]]
         at = lands[mine]
         before = np.searchsorted(at, t0 - ticks.period, side="right")
@@ -436,111 +484,22 @@ def applied(
     )
 
 
-#: One CC message put on the wire: controller, 7-bit value, and the index of the send that carried it.
-MESSAGE = np.dtype([("cc", "<i8"), ("value", "<i8"), ("send", "<i8")])
-#: A sent message no receipt answers: the send's index, interval start, parameter, target and the message.
-MISSING = np.dtype(
-    [("send", "<i8"), ("t0_ns", "<i8"), ("param", "<i8"), ("target", "<i8"), ("cc", "<i8"), ("value", "<i8")]
-)
+def realized(rows: np.ndarray, start: Sequence[int], frames: int) -> np.ndarray:
+    """The ``(frames, 12)`` parameter state in effect over clip frames ``0..frames-1``.
 
-
-def expected_messages(
-    sends: np.ndarray, cc_map: Sequence[int], *, high_resolution: bool = True
-) -> np.ndarray:
-    """The :data:`MESSAGE` records the sends put on the wire, in order, as pyvmancer encodes them."""
-    cc = np.asarray(cc_map, dtype=np.int64)
-    per = wire_messages(cc, high_resolution=high_resolution)
-    param = np.asarray(sends["param"], dtype=np.int64) - 1
-    value = np.asarray(sends["value"], dtype=np.int64)
-    pair = per[param] == 2
-    word = np.rint(value * 16383 / 1023).astype(np.int64)
-    out = np.zeros(int(per[param].sum()), dtype=MESSAGE)
-    out["send"] = np.repeat(np.arange(value.size), per[param])
-    head = np.r_[0, np.cumsum(per[param])[:-1]].astype(np.int64)
-    out["cc"][head] = cc[param]
-    out["value"][head] = np.where(pair, word >> 7, np.rint(value * 127 / 1023).astype(np.int64))
-    tail = head[pair] + 1
-    out["cc"][tail] = cc[param][pair] + LSB_OFFSET
-    out["value"][tail] = word[pair] & 0x7F
-    return out
-
-
-@dataclass(frozen=True)
-class Received:
-    """Sent against received: the firmware's monitor receipts aligned to the messages put on the wire."""
-
-    sent: int
-    received: int
-    matched: int
-    missing: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=MISSING))
-
-    @property
-    def ok(self) -> bool:
-        """Every message received, in order, and nothing else."""
-        return self.sent == self.received == self.matched
-
-    @property
-    def extra(self) -> int:
-        """Receipts no sent message answers."""
-        return self.received - self.matched
-
-    def gaps(self) -> list[dict]:
-        """Runs of consecutive missing messages: how many, the sends that carried them and when."""
-        miss = self.missing
-        if not miss.size:
-            return []
-        cut = np.flatnonzero(np.diff(miss["send"]) > 1) + 1
-        return [
-            {
-                "messages": int(run.size),
-                "sends": [int(run["send"][0]), int(run["send"][-1])],
-                "params": sorted({int(p) for p in run["param"]}),
-                "targets": sorted({int(t) for t in run["target"]}),
-                "t0_ns": [int(run["t0_ns"][0]), int(run["t0_ns"][-1])],
-            }
-            for run in np.split(miss, cut)
-        ]
-
-    def summary(self) -> str:
-        """One line of counts, and each run of missing messages."""
-        said = (
-            f"{self.sent} messages sent, {self.received} received, {self.matched} aligned, "
-            f"{self.sent - self.matched} missing, {self.extra} unexpected"
-        )
-        for gap in self.gaps():
-            span = (gap["t0_ns"][1] - gap["t0_ns"][0]) / 1e6
-            said += (
-                f"; {gap['messages']} missing from sends {gap['sends'][0]}..{gap['sends'][1]} "
-                f"(P{', P'.join(map(str, gap['params']))} for frames "
-                f"{gap['targets'][0]}..{gap['targets'][-1]}, sent over {span:.2f} ms)"
-            )
-        return said
-
-
-def received(expected: np.ndarray, got: np.ndarray, sends: np.ndarray | None = None) -> Received:
-    """Receipts aligned against the expected messages, so a gap costs only the messages it lost.
-
-    The alignment is difflib's matching blocks over ``(cc, value)``, a common subsequence in which
-    every receipt answers at most one message in order. ``sends`` names the missing messages' writes.
+    Each slot holds ``start``, then each :data:`LANDED` row's sent value from the frame it took effect
+    on; a write landing before frame 0 holds from frame 0, and one never taken holds nowhere.
     """
-    exp = np.asarray(expected["cc"], dtype=np.int64) * 128 + np.asarray(expected["value"], dtype=np.int64)
-    rec = np.asarray(got["cc"], dtype=np.int64) * 128 + np.asarray(got["value"], dtype=np.int64)
-    blocks = difflib.SequenceMatcher(None, exp.tolist(), rec.tolist(), autojunk=False).get_matching_blocks()
-    hit = np.zeros(exp.size, dtype=bool)
-    for block in blocks:
-        hit[block.a : block.a + block.size] = True
-    lost = np.flatnonzero(~hit)
-    missing = np.zeros(lost.size, dtype=MISSING)
-    missing["cc"], missing["value"] = expected["cc"][lost], expected["value"][lost]
-    missing["send"] = expected["send"][lost]
-    if sends is not None and lost.size:
-        carried = sends[missing["send"]]
-        missing["t0_ns"], missing["param"], missing["target"] = (
-            carried["t0_ns"],
-            carried["param"],
-            carried["target"],
-        )
-    return Received(sent=int(exp.size), received=int(rec.size), matched=int(hit.sum()), missing=missing)
+    base = np.asarray(start, dtype=np.int64)
+    out = np.repeat(base[None, :], int(frames), axis=0)
+    took = rows[(rows["sent"] >= 0) & (rows["landed"] != CALIBRATION)]
+    took = took[np.lexsort((took["sent"], took["landed"]))]
+    clip = np.arange(int(frames))
+    for slot in range(base.size):
+        mine = took[took["param"] == slot + 1]
+        held = np.searchsorted(np.maximum(mine["landed"], 0), clip, side="right")
+        out[:, slot] = np.r_[base[slot], mine["wire"]][held]
+    return out
 
 
 #: Steps the model does not prove leave the picture alone: the ones a parameter is tested on.

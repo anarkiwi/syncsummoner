@@ -153,10 +153,6 @@ def test_automation_algebra():
     assert Automation.concat([]).times.size == 0
     assert merged.shift(2.0).times.tolist() == [2.0, 2.5, 3.0]
     assert len(merged.within(0.4, 1.0)) == 1
-    assert Automation.empty().max_rate() == 0.0
-    dense = Automation.of(np.linspace(0, 0.5, 5), 1, np.arange(5))
-    assert dense.max_rate() == 5.0
-    assert dense.max_rate(window_s=0.25) == 8.0
 
 
 def test_automation_hold_is_zero_order():

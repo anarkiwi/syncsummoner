@@ -486,16 +486,3 @@ def test_a_link_dropped_load_on_a_device_that_runs_only_with_the_link_completes_
     assert link.calls == ["down", "up"]
     assert device.shell.program == "Passthru" and device.shell.link_up
     assert np.all(device.shell.combined() == 0)
-
-
-def test_a_write_takes_a_pair_only_where_its_msb_has_an_lsb_partner():
-    """Controllers 0..31 pair with one 32 higher at high resolution; any other is one message."""
-    assert sess_mod.wire_messages([0, 31, 32, 64]).tolist() == [2, 2, 1, 1]
-    assert sess_mod.wire_messages([0, 31], high_resolution=False).tolist() == [1, 1]
-
-
-def test_a_frames_capacity_is_the_budgets_message_rate_over_a_frame():
-    assert sess_mod.frame_capacity(200.0, 30.0, [2, 1]) == 13
-    assert sess_mod.frame_capacity(200.0, 60.0, [1]) == 3
-    with pytest.raises(ValueError, match="less than one 2-message write"):
-        sess_mod.frame_capacity(10.0, 30.0, [2])

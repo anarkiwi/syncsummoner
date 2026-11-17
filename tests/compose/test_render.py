@@ -77,7 +77,7 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
     module("syncsummoner.device.playout", ClipPlayer=record("playout"))
     module("syncsummoner.device.link", Link=record("link"))
     rig = R.open_rig(CONFIG)
-    assert rig.session == (("transport",), {"cc_budget_hz": CONFIG.cc_budget_hz})
+    assert rig.session == (("transport",), {})
     assert built["capture"][1]["width"] == 32 and built["playout"][1]["height"] == 24
     assert rig.capture == "open capture", "the rig hands back an opened capture"
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"

@@ -7,14 +7,12 @@ the outermost loop variable and is never mutated inside the inner loop.
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
-from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, track
 from syncsummoner import aesthetics
 from syncsummoner.compose.gating import model_gate
@@ -143,14 +141,10 @@ def _response(spec: ParamSpec, values: np.ndarray) -> np.ndarray:
     return np.interp(values, v[order], (r - r.min()) / (np.ptp(r) + EPS))
 
 
-def reachable(
-    auto: Automation, profile: ProgramProfile, *, fps: float, cc_budget_hz: float = CC_BUDGET_HZ
-) -> bool:
-    """Hard constraint: aggregate parameter writes per second and per-parameter settle time both respected."""
+def reachable(auto: Automation, profile: ProgramProfile, *, fps: float) -> bool:
+    """Hard constraint: every parameter's writes no closer together than its settle time."""
     if len(auto) == 0:
         return True
-    if auto.max_rate() > cc_budget_hz:
-        return False
     tol = 0.5 / fps
     for idx in np.unique(auto.indices):
         m = auto.indices == idx
@@ -191,14 +185,11 @@ def _settled(times: np.ndarray, values: np.ndarray, settle: float) -> tuple[list
     return out_t, out_v
 
 
-def thin(
-    auto: Automation, profile: ProgramProfile, *, fps: float, cc_budget_hz: float = CC_BUDGET_HZ
-) -> Automation:
-    """Defer and drop messages so the result satisfies the hard constraint.
+def thin(auto: Automation, profile: ProgramProfile, *, fps: float) -> Automation:
+    """Defer writes so the result satisfies the hard constraint.
 
-    Writes a parameter cannot settle between are deferred to the latest value, so the
-    held state matches what the gestures asked for; the write budget, in parameter writes per
-    second, then drops the excess.
+    Writes a parameter cannot settle between are deferred to the latest value, so the held state
+    matches what the gestures asked for. The link is paced by its echoes, not by a rate here.
     """
     if len(auto) == 0:
         return auto
@@ -207,17 +198,7 @@ def thin(
         m = auto.indices == idx
         t, v = _settled(auto.times[m], auto.values[m], profile.settle_frames.get(int(idx), 0) / fps)
         parts.append(Automation(np.asarray(t), np.full(len(t), idx, np.int32), np.asarray(v, np.int32)))
-    auto = Automation.concat(parts)
-    window: deque[float] = deque()
-    quota = max(1, int(cc_budget_hz))
-    keep = np.zeros(len(auto), dtype=bool)
-    for i, t in enumerate(auto.times.tolist()):
-        while window and window[0] <= t - 1.0:
-            window.popleft()
-        if len(window) < quota:
-            window.append(t)
-            keep[i] = True
-    return Automation(auto.times[keep], auto.indices[keep], auto.values[keep])
+    return Automation.concat(parts)
 
 
 def plan_automation(
@@ -225,7 +206,6 @@ def plan_automation(
     profiles: Mapping[str, ProgramProfile],
     *,
     fps: float | None = None,
-    cc_budget_hz: float = CC_BUDGET_HZ,
     gates: Mapping[str, Callable[[Automation], Automation] | None] | None = None,
 ) -> dict[int, Automation]:
     """Expand a score to reachable automation per layer; this is what the renderer plays.
@@ -240,7 +220,7 @@ def plan_automation(
         if profile is None:
             continue
         auto = score.render_layer(layer, profile, rate=control_rate(fps))
-        auto = thin(auto, profile, fps=fps, cc_budget_hz=cc_budget_hz)
+        auto = thin(auto, profile, fps=fps)
         gate = model_gate(layer.program) if gates is None else gates.get(layer.program)
         out[layer.index] = auto if gate is None else gate(auto)
     return out
@@ -617,7 +597,6 @@ def search(
     population: int = 6,
     density: float = 0.5,
     weights: ObjectiveWeights | None = None,
-    cc_budget_hz: float = CC_BUDGET_HZ,
     evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None,
 ) -> Score:
     """Evolve one layer per program, then keep the best ``n_passes`` as the score's layers.
@@ -677,9 +656,8 @@ def search(
                 base.render_layer(layer, profile, rate=control_rate(fps)),
                 profile,
                 fps=fps,
-                cc_budget_hz=cc_budget_hz,
             )
-            if not reachable(auto, profile, fps=fps, cc_budget_hz=cc_budget_hz):
+            if not reachable(auto, profile, fps=fps):
                 return Objective(total=-np.inf, feasible=False, violation=np.inf)
             traj = proxy_render(
                 auto,

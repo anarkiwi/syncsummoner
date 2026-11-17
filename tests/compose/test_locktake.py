@@ -15,7 +15,8 @@ from syncsummoner.device import v4l2rec
 from syncsummoner.device.playout import FLIP
 from syncsummoner.device.profile import PARAM_MAX, ParamSpec
 from syncsummoner.device.v4l2rec import FRAME
-from syncsummoner.device.wire import SEND, Poller, Sender
+from syncsummoner.device import wire as W
+from syncsummoner.device.wire import SEND, Echoes, Poller, Sender
 from syncsummoner.probe import decoded
 
 FPS = 30.0
@@ -100,63 +101,20 @@ def test_a_schedule_drops_writes_the_slots_already_hold():
     assert LT.schedule(rows_of()).size == 0
 
 
-TWO = np.full(12, 2)
-
-
-def test_pacing_moves_a_frames_excess_to_the_latest_earlier_frames_with_room():
-    """Four writes on frame 10 at two a frame: two stay, two go to frame 9; nothing else moves."""
-    plan = rows_of((2, 5, 1), (10, 1, 1), (10, 2, 1), (10, 3, 1), (10, 4, 1), (12, 1, 2))
-    out = LT.pace(plan, 4, TWO, floor=-5)
-    assert np.bincount(out["target"] - out["target"].min()).max() <= 2
-    assert out["target"].tolist() == [2, 9, 9, 10, 10, 12]
-    assert sorted(out["param"][out["target"] == 9].tolist()) == [3, 4]
-
-
-def test_pacing_never_moves_a_write_onto_or_before_its_slots_previous_write():
-    """P1's frame-10 write keeps its frame, as P1 writes on 9; the rest fill the frames before it."""
-    plan = rows_of((9, 1, 1), (10, 1, 2), (10, 2, 1), (10, 3, 1))
-    out = LT.pace(plan, 2, TWO, floor=0)
-    assert out.tolist() == [(7, 1, 1), (8, 3, 1), (9, 2, 1), (10, 1, 2)]
-    unlimited = LT.pace(plan, 24, TWO, floor=0)
-    assert unlimited.tolist() == plan.tolist()
-
-
-def test_a_plan_no_earlier_frame_can_absorb_is_infeasible():
-    """Both slots already written on the frame before, and nothing allowed before it."""
-    plan = rows_of((4, 1, 1), (4, 2, 1), (5, 1, 2), (5, 2, 2))
-    with pytest.raises(LT.InfeasibleScheduleError, match="frame 5 needs more than the link's 2 messages"):
-        LT.pace(plan, 2, TWO, floor=4)
-    with pytest.raises(LT.InfeasibleScheduleError, match="frame 0"):
-        LT.pace(rows_of((0, 1, 1), (0, 2, 1)), 2, TWO, floor=0)
-    assert LT.pace(rows_of(), 2, TWO, floor=0).size == 0
-    assert LT.pace(rows_of((-9, 1, 1)), 2, TWO, floor=0).tolist() == [(-9, 1, 1)]
-
-
-def test_pacing_follows_the_budget_and_the_encoding():
-    """Messages a frame from writes a second, and START batches cut at that capacity."""
-    config = types.SimpleNamespace(fps=30.0, cc_budget_hz=60.0)
-    pacing = LT.Pacing.of(list(range(12)), config)
-    assert pacing.capacity == 4 and pacing.per_write.tolist() == [2] * 12
-    assert pacing.batches([1, 2, 3, 4, 5]) == [[1, 2], [3, 4], [5]]
-    mixed = LT.Pacing.of([40] + list(range(1, 12)), config)
-    assert mixed.batches([1, 2, 3]) == [[1, 2], [3]]
-    assert LT.Pacing.of(list(range(12)), config, high_resolution=False).per_write.tolist() == [1] * 12
-
-
-def test_a_take_schedule_reports_its_load_against_capacity():
-    """Rows sent per frame, the busiest against capacity, and the frame the lead-in turns wet on."""
-    pacing = LT.Pacing(capacity=4, per_write=TWO)
+def test_a_take_schedule_reports_the_messages_its_frames_carry():
+    """Rows sent per frame as scheduled, nothing moved, and the frame the lead-in turns wet on."""
     plan = rows_of((0, 1, 5), (3, 1, 6), (3, 2, 6), (3, 3, 6))
-    rows = LT.take_schedule(plan, np.zeros(12, dtype=np.int64), capacity=4, per_write=TWO, floor=-3)
-    assert rows.tolist() == [(0, 1, 5), (2, 3, 6), (3, 1, 6), (3, 2, 6)]
-    frames, carried = LT.frame_load(rows, TWO)
-    assert frames.tolist() == [0, 2, 3] and carried.tolist() == [2, 2, 4]
-    said = LT.describe_load(np.zeros(9), plan, rows, pacing)
+    rows = LT.schedule(plan, np.zeros(12, dtype=np.int64))
+    assert rows.tolist() == plan.tolist()
+    per_write = np.r_[2, 2, 1, np.full(9, 2)]
+    frames, carried = LT.frame_load(rows, per_write)
+    assert frames.tolist() == [0, 3] and carried.tolist() == [2, 5]
+    said = LT.describe_load(np.zeros(9), plan, rows, per_write)
     assert said == (
-        "9 automation writes, 4 frame-plan rows, 4 sent; busiest frame 3 carries 4 of 4 messages a frame, "
-        "1 at capacity"
+        "9 automation writes, 4 frame-plan rows, 4 sent; 2 frames carry writes, 7 messages, "
+        "busiest frame 3 with 5, median 3.5 a frame"
     )
-    assert LT.describe_load([], rows_of(), rows_of(), pacing).endswith("nothing to send")
+    assert LT.describe_load([], rows_of(), rows_of(), per_write).endswith("nothing to send")
     assert LT.wet_at(LT.LeadIn(wet_s=0.5), 30.0) == -15
 
 
@@ -445,6 +403,12 @@ class Sim:
             agreed=size,
         )
 
+    def poll_next(self):
+        """Advance to the next poll and run it: what a sender waiting on its echo sees."""
+        self.now = max(self.now, int(self.next_poll))
+        self.next_poll = self.now + self.poller.interval_s * 1e9
+        self.poller.poll_once()
+
     def sleep(self, seconds):
         """Advance, polling and sending whatever falls due on the way."""
         end = self.now + int(seconds * 1e9)
@@ -471,8 +435,9 @@ class Sim:
         self.now = max(self.now, end)
 
 
-def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13))):
-    """A rig over ``sim``: shell, MIDI port, session, playout and recorder."""
+def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
+    """A rig over ``sim``: shell, MIDI port, session, playout and recorder; ``lose`` is lost once."""
+    lost = [] if lose is None else [lose]
     boots, said, loads = list(boots), [], []
     offsets = [0] * 12
     shell = types.SimpleNamespace(log_lines=[], said=said)
@@ -490,6 +455,9 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13))):
 
     def set_param(param, value):
         offsets[param - 1] = value
+        if (param, value) in lost:
+            lost.remove((param, value))
+            return
         sim.write(param, value)
         word = int(round(value * 16383 / 1023))
         msb = cc_map[param - 1]
@@ -530,11 +498,19 @@ def fixture_simulate(monkeypatch):
     def build(**kw):
         sim = Sim(**kw)
 
+        class SimEchoes(Echoes):
+            """Awaited by polling the simulation."""
+
+            def __init__(self):
+                super().__init__(idle=sim.poll_next)
+
         class SimPoller(Poller):
             """Polled from the simulation's sleeps."""
 
-            def __init__(self, shell, *, interval_s):
-                super().__init__(shell, interval_s=interval_s, clock=sim.clock, sleep=sim.sleep)
+            def __init__(self, shell, *, interval_s, echoes=None):
+                super().__init__(
+                    shell, interval_s=interval_s, clock=sim.clock, sleep=sim.sleep, echoes=echoes
+                )
 
             def start(self):
                 sim.poller, sim.next_poll = self, sim.now
@@ -547,8 +523,8 @@ def fixture_simulate(monkeypatch):
         class SimSender(Sender):
             """Sent from the simulation's sleeps."""
 
-            def __init__(self, write):
-                super().__init__(write, clock=sim.clock, sleep=sim.sleep)
+            def __init__(self, write, *, echoes=None, encode=None):
+                super().__init__(write, clock=sim.clock, sleep=sim.sleep, echoes=echoes, encode=encode)
 
             def start(self):
                 sim.sender = self
@@ -557,6 +533,7 @@ def fixture_simulate(monkeypatch):
             def stop(self):
                 sim.sender = None
 
+        monkeypatch.setattr(LT, "Echoes", SimEchoes)
         monkeypatch.setattr(LT, "Poller", SimPoller)
         monkeypatch.setattr(LT, "Sender", SimSender)
         monkeypatch.setattr(LT, "time", types.SimpleNamespace(monotonic_ns=sim.clock, sleep=sim.sleep))
@@ -584,10 +561,12 @@ PLAN_ROWS = np.array(
 )
 
 
-def take_and_prove(monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7), drop=None, config=None):
+def take_and_prove(
+    monkeypatch, simulate, tmp_path, *, dry, working, boots=(7, 7), drop=None, config=None, lose=None
+):
     """A whole simulated take, then its evidence from the files it left."""
     sim = simulate(lead=120, count=30, drop=drop)
-    rig, recorder, load, loads = rigged(sim, info_with(dry), boots=boots)
+    rig, recorder, load, loads = rigged(sim, info_with(dry), boots=boots, lose=lose)
     out = tmp_path / "take.mkv"
     record = LT.locked_take(
         rig,
@@ -622,7 +601,8 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
         monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 3: 0.5, 4: 100}
     )
     assert [name for name, _ in loads] == ["Teletext"]
-    assert record.delta == pytest.approx(DELTA, abs=2e6)
+    band = json.loads(str(np.load(tmp_path / "take.mkv.wire.npz")["latency"]))
+    assert band["lo"] <= DELTA <= band["hi"]
     assert LT.read_latency(tmp_path).delta == pytest.approx(record.delta)
     assert record.plan[0].tolist() == (-15, 1, 0)
     calibration = record.sends[record.sends["target"] == ev.CALIBRATION]
@@ -633,7 +613,7 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert ("fpga", "status") in said
     assert proof.ok, proof.lines()
     assert proof.landed.ok and proof.applied.ok and proof.received.ok and proof.loaded["ok"]
-    assert proof.latency["frames"] == pytest.approx(1.7, abs=0.06)
+    assert proof.latency["lo"] <= DELTA <= proof.latency["hi"]
     assert len(proof.landed.rows) == np.count_nonzero(PLAN_ROWS["target"] > 0) + 1
     assert 0 not in record.plan["target"].tolist()
     assert proof.received.sent == 2 * record.sends.size
@@ -642,10 +622,8 @@ def test_a_dry_take_measures_its_latency_and_proves_every_write_landed(monkeypat
     assert sim.sender is None and sim.poller is None
 
 
-def test_a_take_paced_to_one_write_a_frame_moves_its_excess_earlier_and_still_proves(
-    monkeypatch, simulate, tmp_path
-):
-    """Start state a write a frame, unparked slots only; frame 20's second write lands on frame 19."""
+def test_every_write_waits_for_the_previous_ones_echo_and_lands_on_its_frame(monkeypatch, simulate, tmp_path):
+    """One write in flight: each starts after the last one's echo; frame 20's two writes both land there."""
     collecting, original = [], Sim.write
 
     def watched(self, param, value):
@@ -654,23 +632,35 @@ def test_a_take_paced_to_one_write_a_frame_moves_its_excess_earlier_and_still_pr
 
     monkeypatch.setattr(Sim, "write", watched)
     sim, _, record, proof, _ = take_and_prove(
-        monkeypatch,
-        simulate,
-        tmp_path,
-        dry=1,
-        working={1: 0, 3: 0.5, 4: 100, 6: 0},
-        config=config_for(4.0, cc_budget_hz=30.0),
+        monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 3: 0.5, 4: 100, 6: 0}
     )
-    start = record.sends[record.sends["target"] == ev.START]
-    assert start["param"].tolist() == [1, 3, 4]
-    assert np.diff(start["t0_ns"]).min() >= int(P)
-    assert sorted(record.plan[record.plan["target"] >= 19][["target", "param"]].tolist()) == [
-        (19, 5),
-        (20, 3),
-    ]
+    sends = record.sends
+    assert sends[sends["target"] == ev.START]["param"].tolist() == [1, 3, 4]
+    echo = W.echoed(sends, record.arrays["receipts"], record.arrays["reads"], record.cc_map)
+    assert np.isfinite(echo).all() and (sends["t0_ns"][1:] >= echo[:-1, 1]).all()
+    assert record.resent.size == 0
+    rows = proof.landed.rows
+    assert sorted(rows[rows["target"] == 20][["landed", "param"]].tolist()) == [(20, 3), (20, 5)]
     assert proof.ok, proof.lines()
     assert collecting and not any(collecting) and gc.isenabled()
     assert sim.sender is None
+
+
+def test_a_write_lost_on_the_link_is_resent_once_and_lands_from_its_copy(monkeypatch, simulate, tmp_path):
+    """No echo past the take's longest one: written again, the copy recorded, its echo landing the write."""
+    _, _, record, proof, _ = take_and_prove(
+        monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 3: 0.5}, lose=(3, 600)
+    )
+    (copy,) = record.resent.tolist()
+    sends = record.sends
+    assert (
+        sends[copy][["param", "value", "target"]].tolist()
+        == sends[copy - 1][["param", "value", "target"]].tolist()
+    )
+    assert sends[copy]["t0_ns"] > sends[copy - 1]["t1_ns"]
+    row = proof.landed.rows[(proof.landed.rows["target"] == 5) & (proof.landed.rows["param"] == 3)][0]
+    assert row["echo_ns"] > sends[copy]["t1_ns"] and row["landed"] in (5, 6)
+    assert proof.landed.unechoed == 0 and not proof.landed.duplicated and proof.applied.ok
 
 
 def test_a_write_the_device_drops_fails_the_readback(monkeypatch, simulate, tmp_path):
