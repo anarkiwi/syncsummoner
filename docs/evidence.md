@@ -111,15 +111,29 @@ so a hue change counts); the source change is the same measure on the clip
   every parameter and lag tested in the take (Bonferroni), as survival.py does.
 
 A parameter that only ever lands together with others is tested on those frames and
-reported with its partners. Why a parameter is not acted upon comes from the first
-link that broke: not sent on time; the firmware did not take it; the program names
-the slot unused; the picture was a uniform field at most of its steps; or the
-firmware took it and the picture did not move.
+reported with its partners.
+
+Failing to reject is not evidence of no effect, so a parameter not acted upon is one
+of two verdicts (`Moved.verdict`):
+
+- **no effect**: the steps' mean matched score plus the least mean they could detect
+  at the family-wise bound (`critical * scatter / sqrt(effective steps)`) stays below
+  the smallest mean score of any parameter the same take found acted upon. The steps
+  had the power to see an effect that size, and exclude it.
+- **undetermined**: they did not, or nothing in the take moved the picture to give an
+  effect size. The report gives the least detectable effect and the steps that would
+  decide it; they are written to the take directory's `schedule.json`, and
+  `probe archive --schedule schedule.json` adds that many one-at-a-time steps of each
+  listed parameter to the program's sweep.
+
+Before either verdict, the reason comes from the first link that broke: not sent on
+time; the firmware did not take it; the program names the slot unused; or the
+picture was a uniform field at most of its steps.
 
 ## Commands
 
 ```sh
-syncsummoner render score.yaml --source clip.mp4 --cut-programs ... --takes takes/   # evidence per take, hard check
+syncsummoner render score.yaml --source clip.mp4 --cut-programs ... --takes takes/   # evidence per take
 syncsummoner evidence takes/take-Pinwheel.mkv --source timecoded.mkv           # recompute and print it
 ```
 
