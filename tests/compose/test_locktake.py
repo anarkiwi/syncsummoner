@@ -746,6 +746,20 @@ def test_a_write_the_device_drops_fails_the_readback(monkeypatch, simulate, tmp_
     assert set(proof.applied.disagree["want"].tolist()) == {600}
 
 
+def test_a_calibration_the_picture_cannot_show_lands_by_the_band_on_file(monkeypatch, simulate, tmp_path):
+    """A start state whose wet picture is the dry one hides every toggle; the dry takes' band lands it."""
+
+    def unseen(*_a, **_k):
+        raise ev.EvidenceError("no calibration write showed in the picture")
+
+    monkeypatch.setattr(LT, "measure_latency", unseen)
+    LT.write_latency(tmp_path, lat_for(width=0.0, samples=1), "Other")
+    record = take_and_prove(monkeypatch, simulate, tmp_path, dry=1, working={1: 0})[2]
+    assert record.delta == pytest.approx(DELTA)
+    said = json.loads((tmp_path / LT.LATENCY_FILE).read_text())["takes"]
+    assert [t["program"] for t in said] == ["Other"]
+
+
 def test_a_take_without_a_dry_control_uses_the_last_measured_latency(monkeypatch, simulate, tmp_path):
     """No latency yet is refused before anything plays; with one, the take probes ticks and holds."""
     sim = simulate(lead=120, count=30)

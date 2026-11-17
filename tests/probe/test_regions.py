@@ -138,14 +138,18 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
         6: np.array([0, 1023]),
         11: np.array([0, 1023]),
     }
-    model = SimpleNamespace(resolution=lambda: {p: (0,) for p in values})
+    model = SimpleNamespace(resolution=lambda: {p: (0,) for p in values}, bypass=lambda state: 11)
     monkeypatch.setattr("syncsummoner.program.model", lambda name: model)
     monkeypatch.setattr("syncsummoner.program.gates.representatives", lambda m, p, bits: values[p])
+    cover.write_text(
+        json.dumps({"states": states.tolist(), "chosen": [0, 1], "stepped": {"0": [1, 2, 11], "1": [2]}})
+    )
     argv = ["probe", "sweep", "regions", "p", "--cover", str(cover), "--hold", str(hold), "--source", "c.mkv"]
     argv += ["--audio", "a.wav", "--takes", str(tmp_path), "--budget-s", "900", "--joint", "11:6"]
     assert cli.main(argv) == 0
     chunks, said = L.read_plan(tmp_path / "sweep-p.json")
     regions = said["regions"]
+    assert regions["dims"] == {"0": [1, 2], "1": [2]}
     assert regions["joint"] == 6 and regions["guard_frames"] == 1 + 1 + 2
     assert (
         sum(len(c.states) for c in chunks) == regions["settings"] == sum(regions["per_regime"].values()) + 6
@@ -160,3 +164,10 @@ def test_clip_ti_compares_each_frame_with_the_one_played_before():
     luma[2:4] = [[[0, 2], [0, 2]], [[2, 0], [2, 0]]]
     ti = sweep_cmds.clip_ti(luma, lead=2, tail=2)
     assert ti.tolist() == [1.0, 2.0]
+
+
+def test_region_dims_keep_the_read_stepped_parameters_and_never_the_bypass():
+    record = {"chosen": [0, 2], "stepped": {"0": [1, 2, 11], "2": [3, 9]}}
+    values = {1: np.arange(4), 2: np.arange(4), 3: np.arange(4), 11: np.array([0, 1023])}
+    assert R.region_dims(record, values, 11) == [[1, 2], [3]]
+    assert R.region_dims(record, values, None) == [[1, 2, 11], [3]]
