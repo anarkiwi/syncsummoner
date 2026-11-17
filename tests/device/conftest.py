@@ -130,9 +130,16 @@ class FakeShell(Live):
     def authors(self):
         return ["lzx", "czartroniks"]
 
+    active = "lzx"
+
+    def active_author(self, watch=None):
+        del watch
+        return self.active
+
     def enumerate_author(self, author, watch=None):
         del watch
         self.calls.append(("enumerate", author))
+        self.active = author
 
     @property
     def loads(self):

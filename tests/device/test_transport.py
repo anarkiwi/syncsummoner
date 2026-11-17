@@ -487,3 +487,40 @@ def test_firmware_without_authors_reports_none():
 
     device.shell.authors = authors
     assert tr.Transport(device, DECLARED).authors() is None
+
+
+def _enumerations(device):
+    return [c[1] for c in device.shell.calls if c[0] == "enumerate"]
+
+
+def test_a_program_of_the_active_author_loads_without_rebuilding_its_index(device):
+    port = tr.Transport(device, DECLARED)
+    port.load_program("Passthru")
+    port.load_program("Colorbars")
+    assert not _enumerations(device) and device.shell.loads == ["Passthru", "Colorbars"]
+
+
+@pytest.mark.parametrize(
+    "name,listing,enumerated",
+    [
+        ("czartroniks/Fray", ["Passthru", "czartroniks/Fray"], []),
+        ("czartroniks/Fray", ["Passthru", "czartroniks/fray", "boneoh/FRAY"], ["czartroniks"]),
+        ("czartroniks/Fray", ["Passthru", "czartroniks/Quilt"], ["czartroniks"]),
+        ("czartroniks/YUV_Amp", ["czartroniks/YUV Amp", "boneoh/Quilt"], []),
+    ],
+    ids=["unique", "shared-with-another-author", "unlisted", "underscore-matches-space"],
+)
+def test_another_authors_program_skips_enumeration_only_when_its_name_is_unique(
+    device, name, listing, enumerated
+):
+    """The firmware searches every author for a name the active index lacks; a shared name needs one."""
+    device.programs = lambda: listing
+    port = tr.Transport(device, DECLARED)
+    port.programs()
+    port.load_program(name)
+    assert _enumerations(device) == enumerated
+
+
+def test_an_unlisted_session_enumerates_another_author(device):
+    tr.Transport(device, DECLARED).load_program("czartroniks/Fray")
+    assert _enumerations(device) == ["czartroniks"]
