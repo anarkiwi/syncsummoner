@@ -151,7 +151,8 @@ class Line:
 
     ``frame`` names each bracket's start, -1 for a stray no line meets within the jitter; ``tied``
     starts fit two frames and took the one hiding no frame from the neighbour they were named from.
-    ``slack`` is the most a bracket was widened, ``residual`` the furthest a named one passes the line.
+    ``slack`` is the most a bracket was widened, ``residual`` the furthest a named one passes the line,
+    and ``rejected`` the named starts whose group no line through the largest met.
     """
 
     origin: float
@@ -162,6 +163,7 @@ class Line:
     polygon: Polygon
     tied: int = 0
     mid: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    rejected: int = 0
 
     @property
     def strays(self) -> np.ndarray:
@@ -189,37 +191,50 @@ def fit(
     jitter: float,
     *,
     period: tuple[float, float] | None = None,
+    group: np.ndarray | None = None,
+    resolution: float = 0.0,
 ) -> Line:
     """The frame line through starts bracketed by ``(lo, hi]`` in capture order, ``frame >= 0`` named already.
 
-    Named brackets clip the polygon first; the rest are named outward from them, each by the one frame
-    the polygon admits between its named neighbours'. A bracket missing it by less than ``jitter`` is
-    widened to meet it; a named one missing by more is a :class:`LineError`, any other a stray, -1.
+    Named brackets clip the polygon a ``group`` at a time, the largest first; a later group missing it
+    past ``jitter`` is unnamed again, the first a :class:`LineError`. The rest are named outward, each by
+    the one frame the polygon admits between its named neighbours'; one missing it by less than
+    ``jitter`` is widened to meet it, by more a stray, -1. A start lies a timestamp ``resolution`` past ``lo``.
     """
-    lo, hi = np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
+    lo, hi = np.asarray(lo, dtype=np.float64) + resolution, np.asarray(hi, dtype=np.float64)
     frame = np.asarray(frame, dtype=np.int64).copy()
     named = np.flatnonzero(frame >= 0)
+    group = np.zeros(frame.size, dtype=np.int64) if group is None else np.asarray(group, dtype=np.int64)
     if not named.size:
         if period is None or not frame.size:
             raise LineError("no bracket is named, so nothing fixes the frame line")
         frame[0], named = 0, np.array([0])
-    ends = named[[np.argmin(frame[named]), np.argmax(frame[named])]]
+    ids, sizes = np.unique(group[named], return_counts=True)
+    order_groups = ids[np.argsort(-sizes, kind="stable")]
+    first = named[group[named] == order_groups[0]]
+    ends = first[[np.argmin(frame[first]), np.argmax(frame[first])]]
     if frame[ends[0]] != frame[ends[1]]:
         poly = Polygon.through((int(frame[ends[0]]), int(frame[ends[1]])), lo[ends], hi[ends])
     elif period is not None:
         poly = Polygon.within(int(frame[ends[0]]), float(lo[ends[0]]), float(hi[ends[0]]), period)
     else:
         raise LineError("the named brackets are all one frame's, so nothing fixes the period")
-    worst = 0.0
-    for i in named:
-        miss = poly.meet(int(frame[i]), float(lo[i]), float(hi[i]))
-        if miss > jitter:
+    worst, rejected = 0.0, 0
+    for index, g in enumerate(order_groups):
+        members = named[group[named] == g]
+        before, misses = poly.vertices.copy(), [poly.meet(int(frame[i]), float(lo[i]), float(hi[i])) for i in members]
+        if max(misses) <= jitter:
+            worst = max(worst, *misses)
+            continue
+        if not index:
+            miss = max(misses)
             raise LineError(
-                f"frame {frame[i]}'s start misses every line through the other starts by {miss / 1e6:.3f} ms, "
-                f"past the capture jitter of {jitter / 1e6:.3f} ms",
+                f"frame {frame[members[int(np.argmax(misses))]]}'s start misses every line through the starts "
+                f"before it by {miss / 1e6:.3f} ms, past the capture jitter of {jitter / 1e6:.3f} ms",
                 miss=miss,
             )
-        worst = max(worst, miss)
+        poly.vertices, frame[members], rejected = before, -1, rejected + members.size
+    named = np.flatnonzero(frame >= 0)
     rest = np.setdiff1d(np.arange(frame.size), named)
     if rest.size:
         place = np.searchsorted(named, rest)
@@ -235,11 +250,12 @@ def fit(
         if frame[i] >= 0:
             tied, worst = tied + tie, max(worst, miss)
             insort(order, int(i))
-    return _line(poly, frame, 0.5 * (lo + hi), worst, tied, lo, hi)
+    return _line(poly, frame, 0.5 * (lo + hi), worst, tied, lo, hi, rejected)
 
 
-def extend(line: Line, lo: np.ndarray, hi: np.ndarray, jitter: float) -> Line:
+def extend(line: Line, lo: np.ndarray, hi: np.ndarray, jitter: float, resolution: float = 0.0) -> Line:
     """``line`` carried on over brackets later in capture order than every one it named, as :func:`fit` names them."""
+    lo = np.asarray(lo, dtype=np.float64) + resolution
     poly = Polygon(line.polygon.ref, line.polygon.vertices.copy())
     frame = np.full(np.size(lo), -1, dtype=np.int64)
     low = int(line.frame.max()) if line.frame.size else None
@@ -249,7 +265,7 @@ def extend(line: Line, lo: np.ndarray, hi: np.ndarray, jitter: float) -> Line:
         if frame[i] >= 0:
             low, tied, worst = int(frame[i]), tied + tie, max(worst, miss)
     mid = np.r_[line.mid, 0.5 * (np.asarray(lo, dtype=np.float64) + np.asarray(hi, dtype=np.float64))]
-    return _line(poly, np.r_[line.frame, frame], mid, worst, tied)
+    return _line(poly, np.r_[line.frame, frame], mid, worst, tied, rejected=line.rejected)
 
 
 def _name(
@@ -285,6 +301,7 @@ def _line(
     tied: int,
     lo: np.ndarray | None = None,
     hi: np.ndarray | None = None,
+    rejected: int = 0,
 ) -> Line:
     """The least-squares line in ``poly`` through the named brackets' midpoints."""
     ok = frame >= 0
@@ -295,5 +312,13 @@ def _line(
         at = origin + frame[ok] * p
         residual = max(float(np.max(np.maximum(lo[ok] - at, at - hi[ok]))), worst)
     return Line(
-        origin=origin, period=p, slack=worst, residual=residual, frame=frame, polygon=poly, tied=int(tied), mid=mid
+        origin=origin,
+        period=p,
+        slack=worst,
+        residual=residual,
+        frame=frame,
+        polygon=poly,
+        tied=int(tied),
+        mid=mid,
+        rejected=rejected,
     )

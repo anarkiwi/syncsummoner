@@ -56,6 +56,7 @@ class Attribution:
     ahead: int
     faults: int
     strays: int
+    rejected: int = 0
 
     @property
     def period_ns(self) -> float:
@@ -111,6 +112,7 @@ class Attribution:
             "strips_behind": self.behind,
             "faults": self.faults,
             "strays": self.strays,
+            "rejected": self.rejected,
         }
 
     @property
@@ -128,8 +130,8 @@ class Attribution:
             f"{self.line.residual / 1e6:.3f} of {self.jitter_ns / 1e6:.3f} ms jitter, frame 0 within "
             f"{self.spread_ms:.3f} ms; {self.slips} slips; {self.uncertain} captures on a boundary, "
             f"{self.tied} tied; strips agree {self.agreed}/{self.read}, {self.ahead} ahead, "
-            f"{self.behind} behind, {self.faults} a boundary off; {self.strays} byte changes off the line "
-            f"in the clip; {self.drops} frames lost by the driver"
+            f"{self.behind} behind, {self.faults} a boundary off, {self.rejected} lead strips off the line; "
+            f"{self.strays} byte changes off the line in the clip; {self.drops} frames lost by the driver"
         )
 
 
@@ -172,31 +174,31 @@ def changes(digest: np.ndarray) -> np.ndarray:
     return new & (np.cumsum(length)[:-1] < 3)
 
 
-def anchors(tau: np.ndarray, played: np.ndarray, seg: np.ndarray, period: float) -> np.ndarray:
-    """Strip-named frame starts each run agrees on: the commonest whole-frame offset from its median.
+def anchors(played: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Strip-named frame starts, and each one's group: the run of starts on consecutive frames it is in.
 
-    A program can show a past frame's strip, which puts it whole frames off the rest.
+    A program showing past frames' strips makes a group of its own, which the frame line then refuses.
     """
-    k = np.arange(1, tau.size)
-    start = (seg[k] == seg[k - 1]) & (played[k] >= 0) & (played[k - 1] == played[k] - 1)
-    k = k[start]
-    out = np.full(tau.size, -1, dtype=np.int64)
-    for s in np.unique(seg[k]):
-        mine = k[seg[k] == s]
-        lag = tau[mine] - played[mine] * period
-        whole = np.rint((lag - np.median(lag)) / period).astype(np.int64)
-        values, counts = np.unique(whole, return_counts=True)
-        keep = mine[whole == values[counts.argmax()]]
-        out[keep] = played[keep]
-    return out
+    k = np.arange(1, played.size)
+    k = k[(seg[k] == seg[k - 1]) & (played[k] >= 0) & (played[k - 1] == played[k] - 1)]
+    out, group = np.full(played.size, -1, dtype=np.int64), np.full(played.size, -1, dtype=np.int64)
+    out[k] = played[k]
+    group[k] = np.cumsum(np.r_[True, (np.diff(played[k]) != 1) | (np.diff(seg[k]) != 0)])
+    return out, group
 
 
 def run_line(
-    lo: np.ndarray, hi: np.ndarray, named: np.ndarray, jitter: float, period: tuple[float, float] | None
+    lo: np.ndarray,
+    hi: np.ndarray,
+    named: np.ndarray,
+    jitter: float,
+    period: tuple[float, float] | None,
+    group: np.ndarray | None = None,
+    resolution: float = 0.0,
 ) -> frameline.Line:
     """A run's frame line; strips that miss every line by more than the capture jitter are a :class:`LockError`."""
     try:
-        return frameline.fit(lo, hi, named, jitter, period=period)
+        return frameline.fit(lo, hi, named, jitter, period=period, group=group, resolution=resolution)
     except frameline.LineError as err:
         raise LockError(str(err)) from err
 
@@ -228,11 +230,11 @@ def attribute(
     legible = (codes >= 0) & (clip >= -lead) & (clip < count + tail)
     played = np.where(legible, clip + lead, -1)
     dry = np.where((clip < 0) | (clip >= count), played, -1)
-    named = anchors(tau, dry, seg, hold * vblank)
+    named, group = anchors(dry, seg)
     digest = frames["digest"]
     k = np.flatnonzero(np.r_[False, seg[1:] == seg[:-1]] & (changes(digest) | (named >= 0)))
     runs = np.unique(seg)
-    lines = _lines(tau, k, seg, named, jitter, shown_at)
+    lines = _lines(tau, k, seg, (named, group), (jitter, resolution), shown_at)
     main = lines[max(lines, key=lambda s: int(np.count_nonzero(seg == s)))]
     shown = np.full(tau.size, -1 - lead, dtype=np.int64)
     uncertain = np.zeros(tau.size, dtype=bool)
@@ -267,17 +269,22 @@ def attribute(
         ahead=int(np.count_nonzero(diff > 0)),
         faults=int(np.count_nonzero(uncertain & (np.abs(diff) == 1))),
         strays=int(np.count_nonzero((shown[stray] >= 0) & (shown[stray] < count))),
+        rejected=int(sum(line.rejected for line in lines.values())),
     )
 
 
 def _lines(
-    tau: np.ndarray, k: np.ndarray, seg: np.ndarray, named: np.ndarray, jitter: float, shown_at: np.ndarray
+    tau: np.ndarray, k: np.ndarray, seg: np.ndarray, anchored: tuple, error: tuple, shown_at: np.ndarray
 ) -> dict:
-    """Each run's frame line through its starts ``k``; ``shown_at[n]`` is when the Pi first showed frame ``n``.
+    """Each run's frame line through its starts ``k``, within ``error``: the capture jitter and timestamp resolution.
+
+    ``shown_at[n]`` is when the Pi first showed frame ``n``.
 
     The run with most strip-named frames fixes the period an outage leaves alone and the lag from the
     Pi showing a frame to its start; another run keeps its strips only if they keep that lag too.
     """
+    named, group = anchored
+    jitter, resolution = error
     runs = [int(s) for s in np.unique(seg[k])]
     own = {s: named[k[seg[k] == s]] for s in runs}
     fixed = sorted(
@@ -288,7 +295,7 @@ def _lines(
 
     def fitted(s: int, period: tuple[float, float] | None) -> frameline.Line:
         mine = k[seg[k] == s]
-        return run_line(tau[mine - 1], tau[mine], own[s], jitter, period)
+        return run_line(tau[mine - 1], tau[mine], own[s], jitter, period, group[mine], resolution)
 
     lines = {s: fitted(s, None) for s in fixed}
     period = lines[fixed[0]].polygon.periods

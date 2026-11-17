@@ -79,6 +79,7 @@ def take(
     static=None,
     wet=None,
     tail=0,
+    kink=None,
     seed=0,
 ):
     """Captures ``first..last`` of the card's clock per run ``(first, last, late, lost)``, ``late`` in captures.
@@ -86,7 +87,7 @@ def take(
     The device's frames, locked to the Pi, run ``ppm`` off ``per_frame`` captures from midway between
     the first run's; ``lost`` sequence numbers go before a run and timestamps up to ``jitter_ns`` late.
     Runs in ``strips`` (all by default) read their frame outside the played frames ``wet``, frames in
-    ``static`` show one picture, and ``misread`` is ``(capture, code)``.
+    ``static`` show one picture, ``misread`` is ``(capture, code)`` and ``kink`` ``(frame, ns)`` bends the line.
     """
     capture = hold * VBLANK_NS / per_frame
     period = per_frame * capture * (1 + ppm * 1e-6)
@@ -102,6 +103,8 @@ def take(
         legible.append(np.full(span.size, strips is None or index in strips))
     tau = np.concatenate(times)
     frame = np.floor((tau - origin) / period).astype(np.int64)
+    if kink is not None:
+        frame = np.floor((tau - origin - np.where(frame >= kink[0], kink[1], 0)) / period).astype(np.int64)
     rng = np.random.default_rng(seed)
     frames = np.zeros(tau.size, FRAME)
     frames["sequence"] = np.concatenate(sequence)
