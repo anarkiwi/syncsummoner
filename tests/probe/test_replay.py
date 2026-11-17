@@ -396,3 +396,15 @@ def test_a_delay_every_shift_reaches_selects_none():
     said = R.select_shift(R.pooled_follow(followed(1), 1))
     assert said["shift"] is None and abs(said["pooled_z"][0] - said["pooled_z"][1]) < 1e-9
     assert R.select_shift(np.array([4.0]))["shift"] == 0
+
+
+def test_a_locked_takes_rows_are_scored_against_the_clip_frames_they_played(clip):
+    """Rows name the played frame, lead-in included; the source series starts after it."""
+    frames, (si, ti) = clip[0], clip[1]
+    lead = 7
+    rows = [FrameRow(frame=j, program="p", params=(0,) * 12, setpoint=0, shown=lead + j) for j in range(40)]
+    stimulus = {"frames": PERIOD, "bits": 16, "strip_px": STRIP, "lead": lead}
+    played = [f[:-STRIP, :, 0] for f in frames[:40]]
+    (kept,), how = R.survival_metrics(rows, played, [None] * 40, stimulus, (si, ti))
+    assert how == "take" and kept["motion_follow"] > 0.99
+    assert kept["si_ratio"] == pytest.approx(1.0, abs=1e-3)

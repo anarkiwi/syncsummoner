@@ -511,18 +511,23 @@ def collect(
         bad_frames=disagreeing(seen.proof.applied),
         ambiguity=getattr(seen.found, "ambiguity", None),
     )
-    from syncsummoner import aesthetics  # pylint: disable=import-outside-toplevel
     from syncsummoner.compose import frameline  # pylint: disable=import-outside-toplevel
     from syncsummoner.compose.lock import save_clock  # pylint: disable=import-outside-toplevel
     from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe.footage import source_series  # pylint: disable=import-outside-toplevel
 
     log = read_log(take)
     clock = [dict(said) for said in getattr(seen.found, "clock", ())]
     if clock:
-        source = decoded.features(clip, decoded.Spec.of(config), workers=workers).luma
-        series = aesthetics.information(source.astype(np.float32) / np.float32(255.0))
+        source = decoded.features(clip, decoded.Spec.of(config), workers=workers)
+        series = source_series(source, strip_px=config.strip_px)
         rows = number_runs(
-            rows, clock, frameline.segments(log["t_ns"], log["sequence"]), seen.features.luma, series
+            rows,
+            clock,
+            frameline.segments(log["t_ns"], log["sequence"]),
+            seen.features.luma,
+            series,
+            lead=seen.found.lead,
         )
         save_clock(take, clock)
     save_rows(take, rows)
@@ -544,15 +549,23 @@ def collect(
 
 
 def number_runs(
-    rows: list[FrameRow], clock: list[dict], seg: np.ndarray, luma: np.ndarray, series: tuple
+    rows: list[FrameRow],
+    clock: list[dict],
+    seg: np.ndarray,
+    luma: np.ndarray,
+    series: tuple,
+    *,
+    lead: int = 0,
 ) -> list:
     """Each clock-numbered run's one numbering, chosen jointly over its settings where their follow says.
 
     A run the clock leaves several candidates is numbered by the highest; every shift back to the lowest is
     scored over the run's settings at that shift's own leads and pooled (:func:`replay.pooled_follow`). A
     shift that beats every other (:func:`replay.select_shift`) renumbers the run's rows, ambiguity none;
-    otherwise they keep it. Each run's ``clock`` record gains its ``selection``.
+    otherwise they keep it. Each run's ``clock`` record gains its ``selection``. ``series`` is the clip's
+    :func:`footage.source_series`, and rows' played frames reach it through :func:`footage.source_frame`.
     """
+    from syncsummoner.probe.footage import source_frame  # pylint: disable=import-outside-toplevel
     from syncsummoner.probe.replay import (  # pylint: disable=import-outside-toplevel
         _measured,
         pooled_follow,
@@ -570,7 +583,7 @@ def number_runs(
             continue
         mine = (seg[: len(rows)] == said["run"]) & (setpoint != GAP) & (shown >= 0)
         measured = [
-            _measured(frames, members, shown[members], series, len(series[0]))
+            _measured(frames, members, source_frame(shown[members], lead), series, len(series[0]))
             for k in np.unique(setpoint[mine])
             for members in [np.flatnonzero(mine & (setpoint == k))]
         ]
