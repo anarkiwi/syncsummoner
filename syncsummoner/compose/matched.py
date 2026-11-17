@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 import numpy as np
+from scipy.special import ndtri_exp  # pylint: disable=no-name-in-module
 from scipy.stats import chi2, norm
 
 from syncsummoner.aesthetics.survival import SIGMA
@@ -85,12 +86,24 @@ def fisher_z(p: np.ndarray) -> tuple[float, float]:
 
     Serial dependence shrinks the statistic and its degrees of freedom by ``n_eff / n`` (Brown).
     """
-    if not p.size:
+    return fisher_z_log(np.log(p))
+
+
+def fisher_z_log(log_p: np.ndarray) -> tuple[float, float]:
+    """:func:`fisher_z` from the p values' logarithms, so p values too small for a float still combine.
+
+    Past where the chi-squared tail underflows, the statistic is mapped by Wilson and Hilferty's cube root.
+    """
+    if not log_p.size:
         return 0.0, 0.0
-    terms = -2.0 * np.log(p)
+    terms = -2.0 * np.asarray(log_p, dtype=np.float64)
     n_eff = effective(terms)
-    stat = float(terms.sum()) * n_eff / p.size
-    return float(norm.isf(chi2.sf(stat, 2.0 * n_eff))), n_eff
+    stat, df = float(terms.sum()) * n_eff / log_p.size, 2.0 * n_eff
+    tail = chi2.logsf(stat, df)
+    if np.isfinite(tail):
+        return float(-ndtri_exp(tail)), n_eff
+    spread = 2.0 / (9.0 * df)
+    return float(((stat / df) ** (1.0 / 3.0) - (1.0 - spread)) / math.sqrt(spread)), n_eff
 
 
 def effective(u: np.ndarray) -> float:

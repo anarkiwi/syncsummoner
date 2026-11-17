@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -37,6 +37,7 @@ __all__ = [
     "owners",
     "plan_sweep",
     "read_plan",
+    "number_runs",
     "realized",
     "recorded",
     "rows_path",
@@ -510,6 +511,20 @@ def collect(
         bad_frames=disagreeing(seen.proof.applied),
         ambiguity=getattr(seen.found, "ambiguity", None),
     )
+    from syncsummoner import aesthetics  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import frameline  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose.lock import save_clock  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
+
+    log = read_log(take)
+    clock = [dict(said) for said in getattr(seen.found, "clock", ())]
+    if clock:
+        source = decoded.features(clip, decoded.Spec.of(config), workers=workers).luma
+        series = aesthetics.information(source.astype(np.float32) / np.float32(255.0))
+        rows = number_runs(
+            rows, clock, frameline.segments(log["t_ns"], log["sequence"]), seen.features.luma, series
+        )
+        save_clock(take, clock)
     save_rows(take, rows)
     kept = {r.setpoint for r in rows if r.setpoint != GAP}
     judged = verdict(chunk, seen.proof.landed, disagreeing(seen.proof.applied), seen.found.picked.size)
@@ -524,7 +539,52 @@ def collect(
         "setpoints": len(chunk.states),
         "setpoints_kept": len(kept),
         "rows_measured": sum(1 for r in rows if r.setpoint != GAP),
+        "numbering": [{k: c.get(k) for k in ("run", "candidates", "selection")} for c in clock],
     }
+
+
+def number_runs(
+    rows: list[FrameRow], clock: list[dict], seg: np.ndarray, luma: np.ndarray, series: tuple
+) -> list:
+    """Each clock-numbered run's one numbering, chosen jointly over its settings where their follow says.
+
+    A run the clock leaves several candidates is numbered by the highest; every shift back to the lowest is
+    scored over the run's settings at that shift's own leads and pooled (:func:`replay.pooled_follow`). A
+    shift that beats every other (:func:`replay.select_shift`) renumbers the run's rows, ambiguity none;
+    otherwise they keep it. Each run's ``clock`` record gains its ``selection``.
+    """
+    from syncsummoner.probe.replay import (  # pylint: disable=import-outside-toplevel
+        _measured,
+        pooled_follow,
+        select_shift,
+    )
+
+    setpoint = np.array([r.setpoint for r in rows], dtype=np.int64)
+    shown = np.array([r.shown for r in rows], dtype=np.int64)
+    frames = list(luma)
+    for said in clock:
+        found = said["candidates"]
+        span = max(found) - min(found)
+        if not span:
+            said["selection"] = {"shift": 0, "numbering": max(found)}
+            continue
+        mine = (seg[: len(rows)] == said["run"]) & (setpoint != GAP) & (shown >= 0)
+        measured = [
+            _measured(frames, members, shown[members], series, len(series[0]))
+            for k in np.unique(setpoint[mine])
+            for members in [np.flatnonzero(mine & (setpoint == k))]
+        ]
+        chosen = select_shift(pooled_follow(measured, span))
+        said["selection"] = {
+            **chosen,
+            "numbering": None if chosen["shift"] is None else max(found) - chosen["shift"],
+        }
+        if chosen["shift"] is not None:
+            at = np.flatnonzero(seg[: len(rows)] == said["run"])
+            for c in at:
+                moved = rows[c].shown - chosen["shift"] if rows[c].shown >= 0 else rows[c].shown
+                rows[c] = replace(rows[c], shown=moved, ambiguity=0)
+    return rows
 
 
 def disagreeing(applied: Any) -> np.ndarray:

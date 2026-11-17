@@ -440,6 +440,17 @@ how many frames earlier the others put them. The lock record's `clock` keeps, pe
 candidates, the period range, the three latencies and the frame a gap's rounding would name, a
 cross-check only. The Pi's flip log disagreeing with the strips is then reported, never acted on.
 
+A run has one numbering, so where the clock leaves several, `probe sweep collect` chooses jointly over
+the run's settings (`locked.number_runs`): every shift back from the highest candidate scores each
+setting's follow at that shift's own leads, the best lead's z Bonferroni over them as a one-sided p,
+and pools the settings by Fisher's combination (`replay.pooled_follow`, `matched.fisher_z`). A shift
+whose pooled z beats every other's by more than the bound for a difference of two unit z scores,
+`matched.critical` over the shifts after dividing by the square root of two, renumbers the run, its
+ambiguity gone and its leads points (`replay.select_shift`); otherwise the run keeps its candidates'
+union. Nothing assumes a program's delay is not negative. The selection, pooled z per shift and margin
+join the run's `clock` record, which `collect` writes into the take's lock record (`lock.save_clock`,
+`lock.read_clock`) beside the keys the capture wrote.
+
 ## The analog input decodes luma and sync only
 
 Composite fed straight in yields zero chroma under both NTSC and PAL while luma
