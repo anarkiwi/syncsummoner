@@ -73,9 +73,12 @@ def test_each_setpoint_keeps_the_frames_after_it_settled_until_the_next_lands():
     count = chunk.frames
     picked = np.arange(count) * 2
     shown = np.repeat(np.arange(count), 2)
+    landed = landed_from(chunk, late=[(1, 1)])
+    lead_out = landed[-1:].copy()
+    lead_out["target"], lead_out["landed"], lead_out["param"], lead_out["value"] = count, count, 11, 1023
     rows = L.settled_rows(
         chunk,
-        landed_from(chunk, late=[(1, 1)]),
+        np.concatenate([landed, lead_out]),
         picked=picked,
         shown=shown,
         captured=np.arange(shown.size) / 60.0,
