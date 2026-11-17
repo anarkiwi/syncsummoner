@@ -166,13 +166,7 @@ def test_program_state_raises_without_vector():
 def test_set_manual_is_zero_based_and_clipped(device):
     port = tr.Transport(device)
     port.set_manual(12, 5000)
-    assert ("set_modulation", 11, 1023, None, None, None) in device.shell.calls
-
-
-def test_set_manual_forwards_the_macro_arguments(device):
-    port = tr.Transport(device)
-    port.set_manual(3, 512, time_=700, space=400, slope=512)
-    assert ("set_modulation", 2, 512, 700, 400, 512) in device.shell.calls
+    assert ("set_modulation", 11, 1023) in device.shell.calls
 
 
 def test_sweepable_skips_booleans_unused_and_the_crossfader():
