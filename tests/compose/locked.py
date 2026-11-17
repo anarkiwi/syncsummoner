@@ -207,6 +207,10 @@ class Proof:
         """The report as JSON."""
         return json.dumps({"ok": self.ok})
 
+    def schedule(self) -> list:
+        """Undetermined parameters to sweep; none."""
+        return []
+
 
 def locked_pass(monkeypatch, played=None, transport=None, *, proof=None, **kwargs):
     """A :class:`Played` rig on its own clock, its frame-locked take and evidence logged rather than run.

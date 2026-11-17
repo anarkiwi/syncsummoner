@@ -364,6 +364,7 @@ def _attempt(
         raise
     proof = locktake.take_evidence(out, program=program, clip=clip, config=config)
     locktake.evidence_path(out).write_text(proof.to_json(), encoding="utf-8")
+    locktake.add_schedule(Path(out).parent, proof.schedule())
     for line in proof.lines():
         LOG.info("%s", line)
     if not proof.ok:

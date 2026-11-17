@@ -293,7 +293,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.device.recorder import FFV1, Recorder, require_ffmpeg
     from syncsummoner.device.transport import Transport
     from syncsummoner.probe.archive import FrameArchive
-    from syncsummoner.probe.harvest import HarvestConfig, harvest, prepare_footage
+    from syncsummoner.probe.harvest import HarvestConfig, harvest, prepare_footage, read_focus
 
     if args.format not in SESSION_FORMATS:
         raise ValueError(f"unknown format {args.format!r}; known: {', '.join(SESSION_FORMATS)}")
@@ -308,6 +308,7 @@ def _harvest_cmd(args: argparse.Namespace) -> int:
         dwell_s=args.dwell,
         seed=args.seed,
         route=args.route,
+        focus=read_focus(args.schedule) if args.schedule else (),
     )
     host = {} if args.source_host is None else {"host": args.source_host}
     player: Any = LoopPlayer(width=config.width, height=config.height, **host)
@@ -791,6 +792,10 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     collect.add_argument("--out", default="archive/")
     collect.add_argument("--format", default="1080p30", help="session format the rig runs at")
     collect.add_argument("--setpoints", type=int, default=32)
+    collect.add_argument(
+        "--schedule",
+        help="a render's schedule.json: undetermined parameters, swept with the steps each needs",
+    )
     collect.add_argument("--dwell", type=float, default=1.0, help="seconds held per setpoint")
     collect.add_argument("--seed", type=int, default=11)
     collect.add_argument(

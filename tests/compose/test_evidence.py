@@ -469,11 +469,24 @@ def verdict(**kw):
         (verdict(steps=0), "Gain", True, True, "no step landed"),
         (verdict(partners=(2, 3)), "Gain", True, True, "even with P2, P3"),
         (verdict(flat=0.75), "Gain", True, True, "uniform field at 75%"),
-        (verdict(), "Gain", True, True, "ignores it in this state"),
+        (verdict(effect=0.1, scatter=0.5, reference=5.0), "Gain", True, True, "ignores it in this state"),
+        (verdict(effect=0.1, scatter=5.0, reference=2.0), "Gain", True, True, "steps would decide it"),
+        (verdict(), "Gain", True, True, "no parameter in the take moved"),
     ],
 )
 def test_why_not_names_the_earliest_broken_link(moved, name, applied_ok, landed_ok, reason):
     assert reason in ev.why_not(moved, name, applied_ok, landed_ok)
+
+
+def test_a_verdict_is_acted_upon_no_effect_or_undetermined_by_power():
+    """No effect needs the steps' bound below the least acted-upon effect; else steps are scheduled."""
+    assert verdict(z=4.0).verdict == "acted upon" and verdict(z=4.0).steps_needed == 0
+    none = verdict(effect=0.1, scatter=0.5, reference=5.0)
+    assert none.detectable == pytest.approx(3.0 * 0.5 / np.sqrt(5.0)) and none.verdict == "no effect"
+    weak = verdict(effect=0.1, scatter=5.0, reference=2.0)
+    assert weak.verdict == "undetermined" and weak.steps_needed == int(np.ceil((3.0 * 5.0 / 2.0) ** 2))
+    assert verdict().verdict == "undetermined" and verdict().steps_needed == 0
+    assert verdict(effect=0.1, scatter=0.0, reference=2.0, effective=0.0).detectable == np.inf
 
 
 def evidence(loaded_ok=True, received=None):
@@ -516,7 +529,7 @@ def test_evidence_reports_per_parameter_verdicts():
     assert table[1]["why_not"] == "the firmware did not take it" and table[1]["on_target"] == 1
     lines = proof.lines()
     assert any("only together with P2" in line for line in lines)
-    assert any("NOT acted upon: the firmware did not take it" in line for line in lines)
+    assert any("the firmware did not take it" in line for line in lines)
     assert any("4 messages sent" in line for line in lines)
     said = json.loads(proof.to_json())
     assert said["ok"] is False and said["disagree"] == [[0, 2, 4, 20, 0]] and len(said["parameters"]) == 2

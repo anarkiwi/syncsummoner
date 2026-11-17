@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -505,11 +505,42 @@ class Moved:
     flat: float
     jointly: int
     partners: tuple[int, ...] = ()
+    effect: float = float("nan")
+    scatter: float = float("nan")
+    reference: float = float("nan")
 
     @property
     def moved(self) -> bool:
         """Whether the steps moved the picture beyond chance, family-wise."""
         return self.z > self.critical
+
+    @property
+    def detectable(self) -> float:
+        """The least mean step score these steps would tell from none at the family-wise bound."""
+        return self.critical * self.scatter / math.sqrt(self.effective) if self.effective > 0 else math.inf
+
+    @property
+    def verdict(self) -> str:
+        """``acted upon``; ``no effect`` if its steps exclude the least acted-upon effect; else undetermined.
+
+        The equivalence bound is the steps' mean score plus :attr:`detectable`; it must fall below
+        :attr:`reference`, the smallest mean step score of a parameter the take found acted upon.
+        """
+        if self.moved:
+            return "acted upon"
+        if np.isfinite(self.reference) and self.effect + self.detectable < self.reference:
+            return "no effect"
+        return "undetermined"
+
+    @property
+    def steps_needed(self) -> int:
+        """Steps whose bound would exclude :attr:`reference` with no effect at this scatter; 0 if decided."""
+        if self.verdict != "undetermined" or not np.isfinite(self.reference) or self.reference <= 0:
+            return 0
+        if not np.isfinite(self.scatter) or self.scatter <= 0:
+            return 0
+        need = (self.critical * self.scatter / self.reference) ** 2
+        return int(math.ceil(need * self.steps / max(self.effective, 1.0)))
 
 
 def frame_change(stack: np.ndarray) -> np.ndarray:
@@ -620,17 +651,18 @@ def acted_upon(
         if not alone.size:
             alone = mine
             partners = tuple(sorted({p for f, p in pairs if f in set(mine.tolist()) and p != param}))
-        best = (np.zeros(0), 0.0, -math.inf, lags[0])
+        best = (np.zeros(0), 0.0, -math.inf, lags[0], np.zeros(0))
         for lag in lags:
             x = alone + lag
             x = x[measured[x]]
             if not (x.size and null.size):
                 continue
-            p_e = tail_p(matched_scores(d_out, d_src, x, controls, quantum), null)
+            score = matched_scores(d_out, d_src, x, controls, quantum)
+            p_e = tail_p(score, null)
             z, n_eff = fisher_z(p_e)
             if z > best[2]:
-                best = (p_e, n_eff, z, lag)
-        p_e, n_eff, z, lag = best
+                best = (p_e, n_eff, z, lag, np.clip(score, *np.percentile(null, [0, 100])))
+        p_e, n_eff, z, lag, score = best
         verdicts.append(
             Moved(
                 param=param,
@@ -644,16 +676,20 @@ def acted_upon(
                 flat=float(np.mean(luma_range[alone] <= FLAT_CODES)) if alone.size else float("nan"),
                 jointly=int(mine.size - alone.size) if not partners else int(mine.size),
                 partners=partners,
+                effect=float(score.mean()) if score.size else float("nan"),
+                scatter=float(score.std(ddof=1)) if score.size > 1 else float("nan"),
             )
         )
-    return verdicts
+    acted = [v.effect for v in verdicts if v.moved and np.isfinite(v.effect)]
+    floor = min(acted) if acted else float("nan")
+    return [replace(v, reference=floor) for v in verdicts]
 
 
 def why_not(moved: Moved, name: str, applied_ok: bool, landed_ok: bool) -> str:
-    """The reason a parameter is not acted upon, from the earliest link of the chain that broke.
+    """Why a parameter is not acted upon, from the earliest link of the chain that broke.
 
     A picture that was a uniform field at most of the steps, as a take's ``mostly_picture`` counts,
-    had nothing to move.
+    had nothing to move. Past the chain, the verdict says whether the steps could have shown it.
     """
     partners = ", P".join(map(str, moved.partners))
     reasons = (
@@ -661,12 +697,27 @@ def why_not(moved: Moved, name: str, applied_ok: bool, landed_ok: bool) -> str:
         (not applied_ok, "the firmware did not take it"),
         (name.strip() in ("-", ""), "the program leaves the slot unused"),
         (moved.steps == 0, "no step landed inside the clip's measured frames"),
-        (bool(moved.partners), f"never moved the picture, even with P{partners} changing at once"),
         (2 * moved.flat > 1, f"the picture was a uniform field at {moved.flat:.0%} of its steps"),
     )
-    return next(
-        (why for broke, why in reasons if broke),
-        "the firmware took it but the picture did not move: the program ignores it in this state",
+    broke = next((why for broken, why in reasons if broken), None)
+    if broke is not None:
+        return broke
+    joint = f", even with P{partners} changing at once" if moved.partners else ""
+    if moved.verdict == "no effect":
+        return (
+            f"no effect{joint}: its steps exclude a mean score of {moved.reference:.1f}, "
+            "the least the take's "
+            "acted-upon parameters show; the firmware took it and the program ignores it in this state"
+        )
+    if not np.isfinite(moved.reference):
+        return (
+            f"undetermined{joint}: no parameter in the take moved the picture, "
+            "so no effect size to test against"
+        )
+    return (
+        f"undetermined{joint}: {moved.steps} steps detect only a mean score of {moved.detectable:.1f}, "
+        f"against {moved.reference:.1f} for the least acted-upon parameter; "
+        f"about {moved.steps_needed} steps would decide it"
     )
 
 
@@ -715,11 +766,24 @@ class Evidence:
                     "critical_z": round(verdict.critical, 2),
                     "lag": verdict.lag,
                     "acted_upon": verdict.moved,
+                    "verdict": verdict.verdict,
+                    "effect": round(verdict.effect, 2),
+                    "detectable": round(verdict.detectable, 2),
+                    "reference": round(verdict.reference, 2),
+                    "steps_needed": verdict.steps_needed,
                     "with": list(verdict.partners),
                     "why_not": None if verdict.moved else why_not(verdict, verdict.name, agree, on_time),
                 }
             )
         return out
+
+    def schedule(self) -> list[dict]:
+        """Undetermined parameters and the steps a sweep would need to decide each."""
+        return [
+            {"program": self.program, "param": v.param, "name": v.name, "steps": v.steps_needed}
+            for v in self.moved
+            if v.steps_needed
+        ]
 
     def lines(self) -> list[str]:
         """The report as log lines."""
@@ -735,7 +799,7 @@ class Evidence:
         if self.received is not None:
             said.append(f"{self.program}: {self.received.summary()}")
         for row in self.table():
-            verdict = "acted upon" if row["acted_upon"] else f"NOT acted upon: {row['why_not']}"
+            verdict = "acted upon" if row["acted_upon"] else row["why_not"]
             if row["acted_upon"] and row["with"]:
                 verdict += f" only together with P{', P'.join(map(str, row['with']))}"
             said.append(
@@ -761,6 +825,7 @@ class Evidence:
                 "disagree": self.applied.disagree.tolist(),
                 "late": self.landed.rows[self.landed.rows["landed"] > self.landed.rows["target"]].tolist(),
                 "parameters": self.table(),
+                "schedule": self.schedule(),
             },
             indent=1,
             default=float,

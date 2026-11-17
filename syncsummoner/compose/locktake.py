@@ -569,11 +569,23 @@ def take_evidence(
     ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
     images = small_frames(take, size=CALIBRATION_SIZE, strip_px=config.strip_px, ffmpeg=ffmpeg)
     used = json.loads(str(wire["latency"])) if "latency" in wire else {}
-    lat = ev.Latency(lo=used.get("lo", np.nan), hi=used.get("hi", np.nan), samples=0, period=times.period)
+    if "lo" in used:
+        lat = ev.Latency(lo=used["lo"], hi=used["hi"], samples=used.get("samples", 0), period=times.period)
+    else:
+        lat = read_latency(Path(take).parent) if Path(take).parent.joinpath(LATENCY_FILE).is_file() else None
     if json.loads(str(wire["dry"])) is not None and calibration.size:
         later = sends["t0_ns"][(sends["target"] > ev.START) & (sends["t0_ns"] > calibration["t1_ns"].max())]
         until = float(later.min()) if later.size else None
-        lat = measure_latency(images, frames, found, calibration, times, until)
+        try:
+            lat = measure_latency(images, frames, found, calibration, times, until)
+        except ev.EvidenceError as err:
+            if lat is None:
+                raise
+            LOG.warning("%s: %s; using the band measured live in the lead-in", take, err)
+    if lat is None:
+        raise ev.EvidenceError(
+            f"{take}: no CC-to-picture latency, measured or on file, to land its writes by"
+        )
     ticks, delta = ev.grid(times, lat), lat.delta
     plan = wire["plan"]
     landed_rows = ev.landed(plan, sends, ticks, times, delta)
@@ -600,6 +612,17 @@ def take_evidence(
         moved=moved,
         loaded=loaded_before(program, wire, ticks, times, delta),
     )
+
+
+def add_schedule(directory: str | Path, entries: list[dict]) -> Path:
+    """Merge a take's undetermined parameters into the directory's ``schedule.json``, by program."""
+    path = Path(directory, "schedule.json")
+    kept = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+    programs = {e["program"] for e in entries}
+    path.write_text(
+        json.dumps([e for e in kept if e["program"] not in programs] + entries, indent=1), encoding="utf-8"
+    )
+    return path
 
 
 def evidence_path(take: str | Path) -> Path:

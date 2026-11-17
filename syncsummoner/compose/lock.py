@@ -271,7 +271,8 @@ def attribute(
     per_frame = max(1, int(round(period / capture_ns)))
     clip = signed(np.asarray(codes, dtype=np.int64), bits)
     played = np.where((codes >= 0) & (clip >= -lead) & (clip < count), clip + lead, -1)
-    anchor, slot0 = anchor_run(runs, played, per_frame)
+    led = np.where(clip < 0, played, -1)
+    anchor, slot0 = anchor_run(runs, led if (led >= 0).any() else played, per_frame)
     new = np.r_[False, frames["digest"][1:] != frames["digest"][:-1]]
     first_up = {int(f): s for f, s in zip(up[::-1], starts[::-1])}
     a_first, a_last = runs[anchor]

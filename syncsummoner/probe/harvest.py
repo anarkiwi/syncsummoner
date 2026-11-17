@@ -113,6 +113,8 @@ class HarvestConfig:
     loop_seed: int = 7
     #: A prepared timecoded clip played in place of the codeframe loop; None plays the loop.
     footage: str | None = None
+    #: Per program, parameters a render's evidence left undetermined and the steps each needs.
+    focus: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -223,6 +225,33 @@ def verify_readback(session: Any, setpoint: int, want: Sequence[int]) -> None:
             f"setpoint {setpoint}: P{', P'.join(map(str, wrong))} read back "
             f"{[got[i - 1] for i in wrong]}, sent {[int(want[i - 1]) for i in wrong]}"
         )
+
+
+def focus_vectors(program: str, info: Any, config: HarvestConfig) -> list[dict]:
+    """One-at-a-time steps across each parameter ``config.focus`` names for ``program``, evenly spaced.
+
+    These are the parameters a render's evidence could not decide; their steps follow the sweep.
+    """
+    out = []
+    for name, param, steps in config.focus:
+        spec = next((p for p in info.params if p.index == param), None)
+        if name != program or spec is None or steps < 1:
+            continue
+        values = (
+            [bool(k % 2) for k in range(steps)]
+            if spec.kind is ParamKind.BOOLEAN
+            else np.linspace(0.0, 1.0, steps)
+        )
+        out.extend({param: v if isinstance(v, bool) else float(v)} for v in values)
+    return out
+
+
+def read_focus(path: str | Path) -> tuple[tuple[str, int, int], ...]:
+    """A render's ``schedule.json`` as ``(program, param, steps)`` triples."""
+    return tuple(
+        (e["program"], int(e["param"]), int(e["steps"]))
+        for e in json.loads(Path(path).read_text(encoding="utf-8"))
+    )
 
 
 def sweep(
@@ -568,7 +597,7 @@ def harvest_program(
             windows = sweep(
                 session,
                 base,
-                sweep_vectors(info, config, rng),
+                sweep_vectors(info, config, rng) + focus_vectors(program, info, config),
                 config=config,
                 sleep=sleep,
                 clock=clock,
