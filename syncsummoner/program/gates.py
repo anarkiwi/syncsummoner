@@ -82,6 +82,20 @@ def representatives(m: ProgramModel, param: int, live_bits: Sequence[int]) -> np
     return np.sort(np.array([g[len(g) // 2] for g in groups], dtype=np.int64))
 
 
+def tour(values: np.ndarray, base: int) -> np.ndarray:
+    """``values`` in the order of a closed walk from ``base`` and back that moves at most two settings a step.
+
+    Every closed walk on a line that reaches both ends moves ``2 * (max - min)`` in all; this one, the
+    evens ascending and the odds descending, also keeps each move to the next setting but one.
+    The walk starts beside ``base`` and ends beside it; ``base`` itself is left out.
+    """
+    line = np.union1d(np.asarray(values, dtype=np.int64), [int(base)])
+    cycle = np.r_[np.arange(0, line.size, 2), np.arange(line.size - 1 - (line.size % 2 == 1), 0, -2)]
+    at = int(np.flatnonzero(line[cycle] == int(base))[0])
+    walk = line[np.roll(cycle, -at)[1:]]
+    return walk[np.isin(walk, values)]
+
+
 def probe_steps(values: np.ndarray) -> list[tuple[int, int]]:
     """Lowest to middle and middle to highest setting: two steps that between them span every bit."""
     lo, mid, hi = int(values[0]), int(values[len(values) // 2]), int(values[-1])
@@ -239,14 +253,17 @@ class Cover:
         return [i for i in self.chosen if param in self.stepped.get(i, [])]
 
     def vectors(self) -> list[tuple[np.ndarray, np.ndarray]]:
-        """``(from, to)`` full states in sweep order: each base state, then one parameter at a time off it."""
+        """``(from, to)`` full states in sweep order: each base state, then one parameter at a time off it.
+
+        Each parameter's settings are walked by :func:`tour` from the base value and back.
+        """
         out, prev = [], self.reference
         for i in self.chosen:
             base = self.states[i]
             out.append((prev, base))
             prev = base
             for p in self.stepped.get(i, []):
-                for v in self.schedule(i, p):
+                for v in tour(self.schedule(i, p), int(base[p - 1])):
                     if int(v) != int(prev[p - 1]):
                         out.append((prev, _apply(prev, [(p, int(v))])))
                         prev = out[-1][1]

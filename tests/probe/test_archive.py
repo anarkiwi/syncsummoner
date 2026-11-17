@@ -709,3 +709,12 @@ def test_has_resumes_only_against_the_same_stimulus(tmp_path, stored, asked, hel
     assert archive.has("bitcrush", KEY, stimulus=asked) is held
     assert archive.has("bitcrush", KEY) is True
     assert archive.has("bitcrush", ProgramKey("bitcrush", "cafe", KeyKind.BINARY), stimulus=asked) is False
+
+
+def test_a_row_names_the_clip_frame_it_shows_and_old_rows_name_none():
+    from syncsummoner.probe.archive import GAP, FrameRow  # pylint: disable=import-outside-toplevel
+
+    row = FrameRow(frame=1, program="p", params=(0,) * 12, setpoint=2, captured=1.5, shown=40)
+    assert FrameRow.from_row(row.as_row()) == row
+    old = {k: v for k, v in row.as_row().items() if k != "shown"}
+    assert FrameRow.from_row(old).shown == GAP

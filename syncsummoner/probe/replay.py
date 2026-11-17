@@ -141,11 +141,17 @@ def clip_series(archive: Any, meta: dict[str, Any]) -> tuple[np.ndarray, np.ndar
     return source_series(Path(archive.directory) / stimulus["clip"], strip_px=int(stimulus["strip_px"]))
 
 
-def _survival_frames(frames: Iterable[np.ndarray], into: list) -> Iterator[np.ndarray]:
-    """Pass frames through, keeping each in 8-bit luma area-scaled to the clip series' size."""
-    for frame in frames:
-        luma = cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_RGB2GRAY)  # pylint: disable=no-member
-        into.append(cv2.resize(luma, INSPECT_SIZE, interpolation=cv2.INTER_AREA))  # pylint: disable=no-member
+def _survival_frames(frames: Iterable[np.ndarray], into: list, keep: np.ndarray | None = None) -> Iterator[np.ndarray]:
+    """Pass frames through, keeping each ``keep`` marks (all by default) in 8-bit luma at the clip series' size.
+
+    A frame not kept is held as None, so indices still follow the stream.
+    """
+    for index, frame in enumerate(frames):
+        if keep is not None and not (index < keep.size and keep[index]):
+            into.append(None)
+        else:
+            luma = cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_RGB2GRAY)  # pylint: disable=no-member
+            into.append(cv2.resize(luma, INSPECT_SIZE, interpolation=cv2.INTER_AREA))  # pylint: disable=no-member
         yield frame
 
 
@@ -190,13 +196,18 @@ def survival_metrics(
 ) -> tuple[list[dict[str, float]], str]:
     """Per setpoint group, in :func:`group` order, what it kept of the clip, and how the clock was found.
 
-    Captures are attributed to clip frames by the fitted clock and ordered unwrapped, so a dwell
-    across the loop's wrap stays consecutive; with no clock every group comes back empty.
+    A locked take names the clip frame of every capture it keeps; otherwise captures are attributed
+    by the fitted clock and ordered unwrapped, so a dwell across the loop's wrap stays consecutive.
+    With neither, every group comes back empty.
     """
     rows = rows[: len(frames)]
     setpoint = np.array([row.setpoint for row in rows], dtype=np.int64)
     live = np.flatnonzero(setpoint != GAP)
     groups = np.split(live, np.flatnonzero(np.diff(setpoint[live]) != 0) + 1) if live.size else []
+    named = np.array([row.shown for row in rows], dtype=np.int64)
+    period = int(stimulus["frames"])
+    if live.size and np.all(named[live] >= 0):
+        return [_kept(frames, members, named[members], series, period) for members in groups], "take"
     times = np.array([row.captured for row in rows], dtype=np.float64)
     bits, strip_px = int(stimulus["bits"]), int(stimulus["strip_px"])
     codes = np.array(
@@ -212,7 +223,6 @@ def survival_metrics(
         return [{} for _ in groups], how
     shown = attribute(times, model)
     unwrapped = np.rint((times - model.origin) / model.interval).astype(np.int64)
-    period = int(stimulus["frames"])
     return [
         _kept(frames, picked, unwrapped[picked], series, period)
         for members in groups
@@ -245,6 +255,8 @@ def replay_program(
     if reader is None:
         return Replayed(records, profile, found, [f"{program}: no committed archive"])
     footage, stimulus = is_footage(reader.meta), stimulus_of(reader.meta)
+    live = np.array([row.setpoint != GAP for row in reader.rows], dtype=bool)
+    named = bool(live.any()) and all(row.shown >= 0 for row in reader.rows if row.setpoint != GAP)
     spread = [] if footage else B.dwells(reader.rows)
     natives: dict[int, np.ndarray] = {}
     strips: list[np.ndarray] = []
@@ -256,10 +268,10 @@ def replay_program(
                 native=B.positions(spread),
                 into=natives,
                 strip_px=int(stimulus.get("strip_px", 0)) if footage else 0,
-                strips=strips if footage else None,
+                strips=strips if footage and not named else None,
             )
         ) as passes:
-            frames = _survival_frames(passes, small) if footage else passes
+            frames = _survival_frames(passes, small, live if named else None) if footage else passes
             records = _records(
                 group((row, frame) for frame, row in zip(frames, reader.rows)),
                 reader,
