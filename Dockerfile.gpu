@@ -38,9 +38,13 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
+# dd's Cython bindings to CUDD, built against the CUDD release dd pins and verifies.
+ARG DD=0.6.0
 RUN python3 -c "import tomllib; p = tomllib.load(open('pyproject.toml', 'rb'))['project']; \
 print('\n'.join(p['dependencies'] + p['optional-dependencies']['audio']))" > /tmp/requirements.txt \
     && python3 -m venv /venv \
+    && /venv/bin/pip install --no-cache-dir cython setuptools wheel \
+    && DD_FETCH=1 DD_CUDD=1 /venv/bin/pip install --no-cache-dir --no-binary dd --no-build-isolation "dd==${DD}" \
     && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt "pyvmancer[all]>=0.6.5"
 
 FROM deps AS runtime
