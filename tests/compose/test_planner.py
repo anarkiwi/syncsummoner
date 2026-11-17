@@ -431,18 +431,10 @@ def test_thin_defers_a_release_it_cannot_settle_rather_than_latching_the_toggle(
     assert P.thin(back, profile, fps=FPS).values.tolist() == [1023], "a change undone in time is no change"
 
 
-def test_the_style_sets_the_wet_range_and_the_caller_can_override_it(features):
+def test_a_composed_score_states_no_wet_band(features):
     profiles = {"glitch": make_profile("glitch")}
-    rng = np.random.default_rng(3)
-    glitchy = P.search(profiles, features, style="glitchy", rng=rng, budget=6, fps=FPS)
-    assert glitchy.wet == (P.DEFAULT_WET[0], 1.0)
-    calm = P.search(profiles, features, style="smooth", rng=rng, budget=6, fps=FPS)
-    assert calm.wet == P.DEFAULT_WET
-    chosen = P.search(profiles, features, style="smooth", rng=rng, budget=6, fps=FPS, wet=(0.3, 0.9))
-    assert chosen.wet == (0.3, 0.9)
-    fader = P.plan_automation(chosen, profiles)[0]
-    values = fader.values[fader.indices == 12]
-    assert values.size == 0 or (values.min() >= round(0.3 * 1023) and values.max() <= round(0.9 * 1023))
+    score = P.search(profiles, features, style="glitchy", rng=np.random.default_rng(3), budget=6, fps=FPS)
+    assert "wet" not in score.meta and "morph" not in P.STYLES["glitchy"]
 
 
 def _footage(seconds, fps=FPS, seed=0):

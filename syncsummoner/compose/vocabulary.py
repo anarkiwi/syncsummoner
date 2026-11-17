@@ -20,17 +20,10 @@ from syncsummoner.device.profile import (
     ParamKind,
     ParamSpec,
     ProgramProfile,
-    Role,
     Tongue,
 )
 
 CONTINUOUS_KINDS = (ParamKind.CONTINUOUS, ParamKind.QUANTIZED)
-#: Roles a gesture may drive freely; a bypass never, the wet control only through ``morph``.
-EFFECT_ROLES = (Role.EFFECT,)
-#: Roles a pulse may drive, being released again before it ends.
-PULSE_ROLES = (Role.EFFECT, Role.MOMENTARY)
-#: The whole wet range, as fractions of the control's travel.
-FULL_WET = (0.0, 1.0)
 
 
 class Anchor(enum.Enum):
@@ -120,7 +113,6 @@ class GestureContext:
     axis: Axis
     rng: np.random.Generator
     targets: tuple[int, ...] = ()
-    wet: tuple[float, float] = FULL_WET
 
 
 Renderer = Callable[[ProgramProfile, GestureContext], Automation]
@@ -180,18 +172,16 @@ def step_margin(spec: ParamSpec) -> int:
     return max(1, int(round(PARAM_MAX / (2 * (n - 1)))))
 
 
-def drivable(spec: ParamSpec, *, kinds=CONTINUOUS_KINDS, roles=EFFECT_ROLES) -> bool:
-    """Whether a gesture of this sort may write the parameter at all."""
-    return spec.kind in kinds and spec.role in roles
+def drivable(spec: ParamSpec, *, kinds=CONTINUOUS_KINDS) -> bool:
+    """Whether a gesture of this sort may write the parameter: its declared kind is one of ``kinds``."""
+    return spec.kind in kinds
 
 
-def targets(
-    profile: ProgramProfile, axis: Axis, *, kinds=CONTINUOUS_KINDS, roles=EFFECT_ROLES, n: int = 1
-) -> list[ParamSpec]:
+def targets(profile: ProgramProfile, axis: Axis, *, kinds=CONTINUOUS_KINDS, n: int = 1) -> list[ParamSpec]:
     """Most sensitive drivable parameters on a canonical axis, falling back to any drivable one."""
-    pool = [p for p in profile.by_axis(axis) if drivable(p, kinds=kinds, roles=roles)]
+    pool = [p for p in profile.by_axis(axis) if drivable(p, kinds=kinds)]
     if not pool:
-        pool = [p for p in profile.params if drivable(p, kinds=kinds, roles=roles)]
+        pool = [p for p in profile.params if drivable(p, kinds=kinds)]
     return sorted(pool, key=lambda p: -p.sensitivity)[:n]
 
 
@@ -202,16 +192,12 @@ def _grid(ctx: GestureContext, span: float | None = None) -> np.ndarray:
     return np.linspace(ctx.arrival - span, ctx.arrival, n)
 
 
-def _pick(
-    profile: ProgramProfile, ctx: GestureContext, kinds=CONTINUOUS_KINDS, roles=EFFECT_ROLES
-) -> ParamSpec | None:
+def _pick(profile: ProgramProfile, ctx: GestureContext, kinds=CONTINUOUS_KINDS) -> ParamSpec | None:
     if ctx.targets:
-        chosen = [
-            p for p in profile.params if p.index in ctx.targets and drivable(p, kinds=kinds, roles=roles)
-        ]
+        chosen = [p for p in profile.params if p.index in ctx.targets and drivable(p, kinds=kinds)]
         if chosen:
             return chosen[0]
-    found = targets(profile, ctx.axis, kinds=kinds, roles=roles)
+    found = targets(profile, ctx.axis, kinds=kinds)
     return found[0] if found else None
 
 
@@ -282,7 +268,7 @@ def _lock_snap(profile: ProgramProfile, ctx: GestureContext) -> Automation:
 
 @_register("punch", Anchor.ONSET, "effect_buttons")
 def _punch(profile: ProgramProfile, ctx: GestureContext) -> Automation:
-    spec = _pick(profile, ctx, kinds=(ParamKind.BOOLEAN,), roles=PULSE_ROLES)
+    spec = _pick(profile, ctx, kinds=(ParamKind.BOOLEAN,))
     if spec is None:
         return Automation.empty()
     dwell = max(ctx.duration, 2.0 / ctx.rate)
@@ -292,19 +278,6 @@ def _punch(profile: ProgramProfile, ctx: GestureContext) -> Automation:
             Automation.of([ctx.arrival + dwell], spec.index, 0),
         ]
     )
-
-
-@_register("morph", Anchor.PHRASE, "crossfader")
-def _morph(profile: ProgramProfile, ctx: GestureContext) -> Automation:
-    fader = next(iter(profile.by_role(Role.WET)), None)
-    if fader is None:
-        return Automation.empty()
-    t = _grid(ctx)
-    parts = [Automation.of(t, fader.index, PARAM_MAX * np.linspace(*ctx.wet, t.size))]
-    for spec in targets(profile, ctx.axis, n=2):
-        lo, hi = safe_range(spec)
-        parts.append(Automation.of([t[0]], spec.index, ctx.rng.integers(lo, hi)))
-    return Automation.concat(parts)
 
 
 @_register("hysteresis_loop", Anchor.TWO_BAR, "hysteresis")

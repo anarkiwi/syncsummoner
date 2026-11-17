@@ -12,8 +12,10 @@ from typing import Any, Callable, Iterable, Mapping
 
 from pyvmancer.errors import DeviceGoneError
 
+from syncsummoner.device.declared import declaration
 from syncsummoner.device.profile import ParamSpec
 from syncsummoner.device.transport import ProgramInfo
+from syncsummoner.program.library import Library
 from syncsummoner.probe.archive import PROGRAM_INFO
 from syncsummoner.probe.harvest import GONE_NOTE
 from syncsummoner.progress import track
@@ -31,10 +33,16 @@ class NamesReport:
     gone: bool = False
 
 
-def archived_specs(meta: Mapping[str, Any] | None) -> list[ParamSpec] | None:
-    """Parameter specs from an archive's stored ``program info``, or None where it has none."""
+def archived_specs(
+    meta: Mapping[str, Any] | None, program: str, library: Library | None = None
+) -> list[ParamSpec] | None:
+    """Specs from an archive's stored ``program info``, typed by ``program``'s declaration; None without one.
+
+    Raises :class:`~syncsummoner.device.declared.UndeclaredProgramError` when no
+    ``.vmprog`` declares ``program``.
+    """
     payload = (meta or {}).get(PROGRAM_INFO)
-    return None if payload is None else ProgramInfo.from_json(payload).params
+    return None if payload is None else ProgramInfo.from_json(payload, declaration(program, library)).params
 
 
 def plain_name(program: str) -> str:

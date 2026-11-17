@@ -18,7 +18,7 @@ from syncsummoner.device.session import CC_BUDGET_HZ
 from syncsummoner.progress import LOG, track
 from syncsummoner import aesthetics
 from syncsummoner.compose.features import Features, Section, information_content, phrases
-from syncsummoner.compose.score import DEFAULT_WET, GestureInstance, Layer, Score, control_rate, program_key
+from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext
 
 EPS = 1e-12
@@ -53,7 +53,6 @@ STYLES: dict[str, dict[str, float]] = {
         "detune_drift": 2.0,
         "lock_snap": 1.0,
         "punch": 3.0,
-        "morph": 1.0,
         "hysteresis_loop": 2.0,
     },
     "smooth": {
@@ -63,14 +62,10 @@ STYLES: dict[str, dict[str, float]] = {
         "detune_drift": 2.0,
         "lock_snap": 1.0,
         "punch": 0.2,
-        "morph": 3.0,
         "hysteresis_loop": 0.5,
     },
 }
 DESTROY_STYLES = frozenset({"glitchy"})
-#: Wet range per style, as fractions of the wet control's travel. Neither end blacks the
-#: output on any archived program, so the range is a look: ``glitchy`` reaches fully wet.
-STYLE_WET: dict[str, tuple[float, float]] = {"glitchy": (DEFAULT_WET[0], 1.0)}
 
 
 @dataclass(frozen=True)
@@ -609,7 +604,6 @@ def search(
     style: str = "default",
     rng: np.random.Generator,
     budget: int = 48,
-    wet: tuple[float, float] | None = None,
     fps: float = 60.0,
     n_passes: int = 1,
     population: int = 6,
@@ -640,7 +634,6 @@ def search(
         meta={
             "style": style,
             "density": density,
-            "wet": list(wet or STYLE_WET.get(style, DEFAULT_WET)),
             "bar": audio.bar_duration,
             "phrase_bars": audio.phrase_bars,
         },

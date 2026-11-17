@@ -24,7 +24,6 @@ from syncsummoner.device.profile import (
     ParamSpec,
     ProgramProfile,
     Tongue,
-    classify_role,
 )
 from syncsummoner.probe.runner import STABILITY_ORDER
 
@@ -479,7 +478,6 @@ def fit_profile(
             native_max=1.0,
             kind=kind,
             steps=steps,
-            role=classify_role(j + 1, f"p{j + 1}"),
         )
         if j not in varying or not names:
             fitted.append(spec)

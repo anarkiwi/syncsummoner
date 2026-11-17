@@ -291,6 +291,11 @@ def test_raw_params_encodes_booleans_at_the_rails():
     )
 
 
+def test_raw_params_keeps_integers_in_device_units():
+    """Integers are device units, floats fractions of travel."""
+    assert runner.raw_params({3: 682, 5: 0.5, 6: 1023})[2:6] == (682, 0, 512, PARAM_MAX)
+
+
 def test_allow_untagged_ignores_a_spuriously_decoded_index():
     """Untagged playout has no strip, so any decoded index is noise, not a mismatch."""
     rng = np.random.default_rng(4)

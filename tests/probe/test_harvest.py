@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from pyvmancer import CcMapError, DeviceGoneError, PortBusyError, ProgramLoadError, ShellError
 
-from syncsummoner.device.profile import CROSSFADER_INDEX, ParamKind
+from syncsummoner.device.profile import ParamKind
 from syncsummoner.device import recorder as recorder_mod
 from syncsummoner.device.recorder import BlankTakeError, InputRouteError, TakeReport, inspect_take
 from syncsummoner.device.session import Session
@@ -19,11 +19,11 @@ from syncsummoner.probe import harvest as H
 from syncsummoner.probe.archive import CODEFRAMES, GAP, same_stimulus
 from syncsummoner.probe.store import KeyKind, ProgramKey, slug
 from tests import transmitter as tx
-from tests.device.conftest import COLORBARS_INFO, FakeClock, FakeTransport, Readback
+from tests.device.conftest import COLORBARS_DECLARED, COLORBARS_INFO, FakeClock, FakeTransport, Readback
 from tests.device.test_liveness import mjpeg, needs_ffmpeg
 
 FIRMWARE = "1.0.0-rc.37"
-INFO = ProgramInfo.from_json(COLORBARS_INFO)
+INFO = ProgramInfo.from_json(COLORBARS_INFO, COLORBARS_DECLARED)
 KEY = ProgramKey("Alpha", FIRMWARE, KeyKind.NAME_FIRMWARE)
 CONFIG = H.HarvestConfig(
     width=64,
@@ -120,7 +120,11 @@ class Port(Readback):
         return dict(self.info)
 
     def program_info(self, name=None):
-        return ProgramInfo.from_json(self.program_payload(name))
+        return self.describe(self.program_payload(name))
+
+    @staticmethod
+    def describe(payload):
+        return ProgramInfo.from_json(payload, COLORBARS_DECLARED)
 
     def file_hash(self, path):
         del path
@@ -302,21 +306,16 @@ def window(setpoint, start, end):
     return H.Window(setpoint, tuple([setpoint] * 12), start, end)
 
 
-def test_sweep_includes_the_crossfader_like_any_other_continuous_effect():
-    """Pinning P12 open produced false blank takes; it now sweeps 0..100% too."""
+def test_sweep_varies_every_declared_parameter_and_nothing_else():
     vectors = H.sweep_vectors(INFO, CONFIG, np.random.default_rng(0))
-    assert vectors and all(CROSSFADER_INDEX in v for v in vectors)
-    values = {v[CROSSFADER_INDEX] for v in vectors}
-    assert len(values) > 1, "a fixed value would be the same regression as pinning it open"
+    assert vectors and all(set(v) == {p.index for p in INFO.used} for v in vectors)
+    assert len({v[12] for v in vectors}) > 1, "P12 is swept as the continuous control it is declared"
     booleans = {p.index for p in INFO.params if p.kind is ParamKind.BOOLEAN}
-    assert booleans and all(booleans <= set(v) for v in vectors), "booleans change the picture"
+    assert booleans == {7, 8, 9, 10, 11}
 
 
-def test_sweep_still_forces_the_crossfader_even_when_the_program_calls_every_slot_null():
-    """It gates output even where ``program info`` names it ``Null 12``."""
-    info = ProgramInfo.from_json({"name": "Null", "parameters": [{"name": "-", "min": 0, "max": 100}] * 12})
-    vectors = H.sweep_vectors(info, CONFIG, np.random.default_rng(0))
-    assert vectors and all(set(v) == {CROSSFADER_INDEX} for v in vectors)
+def test_sweep_of_an_undeclared_program_is_one_empty_vector():
+    assert H.sweep_vectors(ProgramInfo.from_json(COLORBARS_INFO), CONFIG, np.random.default_rng(0)) == [{}]
 
 
 def test_sweep_of_a_program_reporting_no_parameters_at_all_is_one_empty_vector():
@@ -335,15 +334,14 @@ def test_a_window_opens_only_once_the_parameters_have_settled():
 
 
 def test_a_window_carries_the_whole_commanded_state_not_only_the_swept_slots():
-    """P12 gates the output and is held open off-sweep, so a zero there misreads the state."""
     clock = FakeClock()
     session = Sess(Readback())
     base = session.working_point(INFO)
     session.set_params(base)
-    windows = H.sweep(session, base, [{1: 0.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
-    parked = H.raw_params(base)[CROSSFADER_INDEX - 1]
-    assert parked and len(windows[0].params) == 12
-    assert windows[0].params[CROSSFADER_INDEX - 1] == parked
+    windows = H.sweep(session, base, [{2: 0.0}], config=CONFIG, sleep=clock.sleep, clock=clock)
+    held = H.raw_params(base)[2]
+    assert held and len(windows[0].params) == 12
+    assert windows[0].params[2] == held and windows[0].params[1] == 0
 
 
 def test_a_frame_is_attributed_to_the_setpoint_that_was_being_held_when_it_arrived():
@@ -965,6 +963,7 @@ def test_a_real_session_holds_the_link_down_for_the_load_command_only(tmp_path):
     port.firmware = lambda: FIRMWARE
     port.program_info = lambda name=None: INFO
     port.program_payload = lambda name=None: dict(COLORBARS_INFO)
+    port.describe = Port.describe
     port.close = lambda: calls.append("close")
 
     def load(name, hold=None):

@@ -169,6 +169,15 @@ def test_one_program_is_measured_fitted_and_read_from_one_decode(loop):
     assert any("no program info archived" in note for note in result.notes)
 
 
+def test_an_undeclared_program_is_refitted_unnamed_with_the_reason_noted(loop, monkeypatch):
+    def undeclared(meta, program):
+        raise R.UndeclaredProgramError(f"no single .vmprog declares {program!r}")
+
+    monkeypatch.setattr(R, "archived_specs", undeclared)
+    result = R.replay_program(Archive({"p": sweep()}), "p", analyzer=FakeAnalyzer(), loop=loop)
+    assert result.profile is not None and "p: no single .vmprog declares 'p'" in result.notes
+
+
 def test_a_program_the_archive_does_not_hold_is_a_note(loop):
     result = R.replay_program(Archive({}), "absent", analyzer=FakeAnalyzer(), loop=loop)
     assert not result.records and result.profile is None and result.notes == ["absent: no committed archive"]

@@ -324,7 +324,7 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ),
         ("render", ["--audio", "--fade", "--fade-in", "--fade-out", "--no-master", "--take"]),
         ("audition", ["--seconds", "--start", "--audio", "--fade", "--cut-programs"]),
-        ("compose", ["--density", "--style", "--budget", "--passes", "--format", "--wet"]),
+        ("compose", ["--density", "--style", "--budget", "--passes", "--format"]),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe names", ["--archive", "--program"]),
         ("score show", ["--profiles"]),
@@ -554,12 +554,6 @@ def test_score_show_prints_the_audit_and_fails_on_a_flag(monkeypatch, tmp_path, 
     monkeypatch.setattr(cli, "_profiles_in", lambda directory: {})
     assert cli.main(["score", "show", str(path)]) == 1
     assert "layer 0: missing  ! no profile" in capsys.readouterr().out
-
-
-def test_compose_wet_is_a_range_of_fractions():
-    assert cli._wet(None) is None and cli._wet("0.2,1") == (0.2, 1.0)
-    with pytest.raises(ValueError, match="--wet"):
-        cli._wet("0.9,0.1")
 
 
 def test_render_timing_flags_reach_the_config(monkeypatch, tmp_path):

@@ -12,16 +12,24 @@ from pyvmancer import CcMapError
 
 from syncsummoner.device import journal as jn
 from syncsummoner.device import session as sess_mod
-from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, Role
+from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
 from syncsummoner.device.session import (
     AddressingError,
     ParkError,
     Session,
     to_device,
 )
-from syncsummoner.device.transport import Transport
+from syncsummoner.device.transport import ProgramInfo, Transport
 
-from .conftest import FakeCapture, FakeClock, FakeTransport, GatedLink, videomancer
+from .conftest import (
+    COLORBARS_DECLARED,
+    COLORBARS_INFO,
+    FakeCapture,
+    FakeClock,
+    FakeTransport,
+    GatedLink,
+    videomancer,
+)
 
 _TICK = iter(float(n) for n in range(1, 100000))
 
@@ -75,15 +83,6 @@ def test_park_drives_manual_and_zeroes_midi():
     assert np.all(port.midi == 0)
     assert np.all(port.program_state() == 0)
     assert sum(1 for c in port.calls if c[0] == "manual") == PARAM_COUNT
-
-
-def test_park_zeroes_the_crossfader_too():
-    """A crossfader parked at max would clip every offset for it to zero."""
-    port = FakeTransport(manual=[512] * PARAM_COUNT)
-    session, _, _ = make_session(port)
-    session.park()
-    assert port.manual[sess_mod.CROSSFADER_INDEX - 1] == 0
-    assert session.park_values[sess_mod.CROSSFADER_INDEX - 1] == 0
 
 
 def test_park_verifies_readback():
@@ -316,36 +315,19 @@ def _spec(index, name, kind):
     return ParamSpec(index=index, name=name, native_min=0, native_max=100, kind=kind)
 
 
-def test_working_point_opens_the_output_and_skips_driven_slots():
-    info = _info(
-        [
-            _spec(1, "Posterize", ParamKind.CONTINUOUS),
-            _spec(2, "Flag", ParamKind.BOOLEAN),
-            _spec(3, "-", ParamKind.UNUSED),
-            _spec(12, "Null 12", ParamKind.CONTINUOUS),
-        ]
-    )
-    port = FakeTransport()
-    session, _, _ = make_session(port)
-    point = session.working_point(info, exclude=[1])
-    assert 1 not in point and 3 not in point
-    assert point[2] is False
-    assert point[sess_mod.CROSSFADER_INDEX] == 0.5
+def test_working_point_is_the_declared_initial_state_short_of_driven_slots():
+    info = ProgramInfo.from_json(COLORBARS_INFO, COLORBARS_DECLARED)
+    session, port, _ = make_session()
+    point = session.working_point(info, exclude=[2])
+    assert point == {3: 1023, 5: 512, 6: 682, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0}
+    session.park()
+    session.set_params(point)
+    assert [int(port.program_state()[i - 1]) for i in (3, 5, 6)] == [1023, 512, 682]
 
 
-def test_working_point_forces_the_crossfader_even_when_the_program_calls_it_unused():
-    """It gates output even where ``program info`` names it ``Null 12``."""
-    info = _info([_spec(12, "-", ParamKind.UNUSED)])
-    port = FakeTransport()
-    session, _, _ = make_session(port)
-    assert session.working_point(info) == {sess_mod.CROSSFADER_INDEX: 0.5}
-
-
-def test_working_point_holds_a_bypass_off_whatever_its_range():
-    bypass = ParamSpec(index=11, name="Bypass", native_min=0, native_max=4, kind=ParamKind.QUANTIZED)
-    bypass.role = Role.BYPASS
+def test_an_undeclared_program_has_no_working_point():
     session, _, _ = make_session(FakeTransport())
-    assert session.working_point(_info([bypass]))[11] is False
+    assert not session.working_point(ProgramInfo.from_json(COLORBARS_INFO))
 
 
 def test_ensure_live_resyncs_once_then_raises():

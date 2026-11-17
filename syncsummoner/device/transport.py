@@ -14,7 +14,7 @@ from typing import Any, Callable, ContextManager, Iterable, Iterator, Mapping, S
 import numpy as np
 import pyvmancer as vm
 
-from pyvmancer.const import ABSENT_COMMAND_CODES, ParamRole, classify_param
+from pyvmancer.const import ABSENT_COMMAND_CODES
 from pyvmancer.diagnose import diagnose_video
 from pyvmancer.route import read_route
 from pyvmancer.shell import DEFAULT_AUTHOR
@@ -22,17 +22,12 @@ from pyvmancer.video import VideoStatus
 
 from syncsummoner.progress import LOG
 
-from .profile import CROSSFADER_INDEX, PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec, Role, classify_role
+from syncsummoner.program.library import Library
+from syncsummoner.program.vmprog import ProgramConfig
 
-#: Native ranges no wider than a default OAT sweep are enumerable, not swept.
-DEFAULT_SAMPLE_STEPS = 32
-#: pyvmancer classifies a slot; this maps its vocabulary onto the profile schema.
-ROLE_TO_KIND = {
-    ParamRole.CONTINUOUS: ParamKind.CONTINUOUS,
-    ParamRole.BOOLEAN: ParamKind.BOOLEAN,
-    ParamRole.QUANTIZED: ParamKind.QUANTIZED,
-    ParamRole.UNASSIGNED: ParamKind.UNUSED,
-}
+from .declared import declaration, initial_value, specs
+from .profile import PARAM_COUNT, PARAM_MAX, ParamKind, ParamSpec
+
 #: Combined (Manual + Modulation + MIDI) output keys, in order of preference.
 COMBINED_KEYS = ("o", "out", "output", "combined")
 #: Stored manual value keys.
@@ -92,46 +87,37 @@ def transmitting(status: VideoStatus, timing: str) -> bool | None:
 
 @dataclass(frozen=True)
 class ProgramInfo:
-    """A program's name and its twelve parameter specs, as the device reports them."""
+    """A program's name and its twelve parameter specs: labels as the device reports, kinds as declared."""
 
     name: str
     params: list[ParamSpec] = field(default_factory=list)
     program_id: int | None = None
+    declared: ProgramConfig | None = None
 
     @classmethod
-    def from_json(cls, data: Mapping[str, Any], *, steps: int = DEFAULT_SAMPLE_STEPS) -> "ProgramInfo":
-        """Parse a ``program info`` payload into ``ParamSpec`` objects."""
-        params = []
-        for index, entry in enumerate(data.get("parameters", ()), start=1):
-            name = str(entry.get("name", ""))
-            low, high = float(entry.get("min", 0)), float(entry.get("max", 0))
-            sampling, count = classify_param(name, low, high, sweep_steps=steps)
-            role = classify_role(index, name)
-            kind = ParamKind.CONTINUOUS if role is Role.WET else ROLE_TO_KIND[sampling]
-            params.append(
-                ParamSpec(
-                    index=index,
-                    name=name,
-                    native_min=low,
-                    native_max=high,
-                    kind=kind,
-                    steps=None if role is Role.WET else count,
-                    role=role,
-                )
-            )
-        return cls(name=str(data.get("name", "")), params=params, program_id=data.get("id"))
+    def from_json(cls, data: Mapping[str, Any], declared: ProgramConfig | None = None) -> "ProgramInfo":
+        """Parse a ``program info`` payload; every slot ``declared`` leaves undeclared is UNUSED."""
+        names = {i: str(entry.get("name", "")) for i, entry in enumerate(data.get("parameters", ()), start=1)}
+        return cls(
+            name=str(data.get("name", "")),
+            params=specs(declared, names),
+            program_id=data.get("id"),
+            declared=declared,
+        )
 
     @property
     def used(self) -> list[ParamSpec]:
-        """Parameters this program actually assigns."""
+        """Parameters this program actually declares."""
         return [p for p in self.params if p.kind is not ParamKind.UNUSED]
 
-    def sweepable(self, count: int | None = None, *, exclude: Iterable[int] = ()) -> list[ParamSpec]:
-        """Parameters worth sweeping: continuous or quantized, never the crossfader.
+    @property
+    def initial(self) -> dict[int, int]:
+        """Each declared parameter's initial value in device units, by 1-based index."""
+        return {d.parameter_id: initial_value(d) for d in self.declared.params} if self.declared else {}
 
-        The crossfader gates the output, so sweeping it black-holes the sample.
-        """
-        skip = set(exclude) | {CROSSFADER_INDEX}
+    def sweepable(self, count: int | None = None, *, exclude: Iterable[int] = ()) -> list[ParamSpec]:
+        """Declared continuous or quantized parameters, short of ``exclude``."""
+        skip = set(exclude)
         out = [
             p
             for p in self.params
@@ -147,9 +133,10 @@ class Transport:
     modulation verbs take 0-based slots and the conversion happens here.
     """
 
-    def __init__(self, device: Any):
+    def __init__(self, device: Any, library: Library | None = None):
         self._device = device
         self.cc_faults: list[dict[str, Any]] = []
+        self._library = library
         self._loaded: str | None = None
         self._held: str | None = None
         self._authored: bool | None = None
@@ -161,14 +148,14 @@ class Transport:
         serial: str | None = None,
         report: Callable[[str], None] | None = LOG.info,
         stall: float | None = None,
+        library: Library | None = None,
     ) -> "Transport":
-        """Open both control links to an attached device.
+        """Open both control links to an attached device, declarations read from ``library``.
 
-        Loads and other device-side work wait for as long as the device stays on
-        USB, reporting progress to ``report``; ``stall`` is pyvmancer's opt-in
-        guard, failing a wait once nothing observable changes for that long.
+        Device-side waits last while the device stays on USB, reporting to ``report``;
+        ``stall`` is pyvmancer's opt-in guard, failing once nothing observable changes.
         """
-        transport = cls(vm.Videomancer.open(serial_number=serial))
+        transport = cls(vm.Videomancer.open(serial_number=serial), library)
         if transport.device.has_shell:
             transport.device.shell.report, transport.device.shell.stall = transport.annotate(report), stall
         return transport
@@ -313,7 +300,20 @@ class Transport:
         The device reports a plain name that does not say which author it came
         from, so only a program this transport loaded counts as current.
         """
-        return ProgramInfo.from_json(self.program_payload(name))
+        return self.describe(self.program_payload(name))
+
+    def describe(self, payload: Mapping[str, Any]) -> ProgramInfo:
+        """A ``program info`` payload of the loaded program, typed by that program's own declaration.
+
+        Raises :class:`~syncsummoner.device.declared.UndeclaredProgramError` when no
+        ``.vmprog`` or firmware image declares it.
+        """
+        loaded = (
+            self._loaded if self._loaded and self._loaded.rpartition("/")[2] == payload.get("name") else None
+        )
+        return ProgramInfo.from_json(
+            payload, declaration(loaded or str(payload.get("name", "")), self._library)
+        )
 
     def program_payload(self, name: str | None = None) -> dict[str, Any]:
         """The device's own ``program info`` reply, unparsed, so it can be archived as is."""

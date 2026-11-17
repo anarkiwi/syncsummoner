@@ -23,6 +23,7 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 from syncsummoner import aesthetics
+from syncsummoner.device.declared import UndeclaredProgramError
 from syncsummoner.device.profile import MeasurementRecord, ProgramProfile, Source
 from syncsummoner.device.recorder import INSPECT_SIZE
 from syncsummoner.probe import behaviour as B
@@ -288,9 +289,14 @@ def replay_program(
         except Exception as exc:
             notes.append(f"{program}: survival not measured ({type(exc).__name__}: {exc})")
     if records:
-        specs = archived_specs(reader.meta)
-        if specs is None:
-            notes.append(f"{program}: no program info archived, so parameters stay unnamed")
+        try:
+            specs = archived_specs(reader.meta, program)
+        except UndeclaredProgramError as exc:
+            specs = None
+            notes.append(f"{program}: {exc}")
+        else:
+            if specs is None:
+                notes.append(f"{program}: no program info archived, so parameters stay unnamed")
         profile = fit_profile(records, specs=specs)
     return Replayed(records, profile, found, notes)
 

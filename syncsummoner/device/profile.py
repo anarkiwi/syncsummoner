@@ -8,7 +8,6 @@ editing the composer.
 from __future__ import annotations
 
 import enum
-import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Mapping, Sequence
 
@@ -17,59 +16,15 @@ import numpy as np
 PARAM_COUNT = 12
 PARAM_MAX = 1023
 BOOL_THRESHOLD = 512
-#: The crossfader; it gates output even where `program info` names it `Null 12`.
-CROSSFADER_INDEX = 12
 
 
 class ParamKind(enum.Enum):
-    """Parameter type. Determines how a plan samples it."""
+    """Parameter type, as the program declares it. Determines how a plan samples it."""
 
     CONTINUOUS = "continuous"
     BOOLEAN = "boolean"
     QUANTIZED = "quantized"
     UNUSED = "unused"
-
-
-class Role(enum.Enum):
-    """What a parameter does to the program as a whole, which decides what may drive it.
-
-    A bypass returns the input unprocessed, so automating it reads as the effect
-    switching off; the wet control blends the effect with its input; a momentary
-    control acts on its rising edge and is pulsed, never held.
-    """
-
-    EFFECT = "effect"
-    BYPASS = "bypass"
-    WET = "wet"
-    MOMENTARY = "momentary"
-
-
-#: Words in a program's own parameter label that name a role other than an effect.
-ROLE_WORDS = {
-    "bypass": Role.BYPASS,
-    "reset": Role.MOMENTARY,
-    "trigger": Role.MOMENTARY,
-    "retrig": Role.MOMENTARY,
-    "serve": Role.MOMENTARY,
-    "fire": Role.MOMENTARY,
-    "impulse": Role.MOMENTARY,
-}
-#: Labels the crossfader slot carries when it blends the effect with its input.
-WET_WORDS = frozenset({"mix", "blend", "fader", "fade", "wet", "dry"})
-#: Words of a label that names no function: unassigned slots and unnamed fallbacks.
-PLACEHOLDER_WORDS = frozenset({"null", "none", "p"})
-
-
-def classify_role(index: int, name: str) -> Role:
-    """Role of one parameter from its slot and the label its program gives it.
-
-    The crossfader slot is the wet control unless its program labels it as
-    something else, since it gates output even where it is left unnamed.
-    """
-    words = set(re.findall(r"[a-z]+", name.lower()))
-    if index == CROSSFADER_INDEX and (words & WET_WORDS or words <= PLACEHOLDER_WORDS):
-        return Role.WET
-    return next((role for word, role in ROLE_WORDS.items() if word in words), Role.EFFECT)
 
 
 class Axis(enum.Enum):
@@ -128,7 +83,6 @@ class ParamSpec:
     kind: ParamKind = ParamKind.CONTINUOUS
     axis: Axis = Axis.UNASSIGNED
     steps: int | None = None
-    role: Role = Role.EFFECT
     response: list[float] = field(default_factory=list)
     values: list[int] = field(default_factory=list)
     #: Measured value of each proxy metric at each visited setpoint, parallel to ``values``.
@@ -265,10 +219,6 @@ class ProgramProfile:
     registered: float = 0.0
     binary_hash: str = ""
 
-    def by_role(self, *roles: Role) -> list[ParamSpec]:
-        """Parameters holding any of ``roles``."""
-        return [p for p in self.params if p.role in roles]
-
     def by_axis(self, axis: Axis) -> list[ParamSpec]:
         """Parameters assigned to a canonical axis, so gestures stay program-agnostic."""
         return [p for p in self.params if p.axis is axis]
@@ -322,7 +272,6 @@ def _param_from_dict(data: Mapping[str, Any]) -> ParamSpec:
         kind=ParamKind(data.get("kind", "continuous")),
         axis=Axis(data.get("axis", "unassigned")),
         steps=data.get("steps"),
-        role=Role(data["role"]) if data.get("role") else classify_role(data["index"], data["name"]),
         response=list(data.get("response", ())),
         values=list(data.get("values", ())),
         measured={k: [float(v) for v in vs] for k, vs in (data.get("measured") or {}).items()},
