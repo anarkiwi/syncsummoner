@@ -184,10 +184,10 @@ def test_a_real_decoder_either_matches_on_the_gpu_or_falls_back(tmp_path):
 def test_digest_covers_every_frame_in_order(tmp_path):
     """Two decodes agree only if every frame does, in the same order."""
     reader, made = vulkan_reader(tmp_path)
-    reader.stream = lambda width=None: iter(made)
+    reader.stream = lambda start=0, count=None, width=None: iter(made)
     expected = hashlib.sha256(b"".join(f.tobytes() for f in made)).hexdigest()
     assert decoders.digest(reader) == (expected, len(made))
-    reader.stream = lambda width=None: iter(made[::-1])
+    reader.stream = lambda start=0, count=None, width=None: iter(made[::-1])
     assert decoders.digest(reader)[0] != expected
 
 

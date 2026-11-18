@@ -168,6 +168,14 @@ def test_cover_spares_one_destroyed_bar_and_reports_what_it_cannot_cover():
     assert "no take is alive there" in str(spans[0])
 
 
+def test_a_bar_is_judged_in_the_cut_its_middle_falls_in():
+    kept = aesthetics.Survival(10, 1.0, 1.0, 1.0, 1.0, 0.9, 0, 5.0)
+    sliver = T.Verdict(2.0, 2.1, kept, T.Fault.FROZEN)
+    verdicts = {"a": [verdict(0), verdict(1), sliver], "b": [verdict(0), verdict(1), verdict(2.0)]}
+    cuts, spans = T.cover([R.Cut(0.0, 2.04, "a")], verdicts)
+    assert cuts == [R.Cut(0.0, 2.04, "a")] and not spans
+
+
 def test_the_report_names_alignments_and_failures():
     model = F.ClockModel(1.0 + 1 / 60, 1 / 30)
     traces = {
@@ -182,6 +190,12 @@ def test_the_report_names_alignments_and_failures():
 
 def test_bar_edges_end_on_the_duration():
     assert list(T.bar_edges(5.0, 2.0, FPS)) == [0, 60, 120, 150]
+
+
+def test_bars_are_the_planners_split_at_every_cut():
+    cuts = [R.Cut(0.0, 1.5, "a"), R.Cut(1.5, 5.0, "b")]
+    assert list(T.bar_edges(5.0, 2.0, FPS, cuts=cuts)) == [0, 45, 60, 120, 150]
+    assert list(T.bar_edges(5.0, 2.0, FPS, downbeats=[0.5, 2.4, 4.3], cuts=cuts)) == [0, 15, 45, 72, 129, 150]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")

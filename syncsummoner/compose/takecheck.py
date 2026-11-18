@@ -177,10 +177,19 @@ def read_recording(
     return trace(recording, source_si, source_ti, fps=fps, bits=bits, model=model, picked=picked)
 
 
-def bar_edges(duration: float, length: float, fps: float) -> np.ndarray:
-    """Clip-frame boundaries of every ``length``-second bar up to ``duration``, the last one partial."""
-    marks = np.arange(0.0, duration, length)
-    return np.unique(np.rint(np.r_[marks, duration] * fps).astype(np.int64))
+def bar_edges(
+    duration: float, length: float, fps: float, *, downbeats: Sequence[float] = (), cuts: Sequence[Cut] = ()
+) -> np.ndarray:
+    """Clip-frame boundaries of the bars every take is judged on, up to ``duration``: the planner's.
+
+    Bars run between ``downbeats`` where there are any, else every ``length`` seconds from zero, and
+    split at every cut, so each cut is judged on the frames it shows alone.
+    """
+    marks = (
+        np.asarray(downbeats, dtype=np.float64) if len(downbeats) > 1 else np.arange(0.0, duration, length)
+    )
+    marks = np.r_[0.0, marks, [c.start for c in cuts], [c.end for c in cuts], duration]
+    return np.unique(np.rint(marks[(marks >= 0.0) & (marks <= duration)] * fps).astype(np.int64))
 
 
 @dataclass(frozen=True)
@@ -290,14 +299,16 @@ def cover(
 ) -> tuple[list[Cut], list[DeadSpan]]:
     """Replace every dead run of every cut with the take alive across it that follows best.
 
-    Every take is judged on the same bars. Destruction is budgeted at one bar at a time, so
-    a lone dead bar inside a destroy-marked section stays; any other dead run is covered.
+    Every take is judged on the same bars, each in the cut its middle falls in, as :func:`bar_edges`
+    splits them at every cut. Destruction is budgeted at one bar at a time, so a lone dead bar
+    inside a destroy-marked section stays; any other dead run is covered.
     """
     grid = next(iter(verdicts.values()), [])
+    middles = np.array([0.5 * (v.start + v.end) for v in grid])
     out: list[Cut] = []
     spans: list[DeadSpan] = []
     for cut in cuts:
-        index = np.array([i for i, v in enumerate(grid) if v.end > cut.start and v.start < cut.end], np.intp)
+        index = np.flatnonzero((middles >= cut.start) & (middles < cut.end))
         dead = np.array([verdicts[cut.program][i].fault is not None for i in index], dtype=bool)
         cursor = cut.start
         for a, b in _runs(dead):
@@ -361,7 +372,13 @@ def check_takes(
     source_si, source_ti = source_series(clip if source is None else source, strip_px=strip_px, ffmpeg=ffmpeg)
     if source_si.size < 2:
         raise DeadTakeError(f"cannot judge any take: {clip} decoded to {source_si.size} frames")
-    edges = bar_edges(min(score.duration, source_si.size / fps), with_bar, fps)
+    edges = bar_edges(
+        min(score.duration, source_si.size / fps),
+        with_bar,
+        fps,
+        downbeats=score.meta.get("downbeats", ()),
+        cuts=cuts,
+    )
     fixed, given, decodes = dict(models or {}), dict(attributions or {}), dict(features or {})
 
     def read(name: str) -> tuple[str, Trace]:
