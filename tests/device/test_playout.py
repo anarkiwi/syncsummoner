@@ -314,5 +314,5 @@ def test_a_reply_pairs_with_the_request_before_it_and_never_counts_as_a_flip():
         shown.close()
     assert asks.getvalue() == b"?"
     assert shown.log()["frame"].tolist() == [0, 1, 2]
-    (asked,) = shown.asked().tolist()
-    assert asked[0] < asked[1] and asked[2] == 1
+    asked = shown.asked()
+    assert asked.size == 1 and asked["t0_ns"][0] < asked["t1_ns"][0] and asked["frame"][0] == 1

@@ -633,3 +633,12 @@ def test_each_request_is_answered_with_the_last_flip_flagged_as_a_reply():
     K.answer(io.BytesIO(b"??"), lambda: last.pop(0), live)
     assert len(sent) == 1, "nothing to answer before the first flip"
     assert K.RECORD.unpack(sent[0]) == (4, 4, 4, 99, K.SEGMENT | K.REPLY)
+
+
+def test_each_flip_is_logged_offered_live_and_kept_for_replies():
+    log, offered = io.BytesIO(), []
+    record = K.recorder(log, SimpleNamespace(write=offered.append), None)
+    record(1, 2, 3, 4, 0)
+    record(2, 3, 4, 5, 0)
+    assert log.getvalue() == K.RECORD.pack(1, 2, 3, 4, 0) + K.RECORD.pack(2, 3, 4, 5, 0) == b"".join(offered)
+    assert K.recorder(io.BytesIO(), None, None) is not None

@@ -230,8 +230,7 @@ ss probe sweep commit sweep/sweep-NAME.json --archive archive/
 
 `probe timecode` writes the clip a sweep's sessions play, its lead-in and lead-out each sized to
 hold, with no dry control, a load as long as the device stall guard lets a wait run (`--stall`, else
-the longest load timed on the rig), so no load the rig lets through outgrows the clip. The lead-out
-also holds the latency band of the takes directory's `ccpicture.json`. `probe sweep capture` runs
+the longest load timed on the rig), so no load the rig lets through outgrows the clip. `probe sweep capture` runs
 under the same guard.
 
 `probe hold` measures how long each program's picture keeps moving after a step
@@ -280,7 +279,7 @@ program's read bits tell apart by the stratum it falls in, so interactions are s
 switch or a few-setting control comes up in equal shares, and no unread bit is spent;
 other parameters keep the regime's base. The program's bypass setting (`ProgramModel.bypass`)
 is never sampled (`regions.without_bypass`). It leaves every other control dead, so it would
-spend settings on the input, and the take's calibration toggles it against the start setting.
+spend settings on the input.
 A switch bypass leaves its switch unsampled. A fader bypass keeps its fader's other settings. Each setting is held long enough for the
 follow test (`survival.follow_z`) to see the least follow the planner's dead-bar test
 resolves over the bar it plays in (`regions.effect_sizes`, bars from the track's
@@ -576,10 +575,9 @@ ss audition score.yaml --source source.mkv --audio track.flac \
 
 An excerpt costs a program load, the lead-in and the excerpt. The program is
 loaded before playout and held dry through the lead-in by its bypass setting (a
-declared switch, or else any control setting, that leaves every other control dead in its HDL),
-toggled to time the device; one with none loads inside a Passthru
-lead-in ([evidence.md](evidence.md)). Each take logs the measured
-CC-to-picture latency, its attribution summary, the evidence report (every write's
+declared switch, or else any control setting, that leaves every other control dead in its HDL);
+one with none loads inside a Passthru lead-in ([evidence.md](evidence.md)). Each take logs the
+device-to-clip offset its events bound, its attribution summary, the evidence report (every write's
 landing frame, readback and receipt counts, and one line per parameter: acted upon
 or not, and why), then the take's picture report. A take whose capture driver lost
 frames is recaptured once (`TakeFaultError`).

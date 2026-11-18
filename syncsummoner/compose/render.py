@@ -373,7 +373,6 @@ def render_played(
         scratch,
         program,
         config=config,
-        directory=Path(out).parent,
         seconds=score.duration,
         start=start,
         prepared=prepared,
@@ -471,7 +470,6 @@ def ensure_clip(
     program: str,
     *,
     config: RenderConfig,
-    directory: str | Path,
     seconds: float,
     start: float = 0.0,
     prepared: bool = False,
@@ -483,7 +481,7 @@ def ensure_clip(
     from syncsummoner.compose import locktake, session  # pylint: disable=import-outside-toplevel
 
     dry = locktake.dry_state(program, locktake.declared_bypass) is not None
-    lead, tail = session.session_frames(locktake.LeadIn(), config.fps, dry=dry, directory=directory)
+    lead, tail = session.session_frames(locktake.LeadIn(), config.fps, dry=dry)
     try:
         have = timecode.clip_layout(scratch) if Path(scratch).is_file() else None
     except timecode.LayoutError:

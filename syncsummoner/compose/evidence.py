@@ -108,7 +108,7 @@ def latches(
 
 @dataclass(frozen=True)
 class Offset:
-    """Device frame ``n`` processes clip frame ``n - O``, ``O`` in ``lo..hi``, as the session's events bound it."""
+    """Device frame ``n`` processes clip frame ``n - O``, ``O`` in ``lo..hi`` as the events bound it."""
 
     lo: int
     hi: int
@@ -146,9 +146,9 @@ def offset(
     found = Offset(lo=int((c[told] - asked["frame"][told]).max()), hi=hi)
     if found.lo > found.hi:
         raise EvidenceError(
-            f"device frames lead clip frames by at least {found.lo} by the Pi's replies and at most {found.hi} "
-            "by its reports and the writes' floors: the device is not locked to the player, or events are "
-            "misordered"
+            f"device frames lead clip frames by at least {found.lo} by the Pi's replies and at most "
+            f"{found.hi} by its reports and the writes' floors: the device is not locked to the player, "
+            "or events are misordered"
         )
     return found
 
@@ -724,9 +724,9 @@ class Evidence:
         if verdict == "moved before sent":
             early = max((m for m in (test, dead) if m is not None), key=lambda m: m.before)
             return (
-                f"contradiction: its steps moved the picture the frame before their floor (z {early.before:+.2f}, "
-                f"critical {early.critical:.2f}), before the CC left the host; the change is not this "
-                "parameter's, or the device shows a CC on frames it had already taken in"
+                "contradiction: its steps moved the picture the frame before their floor "
+                f"(z {early.before:+.2f}, critical {early.critical:.2f}), before the CC left the host; the "
+                "change is not this parameter's, or the device shows a CC on frames it had already taken in"
             )
         if verdict == "dead, moved":
             return (

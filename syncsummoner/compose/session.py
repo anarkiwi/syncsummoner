@@ -1,8 +1,8 @@
 """A session: one program loaded once and its takes played back to back while the card holds lock.
 
 The Pi plays the lead-in, each take's clip frames and a lead-out as one stream (:meth:`Layout.spans`) and
-the recorder rolls between take files on the capture clock, so every take shares one frame line, anchored
-by the lead-in's and lead-out's unprocessed strips. See docs/evidence.md.
+the recorder rolls between take files as the Pi reports each take's first frame near, so every take shares
+one frame line, anchored by the lead-in's and lead-out's unprocessed strips. See docs/evidence.md.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ import numpy as np
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import (
     ANCHOR_FRAMES,
-    live_attribution,
     read_live,
     save_lock,
     session_log,
@@ -33,7 +32,6 @@ from syncsummoner.compose.lock import (
 from syncsummoner.compose.lock import changes
 from syncsummoner.compose.locktake import (
     PLAN,
-    Clock,
     LeadIn,
     LeadInTimeError,
     Record,
@@ -59,8 +57,6 @@ from syncsummoner.progress import LOG, meter
 
 #: The program whose picture is its input, carrying the strips for a program with no dry control.
 PASSTHRU = "Passthru"
-#: Longest a session sleeps between carrying its frame line on over the captures since.
-WAKE_S = 1.0
 #: Interpreter thread switch interval during a session, well inside the tick a late wake-up must make.
 SWITCH_S = 0.0005
 
@@ -132,17 +128,17 @@ def frames_of(seconds: float, fps: float) -> int:
 
 
 def lead_in_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None) -> int:
-    """The frames a lead-in must hold: what comes before the clock, the clock, then any wet stretch.
+    """The frames a lead-in must hold: the strips' anchor, the start state settling, then any wet stretch.
 
-    Dry: settle and :data:`~.lock.ANCHOR_FRAMES`. Otherwise: the anchor under Passthru, the longest load
-    timed and settle. The host decodes faster than real time, so the clock takes at most as long again.
+    Dry: settle, the start state's writes and the offset's bounds (``bound_s``), then the wet stretch,
+    the frames before it the strips' anchor. Otherwise: the anchor under Passthru, the longest load
+    timed, then the same (docs/evidence.md).
     """
     if dry:
-        before = frames_of(lead_in.settle_s, fps) + ANCHOR_FRAMES
-        return 2 * before + frames_of(lead_in.wet_s, fps)
+        return frames_of(lead_in.settle_s + lead_in.bound_s, fps) + frames_of(lead_in.wet_s, fps)
     if load_s is None:
         raise NoLoadTimeError("a program with no dry control loads inside the lead-in, and no load is timed")
-    return 2 * (ANCHOR_FRAMES + frames_of(load_s + lead_in.settle_s, fps))
+    return ANCHOR_FRAMES + frames_of(load_s + lead_in.settle_s + lead_in.bound_s, fps)
 
 
 def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None) -> int:
@@ -257,7 +253,6 @@ def locked_session(
     held: dict[str, Any] = {
         "recording": False,
         "loaded": None,
-        "codes": [],
         "dry": dry,
     }
     held["info"] = None
@@ -300,8 +295,6 @@ def locked_session(
             _monitored(shell, poller, sender),
         ):
             held["recording"] = True
-            held["shown"] = shown
-            sender.floor = lambda: _session_frame(shown.latest(), layout.lead)
             _play(
                 rig,
                 Live(recorder, proc, takes, layout),
@@ -309,7 +302,6 @@ def locked_session(
                 poller=poller,
                 shown=shown,
                 shell=shell,
-                player=player,
                 held=held,
                 program=program,
                 config=config,
@@ -523,18 +515,16 @@ def _save_locks(
 
     log = session_log([_read_sidecar(t.out) for t in takes])
     codes = np.full(log.size, -1, dtype=np.int64)
-    live = np.asarray(held["codes"], dtype=np.int64)
-    codes[: min(live.size, log.size)] = live[: log.size]
-    if len(takes) > 1:
-        last, _ = read_live(
-            takes[-1].out,
+    for take in takes[:: max(len(takes) - 1, 1)]:
+        read, _ = read_live(
+            take.out,
             strip_px=config.strip_px,
             bits=config.bits,
             size=CALIBRATION_SIZE,
             ffmpeg=getattr(config, "ffmpeg", "ffmpeg"),
         )
-        seq = _read_sidecar(takes[-1].out)["sequence"][: last.size]
-        codes[np.searchsorted(log["sequence"], seq)] = last[: seq.size]
+        seq = _read_sidecar(take.out)["sequence"][: read.size]
+        codes[np.searchsorted(log["sequence"], seq)] = read[: seq.size]
     span = _written_span({**wire, "cc_map": np.asarray(held.get("cc_map", []))}, layout.count)
     for index, take in enumerate(takes):
         said = {**session, "index": index, "source_lead": layout.source_lead}
@@ -586,7 +576,6 @@ def _run(
     poller: Poller,
     shown: Any,
     shell: Any,
-    player: Any,
     held: dict,
     program: str,
     config: Any,
@@ -607,7 +596,8 @@ def _run(
     acknowledged before the next goes.
     """
     layout, period = live.layout, 1e9 / float(config.fps)
-    held["cc_map"] = rig.transport.device.midi.cc_map
+    held["cc_map"], held["shown"] = rig.transport.device.midi.cc_map, shown
+    sender.floor = lambda: _session_frame(shown.latest(), layout.lead)
     if dry is None:
         _await_starts(live, began, ANCHOR_FRAMES, period)
         prepare(load(program))
@@ -619,22 +609,7 @@ def _run(
     for slot in np.flatnonzero(start != park) + 1:
         sender.send(int(slot), int(start[slot - 1]), ev.START)
     time.sleep(lead_in.settle_s)
-    if dry is not None:
-        _await_starts(live, time.monotonic_ns(), ANCHOR_FRAMES, period)
-    hold = int(player.status().get("hold", 1))
-    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    codes, _ = read_live(
-        live.first, strip_px=config.strip_px, bits=config.bits, size=CALIBRATION_SIZE, ffmpeg=ffmpeg
-    )
-    held["codes"] = codes
-    found, _ = live_attribution(
-        live.first, rig.playout.flips(), codes, config=config, hold=hold, lead=layout.lead, count=layout.count
-    )
-    clock = Clock.of(found)
-    wire = _session_wire(held, sender, poller, [], dry)
-    shift = ev.offset(
-        np.zeros((0, 2), np.int64), np.zeros(0, np.int64), wire["asked"], wire["shown"], wire["ticks"]
-    )
+    shift = _offset(poller, held, sender, dry)
     held["shift"] = shift
     LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
     rows = held["rows"]
@@ -642,42 +617,53 @@ def _run(
     now = json.loads(poller.ask("transport", "status", timeout_s=5.0).payload or "{}").get("field_count")
     if now is None or int(now) >= first + shift.lo - 1:
         raise LeadInTimeError(
-            f"{program}: the device-to-clip offset was known after the device ticked for clip frame {first - 1}, "
-            "past the lead-in this session derived"
+            f"{program}: the device-to-clip offset was known after the device ticked for clip frame "
+            f"{first - 1}, past the lead-in this session derived"
         )
-    clock.extend(live.log())
     sender.due = lambda target, stop: poller.wait_count(target + shift.lo - 1, stop)
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
     poller.wait_count(shift.lo - 2, threading.Event())
     held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
-    end = int(clock.times.at(layout.count + (0 if dry is None else layout.tail))) + int(config.tail_s * 1e9)
-    rolls = list(range(1, len(live.takes)))
-    with meter((end - began) / 1e9, desc="session") as progress:
-        while (now := time.monotonic_ns()) < end:
-            rolls = _roll_due(live, clock, rolls, now, period)
-            time.sleep(min(WAKE_S, (end - now) / 1e9))
-            clock.extend(live.log())
-            progress.to((time.monotonic_ns() - began) / 1e9)
+    last = layout.lead + layout.count + (0 if dry is None else layout.tail)
+    with meter((last - layout.lead) / float(config.fps), desc="session") as progress:
+        for k in range(1, len(live.takes)):
+            _roll(live, shown, k, period)
+            progress.to((layout.offsets[k]) / float(config.fps))
+        shown.wait(last)
+        progress.to((last - layout.lead) / float(config.fps))
+    time.sleep(config.tail_s)
     sender.drain(timeout_s=1.0)
     if dry is None:
         _reload_quiet(sender, poller, shell, load)
-        _sleep_until(int(clock.times.at(layout.count + layout.tail)) + int(config.tail_s * 1e9))
+        shown.wait(layout.lead + layout.count + layout.tail)
+        time.sleep(config.tail_s)
 
 
-def _roll_due(live: Live, clock: Clock, rolls: list[int], now: int, period: float) -> list[int]:
-    """Roll the recording on to each take whose first frame is near: sent at least a wake before the
-    captures it shares with the take before, those every line the clock admits puts within a frame of it.
+def _offset(poller: Poller, held: dict, sender: Sender, dry: Any) -> ev.Offset:
+    """The device-to-clip offset the session's events bound so far, waiting for a frame tick while none do."""
+    while True:
+        wire = _session_wire(held, sender, poller, [], dry)
+        try:
+            return ev.offset(
+                np.zeros((0, 2), np.int64), np.zeros(0, np.int64), wire["asked"], wire["shown"], wire["ticks"]
+            )
+        except ev.EvidenceError:
+            count = int(wire["ticks"]["field"][-1]) + 1 if wire["ticks"].size else 0
+            if poller.wait_count(count, threading.Event()) is None:
+                raise
+
+
+def _roll(live: Live, shown: Any, k: int, period: float) -> None:
+    """Roll the recording on to take ``k`` once the Pi is heard showing the frame two before its first.
+
+    Both files keep the captures from that report to two frames past the boundary, so the boundary's
+    captures are in each whichever card delay holds.
     """
-    left = []
-    for k in rolls:
-        lo, hi = clock.line.polygon.at(np.array([live.layout.lead + int(live.layout.offsets[k])]))
-        opens, closes = int(lo[0] - period), int(hi[0] + period)
-        if now + 2 * WAKE_S * 1e9 < opens:
-            left.append(k)
-            continue
-        live.recorder.roll(live.proc, live.takes[k].out, opens, closes)
-    return left
+    boundary = live.layout.lead + int(live.layout.offsets[k])
+    heard = shown.wait(boundary - 2)
+    if heard is not None:
+        live.recorder.roll(live.proc, live.takes[k].out, int(heard), int(heard + 4 * period))
 
 
 def _reload_quiet(sender: Sender, poller: Poller, shell: Any, reload: Callable[[str], Any]) -> None:
@@ -706,9 +692,3 @@ def _read_sidecar(take: str | Path) -> np.ndarray:
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
     return read_log(take)
-
-
-def _sleep_until(t_ns: int) -> None:
-    """Sleep to ``t_ns`` on the host clock."""
-    while (left := t_ns - time.monotonic_ns()) > 0:
-        time.sleep(min(left / 1e9, 0.5))

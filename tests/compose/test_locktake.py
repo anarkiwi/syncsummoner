@@ -16,7 +16,7 @@ from syncsummoner.device import loadtimes, v4l2rec
 from syncsummoner.device.profile import PARAM_MAX, ParamSpec
 from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device import wire as W
-from syncsummoner.device.wire import SEND, Echoes, Poller, Sender
+from syncsummoner.device.wire import Echoes, Poller, Sender
 from syncsummoner.probe import decoded
 from syncsummoner.program.model import Bypass
 from syncsummoner.compose.timecode import ClipLayout
@@ -164,15 +164,9 @@ def test_the_boot_count_is_read_from_its_setting():
     assert LT.boot_count(shell) == 7 and asked == [LT.BOOT_COUNT_KEY]
 
 
-
-
-
-
 def times_for(lead=10, period=P):
     """Frame times on the line through ``T0 + lead * P``."""
     return ev.FrameTimes(lead=lead, origin=T0 + lead * P, period=period)
-
-
 
 
 def test_a_clock_with_no_line_is_not_extended():
@@ -180,18 +174,6 @@ def test_a_clock_with_no_line_is_not_extended():
     clock = LT.Clock(times=times_for(period=1.01 * P))
     clock.extend(np.zeros(10, FRAME))
     assert clock.times == times_for(period=1.01 * P)
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class Recorded:
@@ -203,8 +185,6 @@ class Recorded:
     def send(self, param, value, target):
         """Keep it."""
         self.sends.append((param, value, target))
-
-
 
 
 def test_a_takes_rows_wet_the_dry_control_for_the_plan_and_dry_it_for_the_lead_out():
@@ -235,7 +215,13 @@ def loaded_wire(*, program="Teletext", state="running", said_t1=-1e3, last=(5, 6
     loaded = json.dumps({"fpga": payload, "t1_ns": cutoff + said_t1})
     plan = np.array([(-2, 1, 5), (0, 2, 6), (3, 3, 1)], dtype=LT.PLAN)
     shown = np.array([(-1, cutoff - 3e7), (0, cutoff), (1, cutoff + 3e7)], dtype=SS.PLAYED)
-    return {"loaded": np.array(loaded), "start": np.zeros(3, np.int64), "plan": plan, "reads": reads, "shown": shown}
+    return {
+        "loaded": np.array(loaded),
+        "start": np.zeros(3, np.int64),
+        "plan": plan,
+        "reads": reads,
+        "shown": shown,
+    }
 
 
 @pytest.mark.parametrize(
@@ -419,19 +405,29 @@ class SimShown:
         self.sim, self.asks = sim, []
 
     def latest(self):
+        """The last frame heard shown, :data:`~.wire.NO_FLOOR` before any."""
         frame = self.sim.flipped(self.sim.now - HEARD_NS)
         return frame if frame >= 0 else W.NO_FLOOR
 
     def ask(self):
+        """Ask the Pi for its last flip now."""
         self.asks.append((self.sim.now, self.sim.flipped(self.sim.now + HEARD_NS // 2)))
 
     def asked(self):
+        """Requests answered by now."""
         out = np.zeros(len(self.asks), dtype=SS.ASKED)
         for k, (t0, frame) in enumerate(self.asks):
             out[k] = (t0, t0 + HEARD_NS, frame)
         return out[out["t1_ns"] <= self.sim.now]
 
+    def wait(self, frame, stop=None):  # pylint: disable=unused-argument
+        """Advance until the frame is heard shown."""
+        at = int(np.ceil(T0 + frame * P + HEARD_NS))
+        self.sim.sleep(max(at - self.sim.now, 0) / 1e9)
+        return at
+
     def log(self):
+        """Every frame heard shown by now."""
         frames = np.arange(max(self.sim.flipped(self.sim.now - HEARD_NS) + 1, 0))
         out = np.zeros(frames.size, dtype=SS.PLAYED)
         out["frame"], out["t_ns"] = frames, np.ceil(T0 + frames * P + HEARD_NS)
@@ -574,14 +570,8 @@ def fixture_simulate(monkeypatch):
         monkeypatch.setattr(SS, "Poller", SimPoller)
         monkeypatch.setattr(SS, "Sender", SimSender)
         monkeypatch.setattr(SS, "time", types.SimpleNamespace(monotonic_ns=sim.clock, sleep=sim.sleep))
-        monkeypatch.setattr(LT, "time", types.SimpleNamespace(monotonic_ns=sim.clock, sleep=sim.sleep))
         monkeypatch.setattr(SS, "_read_sidecar", lambda take: sim.frames[sim.captures(take)])
         monkeypatch.setattr(SS, "read_live", live)
-        monkeypatch.setattr(
-            SS,
-            "live_attribution",
-            lambda *a, **k: (L.require_anchor(sim.attribution(), "take"), sim.frames[: sim.stored()]),
-        )
         return sim
 
     return build
@@ -599,7 +589,7 @@ PLAN_ROWS = np.array(
 )
 
 
-def ends_for(dry, directory):
+def ends_for(dry, _directory=None):
     """The lead-in and lead-out a simulated session derives: its loads take no time."""
     loadtimes.record("Passthru", 0, 0)
     return SS.session_frames(LEAD_IN, FPS, dry=dry)
@@ -681,7 +671,9 @@ def test_a_dry_take_lands_every_write_by_command_order_and_proves_it(monkeypatch
     assert wire["ticks"].size and wire["asked"].size and wire["shown"].size
     sends = wire["sends"]
     framed = sends["target"] > ev.START
-    assert (sends["floor"][framed] < sends["target"][framed]).all(), "each write leaves before its frame shows"
+    assert (
+        sends["floor"][framed] < sends["target"][framed]
+    ).all(), "each write leaves before its frame shows"
     assert record.plan[0].tolist() == (-15, 1, 0) and record.plan[-1].tolist() == (30, 1, PARAM_MAX)
     lock = np.load(tmp_path / "take.mkv.lock.npz")
     assert (int(lock["lead"]), int(lock["count"]), int(lock["tail"])) == (
@@ -768,9 +760,9 @@ def test_a_write_the_device_drops_fails_the_readback(monkeypatch, simulate, tmp_
     assert set(proof.applied.disagree["want"].tolist()) == {600}
 
 
-
-
-def test_a_take_without_a_dry_control_lands_its_writes_with_no_other_takes_measure(monkeypatch, simulate, tmp_path):
+def test_a_take_without_a_dry_control_lands_its_writes_with_no_other_takes_measure(
+    monkeypatch, simulate, tmp_path
+):
     """Passthru at the ends only; the take's own events land every write, no other take consulted."""
     _, rig, record, proof, loads = take_and_prove(
         monkeypatch, simulate, tmp_path, dry=None, working={3: 1.0, 4: 100}
@@ -796,17 +788,19 @@ def test_a_reboot_during_the_take_is_an_error_after_its_record_is_kept(monkeypat
     assert (tmp_path / "take.mkv.wire.npz").is_file()
 
 
-def test_a_clock_measured_slower_than_real_time_is_a_lead_in_error(monkeypatch, simulate, tmp_path):
-    """Decoding the lead-in slower than it was recorded leaves the first write due; the monitor left off."""
+def test_an_offset_known_too_late_is_a_lead_in_error(monkeypatch, simulate, tmp_path):
+    """An offset bound only after the first write was due is a lead-in error; the monitor left off."""
     sim, clip = session_for(simulate, tmp_path, dry=True, counts=[30])
     rig, recorder, load, _ = rigged(sim, info_with(1))
 
-    def slow(*_a, **_k):
-        found = sim.attribution()
-        sim.now += 10 * sim.lead * int(P)
-        return found, sim.frames[: sim.stored()]
+    bound = SS._offset  # pylint: disable=protected-access
 
-    monkeypatch.setattr(SS, "live_attribution", slow)
+    def slow(*a, **k):
+        found = bound(*a, **k)
+        sim.sleep(10 * sim.lead * P / 1e9)
+        return found
+
+    monkeypatch.setattr(SS, "_offset", slow)
     with pytest.raises(LT.LeadInTimeError, match="past the lead-in this session derived"):
         SS.locked_take(
             rig,
@@ -825,4 +819,3 @@ def test_a_clock_measured_slower_than_real_time_is_a_lead_in_error(monkeypatch, 
     assert rig.transport.device.shell.said[-1] == ("midi", "monitor", "off")
     assert (tmp_path / "t.mkv.wire.npz").is_file()
     assert sim.sender is None and sim.poller is None
-

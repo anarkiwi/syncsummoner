@@ -1,7 +1,8 @@
 """What crosses the wire during a take: every CC sent, every readback, every receipt.
 
-A :class:`Sender` writes each CC once the Pi shows its target frame, stamped with the frame shown; a :class:`Poller`
-keeps the serial shell busy with one ``modulation status`` at a time and collects the receipts
+A :class:`Sender` writes each CC once the device has ticked for the frame before its target, stamped
+with the frame the Pi was last heard showing; a :class:`Poller` keeps the serial shell busy with one
+``transport status`` and one ``modulation status`` at a time and collects the receipts
 ``midi monitor`` logs. :class:`Echoes` turns the receipts into acknowledgements, so the sender
 keeps one write in flight. Their records are numpy arrays in the dtypes below, saved beside the take.
 """
@@ -42,7 +43,14 @@ READ = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("o", "<i8", (12,))])
 #: One ``transport status`` reply: its request interval, the device's ``field_count`` (its frame tick), and
 #: the transport's beat phase, tempo in hundredths of a bpm and whether it plays, as of that frame.
 TICK = np.dtype(
-    [("t0_ns", "<i8"), ("t1_ns", "<i8"), ("field", "<i8"), ("phase", "<i8"), ("bpm_x100", "<i8"), ("playing", "?")]
+    [
+        ("t0_ns", "<i8"),
+        ("t1_ns", "<i8"),
+        ("field", "<i8"),
+        ("phase", "<i8"),
+        ("bpm_x100", "<i8"),
+        ("playing", "?"),
+    ]
 )
 #: One CC message the firmware logged receiving, at the latest host time it can have arrived.
 RECEIPT = np.dtype([("t_ns", "<i8"), ("cc", "<i8"), ("value", "<i8")])
@@ -400,7 +408,11 @@ class Poller:
         try:
             said = json.loads(self.shell.command("transport", "status").payload)
             count = int(said["field_count"])
-            transport = (int(said.get("phase", -1)), int(said.get("bpm_x100", -1)), said.get("state") == "playing")
+            transport = (
+                int(said.get("phase", -1)),
+                int(said.get("bpm_x100", -1)),
+                said.get("state") == "playing",
+            )
         except Exception as err:  # pylint: disable=broad-exception-caught
             t1 = self.clock()
             self.errors.append((t1, f"{type(err).__name__}: {err}"))

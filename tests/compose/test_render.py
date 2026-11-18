@@ -391,17 +391,10 @@ def fixture_clipped(monkeypatch, tmp_path):
 
 
 def test_a_clip_too_short_for_a_session_is_timecoded_again_never_shorter(clipped, tmp_path):
-    got = R.ensure_clip(
-        "src.mkv", tmp_path / "tc.mkv", "Teletext", config=LOCKED, directory=tmp_path, seconds=0.2
-    )
+    got = R.ensure_clip("src.mkv", tmp_path / "tc.mkv", "Teletext", config=LOCKED, seconds=0.2)
     assert clipped["written"] == [(10, 8)] and got == ClipLayout(10, 6, 8)
     clipped["need"] = (9, 8)
-    assert (
-        R.ensure_clip(
-            "src.mkv", tmp_path / "tc.mkv", "Teletext", config=LOCKED, directory=tmp_path, seconds=0.2
-        )
-        == got
-    )
+    assert R.ensure_clip("src.mkv", tmp_path / "tc.mkv", "Teletext", config=LOCKED, seconds=0.2) == got
     assert clipped["written"] == [(10, 8)], "a clip long enough is reused as it is"
 
 
@@ -412,7 +405,6 @@ def test_a_prepared_clip_too_short_for_a_session_is_refused(clipped, tmp_path):
             tmp_path / "tc.mkv",
             "Teletext",
             config=LOCKED,
-            directory=tmp_path,
             seconds=0.2,
             prepared=True,
         )

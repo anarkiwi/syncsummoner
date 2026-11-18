@@ -1,3 +1,7 @@
+"""Command-order evidence: frame ticks, latch windows and the device-to-clip offset."""
+
+# pylint: disable=missing-function-docstring
+
 import numpy as np
 import pytest
 
@@ -77,7 +81,7 @@ def test_an_unchanged_value_keeps_only_the_send_and_echo_bounds():
 
 
 def test_an_unechoed_write_has_no_upper_bound():
-    ticks, reads = device(1.0)
+    ticks, _ = device(1.0)
     sends = sends_at(np.array([300_000_000]), [900], NO_FLOOR)
     latch = ev.latches(sends, np.array([[3e8, np.nan]]), ticks, np.zeros(0, dtype=READ), [0] * 12)
     assert latch[0, 1] == ev.UNBOUNDED

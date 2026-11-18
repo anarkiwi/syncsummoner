@@ -93,7 +93,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
         body = chunk.plan[chunk.plan["target"] > 0]
         for name in ("target", "param", "value"):
             rows[name] = body[name]
-        rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = body["value"], 0, body["target"], 1.0
+        rows["wire"], rows["sent"], rows["landed"] = body["value"], 0, body["target"]
         rows["first"], rows["last"] = body["target"], body["target"]
         n = chunk.frames
         L.save_rows(
@@ -143,7 +143,7 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     rows = np.zeros(body.size, dtype=LANDED)
     for name in ("target", "param", "value"):
         rows[name] = body[name]
-    rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = body["value"], 0, body["target"], 1.0
+    rows["wire"], rows["sent"], rows["landed"] = body["value"], 0, body["target"]
     rows["first"], rows["last"] = body["target"], body["target"]
     n = chunk.frames
     proof = SimpleNamespace(
@@ -217,9 +217,7 @@ def test_sweep_plan_takes_a_recorded_cover_and_joint_moves(tmp_path, monkeypatch
     assert set(states[:, 0].tolist()) == {0, 512} and set(states[:, 10].tolist()) == {0, 1023}
 
 
-def test_timecode_sizes_the_clip_by_the_stall_guard(tmp_path, monkeypatch, capsys):
-    lat = LT.ev.Latency(lo=30e6, hi=40e6, samples=3, period=1e9 / 30)
-    LT.write_latency(tmp_path, lat, "dry")
+def test_timecode_sizes_the_clip_by_the_stall_guard(monkeypatch, capsys):
     made = {}
 
     def write(source, out, *, config, lead, tail, **_kw):
@@ -227,15 +225,14 @@ def test_timecode_sizes_the_clip_by_the_stall_guard(tmp_path, monkeypatch, capsy
         return 90
 
     monkeypatch.setattr(timecode, "write_timecoded", write)
-    argv = ["--stall", "40", "probe", "timecode", "f.mkv", "--out", "c.mkv", "--latency", str(tmp_path)]
+    argv = ["--stall", "40", "probe", "timecode", "f.mkv", "--out", "c.mkv"]
     assert cli.main(argv) == 0
-    after = (lat.hi + lat.period) / 1e9
     assert made == {
         "source": "f.mkv",
         "out": "c.mkv",
         "fps": 30.0,
         "lead": SS.lead_in_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0),
-        "tail": SS.lead_out_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0, latency_s=after),
+        "tail": SS.lead_out_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0),
     }
     assert "for a 40.0 s load" in capsys.readouterr().out
 

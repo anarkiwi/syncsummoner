@@ -704,7 +704,11 @@ def _written_span(wire: Any, count: int) -> tuple[float, float] | None:
     Processing ends once the device has ticked twice past the end: the frame it took effect on, and
     the frame after, whose capture shows its picture whole.
     """
-    from syncsummoner.compose.evidence import START, UNBOUNDED, count_after  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose.evidence import (
+        START,
+        UNBOUNDED,
+        count_after,
+    )  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.wire import echoed  # pylint: disable=import-outside-toplevel
 
     ticks = wire["ticks"] if "ticks" in wire else None

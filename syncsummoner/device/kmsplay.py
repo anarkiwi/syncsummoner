@@ -469,7 +469,7 @@ def answer(asks: Any, last: Callable[[], bytes | None], live: LiveFeed) -> None:
 
 
 def serve_asks(path: str, last: Callable[[], bytes | None], live: LiveFeed) -> threading.Thread:
-    """Answer requests on a fresh named pipe at ``path`` from a thread of its own, for any number of askers."""
+    """Answer requests on a fresh named pipe at ``path`` from a thread of its own, for askers in turn."""
     try:
         os.unlink(path)
     except FileNotFoundError:
@@ -484,6 +484,22 @@ def serve_asks(path: str, last: Callable[[], bytes | None], live: LiveFeed) -> t
     thread = threading.Thread(target=serve, name="asks", daemon=True)
     thread.start()
     return thread
+
+
+def recorder(log: Any, live: LiveFeed | None, ask: str | None) -> Callable[..., None]:
+    """Each flip's record written to ``log`` and offered ``live``, the last kept to answer ``ask`` with."""
+    last: list[bytes] = []
+    if live is not None and ask:
+        serve_asks(ask, lambda: last[-1] if last else None, live)
+
+    def record(*fields: int) -> None:
+        data = RECORD.pack(*fields)
+        log.write(data)
+        last[:] = [data]
+        if live is not None:
+            live.write(data)
+
+    return record
 
 
 def decode_argv(
@@ -704,17 +720,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         preroll = Prerolled(frames, max(2, round(float(args.preroll_s * args.fps))))
         preroll.wait_full(timeout_s=60.0)
         live = LiveFeed(args.live) if args.live else None
-        last: list[bytes] = []
-        if live is not None and args.ask:
-            serve_asks(args.ask, lambda: last[-1] if last else None, live)
         with open(args.flips, "wb", buffering=0) as log:
-
-            def record(*fields: int) -> None:
-                data = RECORD.pack(*fields)
-                log.write(data)
-                last[:] = [data]
-                if live is not None:
-                    live.write(data)
+            record = recorder(log, live, args.ask)
 
             player = Player(
                 display,

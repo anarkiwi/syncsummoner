@@ -8,7 +8,6 @@ its floor, so no output earlier than its floor can show it. See docs/evidence.md
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -20,7 +19,6 @@ from syncsummoner.compose import frameline
 from syncsummoner.compose.lock import capture_times, changes
 from syncsummoner.device.profile import PARAM_MAX
 from syncsummoner.device import wire as W
-from syncsummoner.device.wire import Sender
 from syncsummoner.probe import decoded
 from syncsummoner.progress import LOG
 
@@ -45,7 +43,7 @@ class LeadIn:
     settle_s: float = 1.0
     wet_s: float = 2.0
     poll_s: float = 0.005
-    probe_s: float = 0.1
+    bound_s: float = 0.1
 
 
 def program_bypass(info: Any) -> Any:

@@ -47,7 +47,12 @@ class Shell:
     def command(self, *words):
         if words == ("transport", "status"):
             self.fields += 1
-            said = {"field_count": self.fields, "phase": 1343 * self.fields, "bpm_x100": 3689, "state": "playing"}
+            said = {
+                "field_count": self.fields,
+                "phase": 1343 * self.fields,
+                "bpm_x100": 3689,
+                "state": "playing",
+            }
             return types.SimpleNamespace(payload=json.dumps(said))
         self.commands.append(words)
         self.log_lines.append("[MIDI USB] CC  ch=1 cc=7 val=99")
@@ -230,7 +235,9 @@ def test_a_threaded_sender_writes_each_row_in_order_no_earlier_than_due():
 
 
 def test_drain_times_out_while_rows_are_not_yet_due():
-    sender = W.Sender(lambda p, v: v, due=lambda target, stop: None if stop.wait(0.2) else time.monotonic_ns())
+    sender = W.Sender(
+        lambda p, v: v, due=lambda target, stop: None if stop.wait(0.2) else time.monotonic_ns()
+    )
     sender.plan([(0, 1, 1)])
     sender.start()
     assert not sender.drain(timeout_s=0.02, poll_s=0.005)
