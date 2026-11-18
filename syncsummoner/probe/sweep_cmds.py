@@ -1,4 +1,4 @@
-"""``probe hold`` and ``probe sweep``: an archive sweep as frame-locked takes, from plan to archive."""
+"""``probe hold``, ``probe timecode`` and ``probe sweep``: an archive sweep as frame-locked takes."""
 
 from __future__ import annotations
 
@@ -24,6 +24,23 @@ def _hold_cmd(args: argparse.Namespace) -> int:
         said.save(out / f"hold-{slug(program)}.json")
         print(said.table())
     return 0 if all(r.bounded for r in found.values()) else 1
+
+
+def _timecode_cmd(args: argparse.Namespace) -> int:
+    """Timecode footage for sweep sessions, its lead-in and lead-out each holding the longest load a device
+    wait allows (the stall guard), so no load the rig lets through outgrows the clip."""
+    from syncsummoner.compose.locktake import LeadIn
+    from syncsummoner.compose.render import RenderConfig
+    from syncsummoner.compose.session import session_frames
+    from syncsummoner.compose.timecode import write_timecoded
+    from syncsummoner.device.loadtimes import stall_guard
+
+    config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
+    load_s = stall_guard(args.stall)
+    lead, tail = session_frames(LeadIn(), config.fps, dry=False, directory=args.latency, load_s=load_s)
+    frames = write_timecoded(args.source, args.out, config=config, lead=lead, tail=tail)
+    print(f"{args.out}: {frames} frames, {lead} lead-in and {tail} lead-out frames, for a {load_s} s load")
+    return 0
 
 
 def _sweep_plan_cmd(args: argparse.Namespace) -> int:
@@ -186,13 +203,15 @@ def _sweep_take(directory: str, program: str, chunk: int) -> Path:
     return Path(directory, f"take-{slug(program)}-{chunk:02d}.mkv")
 
 
-def _sweep_cmd(args: argparse.Namespace) -> int:  # pragma: no cover - needs the rig
+def _sweep_cmd(args: argparse.Namespace) -> int:
     """Capture a plan's chunks back to back as one session, or one chunk alone; 2 on any take's fault."""
     from syncsummoner.compose.render import RenderConfig
     from syncsummoner.probe.locked import capture, read_plan
 
     chunks, said = read_plan(args.plan)
-    config = RenderConfig.for_format(args.format, strip_px=args.strip_px, source_host=args.source_host)
+    config = RenderConfig.for_format(
+        args.format, strip_px=args.strip_px, source_host=args.source_host, stall_s=args.stall
+    )
     picked = range(len(chunks)) if args.chunk is None else [args.chunk]
     outs = [_sweep_take(Path(args.plan).parent, said["program"], k) for k in picked]
     records = capture(config, [chunks[k] for k in picked], outs, program=said["program"], clip=said["source"])
@@ -289,12 +308,24 @@ def _sweep_commit_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_timecode(probe_sub: Any) -> Any:
+    stamp = probe_sub.add_parser(
+        "timecode", help="timecode footage for sweep sessions, sized by the stall guard"
+    )
+    stamp.add_argument("source", help="the footage")
+    stamp.add_argument("--out", required=True, help="the timecoded clip to write")
+    stamp.add_argument("--latency", required=True, help="where the dry takes' ccpicture.json is")
+    stamp.set_defaults(func=_timecode_cmd)
+    return stamp
+
+
 def add_parsers(probe_sub: Any) -> None:
-    """The ``probe hold`` and ``probe sweep`` commands."""
+    """The ``probe hold``, ``probe timecode`` and ``probe sweep`` commands."""
     hold = probe_sub.add_parser("hold", help="each program's settle and archive hold from locked takes")
     hold.add_argument("takes", nargs="+")
     hold.add_argument("--source", required=True, help="the timecoded clip the takes played")
     hold.add_argument("--out", default=".", help="where hold-<program>.json goes")
+    stamp = _add_timecode(probe_sub)
     sweep = probe_sub.add_parser(
         "sweep", help="an archive sweep as locked takes: plan, capture, collect, commit"
     )
@@ -351,8 +382,9 @@ def add_parsers(probe_sub: Any) -> None:
     commit.add_argument("plan")
     commit.add_argument("--archive", required=True)
     commit.set_defaults(func=_sweep_commit_cmd)
-    for node in (hold, plan, regions, run, gather, commit):
+    for node in (hold, stamp, plan, regions, run, gather, commit):
         node.add_argument("--format", default="1080p30", help="the session format")
         node.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
+    for node in (hold, plan, regions, run, gather, commit):
         node.add_argument("--workers", type=int, help="decoders at once")
     hold.set_defaults(func=_hold_cmd)

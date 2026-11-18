@@ -163,10 +163,17 @@ def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | N
 
 
 def session_frames(
-    lead_in: LeadIn, fps: float, *, dry: bool, directory: str | Path, band: ev.Latency | None = None
+    lead_in: LeadIn,
+    fps: float,
+    *,
+    dry: bool,
+    directory: str | Path,
+    band: ev.Latency | None = None,
+    load_s: float | None = None,
 ) -> tuple[int, int]:
-    """A session's lead-in and lead-out frames, from the rig's loads and, without a dry control, its band."""
-    loads = loadtimes.longest()
+    """A session's lead-in and lead-out frames, for a load of ``load_s`` (else the rig's longest timed) and,
+    without a dry control, its band."""
+    loads = loadtimes.longest() if load_s is None else load_s
     if not dry:
         band = read_latency(directory) if band is None else band
     after = 0.0 if band is None else (band.hi + band.period) / 1e9
