@@ -260,6 +260,14 @@ class Miter:
             for c in self.storage
         }
         self.gate_fanin = {n: self.fanin[n] for n in self.gate_nets}
+        self.gate_readers: dict[int, list[int]] = defaultdict(list)
+        for net, ins in self.gate_fanin.items():
+            for b in ins:
+                self.gate_readers[b].append(net)
+        for box in self.boxes:
+            outs = [b for bits in box.outs.values() for b in bits if isinstance(b, int)]
+            for b in (b for bits in box.ins.values() for b in bits if isinstance(b, int)):
+                self.gate_readers[b] += outs
         self.solver = Solver(name=solver, bootstrap_with=cnf.clauses)
         self.flushed = len(cnf.clauses)
         self.solves = 0
@@ -575,16 +583,20 @@ class Miter:
         inner = [n for n in self.gate_nets if n in reach]
         border = {b for n in reach for b in self.fanin.get(n, ()) if b not in reach}
         base += [self._eq(b) for b in border if b in self._val[0]]
+        proven: set[int] = set()
         while True:
+            before = set(open_)
             differ = self._witness(held, nets, open_, free, outs, linked)
             if differ is None:
                 return True
+            proven -= self._downstream(open_ - before) | differ
             pinned = [-p[2] for n, p in self.pairs.items() if n not in open_]
-            todo = [n for n in [*inner, *sorted(free - open_)] if n not in differ]
-            ctx = self._under([*base, *pinned])
+            todo = [n for n in [*inner, *sorted(free - open_)] if n not in differ and n not in proven]
+            same = [self._eq(n) for n in proven if n not in self.cells]
+            ctx = self._under([*base, *pinned, *same])
             watch = self._any(self.outputs[o] for o in outs)
             try:
-                found = self._sweep(ctx, todo, differ, watch, open_, free, outs)
+                found = self._sweep(ctx, todo, differ, watch, open_, free, outs, proven)
             finally:
                 self.cnf.clauses += [[-watch], [-ctx]]
             if found is not None:
@@ -596,10 +608,22 @@ class Miter:
         self.cnf.clauses += [[-ctx, lit] for lit in lits if lit != 1]
         return ctx
 
-    def _sweep(self, ctx: int, todo, differ: set, watch: int, open_: set, free: set, outs) -> bool | None:
+    def _downstream(self, opened: set[int]) -> set[int]:
+        """Nets whose proven equality a newly differing storage output can break: the gates and boxes
+        it feeds within a step, and the storage whose next state reads them.
+        """
+        if not opened:
+            return set()
+        cone = _closure(self.gate_readers, opened)
+        return cone | {q for q in self.cells if any(b in cone for b in self.fanin[q])}
+
+    def _sweep(
+        self, ctx: int, todo, differ: set, watch: int, open_: set, free: set, outs, proven: set
+    ) -> bool | None:
         """Prove the nets in ``todo`` equal in both copies in order under ``ctx``, each from those before,
-        racing the output query at a doubling share of the conflicts spent. True when an output can
-        differ, False when none can, None when a storage bit is found to differ (it joins ``open_``).
+        racing the output query at a doubling share of the conflicts spent; each proven joins ``proven``.
+        True when an output can differ, False when none can, None when a storage bit is found to differ
+        (it joins ``open_``).
         """
         start, due, quiet = self.conflicts, 0, False
         for n in track(todo, desc="sweep", unit="net"):
@@ -614,6 +638,7 @@ class Miter:
             goal = self.moves[n] if n in self.cells else self.cnf.xor2(self._val[0][n], self._val[1][n])
             model = self.solve([ctx, goal])
             if model is None:
+                proven.add(n)
                 if n not in self.cells:
                     a, b = self._val[0][n], self._val[1][n]
                     self.cnf.clauses += [[-ctx, -a, b], [-ctx, a, -b]]
