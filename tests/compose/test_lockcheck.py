@@ -11,6 +11,8 @@ import pytest
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import lockcheck as LC
 from syncsummoner.compose import render as R
+from syncsummoner.compose.session import NoLoadTimeError, record_load
+from syncsummoner.compose.timecode import ClipLayout
 from syncsummoner.device import recorder as recorder_mod
 from syncsummoner.device.v4l2rec import sidecar
 from syncsummoner.probe import decoded
@@ -107,18 +109,29 @@ def encode(path, n, fps=30):
     subprocess.run(argv, input=frames.tobytes(), check=True)
 
 
-def test_a_clip_is_measured_between_its_lead_in_and_lead_out(tmp_path):
-    encode(tmp_path / "clip.mkv", 12)
-    config = R.RenderConfig(fps=30.0, lead_in_s=0.1)
-    assert LC.clip_seconds(tmp_path / "clip.mkv", config) == pytest.approx(6 / 30)
+def test_a_clip_is_measured_between_its_lead_in_and_lead_out(monkeypatch):
+    monkeypatch.setattr(LC.timecode, "clip_layout", lambda clip: ClipLayout(lead=3, frames=6, tail=3))
+    assert LC.clip_seconds("clip.mkv", R.RenderConfig(fps=30.0)) == pytest.approx(6 / 30)
+
+
+def test_a_lockcheck_clip_holds_a_load_in_each_end_or_what_it_was_asked(tmp_path):
+    with pytest.raises(NoLoadTimeError):
+        LC.check_frames(tmp_path, 30.0)
+    record_load(tmp_path, "Passthru", 0, 2_000_000_000)
+    lead, tail = LC.check_frames(tmp_path, 30.0)
+    assert lead > 2 * 60 and tail > 60, "each end holds the longest load timed and its anchor"
+    assert LC.check_frames(tmp_path, 30.0, 0.5) == (15, 15)
 
 
 @pytest.mark.parametrize("program", [None, "Teletext"])
 def test_lockcheck_plays_the_clip_and_judges_tears_only_under_passthru(monkeypatch, program):
     seen = {}
     report = types.SimpleNamespace(summary=lambda: "verdict")
-    monkeypatch.setattr(R, "play_take", lambda rig, recorder, take_, **kw: seen.update(kw, take=take_))
+    monkeypatch.setattr(
+        R, "play_take", lambda rig, recorder, take_, **kw: seen.update(kw, take=take_, layout=kw["clip"])
+    )
     monkeypatch.setattr(LC, "judge", lambda take_, *, config, clip: seen.update(clip=clip) or report)
+    monkeypatch.setattr(LC.timecode, "clip_layout", lambda clip: ClipLayout(lead=8, frames=60, tail=8))
     rig = types.SimpleNamespace(
         playout=types.SimpleNamespace(upload=lambda path: seen.update(upload=path) or 5),
         transport=types.SimpleNamespace(close=lambda: pytest.fail("a rig handed in is not closed")),
@@ -133,6 +146,7 @@ def test_lockcheck_plays_the_clip_and_judges_tears_only_under_passthru(monkeypat
         2,
     )
     assert seen["clip"] == (None if program else "c.mkv")
+    assert seen["layout"] == ClipLayout(lead=8, frames=60, tail=8), "the take plays the clip as it lies"
 
 
 def test_lockcheck_opens_and_closes_its_own_rig(monkeypatch):
@@ -144,6 +158,7 @@ def test_lockcheck_opens_and_closes_its_own_rig(monkeypatch):
     monkeypatch.setattr(R, "open_rig", lambda config, capture: seen.append(capture) or rig)
     monkeypatch.setattr(recorder_mod, "Recorder", lambda **kw: seen.append(kw["mode"]) or "rec")
     monkeypatch.setattr(LC, "clip_seconds", lambda clip, config: 3.0)
+    monkeypatch.setattr(LC.timecode, "clip_layout", lambda clip: ClipLayout(lead=8, frames=90, tail=8))
 
     def overran(*args, **kwargs):
         del args

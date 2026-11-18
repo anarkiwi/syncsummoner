@@ -241,8 +241,7 @@ def _regression_effects(params, metrics, varying):
     """Standardized main effects from a design that varies every parameter at once.
 
     A Sobol sweep has no one-at-a-time subset, and the alternative is attributing
-    the whole sweep's variation to every parameter alike, which makes them
-    indistinguishable: measured, the effect vectors sat at cosine 0.84.
+    the whole sweep's variation to every parameter alike, which makes them indistinguishable.
     """
     x = params[:, varying].astype(np.float64)
     x = (x - x.mean(axis=0)) / (x.std(axis=0) + 1e-12)
@@ -550,6 +549,17 @@ def load_profile(path):
     if version > PROFILE_SCHEMA_VERSION:
         raise ValueError(f"profile schema {version} is newer than {PROFILE_SCHEMA_VERSION}")
     return ProgramProfile.from_dict(payload["profile"])
+
+
+def load_profiles(directory):
+    """Every ``*.yaml`` profile in ``directory``, by program, the directory kept with them."""
+    from syncsummoner.device.profile import Profiles  # pylint: disable=import-outside-toplevel
+
+    profiles = Profiles(directory=Path(directory))
+    for path in sorted(Path(directory).glob("*.yaml")):
+        profile = load_profile(path)
+        profiles[profile.program] = profile
+    return profiles
 
 
 def save_measurements(records, path):

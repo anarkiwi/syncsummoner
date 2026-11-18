@@ -67,7 +67,7 @@ def test_take_scores_matches_against_step_free_frames():
     count, rng = 400, np.random.default_rng(1)
     small = rng.integers(0, 255, (count, 3, 4, 4)).astype(np.uint8)
     seen = SimpleNamespace(
-        found=SimpleNamespace(picked=np.arange(count), lead=0),
+        found=SimpleNamespace(picked=np.arange(count), lead=0, source_offset=0),
         features=SimpleNamespace(small=small),
         source=SimpleNamespace(small=small),
         proof=SimpleNamespace(landed=SimpleNamespace(rows=landed_rows([50, 100], [1, 2], [5, 6]))),

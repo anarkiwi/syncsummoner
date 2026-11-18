@@ -3,7 +3,9 @@
 # pylint: disable=missing-function-docstring
 
 import contextlib
+import io
 import subprocess
+import threading
 import types
 from pathlib import Path
 
@@ -431,3 +433,12 @@ def test_require_route_names_the_reading_and_the_panel_setting():
     port.routed = 2
     with pytest.raises(RouteError, match=r"P: Vid Route Mode reads 2 \(Dual In\), the session needs 1 "):
         require_route(port, program="P", route=1)
+
+
+def test_a_roll_asks_the_recorder_for_the_next_file_with_the_captures_both_share():
+    said = []
+    stdin = types.SimpleNamespace(write=said.append, flush=lambda: None)
+    Recorder().roll(types.SimpleNamespace(stdin=stdin), "/t/take-01.mkv", 100, 250)
+    assert said == [b"roll 100 250 /t/take-01.mkv\n"]
+    v4l2rec.watch_stdin(io.BytesIO(said[0]), threading.Event(), lambda *a: said.append(a))
+    assert said[-1] == (100, 250, "/t/take-01.mkv"), "the recorder reads back what was asked"

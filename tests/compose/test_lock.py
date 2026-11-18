@@ -359,3 +359,75 @@ def test_the_clocks_numbering_round_trips_through_the_lock_record(tmp_path):
     record = np.load(L.lock_path(path))
     assert L.read_clock(path) == said and record["flips"].tolist() == played.flips.tolist()
     assert bool(record["wet"]) and int(record["count"]) == played.count
+
+
+def session_played():
+    """Two takes of six clip frames played back to back between an 8-frame lead-in and lead-out."""
+    return take(((0, 59, 0.0),), lead=8, count=12, tail=8, wet=(8, 20))
+
+
+def test_a_view_is_one_takes_share_of_a_session_attribution():
+    played = session_played()
+    whole = attribute(played)
+    mine = np.flatnonzero((played.frame >= 13) & (played.frame < 20))
+    found = L.attribute(played.codes, played.frames, played.flips, **played.kw, view=L.View(6, 6, mine))
+    assert found.lead == 8 + 6 and found.frame0_ns == pytest.approx(
+        whole.line.origin + 14 * whole.line.period
+    )
+    assert found.shown.tolist() == (played.shown()[mine] - 6).tolist()
+    assert (mine[found.picked] == whole.picked[6:]).all(), "each frame is picked from the take's own captures"
+    assert found.read == 0 and whole.read > 0 and found.anchored, "the session's lead-in anchors the take"
+    assert found.span == (0, mine.size - 1)
+
+
+def test_a_view_holding_none_of_a_frames_captures_leaves_it_unpicked():
+    view = L.View(0, 3, np.array([4, 5, 9]))
+    assert view.picked(np.array([4, 7, 9, 2])).tolist() == [0, -1, 2]
+    assert L.View(0, 2, np.zeros(0, np.int64)).picked(np.array([1, 2])).tolist() == [-1, -1]
+    assert view.span(np.array([5, 6, 9])) == (1, 2) and view.span(np.zeros(0, np.int64)) == (0, -1)
+
+
+def test_a_lead_in_that_fixes_no_line_is_an_anchor_error():
+    played = take(((0, 5, 0.0), (10, 59, 0.5)), lead=8, count=12, tail=8, strips={1})
+    found = attribute(played)
+    assert not found.anchored, "only the lead-out's strips fix a line"
+    with pytest.raises(L.AnchorError, match=f"name no two frames by strip.*{L.ANCHOR_FRAMES} consecutive"):
+        L.require_anchor(found, "t.mkv")
+    good = attribute(session_played())
+    assert L.require_anchor(good, "t.mkv") is good
+
+
+def test_a_session_log_keeps_each_capture_once_in_the_cards_order():
+    played = session_played()
+    first, second = played.frames[:30], played.frames[26:]
+    assert L.session_log([first, second]).tolist() == played.frames.tolist()
+    assert L.session_log([]).size == 0
+
+
+def test_a_session_take_is_attributed_by_the_session_line_from_its_record(tmp_path, monkeypatch):
+    """The second take holds no strip: the session's lead-in and its renumbered lead-out number it."""
+    played = session_played()
+    mine = np.flatnonzero(played.frame >= 13)
+    codes = played.codes.copy()
+    after = played.frame >= 20
+    codes[after] = (played.frame[after] - 8 - 6) & WRAP
+    anchors = np.where(played.frame < 13, codes, -1)
+    t = played.frames["t_ns"]
+    wet = (played.frame >= 8) & (played.frame < 20)
+    span = (float(t[wet][0]), float(t[wet][-1]))
+    path = tmp_path / "take-1.mkv"
+    sidecar(path).write_bytes(played.frames[mine].tobytes())
+    said = {"id": "s1", "index": 1, "offsets": [0, 6], "counts": [6, 6], "source_lead": 30}
+    L.save_lock(
+        path, played.flips, **played.kw, wet=True, **L.session_record(said, played.frames, anchors, span)
+    )
+    monkeypatch.setattr(L.decoded, "features", lambda *a, **k: decoded.Features({"codes": codes[mine]}, ""))
+    found = L.attribute_take(path, config=CONFIG)
+    assert found.source_offset == 30 and found.lead == 14 and found.picked.size == 6
+    assert (played.frame[mine][found.picked] == 14 + np.arange(6)).all()
+    assert json.loads(str(np.load(L.lock_path(path))["session"]))["processed"] == list(span)
+    sidecar(path).write_bytes(
+        played.frames[mine][:-1].tobytes() + np.array([(999, 1, 1, 0, 1)], played.frames.dtype).tobytes()
+    )
+    with pytest.raises(L.LockError, match="not the session's s1"):
+        L.attribute_take(path, config=CONFIG)

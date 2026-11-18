@@ -91,13 +91,9 @@ def _as_mapping(obj) -> dict:
 
 
 def _profiles_in(directory: Path) -> dict:
-    from syncsummoner.probe.fit import load_profile
+    from syncsummoner.probe.fit import load_profiles
 
-    profiles = {}
-    for path in sorted(Path(directory).glob("*.yaml")):
-        profile = load_profile(path)
-        profiles[profile.program] = profile
-    return profiles
+    return load_profiles(directory)
 
 
 def _link(args: argparse.Namespace):
@@ -469,9 +465,8 @@ def _lockcheck_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.device.recorder import require_ffmpeg
 
     require_ffmpeg()
-    lead = {} if args.lead_in is None else {"lead_in_s": args.lead_in}
     config = render_mod.RenderConfig.for_format(
-        args.format, source_host=args.source_host, route=args.route, stall_s=args.stall, **lead
+        args.format, source_host=args.source_host, route=args.route, stall_s=args.stall
     )
     _make_room(args.take, args.scratch)
     if args.judge:
@@ -479,14 +474,15 @@ def _lockcheck_cmd(args: argparse.Namespace) -> int:
     else:
         seconds = args.seconds
         if not args.prepared:
+            lead, tail = lockcheck_mod.check_frames(Path(args.take).parent, config.fps, args.lead_in)
             frames = render_mod.write_timecoded(
                 args.source,
                 args.scratch,
                 config=config,
                 seconds=args.seconds,
                 start=args.start,
-                lead=render_mod.lead_frames(config),
-                tail=render_mod.tail_frames(config),
+                lead=lead,
+                tail=tail,
             )
             seconds = frames / config.fps
         report = lockcheck_mod.lockcheck(
@@ -915,7 +911,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     lock.add_argument("--format", default="1080p30", help="session format the rig runs at")
     lock.add_argument("--seconds", type=float, help="length of the clip to play (default: all of it)")
     lock.add_argument("--start", type=float, default=0.0, help="where in the footage the clip starts")
-    lock.add_argument("--lead-in", type=float, help="seconds of strip-coded lead-in (default: the render's)")
+    lock.add_argument("--lead-in", type=float, help="seconds of lead-in and lead-out (default: a load's)")
     lock.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     lock.add_argument("--stall", type=float, help="pyvmancer's stall guard for device waits, seconds")
     _add_route_arg(lock)

@@ -412,8 +412,20 @@ def read_exactly(stream: Any, size: int) -> bytes | None:
     return bytes(buf)
 
 
-def decode_argv(path: str, width: int, height: int, *, loop: bool, ffmpeg: str = "ffmpeg") -> list[str]:
-    """ffmpeg decoding a clip to raw frames at the display's geometry and layout, as fast as it goes."""
+def decode_argv(
+    path: str,
+    width: int,
+    height: int,
+    *,
+    loop: bool,
+    span: tuple[int, int] | None = None,
+    ffmpeg: str = "ffmpeg",
+) -> list[str]:
+    """ffmpeg decoding a clip to raw frames at the display's geometry and layout, as fast as it goes.
+
+    ``span`` keeps the clip's frames ``a..b-1`` only, counted from its first.
+    """
+    trim = "" if span is None else f"trim=start_frame={span[0]}:end_frame={span[1]},"
     return [
         ffmpeg,
         "-nostdin",
@@ -426,7 +438,7 @@ def decode_argv(path: str, width: int, height: int, *, loop: bool, ffmpeg: str =
         "-map",
         "0:v:0",
         "-vf",
-        f"scale={width}:{height}",
+        f"{trim}scale={width}:{height}",
         "-fps_mode",
         "passthrough",
         "-pix_fmt",
@@ -437,9 +449,13 @@ def decode_argv(path: str, width: int, height: int, *, loop: bool, ffmpeg: str =
     ]
 
 
-def clip_frames(argv: list[str], size: int) -> Iterator[bytes]:
-    """Whole frames of ``size`` bytes from a decoder's stdout; a decoder error is a fault."""
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+def _decoder(argv: list[str]) -> subprocess.Popen:
+    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _frames(proc: subprocess.Popen, size: int) -> Iterator[bytes]:
+    """Whole frames of ``size`` bytes from a running decoder's stdout; a decoder error is a fault."""
+    with proc:
         try:
             while (frame := read_exactly(proc.stdout, size)) is not None:
                 yield frame
@@ -448,6 +464,39 @@ def clip_frames(argv: list[str], size: int) -> Iterator[bytes]:
         said = proc.stderr.read().decode(errors="replace").strip()
     if proc.returncode not in (0, -signal.SIGKILL) and said:
         raise PlayoutFault(f"decoding failed: {said.splitlines()[-1]}")
+
+
+def clip_frames(argv: list[str], size: int) -> Iterator[bytes]:
+    """Whole frames of ``size`` bytes from a decoder's stdout; a decoder error is a fault."""
+    yield from _frames(_decoder(argv), size)
+
+
+def parse_spans(text: str) -> list[tuple[int, int]]:
+    """Clip frame ranges given as ``a:b,a:b``, each ``a..b-1``."""
+    spans = [tuple(int(x) for x in part.split(":")) for part in text.split(",") if part]
+    if not spans or any(len(s) != 2 or not 0 <= s[0] < s[1] for s in spans):
+        raise ValueError(f"spans must be a:b with 0 <= a < b, got {text!r}")
+    return spans
+
+
+def span_frames(
+    path: str, width: int, height: int, spans: Iterable[tuple[int, int]], size: int
+) -> Iterator[bytes]:
+    """The clip's frames over each span in turn, as one stream with no seam.
+
+    Each span has its own decoder, started while the span before plays, so its decoding up to the
+    span's first frame is done by the time that frame is due.
+    """
+    argvs = [decode_argv(path, width, height, loop=False, span=span) for span in spans]
+    upcoming = _decoder(argvs[0]) if argvs else None
+    try:
+        for index in range(len(argvs)):
+            current, upcoming = upcoming, _decoder(argvs[index + 1]) if index + 1 < len(argvs) else None
+            yield from _frames(current, size)
+    finally:
+        if upcoming is not None:
+            upcoming.kill()
+            upcoming.wait()
 
 
 def clip_rate(path: str, *, ffprobe: str = "ffprobe") -> Fraction:
@@ -509,6 +558,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source.add_argument("--frames", help="directory of raw frame.* files")
     parser.add_argument("--fps", required=True, type=parse_rate)
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--spans", type=parse_spans, help="play only these clip frame ranges, a:b,a:b")
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--device", default="/dev/dri/card1")
@@ -538,11 +588,16 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         if args.clip and clip_rate(args.clip) != args.fps:
             raise PlayoutFault(f"{args.clip} runs at {clip_rate(args.clip)} fps, not {args.fps}")
         display = KmsDisplay(args.device, args.connector, args.width, args.height, args.fps)
-        frames = (
-            clip_frames(decode_argv(args.clip, args.width, args.height, loop=args.loop), display.frame_bytes)
-            if args.clip
-            else dir_frames(args.frames, loop=args.loop)
-        )
+        if args.spans and not args.clip:
+            raise PlayoutFault("spans play a clip, not a frame directory")
+        if args.spans:
+            frames = span_frames(args.clip, args.width, args.height, args.spans, display.frame_bytes)
+        elif args.clip:
+            frames = clip_frames(
+                decode_argv(args.clip, args.width, args.height, loop=args.loop), display.frame_bytes
+            )
+        else:
+            frames = dir_frames(args.frames, loop=args.loop)
         preroll = Prerolled(frames, max(2, round(float(args.preroll_s * args.fps))))
         preroll.wait_full(timeout_s=60.0)
         with open(args.flips, "wb", buffering=0) as log:

@@ -419,12 +419,16 @@ def save_rows(take: str | Path, rows: Sequence[FrameRow]) -> Path:
 
 
 def capture(
-    config: Any, chunk: Chunk, out: str | Path, *, program: str, clip: str | Path
-) -> dict:  # pragma: no cover - needs the rig
-    """Record one chunk as a locked take of ``program`` on the clip; its device state and any fault."""
+    config: Any, chunks: Sequence[Chunk], outs: Sequence[str | Path], *, program: str, clip: str | Path
+) -> list[dict]:  # pragma: no cover - needs the rig
+    """Record the chunks as one session of ``program`` on the clip; per take, its device state and any fault.
+
+    The program is loaded once for them all; a fault anywhere is every take's, since they share one session.
+    """
     from pyvmancer.ccmap import cc_map_report  # pylint: disable=import-outside-toplevel
 
-    from syncsummoner.compose import locktake, render  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import locktake, render, session  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose.timecode import clip_layout  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.recorder import (  # pylint: disable=import-outside-toplevel
         Recorder,
         await_transmitting,
@@ -432,10 +436,10 @@ def capture(
         require_route,
         require_signal,
     )
-    from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
+    from syncsummoner.device.v4l2rec import read_log, sidecar  # pylint: disable=import-outside-toplevel
 
-    out = Path(out)
-    rig = render.open_rig(config, capture=False)
+    outs = [Path(out) for out in outs]
+    rig = render.open_rig(config, capture=False, directory=outs[0].parent)
     shell = rig.transport.device.shell
 
     def state() -> dict:
@@ -455,39 +459,43 @@ def capture(
             record["program_info"] = rig.transport.program_payload()
         return rig.transport.program_info()
 
-    record: dict = {"program": program, "chunk": chunk.first, "writes": int(chunk.plan.size)}
+    record: dict = {"program": program}
     try:
         record["before"] = state()
         try:
             require_route(rig.transport, program=program, route=config.route)
             rig.playout.upload(str(clip))
-            locktake.locked_take(
+            session.locked_session(
                 rig,
                 Recorder(width=config.width, height=config.height, fps=config.fps),
-                out,
+                [session.Take(out, chunk.plan, chunk.frames) for out, chunk in zip(outs, chunks)],
                 program=program,
-                seconds=chunk.frames / config.fps,
                 config=config,
-                plan=chunk.plan,
                 working=lambda _info: {},
                 load=load,
+                clip=clip_layout(clip),
             )
             rig.transport.verify_cc_map()
             require_signal(rig.transport, when="as the sweep ended", program=program, timing=config.timing)
         except Exception as err:  # pylint: disable=broad-exception-caught
             record["fault"] = f"{type(err).__name__}: {err}"
-        lost = int(np.clip(np.diff(read_log(out)["sequence"].astype(np.int64)) - 1, 0, None).sum())
-        record["frames_lost_by_driver"] = lost
         record["after"] = state()
-        if lost:
-            record.setdefault("fault", f"TakeFaultError: the capture driver lost {lost} frames")
         if record["after"]["boot_count"] != record["before"]["boot_count"]:
-            record.setdefault("fault", "RebootError: the boot count rose across the take")
+            record.setdefault("fault", "RebootError: the boot count rose across the session")
         if not record["after"]["cc_map_ok"]:
-            record.setdefault("fault", "CcMapError: the CC map changed across the take")
+            record.setdefault("fault", "CcMapError: the CC map changed across the session")
     finally:
         rig.transport.close()
-    return record
+    said = []
+    for out, chunk in zip(outs, chunks):
+        mine = {**record, "chunk": chunk.first, "writes": int(chunk.plan.size), "session_takes": len(outs)}
+        seq = read_log(out)["sequence"].astype(np.int64) if sidecar(out).is_file() else np.zeros(0, np.int64)
+        lost = int(np.clip(np.diff(seq) - 1, 0, None).sum())
+        mine["frames_lost_by_driver"] = lost
+        if lost:
+            mine.setdefault("fault", f"TakeFaultError: the capture driver lost {lost} frames")
+        said.append(mine)
+    return said
 
 
 def collect(
@@ -515,7 +523,7 @@ def collect(
         picked=seen.found.picked,
         shown=seen.found.shown,
         captured=read_log(take)["t_ns"].astype(np.float64) / 1e9,
-        lead=seen.found.lead,
+        lead=seen.found.source_offset,
         program=program,
         bad_frames=disagreeing(seen.proof.applied),
         ambiguity=getattr(seen.found, "ambiguity", None),
@@ -536,7 +544,7 @@ def collect(
             frameline.segments(log["t_ns"], log["sequence"]),
             seen.features.luma,
             series,
-            lead=seen.found.lead,
+            lead=seen.found.source_offset,
         )
         save_clock(take, clock)
     save_rows(take, rows)

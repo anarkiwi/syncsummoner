@@ -408,6 +408,14 @@ class Recorder:
         finally:
             errors.close()
 
+    def roll(self, proc: Any, path: str | Path, opens_ns: int, closes_ns: int) -> None:
+        """Send captures from ``opens_ns`` on to ``path``, those before ``closes_ns`` to the file so far too.
+
+        Times are the capture clock's; the card keeps streaming, so both files share the captures between.
+        """
+        proc.stdin.write(f"roll {int(opens_ns)} {int(closes_ns)} {path}\n".encode())
+        proc.stdin.flush()
+
     def stop(self, proc: Any, *, timeout_s: float = 20.0) -> int:
         """Ask ffmpeg to finish the file, and wait for it to do so."""
         try:

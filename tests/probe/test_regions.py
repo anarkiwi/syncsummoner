@@ -12,6 +12,9 @@ import pytest
 from syncsummoner import cli
 from syncsummoner.aesthetics.survival import SIGMA, critical_z, effective_samples, follow_z
 from syncsummoner.compose import locktake as LT
+from syncsummoner.compose import timecode
+from syncsummoner.compose.session import session_frames
+from syncsummoner.compose.render import RenderConfig
 from syncsummoner.probe import decoded
 from syncsummoner.probe import locked as L
 from syncsummoner.probe import regions as R
@@ -67,7 +70,7 @@ def test_the_guard_covers_the_latency_band_an_echo_and_the_settle():
     assert R.guard_frames(2, 40e6, 33e6) == 6
 
 
-def test_settings_fill_the_clip_take_by_take_within_the_budget():
+def test_settings_fill_the_clip_take_by_take_within_one_sessions_budget():
     ti = ar1(3000, 0.5, 6)
     edges = np.arange(0, 3000, 90)
     placed = R.slots(ti, edges, guard=4, budget_s=400.0, overhead_s=80.0, fps=30.0)
@@ -79,8 +82,9 @@ def test_settings_fill_the_clip_take_by_take_within_the_budget():
         assert mine[-1].start + mine[-1].frames <= ti.size
     effect = R.effect_sizes(ti, edges)
     assert all(s.hold == R.hold_at(ti, float(effect[s.start + 4]), s.start + 4) for s in placed)
-    used = sum(s.frames for s in placed) / 30.0 + 80.0 * len(takes)
-    assert used <= 400.0
+    used = sum(s.frames for s in placed) / 30.0 + 80.0
+    assert used <= 400.0, "the takes play back to back in one session, its lead-in and lead-out paid once"
+    assert R.slots(ti, edges, guard=4, budget_s=480.0, overhead_s=160.0, fps=30.0) == placed
     assert len(R.slots(ti, edges, guard=4, budget_s=800.0, overhead_s=80.0, fps=30.0)) > len(placed)
     with pytest.raises(L.SweepError):
         R.slots(np.full(30, 10.0), edges, guard=4, budget_s=400.0, overhead_s=80.0, fps=30.0)
@@ -132,6 +136,7 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     rng = np.random.default_rng(7)
     luma[lead : lead + 3000] = np.cumsum(rng.normal(0, 1, (3000, 4, 4)), axis=0)
     monkeypatch.setattr(decoded, "features", lambda *a, **k: SimpleNamespace(luma=luma))
+    monkeypatch.setattr(timecode, "clip_layout", lambda clip: timecode.ClipLayout(lead, 3000, lead))
     monkeypatch.setattr(sweep_cmds, "downbeat_frames", lambda audio, fps: np.arange(0, 3000, 84))
     values = {
         1: np.arange(0, 1024, 64),
@@ -158,6 +163,9 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
         sum(len(c.states) for c in chunks) == regions["settings"] == sum(regions["per_regime"].values()) + 6
     )
     assert all(c.frames <= 3000 for c in chunks) and regions["rig_s"] <= 900
+    ends = session_frames(LT.LeadIn(), 30.0, dry=True, directory=tmp_path)
+    session_s = sum(ends) / 30.0 + RenderConfig.for_format("1080p30").tail_s
+    assert regions["rig_s"] == pytest.approx(sum(c.frames for c in chunks) / 30.0 + session_s)
     assert "settings" in capsys.readouterr().out
     assert all(math.log2(n).is_integer() for n in regions["per_regime"].values() if n)
 

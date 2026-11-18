@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 
@@ -179,10 +179,16 @@ class KmsPlayer(Playout):
         """The player's source arguments."""
         raise NotImplementedError
 
-    def command(self, fps: Fraction) -> str:
-        """The player's command line on the Pi."""
+    def span_args(self, spans: Sequence[tuple[int, int]] | None) -> str:
+        """The arguments playing only ``spans`` of the source; a player that cannot refuses any."""
+        if spans:
+            raise ValueError(f"{type(self).__name__} plays no spans")
+        return ""
+
+    def command(self, fps: Fraction, spans: Sequence[tuple[int, int]] | None = None) -> str:
+        """The player's command line on the Pi, playing only ``spans`` of the source when given."""
         return (
-            f"python3 {self.path('kmsplay.py')} {self.source_args()} --fps {fps} "
+            f"python3 {self.path('kmsplay.py')} {self.source_args()}{self.span_args(spans)} --fps {fps} "
             f"--width {self.width} --height {self.height} --preroll-s {self.preroll_s:g} "
             f"--flips {self.path('flips.bin')} --status {self.path('status.json')}"
             + (" --loop" if self.loop else "")
@@ -230,8 +236,13 @@ class KmsPlayer(Playout):
             raise PlayoutError(f"the Pi player died while playing: {self.log() or 'no diagnostic'}")
         return status
 
-    def start(self, *, fps: float | str | Fraction = DEFAULT_LOOP_FPS) -> int:
-        """Restart the player at ``fps``, returning its pid once it is flipping.
+    def start(
+        self,
+        *,
+        fps: float | str | Fraction = DEFAULT_LOOP_FPS,
+        spans: Sequence[tuple[int, int]] | None = None,
+    ) -> int:
+        """Restart the player at ``fps``, its pid once it is flipping; ``spans`` as for :meth:`command`.
 
         The pid is recorded by the shell that execs the player, so the pidfile holds the
         player's own pid and survives the ssh session ending.
@@ -244,7 +255,7 @@ class KmsPlayer(Playout):
         self._runner(
             f"rm -f {self.path('status.json')}; setsid sh -c 'echo $$ > {self.pid_path}; "
             f"sudo -n prlimit --rtprio={RTPRIO_LIMIT} --pid $$; "
-            f"exec {self.command(exact)}' < /dev/null > {self.path('player.log')} 2>&1 &"
+            f"exec {self.command(exact, spans)}' < /dev/null > {self.path('player.log')} 2>&1 &"
         )
         deadline = self._clock() + self.timeout_s
         while (state := self.status().get("state")) not in SETTLED:
@@ -280,9 +291,14 @@ class KmsPlayer(Playout):
         return status
 
     @contextmanager
-    def playing(self, *, fps: float | str | Fraction = DEFAULT_LOOP_FPS) -> Iterator["KmsPlayer"]:
+    def playing(
+        self,
+        *,
+        fps: float | str | Fraction = DEFAULT_LOOP_FPS,
+        spans: Sequence[tuple[int, int]] | None = None,
+    ) -> Iterator["KmsPlayer"]:
         """Play for the block, stopping afterwards; a fault fails the block unless it already failed."""
-        self.start(fps=fps)
+        self.start(fps=fps, spans=spans)
         try:
             yield self
         except BaseException:
@@ -326,6 +342,10 @@ class ClipPlayer(KmsPlayer):
     def source_args(self) -> str:
         """Decode the uploaded clip."""
         return f"--clip {self.clip_path}"
+
+    def span_args(self, spans: Sequence[tuple[int, int]] | None) -> str:
+        """Play the clip's frames ``a..b-1`` of each span in turn, with no seam between them."""
+        return f" --spans {','.join(f'{a}:{b}' for a, b in spans)}" if spans else ""
 
 
 class LoopPlayer(KmsPlayer):
