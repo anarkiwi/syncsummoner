@@ -639,7 +639,8 @@ def _run(
     LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
     rows = held["rows"]
     first = int(rows["target"][0]) if rows.size else 0
-    if wire["ticks"]["field"][-1] >= first + shift.lo - 1:
+    now = json.loads(poller.ask("transport", "status", timeout_s=5.0).payload or "{}").get("field_count")
+    if now is None or int(now) >= first + shift.lo - 1:
         raise LeadInTimeError(
             f"{program}: the device-to-clip offset was known after the device ticked for clip frame {first - 1}, "
             "past the lead-in this session derived"

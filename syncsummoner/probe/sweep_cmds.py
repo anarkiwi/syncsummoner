@@ -37,7 +37,7 @@ def _timecode_cmd(args: argparse.Namespace) -> int:
 
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     load_s = stall_guard(args.stall)
-    lead, tail = session_frames(LeadIn(), config.fps, dry=False, directory=args.latency, load_s=load_s)
+    lead, tail = session_frames(LeadIn(), config.fps, dry=False, load_s=load_s)
     frames = write_timecoded(args.source, args.out, config=config, lead=lead, tail=tail)
     print(f"{args.out}: {frames} frames, {lead} lead-in and {tail} lead-out frames, for a {load_s} s load")
     return 0
@@ -110,7 +110,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     import numpy as np
     from pyvmancer.midi import ParamKind, param_kind
 
-    from syncsummoner.compose.locktake import LeadIn, read_latency
+    from syncsummoner.compose.locktake import LeadIn
     from syncsummoner.compose.session import session_frames
     from syncsummoner.compose.render import RenderConfig
     from syncsummoner.compose.timecode import clip_layout
@@ -143,10 +143,9 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     layout = clip_layout(args.source)
     ti = clip_ti(clip.luma, layout.lead, layout.tail)
     edges = downbeat_frames(args.audio, config.fps)
-    lat = read_latency(args.latency or args.takes)
-    guard = guard_frames(int(held["settle"]), lat.hi - lat.lo, 1e9 / config.fps)
+    guard = guard_frames(int(held["settle"]))
     m = model(args.program)
-    ends = session_frames(LeadIn(), config.fps, dry=m.bypass() is not None, directory=args.takes, band=lat)
+    ends = session_frames(LeadIn(), config.fps, dry=m.bypass() is not None)
     overhead_s = sum(ends) / config.fps + config.tail_s
     values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
     states = np.asarray(record["states"], dtype=np.int64)
@@ -347,7 +346,6 @@ def _add_timecode(probe_sub: Any) -> Any:
     )
     stamp.add_argument("source", help="the footage")
     stamp.add_argument("--out", required=True, help="the timecoded clip to write")
-    stamp.add_argument("--latency", required=True, help="where the dry takes' ccpicture.json is")
     stamp.set_defaults(func=_timecode_cmd)
     return stamp
 
@@ -393,9 +391,6 @@ def add_parsers(probe_sub: Any) -> None:
     regions.add_argument("--source", required=True, help="the timecoded clip the takes will play")
     regions.add_argument("--audio", required=True, help="the track the clip is scored to, for its bars")
     regions.add_argument("--takes", required=True, help="the sweep's takes directory")
-    regions.add_argument(
-        "--latency", help="where the dry takes' ccpicture.json is; the takes directory by default"
-    )
     regions.add_argument(
         "--budget-s",
         type=float,

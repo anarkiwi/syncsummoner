@@ -699,19 +699,28 @@ def processed(take: str | Path, record: Any, frames: np.ndarray) -> tuple[float,
 
 
 def _written_span(wire: Any, count: int) -> tuple[float, float] | None:
-    """:func:`processed` from a wire record: the dry control's writes, else the loads it recorded."""
-    from syncsummoner.compose.evidence import START  # pylint: disable=import-outside-toplevel
+    """:func:`processed` from a wire record: the dry control's writes, else the loads it recorded.
+
+    Processing ends once the device has ticked twice past the end: the frame it took effect on, and
+    the frame after, whose capture shows its picture whole.
+    """
+    from syncsummoner.compose.evidence import START, UNBOUNDED, count_after  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.wire import echoed  # pylint: disable=import-outside-toplevel
 
-    lat = json.loads(str(wire["latency"])) if "latency" in wire else {}
-    if "hi" not in lat:
+    ticks = wire["ticks"] if "ticks" in wire else None
+    if ticks is None or not ticks.size:
         return None
-    after = float(lat["hi"]) + float(lat["period"])
+
+    def settled(t_ns: float) -> float:
+        later = int(count_after(ticks, np.array([t_ns]))[0])
+        k = np.flatnonzero(ticks["field"] >= later + 2) if later != UNBOUNDED else np.zeros(0, np.int64)
+        return float(ticks["t1_ns"][k[0]]) if k.size else np.inf
+
     loads = json.loads(str(wire["loads"])) if "loads" in wire else []
     if json.loads(str(wire["dry"])) is None:
         if len(loads) < 2:
             return None
-        return float(loads[0]["t0_ns"]), float(loads[-1]["t1_ns"]) + after
+        return float(loads[0]["t0_ns"]), settled(float(loads[-1]["t1_ns"]))
     sends = wire["sends"]
     moved = np.flatnonzero(sends["target"] != START)
     back = np.flatnonzero(sends["target"] == count)
@@ -720,7 +729,7 @@ def _written_span(wire: Any, count: int) -> tuple[float, float] | None:
     took = echoed(sends, wire["receipts"], wire["reads"], wire["cc_map"], read_errors=wire.get("read_errors"))
     end = took[back[-1], 1]
     end = float(sends["t1_ns"][back[-1]]) if not np.isfinite(end) else float(end)
-    return float(sends["t0_ns"][moved[0]]), end + after
+    return float(sends["t0_ns"][moved[0]]), settled(end)
 
 
 def attribute_take(

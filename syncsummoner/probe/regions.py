@@ -87,13 +87,13 @@ def holds(ti: np.ndarray, edges: np.ndarray, starts: Sequence[int] | None = None
     return np.array([hold_at(ti, float(effect[t]), int(t)) for t in starts], dtype=np.int64)
 
 
-def guard_frames(settle: int, band_ns: float, period_ns: float) -> int:
+def guard_frames(settle: int) -> int:
     """Frames after a setting's writes before its picture is measured: its landing window, then ``settle``.
 
-    A write lands on one of the ticks its latency band spans, one more for a tick inside its echo
-    bracket and one more for an echo taking up to a frame.
+    A write's device frame is pinned by command order, and its clip frame by the session's offset, which
+    its events bound to within a frame (docs/evidence.md); one more frame for the write's own frame.
     """
-    return int(settle) + int(math.ceil(band_ns / period_ns)) + 2
+    return int(settle) + 2
 
 
 @dataclass(frozen=True)
