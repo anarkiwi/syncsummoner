@@ -174,9 +174,13 @@ def test_a_measured_hold_overrides_a_plans_settle_and_says_so(tmp_path):
     hold = tmp_path / "hold-p.json"
     hold.write_text(json.dumps({"program": "p", "settle": 27, "hold": 29}))
     moved, said = sweep_cmds.settled_by(chunk, "p", str(hold), "plan.json")
-    assert moved.settle == 27 and said == {"frames": 27, "source": str(hold)}
+    assert moved.settle == 27 and said == {"frames": 27, "source": str(hold), "measured": True}
     kept, said = sweep_cmds.settled_by(chunk, "p", None, "plan.json")
-    assert kept is chunk and said == {"frames": 1, "source": "plan.json"}
+    assert kept is chunk and said == {"frames": 1, "source": "plan.json", "measured": True}
+    _, said = sweep_cmds.settled_by(chunk, "p", None, "plan.json", measured=False)
+    assert said["measured"] is False
+    _, said = sweep_cmds.settled_by(chunk, "p", str(hold), "plan.json", measured=False)
+    assert said["measured"] is True, "a hold record is a measured settle whatever the plan had"
     with pytest.raises(ValueError, match="not q"):
         sweep_cmds.settled_by(chunk, "q", str(hold), "plan.json")
 
@@ -255,3 +259,30 @@ def test_sweep_capture_passes_the_stall_guard_and_keeps_each_attempt(tmp_path, m
     }
     meta = json.loads((tmp_path / "take-p-00.mkv.meta.json").read_text())
     assert meta == {"attempt-2": {"fault": "LeadInTimeError: late"}}
+
+
+def test_commit_refuses_rows_that_waited_no_measured_settle(tmp_path, monkeypatch):
+    chunks = L.plan_sweep(plan_states(), settle=0, hold=2, frames=6)
+    unmeasured = {"program": "p", "settle": 0, "measured": False}
+    plan = L.write_plan(tmp_path / "sweep-p.json", chunks, program="p", source="c.mkv", response=unmeasured)
+    seen = []
+
+    def collect(take, _chunk, *, settle, **_kw):
+        seen.append(settle)
+        LT.evidence_path(take).write_text(json.dumps({"settle": settle}), encoding="utf-8")
+        return {"evidence_ok": True}
+
+    monkeypatch.setattr(L, "collect", collect)
+    for k in range(len(chunks)):
+        assert cli.main(["probe", "sweep", "collect", str(plan), "--chunk", str(k)]) == 0
+    assert [s["measured"] for s in seen] == [False] * len(chunks)
+    take = tmp_path / "take-p-00.mkv"
+    assert not sweep_cmds.settle_measured(take) and sweep_cmds.settle_measured(tmp_path / "none.mkv")
+    assert cli.main(["probe", "sweep", "commit", str(plan), "--archive", str(tmp_path / "a")]) == 1
+    assert FrameArchive(tmp_path / "a").meta("p") is None
+    hold = tmp_path / "hold-p.json"
+    hold.write_text(json.dumps({"program": "p", "settle": 2, "hold": 4}))
+    assert cli.main(["probe", "sweep", "collect", str(plan), "--chunk", "0", "--hold", str(hold)]) == 0
+    assert seen[-1] == {"frames": 2, "source": str(hold), "measured": True} and sweep_cmds.settle_measured(
+        take
+    )
