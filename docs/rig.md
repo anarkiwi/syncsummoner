@@ -7,11 +7,9 @@ one records how it is put together and how to get it running.
 
 ```
 Raspberry Pi 4B (videopi)
-  /dev/fb0, 720x576i PAL composite
+  KMS player, card1 HDMI-A-1, 1920x1080 at 30 Hz, vsync-locked
         |
-        +-- [RGB encoder] --> Videomancer analog in   (colour, needs calibration)
-        |
-        +-- direct CVBS ----> Videomancer analog in   (luma only, clean)
+        +-- HDMI ---------> Videomancer HDMI in (source hdmi)
                                     |
                                     +-- HDMI out --> AVerMedia Live Gamer Ultra 2.1
                                                      /dev/video0 on the host
