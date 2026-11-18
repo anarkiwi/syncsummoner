@@ -4,6 +4,7 @@
 
 import io
 import json
+import shutil
 import struct
 import subprocess
 import sys
@@ -460,9 +461,24 @@ def test_realtime_asks_for_fifo_at_the_pacing_priority_and_reports_a_refusal(mon
     assert asked == [(0, K.os.SCHED_FIFO, K.REALTIME_PRIORITY)]
 
 
-def test_a_span_is_trimmed_before_it_is_scaled():
-    argv = K.decode_argv("c.mkv", 8, 6, loop=False, span=(3, 9))
-    assert argv[argv.index("-vf") + 1] == "trim=start_frame=3:end_frame=9,scale=8:6"
+def test_a_span_is_sought_half_a_frame_early_and_trimmed_to_its_length_before_it_is_scaled():
+    argv = K.decode_argv("c.mkv", 8, 6, loop=False, span=(3, 9), rate=Fraction(30))
+    assert argv[argv.index("-vf") + 1] == "trim=end_frame=6,scale=8:6"
+    assert argv[argv.index("-ss") + 1] == "0.083333" and argv.index("-ss") < argv.index("-i")
+    assert "-ss" not in K.decode_argv("c.mkv", 8, 6, loop=False, span=(0, 9), rate=Fraction(30))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_a_sought_span_decodes_the_frames_a_full_decode_trims_to(tmp_path):
+    clip = str(tmp_path / "c.mkv")
+    src = "testsrc2=size=64x48:rate=30"
+    encode = ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", src, "-frames:v", "90"]
+    subprocess.run(encode + ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", clip], check=True)
+    whole = b"".join(K.clip_frames(K.decode_argv(clip, 64, 48, loop=False), 64 * 48 * 2))
+    size = 64 * 48 * 2
+    for a, b in ((0, 7), (1, 4), (26, 40), (52, 90)):
+        got = b"".join(K.span_frames(clip, 64, 48, [(a, b)], size, Fraction(30)))
+        assert got == whole[a * size : b * size], (a, b)
 
 
 def test_spans_parse_as_ranges_and_refuse_empty_or_backward_ones():
@@ -481,18 +497,18 @@ def test_spans_play_as_one_stream_each_next_decoder_started_before_it_is_due(mon
         procs.append(real(argv))
         return procs[-1]
 
-    def argv_for(path, width, height, *, loop, span):
-        del path, width, height, loop
+    def argv_for(path, width, height, *, loop, span, rate):
+        del path, width, height, loop, rate
         data = bytes(range(span[0], span[1]))
         return [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({data!r})", f"{span[0]}"]
 
     monkeypatch.setattr(K, "_decoder", decoder)
     monkeypatch.setattr(K, "decode_argv", argv_for)
-    stream = K.span_frames("c.mkv", 1, 1, [(0, 2), (5, 7), (1, 2)], 1)
+    stream = K.span_frames("c.mkv", 1, 1, [(0, 2), (5, 7), (1, 2)], 1, Fraction(30))
     assert next(stream) == b"\x00" and started == ["0", "5"], "the next span decodes while this one plays"
     assert list(stream) == [b"\x01", b"\x05", b"\x06", b"\x01"] and started == ["0", "5", "1"]
     procs.clear()
-    closed = K.span_frames("c.mkv", 1, 1, [(0, 2), (5, 7)], 1)
+    closed = K.span_frames("c.mkv", 1, 1, [(0, 2), (5, 7)], 1, Fraction(30))
     next(closed)
     closed.close()
     assert len(procs) == 2 and all(p.poll() is not None for p in procs), "closing early reaps both decoders"
