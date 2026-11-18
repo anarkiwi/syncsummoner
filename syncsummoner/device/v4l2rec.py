@@ -225,6 +225,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a ca
             argv_out = encoder_argv(
                 args.input_format, args.width, args.height, rate, args.out_args, path, ffmpeg=args.ffmpeg
             )
+            # An archive may hold the old take as a hard link; a fresh inode leaves it intact.
+            if Path(path).is_file():
+                Path(path).unlink()
             enc = subprocess.Popen(argv_out, stdin=subprocess.PIPE)  # pylint: disable=consider-using-with
             log = open(sidecar(path), "wb", buffering=0)  # pylint: disable=consider-using-with
             encoders.append(enc)

@@ -14,6 +14,7 @@ from syncsummoner.compose import response as response_mod
 from syncsummoner.compose import session as SS
 from syncsummoner.compose import timecode
 from syncsummoner.compose.evidence import DISAGREE, LANDED
+from syncsummoner.probe import archive as A
 from syncsummoner.probe import decoded
 from syncsummoner.probe import locked as L
 from syncsummoner.probe import sweep_cmds
@@ -115,6 +116,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
                 }
             )
         )
+        take.write_bytes(b"take")
         return {"evidence_ok": True}
 
     monkeypatch.setattr(L, "collect", collect)
@@ -123,14 +125,12 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
     monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(100))
     monkeypatch.setattr(timecode, "clip_layout", lambda clip: timecode.ClipLayout(30, 40, 30))
 
-    def concat(_videos, out, **_kw):
-        out.write_bytes(b"joined")
-
-    monkeypatch.setattr(L, "concat", concat)
+    monkeypatch.setattr(A, "container_duration", lambda *a, **k: "0.2")
     assert cli.main(["probe", "sweep", "commit", str(plan), "--archive", str(tmp_path / "a")]) == 0
     meta = FrameArchive(tmp_path / "a").meta("p")
     assert meta["key_material"] == "rc4" and meta["stimulus"]["frames"] == 100
     assert meta["stimulus"]["lead"] == 30, "the archive names the clip's own lead-in"
+    assert meta["video"] == "p.ffconcat" and len(meta["parts"]) == len(chunks)
     assert (tmp_path / "a" / "c.mkv").is_symlink() and '"measured"' in capsys.readouterr().out
 
 

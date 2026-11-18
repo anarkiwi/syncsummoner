@@ -7,8 +7,10 @@ captured under. Keyed like the result store, so a reflash invalidates both.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -21,7 +23,7 @@ import numpy as np
 
 from syncsummoner.device.profile import PARAM_COUNT
 from syncsummoner.probe.fit import load_measurements, save_measurements
-from syncsummoner.probe.store import ProgramKey, atomic_write, slug
+from syncsummoner.probe.store import ProgramKey, atomic_write, slug, temp_sibling
 
 __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
@@ -37,7 +39,10 @@ __all__ = [
     "FrameArchive",
     "FrameReader",
     "FrameRow",
+    "container_duration",
     "is_footage",
+    "link",
+    "listing",
     "same_stimulus",
     "stimulus_of",
 ]
@@ -52,6 +57,9 @@ CODEFRAMES = {"kind": "codeframes"}
 ARCHIVE_FPS = 30
 CONTAINER = "matroska"
 VIDEO_SUFFIX = ".mkv"
+#: A video of several parts, an ffconcat listing the concat demuxer reads as one stream.
+LISTING_SUFFIX = ".ffconcat"
+LISTING_HEADER = "ffconcat version 1.0"
 #: Marks a program measured black on a healthy rig, so a resume does not re-probe it.
 DARK_SUFFIX = ".dark.json"
 #: Setpoint of a frame captured between setpoints, kept for continuity but not measured.
@@ -111,6 +119,41 @@ def same_stimulus(stored: Mapping[str, Any], asked: Mapping[str, Any]) -> bool:
 
 class ArchiveError(RuntimeError):
     """The archive could not be written, read, or was not encoded losslessly."""
+
+
+def container_duration(path: str | Path, *, ffprobe: str = "ffprobe", run: Callable[..., Any]) -> str:
+    """A part's container duration as ffprobe prints it, to the microsecond the concat demuxer keeps."""
+    argv = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]
+    result = run([*argv, str(path)], capture_output=True, check=False)
+    text = result.stdout.decode() if isinstance(result.stdout, bytes) else str(result.stdout or "")
+    try:
+        if not result.returncode and float(text) > 0:
+            return text.strip()
+    except ValueError:
+        pass
+    raise ArchiveError(f"no container duration for {path}: {_last_line(result.stderr)}")
+
+
+def link(source: str | Path, target: Path) -> None:
+    """Publish ``source`` at ``target`` as a hard link, copying it only across filesystems."""
+    tmp = temp_sibling(target)
+    tmp.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, tmp)
+        except OSError as err:
+            if err.errno != errno.EXDEV:
+                raise
+            shutil.copy2(source, tmp)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def listing(parts: Sequence[str], durations: Sequence[str]) -> str:
+    """An ffconcat listing of ``parts`` by relative name, each with its duration so the whole is seekable."""
+    body = "".join(f"file '{name}'\nduration {span}\n" for name, span in zip(parts, durations))
+    return f"{LISTING_HEADER}\n{body}"
 
 
 @dataclass(frozen=True)
@@ -408,6 +451,7 @@ class FrameArchive:
         popen: Callable[..., Any] = subprocess.Popen,
         run: Callable[..., Any] = subprocess.run,
         ffmpeg: str = "ffmpeg",
+        ffprobe: str = "ffprobe",
         threads: int | None = None,
         decode: str = "cpu",
     ):
@@ -416,11 +460,12 @@ class FrameArchive:
         self.popen = popen
         self.run = run
         self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
         self.threads = threads
         self.decode = decode
 
     def paths(self, program: str) -> tuple[Path, Path, Path]:
-        """Video, sidecar and metadata paths for one program."""
+        """Single-file video, sidecar and metadata paths for one program."""
         stem = slug(program)
         return (
             self.directory / f"{stem}{VIDEO_SUFFIX}",
@@ -428,9 +473,14 @@ class FrameArchive:
             self.directory / f"{stem}.json",
         )
 
+    def files(self, program: str, meta: Mapping[str, Any]) -> list[Path]:
+        """The video an archive's metadata names, a file or a listing, then any parts it lists."""
+        names = [meta.get("video") or self.paths(program)[0].name, *meta.get("parts", ())]
+        return [self.directory / str(name) for name in names]
+
     def meta(self, program: str) -> dict[str, Any] | None:
         """Committed metadata for ``program``, or None when nothing usable is stored."""
-        video, data, meta_path = self.paths(program)
+        _, data, meta_path = self.paths(program)
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -439,7 +489,7 @@ class FrameArchive:
             return None
         if int(meta.get("schema_version", 0)) not in READABLE_SCHEMAS:
             return None
-        return meta if video.exists() and data.exists() else None
+        return meta if data.exists() and all(path.exists() for path in self.files(program, meta)) else None
 
     def has(self, program: str, key: ProgramKey, stimulus: Mapping[str, Any] | None = None) -> bool:
         """True when a committed archive for ``program`` was keyed on ``key``.
@@ -530,7 +580,7 @@ class FrameArchive:
         self,
         program: str,
         key: ProgramKey,
-        video: str | os.PathLike[str],
+        video: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
         rows: Sequence[FrameRow],
         *,
         width: int,
@@ -543,8 +593,11 @@ class FrameArchive:
     ) -> dict[str, Any]:
         """Publish a recording as this program's archive: video, sidecar, then marker.
 
-        The metadata is written last and is the commit marker, as in the result
-        store: a run killed mid-recording leaves at most an uncommitted temp file.
+        ``video`` is one recording, moved in, or a sequence of them, linked in as parts beside an
+        ffconcat listing of them so nothing is re-written. Any earlier marker goes first and the
+        metadata is written last as the commit marker, as in the result store: a run killed
+        mid-commit leaves no archive rather than a mismatched one, and files only an earlier commit
+        named go once the new one is published.
         ``program_info`` is the device's reply for the program, kept so a refit
         knows each parameter's name and native range, and ``stimulus`` names what was
         played; ``schedule`` lists each setpoint with the full state it was stepped from, and
@@ -558,8 +611,24 @@ class FrameArchive:
         for row in rows:
             _params(row.params)
         target, data, meta_path = self.paths(program)
+        sources = None if isinstance(video, (str, os.PathLike)) else [Path(v) for v in video]
+        spans = [container_duration(v, ffprobe=self.ffprobe, run=self.run) for v in sources or ()]
         self.directory.mkdir(parents=True, exist_ok=True)
-        os.replace(Path(video), target)
+        previous = self.meta(program)
+        stale = set(self.files(program, previous)) if previous else set()
+        meta_path.unlink(missing_ok=True)
+        if sources is None:
+            os.replace(Path(video), target)
+            parts = [target]
+        else:
+            parts = [
+                target.with_name(f"{target.stem}.part{i:02d}{VIDEO_SUFFIX}") for i in range(len(sources))
+            ]
+            for source, part in zip(sources, parts):
+                link(source, part)
+            target = target.with_suffix(LISTING_SUFFIX)
+            text = listing([p.name for p in parts], spans)
+            atomic_write(target, lambda tmp: tmp.write_text(text, encoding="utf-8"))
         atomic_write(data, lambda tmp: save_measurements(rows, tmp))
         meta = {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
@@ -576,7 +645,7 @@ class FrameArchive:
             "fps": float(fps),
             "frames": len(rows),
             "measured": sum(1 for row in rows if row.setpoint != GAP),
-            "bytes_per_frame": target.stat().st_size / len(rows),
+            "bytes_per_frame": sum(p.stat().st_size for p in parts) / len(rows),
             "video": target.name,
             "data": data.name,
             "created": datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(),
@@ -587,7 +656,11 @@ class FrameArchive:
             meta[STIMULUS] = dict(stimulus)
         if schedule is not None:
             meta["schedule"] = [dict(entry) for entry in schedule]
+        if sources is not None:
+            meta["parts"] = [p.name for p in parts]
         self._write_meta(meta_path, meta)
+        for path in stale - set(self.files(program, meta)):
+            path.unlink(missing_ok=True)
         self.dark_path(program).unlink(missing_ok=True)
         return meta
 
@@ -613,7 +686,7 @@ class FrameArchive:
         if meta is None or (key is not None and meta.get("key_digest") != key.digest):
             return None
         return FrameReader(
-            self.paths(program)[0],
+            self.files(program, meta)[0],
             meta,
             self.rows(program),
             ffmpeg=self.ffmpeg,
