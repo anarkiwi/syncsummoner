@@ -16,8 +16,8 @@ from pysat.solvers import Solver
 from syncsummoner.progress import track
 
 from . import hdl, observe
+from .lanes import Lanes, Words
 from .observe import GATES, Cell, Circuit, next_state
-from .ternary import Ternary
 
 SOLVER = "cadical195"
 #: Name prefixes of the video input ports, from source and from the bitstream.
@@ -123,98 +123,6 @@ class Cnf:
         return Lit(self, self.xor2(a.v, b.v))
 
 
-class Words:
-    """Bit-parallel Boolean algebra over ``uint64`` lanes: each bit of each word is one assignment."""
-
-    def __init__(self, width: int):
-        self.width = width
-
-    def const(self, value) -> np.ndarray:
-        """A constant in every lane; a vector of them gives one row per entry."""
-        if np.ndim(value):
-            ones = np.where(np.asarray(value, dtype=bool), ~np.uint64(0), np.uint64(0))
-            return np.repeat(ones[:, None], self.width, axis=1)
-        return np.full(self.width, ~np.uint64(0) if value else np.uint64(0), dtype=np.uint64)
-
-    @staticmethod
-    def ite(s: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """``s ? a : b``."""
-        return (s & a) | (~s & b)
-
-    @staticmethod
-    def xor(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """``a ^ b``."""
-        return a ^ b
-
-
-class Lanes:
-    """Random concrete assignments of both copies, simulated together: each lane is a model of the
-    :class:`Miter`'s CNF with every black box equal in both copies, so what differs in it is a witness.
-    """
-
-    def __init__(self, circuit: Circuit, width: int = 4, seed: int = 0):
-        self.ternary = Ternary(circuit)
-        self.alg = Words(width)
-        self.rng = np.random.default_rng(seed)
-        self.rows = len(self.ternary.index) + 3
-        self.nets = np.array(sorted(self.ternary.index, key=self.ternary.index.get), dtype=np.int64)
-        self.q = np.array([self.row(c.outs["Q"][0]) for c in circuit.storage], dtype=np.int64)
-        kinds: dict[tuple, list[int]] = defaultdict(list)
-        for i, c in enumerate(circuit.storage):
-            kinds[(c.kind, c.code, tuple(sorted(c.ins)))].append(i)
-        self.groups = [
-            (
-                circuit.storage[index[0]],
-                np.array(index),
-                {
-                    p: np.array([self.ternary.at(circuit.storage[i].ins[p][0]) for i in index])
-                    for p in circuit.storage[index[0]].ins
-                },
-            )
-            for index in kinds.values()
-        ]
-
-    def draw(self) -> np.ndarray:
-        """Every row random, the constant rows constant."""
-        t = self.ternary
-        x = self.rng.integers(0, 2**64, size=(self.rows, self.alg.width), dtype=np.uint64)
-        x[t.zero], x[t.one] = self.alg.const(False), self.alg.const(True)
-        return x
-
-    def forward(self, x: np.ndarray, alg: Words | None = None) -> None:
-        """Every gate output from its inputs, in place."""
-        alg = alg or self.alg
-        for level in self.ternary.levels:
-            for kind, ins, outs in level:
-                x[outs] = GATES[kind](alg, *(x[ins[:, k]] for k in range(ins.shape[1])))
-
-    def steps(self, x: np.ndarray, q: np.ndarray, fire: bool, alg: Words | None = None) -> np.ndarray:
-        """Every storage bit's next state in every lane, from outputs ``q`` (one row per bit)."""
-        alg = alg or self.alg
-        out = np.empty_like(q)
-        for cell, index, pins in self.groups:
-            got = {p: x[rows] for p, rows in pins.items()}
-            out[index] = next_state(cell, got.__getitem__, q[index], alg, fire)
-        return out
-
-    def row(self, net: int) -> int:
-        """Row of a net."""
-        return self.ternary.index[net]
-
-    def sensitised(
-        self, ties: Sequence[Mapping[int, int]], fixed: Sequence[Mapping[int, bool]], sources: Sequence
-    ) -> list[set[int]]:
-        """Per lane, the nets its ``sources`` can change by the ternary sensitisation of every pin."""
-        t = self.ternary
-        rows = np.full((len(ties), max(t.circuit.controls(), default=0) + 1), -1, dtype=np.int8)
-        for i, tie in enumerate(ties):
-            for k, v in tie.items():
-                if k < rows.shape[1]:
-                    rows[i, k] = v
-        seen = t.reach(rows, fixed, sources)
-        return [set(self.nets[np.flatnonzero(seen[: len(self.nets), i])].tolist()) for i in range(len(ties))]
-
-
 class Miter:
     """Copies ``a`` and ``b`` of one circuit, with each storage bit's next states, on one solver.
 
@@ -271,6 +179,13 @@ class Miter:
         self.start = np.array([circuit.init.get(q, False) for q in self.qs])
         self.lanes = Lanes(circuit)
         self.support = self._supports(order)
+        self.contested = np.array(
+            [
+                "E" in c.ins or "L" in c.ins or bool(self.support[q][1] >> i & 1)
+                for i, (q, c) in enumerate(self.cells.items())
+            ],
+            dtype=bool,
+        )
         self._links: dict[int, int] = {}
 
     def _supports(self, order: Sequence[Cell]) -> dict[int, tuple[int, int, bool]]:
@@ -732,6 +647,55 @@ class Miter:
                 return
             x[lanes.q] = q
 
+    def _lanes_settle(
+        self, x: np.ndarray, held: np.ndarray, quick: np.ndarray, alg: Words
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Settle storage in the ``quick`` words as the lanes show it, into ``x``: ``held`` (-1 free, else
+        the value) and, per word, whether a witness there stands for the exact settling.
+
+        What the lanes show constant includes all that settles, at the same values, so a witness stands
+        unless the order of the two rules could differ: a load onto other than the initial value where
+        an enable or the bit itself could keep it, or a kept bit whose load is now constant elsewhere.
+        """
+        lanes, ones = self.lanes, ~np.uint64(0)
+        start = np.where(self.start, ones, np.uint64(0))[:, None]
+        has = np.array([q in self.circuit.init for q in self.qs], dtype=bool)[:, None]
+        free = x[lanes.q].copy()
+        kind = np.zeros(held.shape, dtype=np.int8)
+
+        def pin(h):
+            return np.where(h == 1, ones, np.where(h == 0, np.uint64(0), free))
+
+        while True:
+            x[lanes.q] = pin(held)
+            lanes.forward(x, alg)
+            fired = lanes.steps(x, x[lanes.q], True, alg)
+            load = quick & (held < 0) & ((fired == ones) | (fired == 0))
+            kept = x.copy()
+            kept[lanes.q] = np.where((held >= 0) | ~has, x[lanes.q], start)
+            lanes.forward(kept, alg)
+            keep = (
+                quick
+                & (held < 0)
+                & ~load
+                & has
+                & (lanes.steps(kept, np.repeat(start, x.shape[1], axis=1), False, alg) == start)
+            )
+            if not (load | keep).any():
+                break
+            held = np.where(
+                load,
+                (fired == ones).astype(np.int8),
+                np.where(keep, self.start[:, None].astype(np.int8), held),
+            )
+            kind[load], kind[keep] = 1, 2
+        lanes.forward(x, alg)
+        fired = lanes.steps(x, x[lanes.q], True, alg)
+        steady = (fired == ones) | (fired == 0)
+        loaded = (kind == 1) & has & (held != self.start[:, None]) & self.contested[:, None]
+        unkept = (kind == 2) & steady & (fired != start)
+        return held, ~(loaded | unkept).any(axis=0)
+
     def _witnesses(self, ties, settled, sources, linked) -> np.ndarray:
         lanes, n = self.lanes, len(ties)
         alg = Words(n)
@@ -744,11 +708,12 @@ class Miter:
         place = {k: i for i, k in enumerate(ctl)}
         flip = np.zeros((len(ctl), n), dtype=bool)
         video = np.zeros(n, dtype=bool)
+        quick = np.array([s is None for s in settled], dtype=bool)
         for j, (t, s, src) in enumerate(zip(ties, settled, sources)):
             for k, v in t.items():
                 if k in place:
                     tied[place[k], j] = v
-            for q, v in s.items():
+            for q, v in (s or {}).items():
                 held[at[q], j] = v
             video[j] = src is None
             for k in src or ():
@@ -766,6 +731,9 @@ class Miter:
             return x
 
         a, fresh = draw(), draw()
+        trusted = np.ones(n, dtype=bool)
+        if quick.any():
+            held, trusted = self._lanes_settle(a, held, quick, alg)
         link = np.zeros((len(self.qs), n), dtype=bool)
         for j, ls in enumerate(linked):
             link[[at[q] for q in ls], j] = True
@@ -787,7 +755,7 @@ class Miter:
                 & (lanes.steps(a, a[lanes.q], False, alg) != lanes.steps(b, b[lanes.q], False, alg))
             )
             if not more.any():
-                return found
+                return found & trusted
             free &= ~more
             b[lanes.q] = np.where(more, fresh[lanes.q], b[lanes.q])
 
@@ -878,8 +846,9 @@ class Exact:
     ) -> list[list[bool]]:
         """Per tie set, per source (a control bit, or None for every input bit), whether it is observable.
 
-        A source the screen leaves live is first sought a witness in random lanes, then bounded by its
-        sensitised cone and decided by the miter; with ``first``, a tie set's later sources are decided
+        A source the screen leaves live is first sought a witness in random lanes, with storage settled
+        as they show it where nothing is held, then with it settled exactly; the rest is bounded by its
+        sensitised cone and decided by the miter. With ``first``, a tie set's later sources are decided
         only while the earlier are dead.
         """
         video = [n for n in self.miter.inputs.values() if n.startswith(VIDEO)]
@@ -895,6 +864,23 @@ class Exact:
         if not lanes:
             return out
         miter = self.miter
+        if not held:
+            seen = miter.witnesses(
+                [t for t, _ in lanes],
+                [None] * len(lanes),
+                [None if k is None else [k] for _, k in lanes],
+                [frozenset()] * len(lanes),
+            )
+            for (i, j), hit in zip(where, seen):
+                out[i][j] = bool(hit)
+            left = [
+                (lane, (i, j))
+                for lane, (i, j) in zip(lanes, where)
+                if not (out[i][j] or first and any(out[i]))
+            ]
+            lanes, where = [x[0] for x in left], [x[1] for x in left]
+            if not lanes:
+                return out
         settled = [self.settled(t) for t, _ in track(lanes, desc="settle", unit="tie set")]
         linked = [miter.links(t, held, s) if held else frozenset() for (t, _), s in zip(lanes, settled)]
         seen = miter.witnesses(
