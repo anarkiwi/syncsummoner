@@ -832,7 +832,7 @@ def test_a_write_the_device_drops_fails_the_readback(monkeypatch, simulate, tmp_
     """Sent on time but never applied: the readback disagrees on its slot from its frame on."""
     proof = take_and_prove(monkeypatch, simulate, tmp_path, dry=1, working={1: 0, 3: 0.5}, drop=(3, 600))[3]
     assert proof.landed.ok and not proof.applied.ok and not proof.ok
-    assert set(proof.applied.disagree["slot"].tolist()) == {3}
+    assert set(proof.applied.disagree["slot"].tolist()) == {3}, proof.applied.disagree.tolist()
     assert proof.applied.disagree["frame"].min() >= 5
     assert set(proof.applied.disagree["want"].tolist()) == {600}
 
