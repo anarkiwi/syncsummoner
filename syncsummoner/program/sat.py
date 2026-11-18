@@ -271,6 +271,13 @@ class Miter:
         self.start = np.array([circuit.init.get(q, False) for q in self.qs])
         self.lanes = Lanes(circuit)
         self.support = self._supports(order)
+        self.contested = np.array(
+            [
+                "E" in c.ins or "L" in c.ins or bool(self.support[q][1] >> i & 1)
+                for i, (q, c) in enumerate(self.cells.items())
+            ],
+            dtype=bool,
+        )
         self._links: dict[int, int] = {}
 
     def _supports(self, order: Sequence[Cell]) -> dict[int, tuple[int, int, bool]]:
@@ -732,6 +739,55 @@ class Miter:
                 return
             x[lanes.q] = q
 
+    def _lanes_settle(
+        self, x: np.ndarray, held: np.ndarray, quick: np.ndarray, alg: Words
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Settle storage in the ``quick`` words as the lanes show it, into ``x``: ``held`` (-1 free, else
+        the value) and, per word, whether a witness there stands for the exact settling.
+
+        What the lanes show constant includes all that settles, at the same values, so a witness stands
+        unless the order of the two rules could differ: a load onto other than the initial value where
+        an enable or the bit itself could keep it, or a kept bit whose load is now constant elsewhere.
+        """
+        lanes, ones = self.lanes, ~np.uint64(0)
+        start = np.where(self.start, ones, np.uint64(0))[:, None]
+        has = np.array([q in self.circuit.init for q in self.qs], dtype=bool)[:, None]
+        free = x[lanes.q].copy()
+        kind = np.zeros(held.shape, dtype=np.int8)
+
+        def pin(h):
+            return np.where(h == 1, ones, np.where(h == 0, np.uint64(0), free))
+
+        while True:
+            x[lanes.q] = pin(held)
+            lanes.forward(x, alg)
+            fired = lanes.steps(x, x[lanes.q], True, alg)
+            load = quick & (held < 0) & ((fired == ones) | (fired == 0))
+            kept = x.copy()
+            kept[lanes.q] = np.where((held >= 0) | ~has, x[lanes.q], start)
+            lanes.forward(kept, alg)
+            keep = (
+                quick
+                & (held < 0)
+                & ~load
+                & has
+                & (lanes.steps(kept, np.repeat(start, x.shape[1], axis=1), False, alg) == start)
+            )
+            if not (load | keep).any():
+                break
+            held = np.where(
+                load,
+                (fired == ones).astype(np.int8),
+                np.where(keep, self.start[:, None].astype(np.int8), held),
+            )
+            kind[load], kind[keep] = 1, 2
+        lanes.forward(x, alg)
+        fired = lanes.steps(x, x[lanes.q], True, alg)
+        steady = (fired == ones) | (fired == 0)
+        loaded = (kind == 1) & has & (held != self.start[:, None]) & self.contested[:, None]
+        unkept = (kind == 2) & steady & (fired != start)
+        return held, ~(loaded | unkept).any(axis=0)
+
     def _witnesses(self, ties, settled, sources, linked) -> np.ndarray:
         lanes, n = self.lanes, len(ties)
         alg = Words(n)
@@ -744,11 +800,12 @@ class Miter:
         place = {k: i for i, k in enumerate(ctl)}
         flip = np.zeros((len(ctl), n), dtype=bool)
         video = np.zeros(n, dtype=bool)
+        quick = np.array([s is None for s in settled], dtype=bool)
         for j, (t, s, src) in enumerate(zip(ties, settled, sources)):
             for k, v in t.items():
                 if k in place:
                     tied[place[k], j] = v
-            for q, v in s.items():
+            for q, v in (s or {}).items():
                 held[at[q], j] = v
             video[j] = src is None
             for k in src or ():
@@ -766,6 +823,9 @@ class Miter:
             return x
 
         a, fresh = draw(), draw()
+        trusted = np.ones(n, dtype=bool)
+        if quick.any():
+            held, trusted = self._lanes_settle(a, held, quick, alg)
         link = np.zeros((len(self.qs), n), dtype=bool)
         for j, ls in enumerate(linked):
             link[[at[q] for q in ls], j] = True
@@ -787,7 +847,7 @@ class Miter:
                 & (lanes.steps(a, a[lanes.q], False, alg) != lanes.steps(b, b[lanes.q], False, alg))
             )
             if not more.any():
-                return found
+                return found & trusted
             free &= ~more
             b[lanes.q] = np.where(more, fresh[lanes.q], b[lanes.q])
 
@@ -878,8 +938,9 @@ class Exact:
     ) -> list[list[bool]]:
         """Per tie set, per source (a control bit, or None for every input bit), whether it is observable.
 
-        A source the screen leaves live is first sought a witness in random lanes, then bounded by its
-        sensitised cone and decided by the miter; with ``first``, a tie set's later sources are decided
+        A source the screen leaves live is first sought a witness in random lanes, with storage settled
+        as they show it where nothing is held, then with it settled exactly; the rest is bounded by its
+        sensitised cone and decided by the miter. With ``first``, a tie set's later sources are decided
         only while the earlier are dead.
         """
         video = [n for n in self.miter.inputs.values() if n.startswith(VIDEO)]
@@ -895,6 +956,23 @@ class Exact:
         if not lanes:
             return out
         miter = self.miter
+        if not held:
+            seen = miter.witnesses(
+                [t for t, _ in lanes],
+                [None] * len(lanes),
+                [None if k is None else [k] for _, k in lanes],
+                [frozenset()] * len(lanes),
+            )
+            for (i, j), hit in zip(where, seen):
+                out[i][j] = bool(hit)
+            left = [
+                (lane, (i, j))
+                for lane, (i, j) in zip(lanes, where)
+                if not (out[i][j] or first and any(out[i]))
+            ]
+            lanes, where = [x[0] for x in left], [x[1] for x in left]
+            if not lanes:
+                return out
         settled = [self.settled(t) for t, _ in track(lanes, desc="settle", unit="tie set")]
         linked = [miter.links(t, held, s) if held else frozenset() for (t, _), s in zip(lanes, settled)]
         seen = miter.witnesses(
