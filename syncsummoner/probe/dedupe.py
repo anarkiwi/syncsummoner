@@ -232,7 +232,7 @@ def _names(take: Path, roots: Sequence[str | Path]) -> list[Path]:
         raise Refused(
             f"hard-linked {held.st_nlink} times, {len(names)} found{'' if roots else '; pass --links'}"
         )
-    locked = [n for n in names if not os.access(n.parent, os.W_OK)]
+    locked = [n for n in names if not os.access(n.parent, os.W_OK) or not n.parent.stat().st_mode & 0o222]
     if locked:
         raise Refused(f"{locked[0].parent} is read-only")
     own = sidecar(take).stat()
