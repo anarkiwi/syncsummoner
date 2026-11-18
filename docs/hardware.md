@@ -326,9 +326,13 @@ the display's pixel clock and flips cannot tear.
 | Scheduling | the pacing thread runs `SCHED_FIFO`, its ceiling raised with `sudo prlimit` for the player's shell only, with the garbage collector frozen |
 
 Every flip-complete event's vblank sequence is checked against the vblank it was committed
-for and logged with its time (`flips.bin`). A late flip, an undecoded frame or a mode that
-does not divide the clip rate ends the player with a fault in `status.json`, which the host
-raises as `PlayoutError`. Without real-time scheduling a garbage-collector pause or the
+for and logged with its time (`flips.bin`). A flip that lands late is logged on the vblank it
+landed on, flagged `MISSED` (2, beside `SEGMENT`'s 1), and counted in `status.json`'s `missed`;
+the next commit is for the vblank after it, on the same grid, so the frames due meanwhile are
+skipped and every later frame lands on its own vblank. The host faults only the takes resting on a
+frame it may have mis-shown ([evidence.md](evidence.md#frame-locked-sends)). An undecoded frame,
+a flip that never completes or a mode that does not divide the clip rate ends the player with a
+fault in `status.json`, which the host raises as `PlayoutError`. Without real-time scheduling a garbage-collector pause or the
 decoder's teardown delayed one commit past its vblank at the end of every clip; with it none
 has been missed.
 

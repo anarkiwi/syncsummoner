@@ -10,12 +10,15 @@ from syncsummoner.compose import locktake as LT
 from syncsummoner.compose import session as SS
 from syncsummoner.compose.timecode import ClipLayout, LayoutError
 from syncsummoner.device import loadtimes, v4l2rec
+from syncsummoner.device import playout as po
 from syncsummoner.probe import decoded
+from tests.compose import locked
 from tests.compose.test_locktake import (  # pylint: disable=unused-import
     FPS,
     LEAD_IN,
     PLAN_ROWS,
     config_for,
+    ends_for,
     fixture_simulate,
     info_with,
     lat_for,
@@ -96,10 +99,15 @@ def test_a_session_keeps_its_loads_where_a_session_in_another_directory_sizes_by
     )
 
 
-def run_session(monkeypatch, simulate, tmp_path, *, dry, counts=tuple(COUNTS), plans=None):
-    """A simulated session of ``counts`` takes, then each take judged from the files it left."""
+def run_session(
+    monkeypatch, simulate, tmp_path, *, dry, counts=tuple(COUNTS), plans=None, miss=None, judged=None
+):
+    """A simulated session of ``counts`` takes, then its ``judged`` takes (all) judged from their files.
+
+    The Pi's flip for played frame ``miss`` lands a vblank late.
+    """
     info = info_with(dry)
-    sim, clip = session_for(simulate, tmp_path, dry=info.dry is not None, counts=counts)
+    sim, clip = session_for(simulate, tmp_path, dry=info.dry is not None, counts=counts, miss=miss)
     sim.dry = info.dry or sim.dry
     rig, recorder, load, loads = rigged(sim, info)
     takes = [
@@ -129,19 +137,17 @@ def run_session(monkeypatch, simulate, tmp_path, *, dry, counts=tuple(COUNTS), p
         return decoded.Features({"small": sim.images(at=at), "codes": sim.codes[at]}, "")
 
     monkeypatch.setattr(LT.decoded, "features", features)
-    found = [
-        L.attribute_take(t.out, config=config_for(), codes=sim.codes[sim.captures(t.out)]) for t in takes
-    ]
-    proofs = [
-        LT.take_evidence(t.out, program="Teletext", clip="clip.mkv", config=config_for()) for t in takes
-    ]
+    mine = [takes[k] for k in (range(len(takes)) if judged is None else judged)]
+    found = [L.attribute_take(t.out, config=config_for(), codes=sim.codes[sim.captures(t.out)]) for t in mine]
+    proofs = [LT.take_evidence(t.out, program="Teletext", clip="clip.mkv", config=config_for()) for t in mine]
     return sim, rig, takes, records, found, proofs, loads
 
 
-def assert_each_take_shows_its_own_frames(sim, takes, found):
-    """Every take's clip frame ``j`` is the session frame its offset puts it at, from its own captures."""
+def assert_each_take_shows_its_own_frames(sim, takes, found, judged=None):
+    """Each ``judged`` take's clip frame ``j`` is the session frame its offset says, in its own captures."""
     offsets = np.r_[0, np.cumsum([t.count for t in takes])[:-1]]
-    for take, offset, got in zip(takes, offsets, found):
+    judged = range(len(takes)) if judged is None else judged
+    for take, offset, got in zip([takes[k] for k in judged], offsets[list(judged)], found):
         at = sim.captures(take.out)
         assert got.complete and got.picked.size == take.count
         assert np.array_equal(at[got.picked] // 2, sim.lead + offset + np.arange(take.count))
@@ -243,3 +249,47 @@ def test_a_take_judged_against_another_sessions_log_is_refused(monkeypatch, simu
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: shifted)
     with pytest.raises(L.LockError, match="are not the session's"):
         L.attribute_take(takes[1].out, config=config_for(), codes=np.full(shifted.size, -1))
+
+
+def test_a_vblank_missed_in_one_take_faults_that_take_alone(monkeypatch, simulate, tmp_path):
+    """The other takes attribute exactly on the session's line and prove their writes; the late one fails."""
+    lead, _ = ends_for(True, tmp_path)
+    miss = lead + COUNTS[0] + 10
+    sim, _, takes, _, found, proofs, _ = run_session(
+        monkeypatch, simulate, tmp_path, dry=1, miss=miss, judged=(0, 2)
+    )
+    assert_each_take_shows_its_own_frames(sim, takes, found, judged=(0, 2))
+    assert all(p.ok for p in proofs), [p.lines() for p in proofs]
+    with pytest.raises(L.MissedVblankError, match="missed a vblank showing clip frames 10..10$"):
+        L.attribute_take(takes[1].out, config=config_for(), codes=sim.codes[sim.captures(takes[1].out)])
+    faults = [L.take_fault(t.out) for t in takes]
+    assert faults[0] is None and faults[2] is None and faults[1].startswith("MissedVblankError: ")
+    records = [np.load(L.lock_path(t.out)) for t in takes]
+    assert [po.flip_summary(r["flips"], 2, L.rests_on(r))["missed"] for r in records] == [0, 1, 0]
+
+
+@pytest.mark.parametrize(
+    "late, faulted, said",
+    [
+        (3, [0, 1, 2], "lead-in frames 3..4"),
+        (15, [1], "clip frames 2..3"),
+        (12, [0, 1], "clip frames 0..0"),
+        (25, [0, 1, 2], "clip frames 6..6, lead-out frames 0..0"),
+        (27, [0, 1, 2], "lead-out frames 1..2"),
+    ],
+    ids=["lead-in", "own-span", "straddling", "into-lead-out", "lead-out"],
+)
+def test_a_missed_vblank_faults_the_takes_resting_on_the_frames_it_may_have_mis_shown(
+    tmp_path, late, faulted, said
+):
+    """A take rests on its own clip frames and on the lead-in and lead-out that fix every take's line."""
+    lead, counts, tail = 8, [5, 6, 7], 4
+    flips = locked.late(locked.flip_log(lead + sum(counts) + tail, 1), late, 1)
+    session = {"id": "s", "offsets": [0, 5, 11], "counts": counts, "source_lead": lead}
+    log = np.zeros(0, dtype=v4l2rec.FRAME)
+    for k in range(len(counts)):
+        record = L.session_record({**session, "index": k}, log, np.zeros(0), None)
+        L.save_lock(tmp_path / f"{k}.mkv", flips, hold=1, lead=lead, count=sum(counts), tail=tail, **record)
+    got = {k: L.take_fault(tmp_path / f"{k}.mkv") for k in range(len(counts))}
+    assert [k for k, fault in got.items() if fault] == faulted
+    assert got[faulted[-1]].endswith(f"missed a vblank showing {said}")

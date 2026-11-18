@@ -33,6 +33,10 @@ class AnchorError(LockError):
     """The lead-in's unprocessed captures name too few frames by strip to fix the frame line."""
 
 
+class MissedVblankError(LockError):
+    """The Pi's flip for a frame the take rests on landed on a later vblank than it was due."""
+
+
 #: Frames an unprocessed stretch must show for its strips to fix the frame line: a start is strip-named
 #: only when the capture before it shows the frame before (:func:`anchors`), and a run is fixed only by
 #: named starts on two frames (:func:`_lines`), so the frame before the first named one counts too.
@@ -289,7 +293,10 @@ def attribute(
     Only strips on captures ``trusted`` (all by default) are evidence: a program processing its input shows
     its own picture there, so those strips neither anchor the line nor count against it. A run with no strip
     the Pi's flips cannot number is left unattributed; the take stays exact only if the clip needs none of it.
+    The frames a late flip may have mis-shown (:func:`~syncsummoner.device.playout.misses`) number nothing.
     """
+    from syncsummoner.device.playout import misses  # pylint: disable=import-outside-toplevel
+
     seg = frameline.segments(frames["t_ns"], frames["sequence"])
     resolution = float(np.gcd.reduce(frames["t_ns"])) if frames.size else 0.0
     capture, jitter = frameline.capture_line(frames["t_ns"], frames["sequence"], seg)
@@ -297,6 +304,8 @@ def attribute(
     starts, up, _, vblank = displays(flips)
     shown_at = np.full(int(up.max()) + 1 if up.size else 0, np.nan)
     shown_at[up[::-1]] = starts[::-1]
+    for first, last in misses(flips, hold):
+        shown_at[first : last + 1] = np.nan
     clip = signed(np.asarray(codes, dtype=np.int64), bits)
     legible = (codes >= 0) & (clip >= -lead) & (clip < count + tail)
     if trusted is not None:
@@ -660,6 +669,51 @@ def read_clock(take: str | Path) -> list[dict]:
         return json.loads(str(record["clock"])) if "clock" in record.files else []
 
 
+def rests_on(record: Any) -> list[tuple[int, int]]:
+    """The played frames ``a..b-1`` a take's proof rests on, by its lock record: lead-in, its own, lead-out.
+
+    A take of a session rests on its own clip frames and on the session's lead-in and lead-out: their strips
+    fix and pin the one frame line every take is attributed on, and the lead-in's calibration and clock land
+    every take's writes. So a vblank missed in either end is every take's, and one in a take's span its own.
+    """
+    lead, count = int(record["lead"]), int(record["count"])
+    tail = int(record["tail"]) if "tail" in record else 0
+    said = json.loads(str(record["session"])) if "session" in record.files else None
+    offset, own = (
+        (0, count) if said is None else (said["offsets"][said["index"]], said["counts"][said["index"]])
+    )
+    return [(0, lead), (lead + offset, lead + offset + own), (lead + count, lead + count + tail)]
+
+
+def require_flips(take: str | Path, record: Any | None = None) -> None:
+    """A :class:`MissedVblankError` naming each late flip that may have mis-shown a frame ``take`` rests on.
+
+    The frames are counted from the start of the lead-in, the take's clip frame 0 or the lead-out's first
+    (:func:`rests_on`); a miss elsewhere in its session is another take's.
+    """
+    from syncsummoner.device.playout import misses  # pylint: disable=import-outside-toplevel
+
+    record = np.load(lock_path(take)) if record is None else record
+    spans = rests_on(record)
+    said = [
+        f"{name} frames {max(a, lo) - lo}..{min(b, hi - 1) - lo}"
+        for a, b in misses(record["flips"], int(record["hold"]))
+        for name, (lo, hi) in zip(("lead-in", "clip", "lead-out"), spans)
+        if a < hi and b >= lo
+    ]
+    if said:
+        raise MissedVblankError(f"{take}: the Pi missed a vblank showing {', '.join(said)}")
+
+
+def take_fault(take: str | Path) -> str | None:
+    """Why the Pi's flips leave a recorded take unproven (:func:`require_flips`); None when nothing does."""
+    try:
+        require_flips(take)
+    except MissedVblankError as err:
+        return f"{type(err).__name__}: {err}"
+    return None
+
+
 def _trusted(take: str | Path, record: Any, frames: np.ndarray) -> np.ndarray | None:
     if "session" in record.files:
         span = json.loads(str(record["session"]))["processed"]
@@ -734,7 +788,8 @@ def attribute_take(
 
     Strips read as ``codes``, else as the take's :class:`~syncsummoner.probe.decoded.Features` hold them.
     Every clip frame must have a capture, and no strip at a boundary capture nor byte change in the
-    clip may contradict the line; anything less is a :class:`~syncsummoner.compose.lock.LockError`.
+    clip may contradict the line; anything less is a :class:`~syncsummoner.compose.lock.LockError`, and
+    a late flip on a frame the take rests on (:func:`require_flips`) a :class:`MissedVblankError`.
     """
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
@@ -742,6 +797,7 @@ def attribute_take(
         record = np.load(lock_path(take))
     except FileNotFoundError as err:
         raise LostTimecodeError(f"{take}: no lock record, so it was not played by the locked player") from err
+    require_flips(take, record)
     if codes is None:
         if features is None:
             features = decoded.features(

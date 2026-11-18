@@ -126,12 +126,34 @@ def flips(rows):
             1,
             (4, 2, 0, 0),
         ),
+        ([(0, 100, 0, po.SEGMENT), (1, 101, 1, 0), (3, 103, 2, po.MISSED), (4, 104, 4, 0)], 1, (4, 1, 1, 0)),
     ],
-    ids=["empty", "held", "missed", "stale", "resumed"],
+    ids=["empty", "held", "missed", "stale", "resumed", "flagged"],
 )
 def test_flip_summary_counts_misses_and_off_cadence_frames_within_segments(rows, hold, want):
     got = po.flip_summary(flips(rows), hold)
     assert (got["flips"], got["segments"], got["missed"], got["out_of_cadence"]) == want
+
+
+def test_a_late_flip_may_mis_show_every_frame_due_from_the_vblank_after_the_last_to_its_own():
+    log = flips(
+        [(0, 100, 0, po.SEGMENT), (1, 101, 0, 0), (2, 102, 1, 0), (5, 105, 1, po.MISSED), (6, 106, 3, 0)]
+    )
+    assert po.misses(log, 2).tolist() == [[1, 2]]
+    assert po.misses(log[:3], 2).shape == (0, 2)
+
+
+@pytest.mark.parametrize(
+    "spans, want",
+    [(None, (1, 1)), ([(0, 2)], (0, 0)), ([(2, 3)], (1, 0)), ([(3, 4)], (1, 0)), ([(5, 9)], (0, 1))],
+    ids=["all", "before", "first-mis-shown", "skipped", "after"],
+)
+def test_flip_summary_judges_only_the_frames_its_spans_hold(spans, want):
+    log = flips(
+        [(0, 100, 0, po.SEGMENT), (1, 101, 1, 0), (3, 103, 2, po.MISSED), (4, 104, 4, 0), (5, 105, 4, 0)]
+    )
+    got = po.flip_summary(log, 1, spans)
+    assert (got["missed"], got["out_of_cadence"]) == want
 
 
 def test_flip_records_match_the_players_own_layout():
