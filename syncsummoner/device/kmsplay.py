@@ -419,13 +419,20 @@ def decode_argv(
     *,
     loop: bool,
     span: tuple[int, int] | None = None,
+    rate: Fraction = Fraction(1),
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
     """ffmpeg decoding a clip to raw frames at the display's geometry and layout, as fast as it goes.
 
-    ``span`` keeps the clip's frames ``a..b-1`` only, counted from its first.
+    ``span`` keeps the clip's frames ``a..b-1`` only, counted from its first, for a clip at ``rate``. The
+    input is sought half a frame before frame ``a``, so the decoder starts at the keyframe before it and
+    drops every frame earlier than ``a`` however its timestamps round, rather than decoding the clip from
+    its start; ``trim`` then counts from ``a``.
     """
-    trim = "" if span is None else f"trim=start_frame={span[0]}:end_frame={span[1]},"
+    seek, trim = [], ""
+    if span is not None:
+        seek = ["-ss", f"{float((span[0] - Fraction(1, 2)) / rate):.6f}"] if span[0] else []
+        trim = f"trim=end_frame={span[1] - span[0]},"
     return [
         ffmpeg,
         "-nostdin",
@@ -433,6 +440,7 @@ def decode_argv(
         "-loglevel",
         "error",
         *(["-stream_loop", "-1"] if loop else []),
+        *seek,
         "-i",
         path,
         "-map",
@@ -480,14 +488,14 @@ def parse_spans(text: str) -> list[tuple[int, int]]:
 
 
 def span_frames(
-    path: str, width: int, height: int, spans: Iterable[tuple[int, int]], size: int
+    path: str, width: int, height: int, spans: Iterable[tuple[int, int]], size: int, rate: Fraction
 ) -> Iterator[bytes]:
-    """The clip's frames over each span in turn, as one stream with no seam.
+    """The clip's frames over each span in turn, as one stream with no seam, the clip at ``rate``.
 
     Each span has its own decoder, started while the span before plays, so its decoding up to the
     span's first frame is done by the time that frame is due.
     """
-    argvs = [decode_argv(path, width, height, loop=False, span=span) for span in spans]
+    argvs = [decode_argv(path, width, height, loop=False, span=span, rate=rate) for span in spans]
     upcoming = _decoder(argvs[0]) if argvs else None
     try:
         for index in range(len(argvs)):
@@ -591,7 +599,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         if args.spans and not args.clip:
             raise PlayoutFault("spans play a clip, not a frame directory")
         if args.spans:
-            frames = span_frames(args.clip, args.width, args.height, args.spans, display.frame_bytes)
+            frames = span_frames(
+                args.clip, args.width, args.height, args.spans, display.frame_bytes, args.fps
+            )
         elif args.clip:
             frames = clip_frames(
                 decode_argv(args.clip, args.width, args.height, loop=args.loop), display.frame_bytes
