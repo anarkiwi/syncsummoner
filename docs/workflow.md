@@ -302,6 +302,14 @@ later writes of a setting that moves many slots do over an ack-gated link, is co
 `late` and is no fault. A design never asks a regime for more settings than its dimensions
 have between them (`regions.distinct`), so consecutive settings are never the same.
 
+Without `--budget-s`, each regime gets the settings a second-order model of the parameters it
+samples needs (`regions.second_order`: the least power of two at least its intercept, each parameter's
+effect and each pair's interaction), at most its distinct settings, so the rig time follows the
+program. Without `--hold`, a program with no takes yet, each setting's guard is its landing window
+alone and the plan records its settle as unmeasured (`"measured": false`); its takes' rows say so in
+their evidence, and `sweep commit` refuses them until `probe hold` has measured the program on those
+same takes and each is collected again with `--hold`.
+
 `--cover FILE` plans from a cover `program cover --json` already wrote, each stepped
 parameter's settings taken from the bits the program reads, so no cover is searched.
 `--joint SELECTOR:MOVER` adds, from the sweep's last state, SELECTOR held at each of its

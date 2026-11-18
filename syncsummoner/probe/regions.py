@@ -26,6 +26,7 @@ __all__ = [
     "design",
     "distinct",
     "region_dims",
+    "second_order",
     "without_bypass",
     "effect_sizes",
     "guard_frames",
@@ -111,13 +112,23 @@ class Slot:
 
 
 def slots(
-    ti: np.ndarray, edges: np.ndarray, *, guard: int, budget_s: float, overhead_s: float, fps: float
+    ti: np.ndarray,
+    edges: np.ndarray,
+    *,
+    guard: int,
+    budget_s: float = math.inf,
+    overhead_s: float,
+    fps: float,
+    limit: int | None = None,
 ) -> list[Slot]:
-    """Settings placed one after another on the clip, a new take each time it runs out, within ``budget_s``.
+    """Settings placed one after another on the clip, a new take each time it runs out, within ``budget_s``
+    and at most ``limit`` of them; one of the two must bound it.
 
     The takes play back to back in one session, which costs ``overhead_s`` beside their frames; each
     setting is held for what the footage after its ``guard`` needs (:func:`hold_at`).
     """
+    if limit is None and not math.isfinite(budget_s):
+        raise ValueError("slots needs a budget or a limit")
     effect = _filled(effect_sizes(ti, edges))
     out: list[Slot] = []
     take, at, spent = 0, 0, overhead_s
@@ -128,7 +139,7 @@ def slots(
                 raise SweepError("no setting's follow test reaches its power anywhere on this clip")
             take, at = take + 1, 0
             continue
-        if spent + (guard + need) / fps > budget_s:
+        if len(out) == limit or spent + (guard + need) / fps > budget_s:
             return out
         out.append(Slot(take=take, start=at, guard=guard, hold=need))
         at, spent = at + guard + need, spent + (guard + need) / fps
@@ -150,6 +161,12 @@ def distinct(params: Sequence[int], values: Mapping[int, np.ndarray]) -> int:
     """
     total = math.prod(len(values[p]) for p in params) if params else 1
     return int(2 ** math.floor(math.log2(total)))
+
+
+def second_order(dims: int) -> int:
+    """Settings a regime sampling ``dims`` parameters needs: the least power of two at which its design can
+    resolve a second-order model, an intercept, each parameter's effect and each pair's interaction."""
+    return 1 << math.ceil(math.log2(1 + dims + dims * (dims - 1) // 2))
 
 
 def allot(total: int, dims: Sequence[int]) -> list[int]:

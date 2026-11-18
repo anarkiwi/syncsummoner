@@ -54,9 +54,7 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.program import model
     from syncsummoner.program.gates import Gating, cover, representatives
 
-    held = json.loads(Path(args.hold).read_text(encoding="utf-8"))
-    if held["program"] != args.program:
-        raise ValueError(f"{args.hold} measured {held['program']}, not {args.program}")
+    held = held_record(args.hold, args.program)
     frames = clip_layout(args.source).frames
     m = model(args.program)
     toggles = [p for p in range(1, PARAM_COUNT + 1) if param_kind(p) is ParamKind.TOGGLE]
@@ -126,6 +124,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         distinct,
         guard_frames,
         region_dims,
+        second_order,
         slots,
         without_bypass,
     )
@@ -134,9 +133,11 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.program.gates import representatives
 
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
-    held = json.loads(Path(args.hold).read_text(encoding="utf-8"))
-    if held["program"] != args.program:
-        raise ValueError(f"{args.hold} measured {held['program']}, not {args.program}")
+    held = (
+        held_record(args.hold, args.program)
+        if args.hold
+        else {"program": args.program, "settle": 0, "measured": False}
+    )
     record = json.loads(Path(args.cover).read_text(encoding="utf-8"))
     clip = decoded.features(args.source, decoded.Spec.of(config), workers=args.workers)
     layout = clip_layout(args.source)
@@ -147,7 +148,6 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     m = model(args.program)
     ends = session_frames(LeadIn(), config.fps, dry=m.bypass() is not None, directory=args.takes, band=lat)
     overhead_s = sum(ends) / config.fps + config.tail_s
-    placed = slots(ti, edges, guard=guard, budget_s=args.budget_s, overhead_s=overhead_s, fps=config.fps)
     values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
     states = np.asarray(record["states"], dtype=np.int64)
     chosen = [int(i) for i in record["chosen"]]
@@ -156,10 +156,17 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     extra = np.zeros((0, PARAM_COUNT), dtype=np.int64)
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
-    counts = [
-        min(n, distinct(d, kept))
-        for n, d in zip(allot(max(len(placed) - len(extra), 0), [len(d) for d in dims]), dims)
-    ]
+    if args.budget_s is None:
+        counts = [min(second_order(len(d)), distinct(d, kept)) for d in dims]
+        placed = slots(
+            ti, edges, guard=guard, overhead_s=overhead_s, fps=config.fps, limit=sum(counts) + len(extra)
+        )
+    else:
+        placed = slots(ti, edges, guard=guard, budget_s=args.budget_s, overhead_s=overhead_s, fps=config.fps)
+        counts = [
+            min(n, distinct(d, kept))
+            for n, d in zip(allot(max(len(placed) - len(extra), 0), [len(d) for d in dims]), dims)
+        ]
     sampled = [
         design(states[i], d, kept, n, args.seed + k) for k, (i, d, n) in enumerate(zip(chosen, dims, counts))
     ]
@@ -224,16 +231,26 @@ def _sweep_cmd(args: argparse.Namespace) -> int:
     return 2 if any("fault" in r for r in records) else 0
 
 
-def settled_by(chunk: Any, program: str, hold: str | None, plan: str) -> tuple[Any, dict]:
-    """``chunk`` with the settle a ``probe hold`` record measured, else its plan's; and where it came from."""
-    from dataclasses import replace  # pylint: disable=import-outside-toplevel
-
-    if hold is None:
-        return chunk, {"frames": int(chunk.settle), "source": str(plan)}
+def held_record(hold: str | Path, program: str) -> dict:
+    """A ``probe hold`` record, refused when it measured another program."""
     held = json.loads(Path(hold).read_text(encoding="utf-8"))
     if held["program"] != program:
         raise ValueError(f"{hold} measured {held['program']}, not {program}")
-    return replace(chunk, settle=int(held["settle"])), {"frames": int(held["settle"]), "source": str(hold)}
+    return held
+
+
+def settled_by(
+    chunk: Any, program: str, hold: str | None, plan: str, *, measured: bool = True
+) -> tuple[Any, dict]:
+    """``chunk`` with the settle a ``probe hold`` record measured, else its plan's; where it came from, and
+    whether it was measured: a plan made with no hold record (``measured`` false) waited none."""
+    from dataclasses import replace  # pylint: disable=import-outside-toplevel
+
+    if hold is None:
+        return chunk, {"frames": int(chunk.settle), "source": str(plan), "measured": bool(measured)}
+    held = held_record(hold, program)
+    settle = int(held["settle"])
+    return replace(chunk, settle=settle), {"frames": settle, "source": str(hold), "measured": True}
 
 
 def _sweep_collect_cmd(args: argparse.Namespace) -> int:
@@ -244,10 +261,20 @@ def _sweep_collect_cmd(args: argparse.Namespace) -> int:
     chunks, said = read_plan(args.plan)
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     take = _sweep_take(Path(args.plan).parent, said["program"], args.chunk)
-    chunk, settle = settled_by(chunks[args.chunk], said["program"], args.hold, args.plan)
+    measured = said.get("response", {}).get("measured", True)
+    chunk, settle = settled_by(chunks[args.chunk], said["program"], args.hold, args.plan, measured=measured)
     summary = collect(take, chunk, clip=said["source"], config=config, workers=args.workers, settle=settle)
     print(json.dumps(summary, indent=1))
     return 0 if summary["evidence_ok"] else 1
+
+
+def settle_measured(take: str | Path) -> bool:
+    """Whether a collected take's rows waited a measured settle, as its evidence report records."""
+    from syncsummoner.compose.locktake import evidence_path  # pylint: disable=import-outside-toplevel
+
+    path = evidence_path(take)
+    report = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    return bool(report.get("settle", {}).get("measured", True))
 
 
 def _sweep_commit_cmd(args: argparse.Namespace) -> int:
@@ -265,6 +292,12 @@ def _sweep_commit_cmd(args: argparse.Namespace) -> int:
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     program = said["program"]
     takes = [_sweep_take(Path(args.plan).parent, program, k) for k in range(len(chunks))]
+    unmeasured = [str(t) for t in takes if not settle_measured(t)]
+    if unmeasured:
+        raise ValueError(
+            f"{program}'s rows in {unmeasured} waited no measured settle: measure the program's hold with "
+            "`probe hold` and collect them again with --hold"
+        )
     metas = [json.loads(t.with_name(t.name + ".meta.json").read_text(encoding="utf-8")) for t in takes]
     good = [next(a for _, a in sorted(m.items()) if "fault" not in a) for m in metas]
     firmware = {str(a["before"]["firmware"]) for a in good}
@@ -352,7 +385,11 @@ def add_parsers(probe_sub: Any) -> None:
     )
     regions.add_argument("program")
     regions.add_argument("--cover", required=True, help="a cover as `program cover --json` wrote it")
-    regions.add_argument("--hold", required=True, help="the program's hold-<program>.json")
+    regions.add_argument(
+        "--hold",
+        help="the program's hold-<program>.json; without one each setting's guard is its landing window "
+        "alone, and its takes' rows must be collected again with a measured hold before they are committed",
+    )
     regions.add_argument("--source", required=True, help="the timecoded clip the takes will play")
     regions.add_argument("--audio", required=True, help="the track the clip is scored to, for its bars")
     regions.add_argument("--takes", required=True, help="the sweep's takes directory")
@@ -360,7 +397,10 @@ def add_parsers(probe_sub: Any) -> None:
         "--latency", help="where the dry takes' ccpicture.json is; the takes directory by default"
     )
     regions.add_argument(
-        "--budget-s", type=float, required=True, help="rig seconds the program's takes may use"
+        "--budget-s",
+        type=float,
+        help="rig seconds the program's takes may use; without it each regime gets the settings a "
+        "second-order model of its parameters needs, at most their distinct settings",
     )
     regions.add_argument("--seed", type=int, default=0, help="seed of the scrambled Sobol design")
     regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")

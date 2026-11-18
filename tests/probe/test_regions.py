@@ -168,6 +168,30 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     assert regions["rig_s"] == pytest.approx(sum(c.frames for c in chunks) / 30.0 + session_s)
     assert "settings" in capsys.readouterr().out
     assert all(math.log2(n).is_integer() for n in regions["per_regime"].values() if n)
+    assert said["response"]["settle"] == 1 and said["response"].get("measured", True)
+    unheld = [a for i, a in enumerate(argv) if a != "--hold" and argv[i - 1] != "--hold"]
+    assert cli.main([a for a in unheld if a not in ("--budget-s", "900")]) == 0
+    chunks, said = L.read_plan(tmp_path / "sweep-p.json")
+    regions = said["regions"]
+    assert said["response"] == {"program": "p", "settle": 0, "measured": False}
+    assert regions["guard_frames"] == 1 + 2 and regions["budget_s"] is None
+    assert regions["per_regime"] == {"0": 4, "1": 2} and regions["settings"] == 4 + 2 + 6
+    assert sum(len(c.states) for c in chunks) == 12
+
+
+def test_second_order_resolves_every_effect_and_pair_at_a_power_of_two():
+    assert [R.second_order(d) for d in (0, 1, 2, 3, 8, 12)] == [1, 2, 4, 8, 64, 128]
+
+
+def test_slots_stop_at_a_limit_and_need_a_bound():
+    ti = ar1(3000, 0.5, 6)
+    edges = np.arange(0, 3000, 90)
+    full = R.slots(ti, edges, guard=4, budget_s=800.0, overhead_s=80.0, fps=30.0)
+    capped = R.slots(ti, edges, guard=4, overhead_s=80.0, fps=30.0, limit=5)
+    assert len(full) > 5 and capped == full[:5]
+    assert R.slots(ti, edges, guard=4, budget_s=800.0, overhead_s=80.0, fps=30.0, limit=len(full) + 9) == full
+    with pytest.raises(ValueError, match="budget or a limit"):
+        R.slots(ti, edges, guard=4, overhead_s=80.0, fps=30.0)
 
 
 def test_clip_ti_compares_each_frame_with_the_one_played_before():
