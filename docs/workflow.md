@@ -265,8 +265,10 @@ parameter state the take realized on that frame from the landed writes. A
 frame keeps its setpoint only once every write of it has landed, the end of
 each write's landing window, plus the settle, until the next setpoint's first
 write may have landed, and only where the realized state is that setpoint's; frames a readback
-disagreed on keep none. `commit` joins the takes' card MJPEG streams with no
-re-encode into one archive, keyed on name and firmware, with the clip linked
+disagreed on keep none. `commit` hard-links the takes' card MJPEG files into
+the archive as `<program>.partNN.mkv` (copying only across filesystems) behind
+an ffconcat listing, `<program>.ffconcat`, that decoders read as one stream, so
+nothing is re-written; the archive is keyed on name and firmware, with the clip linked
 beside it and each row naming the clip frame it shows, so the survival metrics
 need no clock fit.
 

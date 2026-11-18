@@ -2,17 +2,15 @@
 
 The cover's setpoints are targeted one hold apart and cut into
 takes no longer than the clip. Each take's evidence lands every write on a frame; the frames each
-setpoint settled over become its archive rows, and a program's takes join into one archive.
+setpoint settled over become its archive rows, and a program's takes are linked into one archive.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
-import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -30,7 +28,6 @@ __all__ = [
     "carried",
     "collect",
     "commit_sweep",
-    "concat",
     "disagreeing",
     "joint",
     "levels",
@@ -348,25 +345,6 @@ def rows_path(take: str | Path) -> Path:
     return Path(f"{take}.rows.parquet")
 
 
-def concat(
-    videos: Sequence[str | Path],
-    out: str | Path,
-    *,
-    ffmpeg: str = "ffmpeg",
-    run: Callable[..., Any] = subprocess.run,
-) -> None:
-    """Join ``videos`` into ``out`` packet for packet, with no re-encode."""
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", dir=Path(out).parent, delete=False) as listing:
-        listing.write("".join(f"file '{Path(v).resolve()}'\n" for v in videos))
-    try:
-        argv = [ffmpeg, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", listing.name]
-        result = run(argv + ["-map", "0:v", "-c", "copy", str(out)], capture_output=True, check=False)
-    finally:
-        Path(listing.name).unlink(missing_ok=True)
-    if result.returncode:
-        raise SweepError(f"joining {len(videos)} takes failed: {result.stderr!r}")
-
-
 def commit_sweep(
     archive: Any,
     program: str,
@@ -379,10 +357,8 @@ def commit_sweep(
     fps: float,
     program_info: dict | None,
     stimulus: dict,
-    ffmpeg: str = "ffmpeg",
-    run: Callable[..., Any] = subprocess.run,
 ) -> dict:
-    """Join a program's judged takes, in chunk order, into its archive: one video, one row per capture."""
+    """Link a program's judged takes, in chunk order, into its archive: one listing, one row per capture."""
     rows: list[FrameRow] = []
     for take in takes:
         offset = len(rows)
@@ -391,12 +367,10 @@ def commit_sweep(
             for r in load_measurements(rows_path(take))
         ]
     states = np.concatenate([c.states for c in chunks])
-    video = archive.scratch(program)
-    concat(takes, video, ffmpeg=ffmpeg, run=run)
     return archive.commit(
         program,
         key,
-        video,
+        list(takes),
         rows,
         width=width,
         height=height,

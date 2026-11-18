@@ -2,7 +2,6 @@
 
 # pylint: disable=missing-function-docstring
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -126,15 +125,6 @@ def test_plans_and_rows_round_trip(tmp_path):
     assert len(load_measurements(L.rows_path(tmp_path / "t.mkv"))) == back[0].frames
 
 
-def test_a_failed_join_raises(tmp_path):
-    with pytest.raises(L.SweepError):
-        L.concat(
-            [tmp_path / "a.mkv"],
-            tmp_path / "out.mkv",
-            run=lambda *a, **k: SimpleNamespace(returncode=1, stderr=b"no"),
-        )
-
-
 def test_takes_join_into_one_archive_of_every_capture(tmp_path):
     chunks = L.plan_sweep(sweep_states(5), settle=0, hold=2, frames=6)
     takes = []
@@ -153,13 +143,10 @@ def test_takes_join_into_one_archive_of_every_capture(tmp_path):
         L.save_rows(take, rows)
         takes.append(take)
 
-    def run(argv, **_kw):
-        listing = Path(argv[argv.index("-i") + 1])
-        assert len(listing.read_text(encoding="utf-8").splitlines()) == len(takes)
-        Path(argv[-1]).write_bytes(b"joined")
-        return SimpleNamespace(returncode=0, stderr=b"")
+    def run(_argv, **_kw):
+        return SimpleNamespace(returncode=0, stdout=b"0.2\n", stderr=b"")
 
-    archive = FrameArchive(tmp_path / "archive")
+    archive = FrameArchive(tmp_path / "archive", run=run)
     meta = L.commit_sweep(
         archive,
         "p",
@@ -171,8 +158,8 @@ def test_takes_join_into_one_archive_of_every_capture(tmp_path):
         fps=30.0,
         program_info={"name": "p"},
         stimulus={"kind": "footage", "clip": "c.mkv", "sha256": "x"},
-        run=run,
     )
+    assert meta["parts"] == [f"p.part{k:02d}.mkv" for k in range(len(takes))]
     assert meta["pix_fmt"] == MJPEG_PIX_FMT and meta["codec"] == "mjpeg"
     assert archive.meta("p") is not None
     rows = archive.rows("p")
