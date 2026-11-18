@@ -275,6 +275,7 @@ class Sim:
         self.poller = self.sender = None
         self.next_poll = 0
         self.peeking = False
+        self.played = self.size // 2
         rng = np.random.default_rng(3)
         self.clip = rng.uniform(0, 60, (max(counts) + tail, 3, SIDE, SIDE)).astype(np.float32)
         self.clip_frame = np.r_[
@@ -421,7 +422,8 @@ class SimShown:
         return out[out["t1_ns"] <= self.sim.now]
 
     def wait(self, frame, stop=None):  # pylint: disable=unused-argument
-        """Advance until the frame is heard shown."""
+        """Advance until the frame is heard shown; one the Pi never plays is never heard."""
+        assert frame < self.sim.played, f"waited for frame {frame}, past the {self.sim.played} the Pi plays"
         at = int(np.ceil(T0 + frame * P + HEARD_NS))
         self.sim.sleep(max(at - self.sim.now, 0) / 1e9)
         return at
@@ -490,6 +492,7 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
     @contextlib.contextmanager
     def playing(*, fps, spans=None):
         played.append((fps, spans))
+        sim.played = sum(b - a for a, b in spans) if spans else sim.size // 2
         yield types.SimpleNamespace(status=lambda: {"hold": 2}, following=lambda: following(sim))
 
     @contextlib.contextmanager

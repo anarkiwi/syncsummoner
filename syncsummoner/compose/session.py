@@ -625,7 +625,7 @@ def _run(
     sender.start()
     poller.wait_count(shift.lo - 2, threading.Event())
     held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
-    last = layout.lead + layout.count + (0 if dry is None else layout.tail)
+    last = layout.lead + layout.count + (0 if dry is None else layout.tail - 1)
     with meter((last - layout.lead) / float(config.fps), desc="session") as progress:
         for k in range(1, len(live.takes)):
             _roll(live, shown, k, period)
@@ -636,7 +636,7 @@ def _run(
     sender.drain(timeout_s=1.0)
     if dry is None:
         _reload_quiet(sender, poller, shell, load)
-        shown.wait(layout.lead + layout.count + layout.tail)
+        shown.wait(layout.lead + layout.count + layout.tail - 1)
         time.sleep(config.tail_s)
 
 
