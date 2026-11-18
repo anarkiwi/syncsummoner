@@ -824,9 +824,12 @@ def read_live(
         f"[b]crop=iw:{strip_px}:0:ih-{strip_px},scale={width}:{strip_px}:flags=area[t];"
         "[s][t]vstack,format=yuv444p[o]"
     )
-    argv = [ffmpeg, "-loglevel", "quiet", "-i", str(path), "-filter_complex", graph, "-map", "[o]"]
-    argv += ["-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
-    data = subprocess.run(argv, check=False, capture_output=True).stdout
+    from syncsummoner.device.stored import captures  # pylint: disable=import-outside-toplevel
+
+    with captures(path, ffmpeg=ffmpeg) as source:
+        argv = [ffmpeg, "-loglevel", "quiet", *source, "-filter_complex", graph, "-map", "[o]"]
+        argv += ["-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
+        data = subprocess.run(argv, check=False, capture_output=True).stdout
     rows = height + strip_px
     count = len(data) // (3 * width * rows)
     stack = np.frombuffer(data, np.uint8, count * 3 * width * rows).reshape(count, 3, rows, width)

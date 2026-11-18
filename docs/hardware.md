@@ -484,6 +484,25 @@ the card's buffers with linuxpy and pipes them untouched into ffmpeg, which stor
 the setpoint being held when each arrived with no alignment step. A recording's length is
 counted in frames at the rate the card actually runs.
 
+### Each run of identical captures is stored once
+
+Two captures of one frame are byte-identical, so the recorder stores a buffer only when its
+bytes differ from the last one stored (a matching digest is confirmed byte for byte) and frames
+the stored ones as IVF, each with its capture's timestamp, so the file keeps real time. The
+sidecar (version 2: a header naming the stored fourcc, size and time base, then one row per
+capture) adds to each capture's `FRAME` row the stored frame showing it and its timestamp.
+`read_log` returns the `FRAME` rows of either version. Every reader opens a take through
+`syncsummoner.device.stored.captures`, which hands ffmpeg every capture as it arrived: an old
+take directly, a deduplicated one through a FIFO fed from the stored frames, each checked
+against its logged size and digest.
+
+`syncsummoner probe dedupe TAKE...` rewrites old takes: beside the take, verified capture for
+capture by bytes and by decoded frame (framemd5), then hard-linked over the take and every other
+name of it found under `--links DIR` (sidecars first). A take with a name it cannot account
+for, or in a read-only folder, is left alone and its saving reported; `--dry-run` writes nothing.
+A rewrite interrupted between its renames leaves `.TAKE.dedupe.mkv` beside the take, which a
+rerun reports rather than overwrites.
+
 ## The state-index strip survives the chain
 
 An 8-bit Gray-code strip played from the Pi decoded back bit-exact through

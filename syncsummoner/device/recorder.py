@@ -455,24 +455,14 @@ def inspect_take(
     """
     from syncsummoner.aesthetics.levels import LUMA_709  # keeps scipy off the device import path
 
+    from .stored import captures
+
     width, height = INSPECT_SIZE
-    argv = [
-        ffmpeg,
-        "-loglevel",
-        "error",
-        "-ss",
-        f"{start_s:.3f}",
-        "-i",
-        str(path),
-        "-vf",
-        f"scale={width}:{height}:flags=neighbor,fps=source_fps/{max(1, samples // 60)}",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
-    ]
-    data = subprocess.run(argv, check=False, capture_output=True).stdout
+    with captures(path, start_s=start_s, ffmpeg=ffmpeg) as source:
+        argv = [ffmpeg, "-loglevel", "error", *source, "-vf"]
+        argv += [f"scale={width}:{height}:flags=neighbor,fps=source_fps/{max(1, samples // 60)}"]
+        argv += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        data = subprocess.run(argv, check=False, capture_output=True).stdout
     stride = width * height * 3
     count = len(data) // stride
     if not count:

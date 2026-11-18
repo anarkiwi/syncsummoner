@@ -7,6 +7,7 @@ import io
 import shutil
 import subprocess
 import threading
+from fractions import Fraction
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,6 +31,24 @@ def digest(data):
     return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
 
 
+def ivf(data):
+    """The ``(pts, bytes)`` of every frame in an IVF stream, after checking its header."""
+    assert data[:4] == b"DKIF"
+    at, found = vr.IVF.size, []
+    while at < len(data):
+        size, pts = vr.IVF_FRAME.unpack_from(data, at)
+        at += vr.IVF_FRAME.size
+        found.append((pts, data[at : at + size]))
+        at += size
+    return found
+
+
+def rows(data):
+    """A deduplicated sidecar's rows from its bytes."""
+    assert data[: len(vr.MAGIC)] == vr.MAGIC
+    return np.frombuffer(data[vr.HEADER.size :], dtype=vr.STORED)
+
+
 def test_record_stores_frames_untouched_and_logs_each_ones_sequence_and_time(tmp_path):
     frames = [
         capture(5, 100, 250, b"ab"),
@@ -39,7 +58,7 @@ def test_record_stores_frames_untouched_and_logs_each_ones_sequence_and_time(tmp
     sink = io.BytesIO()
     with open(vr.sidecar(tmp_path / "take.mkv"), "wb") as log:
         assert vr.record(frames, sink, log, stop=lambda: False) == 3
-    assert sink.getvalue() == b"abcdef"
+    assert ivf(sink.getvalue()) == [(0, b"ab"), (33, b"cde"), (67, b"f")]
     got = vr.read_log(tmp_path / "take.mkv")
     assert got.tolist() == [
         (5, 100_000_250_000, 2, 0, digest(b"ab")),
@@ -62,39 +81,82 @@ def test_record_ends_at_its_limit_or_when_asked(limit, stop_at, kept):
 
     sink, log = io.BytesIO(), io.BytesIO()
     assert vr.record(frames(), sink, log, stop=lambda: len(pulled) > (stop_at or 99), limit=limit) == kept
-    assert sink.getvalue() == bytes(range(kept)) and len(log.getvalue()) == kept * vr.FRAME.itemsize
+    assert (
+        [data for _, data in ivf(sink.getvalue())] == [bytes([k]) for k in range(kept)]
+        if kept
+        else not sink.getvalue()
+    )
+    assert len(log.getvalue()) == (vr.HEADER.size + kept * vr.STORED.itemsize if kept else 0)
 
 
 def test_the_sidecar_sits_beside_the_take_and_a_torn_tail_is_dropped(tmp_path):
     take = tmp_path / "take.mkv"
     assert vr.sidecar(take) == tmp_path / "take.mkv.v4l2" == vr.sidecar(str(take))
-    rows = np.array([(1, 2, 3, 4, 5), (6, 7, 8, 9, 10)], dtype=vr.FRAME)
-    vr.sidecar(take).write_bytes(rows.tobytes() + b"\x01\x02\x03")
-    assert vr.read_log(take).tolist() == rows.tolist()
+    logged = np.array([(1, 2, 3, 4, 5), (6, 7, 8, 9, 10)], dtype=vr.FRAME)
+    vr.sidecar(take).write_bytes(logged.tobytes() + b"\x01\x02\x03")
+    assert vr.read_log(take).tolist() == logged.tolist()
+
+
+def test_a_deduplicated_sidecar_reads_as_the_frame_log_with_its_layout_and_a_torn_tail_dropped(tmp_path):
+    take = tmp_path / "take.mkv"
+    layout = vr.Layout(vr.FOURCC["yuyv422"], 64, 32, Fraction(1, 90_000))
+    stored = np.array([(1, 2, 3, 4, 5, 0, 0), (6, 7, 8, 9, 5, 0, 3000)], dtype=vr.STORED)
+    vr.sidecar(take).write_bytes(layout.sidecar_header() + stored.tobytes() + b"\x01")
+    got, found = vr.read_sidecar(take)
+    assert found == layout and got.tolist() == stored.tolist()
+    assert vr.read_log(take).dtype == vr.FRAME and vr.read_log(take).tolist() == [
+        r[:5] for r in stored.tolist()
+    ]
+    vr.sidecar(take).write_bytes(layout.sidecar_header()[:7] + b"\x09" + layout.sidecar_header()[8:])
+    with pytest.raises(ValueError, match="version 9"):
+        vr.read_sidecar(take)
 
 
 @pytest.mark.parametrize(
-    ("fmt", "source"),
-    [
-        ("mjpeg", ["-f", "mjpeg"]),
-        ("yuyv422", ["-f", "rawvideo", "-pix_fmt", "yuyv422", "-video_size", "64x32"]),
-    ],
+    ("rate", "first"), [(Fraction(60), [0, 17, 33, 50, 67]), (vr.card_rate(29.97), [0, 33, 67, 100, 133])]
 )
-def test_encoder_argv_reads_the_cards_own_format_from_the_pipe(fmt, source):
-    argv = vr.encoder_argv(fmt, 64, 32, 29.97, ["-c:v", "copy"], "out.mkv", ffmpeg="ff")
-    assert argv[0] == "ff" and argv[argv.index("-i") - len(source) - 2 : argv.index("-i") - 2] == source
-    assert argv[argv.index("-framerate") + 1] == "29.97" and argv[argv.index("-i") + 1] == "pipe:0"
+def test_timestamps_are_the_captures_at_the_cards_rate_to_the_millisecond(rate, first):
+    assert vr.timestamp(np.arange(5), rate).tolist() == first
+    assert vr.card_rate(59.94) == Fraction(2997, 50) and vr.timestamp(3, Fraction(60)) == 50
+
+
+def test_encoder_argv_reads_timestamped_frames_from_the_pipe():
+    argv = vr.encoder_argv(["-c:v", "copy"], "out.mkv", ffmpeg="ff")
+    assert argv[0] == "ff" and argv[argv.index("-i") - 2 : argv.index("-i") + 2] == [
+        "-f",
+        "ivf",
+        "-i",
+        "pipe:0",
+    ]
     assert argv[-3:] == ["-c:v", "copy", "out.mkv"]
 
 
+def test_a_repeated_capture_is_logged_against_the_frame_already_stored():
+    """Equal digests alone store nothing new only when the bytes match too."""
+    frames = [capture(k, 0, k, data) for k, data in enumerate([b"a", b"a", b"b", b"b", b"b", b"a"])]
+    sink, log = io.BytesIO(), io.BytesIO()
+    vr.record(frames, sink, log, stop=lambda: False, rate=Fraction(60))
+    assert ivf(sink.getvalue()) == [(0, b"a"), (33, b"b"), (83, b"a")]
+    got = rows(log.getvalue())
+    assert got["stored"].tolist() == [0, 0, 1, 1, 1, 2] and got["pts"].tolist() == [0, 17, 33, 50, 67, 83]
+    out = vr.Output(io.BytesIO(), io.BytesIO())
+    out.write(b"x", (0, 0, 1, 0), 7, vr.Layout(), Fraction(30))
+    out.write(b"y", (1, 0, 1, 0), 7, vr.Layout(), Fraction(30))
+    assert [d for _, d in ivf(out.sink.getvalue())] == [b"x", b"y"], "a digest collision is not a repeat"
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-def test_recorded_frames_reach_the_file_one_for_one(tmp_path):
-    width, height, count = 16, 8, 6
-    frames = [capture(k, 10, k * 33_333, bytes([16 * k]) * (width * height * 2)) for k in range(count)]
+def test_recorded_frames_reach_the_file_once_per_run(tmp_path):
+    width, height = 16, 8
+    shades = [0, 1, 1, 2, 3, 3]
+    frames = [
+        capture(k, 10, k * 33_333, bytes([16 * s]) * (width * height * 2)) for k, s in enumerate(shades)
+    ]
     out = tmp_path / "raw.mkv"
-    argv = vr.encoder_argv("yuyv422", width, height, 30.0, ["-c:v", "rawvideo"], str(out), ffmpeg="ffmpeg")
+    argv = vr.encoder_argv(["-c:v", "rawvideo"], str(out), ffmpeg="ffmpeg")
+    layout = vr.Layout(vr.FOURCC["yuyv422"], width, height)
     with subprocess.Popen(argv, stdin=subprocess.PIPE) as enc, open(vr.sidecar(out), "wb") as log:
-        vr.record(frames, enc.stdin, log, stop=lambda: False)
+        vr.record(frames, enc.stdin, log, stop=lambda: False, layout=layout)
         enc.stdin.close()
         assert enc.wait() == 0
     probe = [
@@ -107,8 +169,15 @@ def test_recorded_frames_reach_the_file_one_for_one(tmp_path):
         "-of",
         "csv=p=0",
     ]
-    assert int(subprocess.run([*probe, str(out)], capture_output=True, text=True, check=True).stdout) == count
-    assert len(vr.read_log(out)) == count
+    assert int(subprocess.run([*probe, str(out)], capture_output=True, text=True, check=True).stdout) == 4
+    assert len(vr.read_log(out)) == len(shades) and vr.read_sidecar(out)[0]["stored"].tolist() == [
+        0,
+        1,
+        1,
+        2,
+        3,
+        3,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -162,8 +231,9 @@ def test_a_stalled_sink_does_not_stop_frames_being_dequeued():
 
     sink, log = Stalled(), io.BytesIO()
     assert vr.record(frames(), sink, log, stop=lambda: False, backlog=8) == 5
-    assert pulled == list(range(5)) and sink.got == [bytes([k]) * 4 for k in range(5)]
-    assert np.frombuffer(log.getvalue(), dtype=vr.FRAME)["sequence"].tolist() == list(range(5))
+    assert pulled == list(range(5))
+    assert [d for _, d in ivf(b"".join(sink.got))] == [bytes([k]) * 4 for k in range(5)]
+    assert rows(log.getvalue())["sequence"].tolist() == list(range(5))
 
 
 def test_a_failed_write_is_raised_and_stops_the_recording():
@@ -197,11 +267,15 @@ def test_a_roll_splits_the_captures_between_files_sharing_those_either_side_of_i
             yield capture(k, 0, k, bytes([k]))
 
     assert vr.record(frames(), None, None, stop=lambda: False, outputs=outputs) == 8 and rolled.is_set()
-    seq = {
-        p: np.frombuffer(log.getvalue(), dtype=vr.FRAME)["sequence"].tolist() for p, (_, log) in logs.items()
-    }
+    seq = {p: rows(log.getvalue())["sequence"].tolist() for p, (_, log) in logs.items()}
     assert seq == {"a.mkv": [0, 1, 2, 3, 4, 5], "b.mkv": [4, 5, 6, 7]}
-    assert logs["b.mkv"][0].getvalue() == bytes([4, 5, 6, 7])
+    assert ivf(logs["b.mkv"][0].getvalue()) == [
+        (0, bytes([4])),
+        (33, bytes([5])),
+        (67, bytes([6])),
+        (100, bytes([7])),
+    ]
+    assert rows(logs["b.mkv"][1].getvalue())["stored"].tolist() == [0, 1, 2, 3], "each file numbers its own"
     assert closed == ["a.mkv"], "the old file is closed once the captures move past it"
 
 

@@ -149,3 +149,31 @@ def test_the_spec_of_a_render_config_takes_its_strip():
     config = type("Config", (), {"strip_px": 4, "bits": 12})()
     assert D.Spec.of(config) == D.Spec(strip_px=4, bits=12)
     assert D.Spec.of(config).token()["schema"] == D.SCHEMA
+
+
+def test_a_deduplicated_take_decodes_to_the_old_takes_features_capture_for_capture(tmp_path):
+    # pylint: disable=no-member
+    import cv2  # pylint: disable=import-outside-toplevel
+
+    from syncsummoner.probe import dedupe  # pylint: disable=import-outside-toplevel
+    from tests import takes  # pylint: disable=import-outside-toplevel
+
+    rng = np.random.default_rng(3)
+    shown = np.repeat(np.arange(12), rng.integers(1, 4, 12))
+    plates = rng.uniform(0.1, 0.9, (12, 40, 96, 3)).astype(np.float32)
+    jpegs = [
+        cv2.imencode(".jpg", (burn_timecode(p, i, bits=16, strip_px=8) * 255).astype(np.uint8))[1].tobytes()
+        for i, p in enumerate(plates)
+    ]
+    old = takes.old(tmp_path / "old.mkv", [jpegs[i] for i in shown])
+    new = tmp_path / "new.mkv"
+    shutil.copy(old, new)
+    shutil.copy(sidecar(old), sidecar(new))
+    assert dedupe.dedupe(new).status == "deduplicated"
+    before = D.decode(old, SPEC, workers=1)
+    assert before["codes"].tolist() == shown.tolist()
+    for workers in (1, 4):
+        after = D.decode(new, SPEC, workers=workers)
+        assert after.keys() == before.keys()
+        for key, value in before.items():
+            assert np.array_equal(after[key], value), key

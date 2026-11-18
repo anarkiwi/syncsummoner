@@ -11,6 +11,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from syncsummoner.device.stored import Stored, captures
 from syncsummoner.progress import stage
 
 #: Seconds of fade at each edge unless a caller says otherwise.
@@ -21,7 +22,10 @@ DEFAULT_CRF = 16
 
 
 def probe_duration(path: str | Path, *, ffprobe: str = "ffprobe") -> float:
-    """Container duration in seconds, from the format header."""
+    """Duration in seconds: a deduplicated take's captures' span, else the container's from its header."""
+    stored = Stored.of(path)
+    if stored is not None:
+        return stored.duration()
     done = subprocess.run(
         [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
         check=False,
@@ -70,6 +74,7 @@ def master_command(
     strip_px: int = 0,
     ffmpeg: str = "ffmpeg",
     crf: int = DEFAULT_CRF,
+    source: list[str] | None = None,
 ) -> list[str]:
     """Argv that trims, fades and muxes one take into the finished clip.
 
@@ -89,7 +94,7 @@ def master_command(
     if video_start > 0:
         trim = f"trim=start={video_start:.3f},setpts=PTS-STARTPTS"
         video_chain = f"{trim},{video_chain}" if video_chain else trim
-    argv = [ffmpeg, "-loglevel", "error", "-y", "-i", str(take)]
+    argv = [ffmpeg, "-loglevel", "error", "-y", *(["-i", str(take)] if source is None else source)]
     if audio is not None:
         argv += (["-ss", f"{audio_start:.3f}"] if audio_start > 0 else []) + ["-i", str(audio)]
     argv += ["-t", f"{duration:.3f}"]
@@ -125,20 +130,22 @@ def master(
     as both the take and the track do.
     """
     duration = seconds if seconds else common_duration(take, audio, ffprobe=ffprobe) - video_start
-    argv = master_command(  # pylint: disable=duplicate-code
-        take,
-        audio,
-        out,
-        duration=duration,
-        fade_in=fade_in,
-        fade_out=fade_out,
-        audio_start=audio_start,
-        video_start=video_start,
-        strip_px=strip_px,
-        ffmpeg=ffmpeg,
-    )
-    with stage("master", seconds=f"{duration:.1f}", fades=f"{fade_in:g}/{fade_out:g}", out=str(out)):
-        done = subprocess.run(argv, check=False, capture_output=True)
+    with captures(take, ffmpeg=ffmpeg) as source:
+        argv = master_command(  # pylint: disable=duplicate-code
+            take,
+            audio,
+            out,
+            duration=duration,
+            fade_in=fade_in,
+            fade_out=fade_out,
+            audio_start=audio_start,
+            video_start=video_start,
+            strip_px=strip_px,
+            ffmpeg=ffmpeg,
+            source=source,
+        )
+        with stage("master", seconds=f"{duration:.1f}", fades=f"{fade_in:g}/{fade_out:g}", out=str(out)):
+            done = subprocess.run(argv, check=False, capture_output=True)
     if done.returncode:
         raise RuntimeError(f"mastering failed: {done.stderr.decode('utf-8', 'replace')[:200]}")
     return duration
