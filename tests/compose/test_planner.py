@@ -7,7 +7,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from syncsummoner.compose import kriged
 from syncsummoner.compose import planner as P
+from syncsummoner.compose import survived as S
 from syncsummoner.compose.cut import Cut, spans_of
 from syncsummoner.compose.gating import gate_automation
 from syncsummoner.compose.features import Features, Section, VideoFeatures
@@ -483,7 +485,7 @@ def _kept(features, *, si=1.0, ti=1.0, follow=0.9, dead_from=None):
 
 def test_a_kept_picture_has_no_dead_bars(features):
     both = Features(audio=features.audio, video=_footage(features.audio.duration))
-    kept = P.predict_survival(_kept(both), both)
+    kept = S.predict_survival(_kept(both), both)
     assert kept is not None and not kept.dead.any()
     assert np.allclose(kept.ti_ratio, 1.0)
 
@@ -491,18 +493,18 @@ def test_a_kept_picture_has_no_dead_bars(features):
 def test_a_flat_or_frozen_or_unfollowed_bar_is_dead(features):
     both = Features(audio=features.audio, video=_footage(features.audio.duration))
     for shares in ({"si": 0.0}, {"ti": 0.0}, {"follow": 0.0}):
-        assert P.predict_survival(_kept(both, **shares), both).dead.all()
+        assert S.predict_survival(_kept(both, **shares), both).dead.all()
 
 
 def test_survival_is_unknown_without_curves_or_footage(features):
     traj = _kept(Features(audio=features.audio, video=None))
-    assert P.predict_survival(traj, Features(audio=features.audio, video=None)) is None
+    assert S.predict_survival(traj, Features(audio=features.audio, video=None)) is None
     both = Features(audio=features.audio, video=_footage(features.audio.duration))
-    assert P.predict_survival(replace(traj, si_ratio=None), both) is None
+    assert S.predict_survival(replace(traj, si_ratio=None), both) is None
 
 
 def test_destruction_is_budgeted_one_bar_at_a_time_inside_destroy_sections():
-    kept = P.Kept(
+    kept = S.Kept(
         starts=np.arange(6.0),
         ends=np.arange(1.0, 7.0),
         ti_ratio=np.zeros(6),
@@ -510,8 +512,8 @@ def test_destruction_is_budgeted_one_bar_at_a_time_inside_destroy_sections():
     )
     calm = Score(duration=6.0, sections=[Section(0.0, 6.0, "A")])
     wild = Score(duration=6.0, sections=[Section(0.0, 6.0, "A", destroy=True)])
-    assert P.dead_bars_over_budget(kept, calm) == 4.0
-    assert P.dead_bars_over_budget(kept, wild) == 1.0
+    assert S.dead_bars_over_budget(kept, calm) == 4.0
+    assert S.dead_bars_over_budget(kept, wild) == 1.0
 
 
 def test_dead_bars_outrank_any_total_and_bore_the_objective(features):
@@ -719,3 +721,70 @@ def test_objectives_over_cuts_weigh_by_length_and_sum_dead_bars():
     both = P._combine(parts)
     assert both.total == pytest.approx(-0.5) and both.violation == 1.0
     assert both.terms == {"mud": pytest.approx(0.25), "dead_bars": 3.0}
+
+
+def _joint(traj, name, centre, pull, sd=0.0):
+    """``traj`` with ``name`` kriged at a constant ``pull`` off ``centre``, the records fully informing it."""
+    n = traj.times.size
+    found = kriged.Kriged(name, centre, np.full(n, pull), np.ones(n), np.full(n, sd))
+    return replace(traj, joint={**traj.joint, name: found}, settings=np.full((n, 12), 512.0))
+
+
+def test_a_kriged_response_decides_each_bar_against_its_bound(features):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    traj = _kept(both)
+    alive = S.predict_survival(_joint(traj, "si_ratio", 0.0, 0.0), both)
+    flat = S.predict_survival(_joint(traj, "si_ratio", np.log(1e-3), 0.0), both)
+    assert not alive.dead.any() and flat.dead.all() and not flat.unmeasured
+    open_ = S.predict_survival(_joint(traj, "si_ratio", np.log(1e-3), 0.0, sd=10.0), both)
+    assert open_.dead.all() and open_.unmeasured == {(512,) * 12}
+
+
+def test_a_setting_no_record_informs_is_not_alive(features):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    traj = _kept(both)
+    n = traj.times.size
+    blind = kriged.Kriged("ti_ratio", 0.0, np.zeros(n), np.zeros(n), np.ones(n))
+    kept = S.predict_survival(replace(traj, joint={"ti_ratio": blind}, settings=np.zeros((n, 12))), both)
+    assert kept.dead.all() and kept.unmeasured == {(0,) * 12}
+
+
+def test_live_bounds_follow_the_take_check():
+    moving = np.random.default_rng(0).gamma(4.0, 0.01, 120)
+    bounds = S.live_bounds(0.3, 0.04, moving)
+    assert 0 < bounds["si_ratio"] < 1 and 0 < bounds["ti_ratio"] < 1 and 0 < bounds["motion_follow"] < 1
+    assert "motion_follow" not in S.live_bounds(0.3, 0.04, np.full(120, 0.04))
+    assert S.live_bounds(0.3, 0.04, np.r_[0.0, 0.08, 0.0, 0.08, 0.0])["motion_follow"] == np.inf
+    assert S.live_bounds(0.0, 0.0, moving)["si_ratio"] == -np.inf
+
+
+def test_a_cut_opens_on_the_state_the_program_loaded_in():
+    prog = P._Program("glitch", make_profile(), {}, 1.0, _Gate(set()))
+    held = prog.opening(Cut(1.0, 2.0, "glitch"), FPS).held
+    assert held.indices.tolist() == list(range(1, 13)) and set(held.values.tolist()) == {512}
+    assert (held.hold(np.array([1.0]))[0] == 512).all()
+
+
+def test_a_survival_model_from_the_archive_kriges_the_plan(features, caplog):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    rng = np.random.default_rng(5)
+    settings = rng.integers(0, 1024, (40, 12)).astype(float)
+    dead = {name: rng.uniform(1e-4, 2e-4, 40) for name in ("si_ratio", "ti_ratio")}
+    models = {"alive": kriged.fit(settings, dead)}
+    with caplog.at_level("INFO", logger="syncsummoner"):
+        score = P.search(
+            {"alive": _survival_profiles()["alive"]}, both, rng=rng, budget=6, fps=FPS, survival=models
+        )
+    assert any("no program is alive there" in m for m in caplog.messages)
+    assert score.meta["downbeats"] == pytest.approx(
+        features.audio.downbeats[features.audio.downbeats < score.duration].tolist()
+    )
+    assert isinstance(score.meta["unmeasured"], dict)
+
+
+def test_unmeasured_settings_gather_over_cuts():
+    parts = [
+        (1.0, P.Objective(total=0.0, feasible=True, unmeasured=frozenset({(1,) * 12}))),
+        (1.0, P.Objective(total=0.0, feasible=True, unmeasured=frozenset({(2,) * 12}))),
+    ]
+    assert P._combine(parts).unmeasured == {(1,) * 12, (2,) * 12}

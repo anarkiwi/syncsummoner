@@ -60,7 +60,7 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
     && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
-        "pyvmancer[serial]>=0.6.5" "python-sat>=1.8.dev16" /wheels/dd-*.whl
+        "pyvmancer[serial]>=0.6.5" "python-sat>=1.8.dev16" "scikit-learn>=1.3" /wheels/dd-*.whl
 
 # The seam check (design SS2.7): only the aesthetics extra, no device stack.
 FROM base AS deps-aesthetics
@@ -78,7 +78,7 @@ COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
-        "pyvmancer[all]>=0.6.5" "python-sat>=1.8.dev16" /wheels/dd-*.whl
+        "pyvmancer[all]>=0.6.5" "python-sat>=1.8.dev16" "scikit-learn>=1.3" /wheels/dd-*.whl
 COPY . .
 RUN /venv/bin/pip install --no-deps -e .
 WORKDIR /work

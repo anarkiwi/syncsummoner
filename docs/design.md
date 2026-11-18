@@ -470,15 +470,36 @@ few and carry every other parameter's effect as noise; the kernel pools nearby
 values. The bandwidth minimises leave-one-out squared error over a dyadic grid
 from the least value gap to the span, with zero (the per-value mean) as a
 candidate, so a cliff is smoothed only when the data cannot resolve it. The
-planner predicts a vector as the sum of each parameter's departure from its own
-median (first-order HDMR), which is what first-order marginals are for.
+planner predicts a vector's other metrics as the sum of each parameter's
+departure from its own median (first-order HDMR), which is what first-order
+marginals are for.
+
+Survival is not predicted that way: a sum of one-parameter averages cannot carry
+one parameter gating another (Pinwheel's Posterize near zero flattens the
+picture whatever its gains add, while its marginal, averaged over every other
+parameter, stays flat). `compose.kriged` instead fits each survival response
+jointly over every parameter the archive varied, from the records in the
+`.parquet` beside each profile: a Gaussian process with an ARD squared-exponential
+kernel plus white noise, its hyperparameters by marginal likelihood
+(scikit-learn), in log space for the ratios and Fisher z for the follow. A
+program with no records falls back to the first-order sum. The planner opens
+every cut on the state the program loaded in, from its model, plus every write
+sent since.
 
 ### 9.4 Survival constraint and destruction budget
 
 `predict_survival` judges each bar of a predicted trajectory against the same
 bar of the source footage, whose SI and TI come from `VideoFeatures`. A bar is
-dead when the predicted SI or TI falls below its live floor, or when the
-predicted follow would not reach the critical z over the bar's frames.
+dead when the predicted SI or TI falls below its live floor, or when, where the
+source's TI varies beyond quantisation as the take check asks, the predicted
+follow would not reach the critical z over the bar's effective samples
+(`live_bounds`). A kriged response is judged by simple kriging with the bound
+itself as the prior mean: the bar lives only where the records pull the
+prediction above the bound, so a setting no record informs reverts to the bound
+and is not alive. A dead bar whose verdict lies within the one-sided critical z
+of its posterior spread is undecided by the records; its settings are logged
+and kept in the score's `unmeasured`, by program, as what an archive would have
+to measure.
 
 Destruction is budgeted one bar at a time: inside a `destroy` section the first
 bar of a dead run is allowed and every further one counts; outside, every dead
@@ -508,7 +529,9 @@ exactly (§10) and `checked_plan` passes that attribution to `check_takes`;
 `check` reads it from `<take>.picked.npy`. Only a recording without one, an
 unlocked recording or a master, is traced by the strip clock and the motion
 clock, keeping the clock under which output motion follows the source best, and
-`check` warns that its clock is fitted. Each bar is then judged:
+`check` warns that its clock is fitted. Each bar is then judged, the bars being
+the planner's: the score's `downbeats` (else every `bar` seconds from zero),
+split at every cut, so each cut is judged on the frames it shows alone:
 
 | Fault | Condition |
 | --- | --- |

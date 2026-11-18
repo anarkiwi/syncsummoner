@@ -14,11 +14,12 @@ import numpy as np
 
 from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
 from syncsummoner.progress import LOG, track
-from syncsummoner import aesthetics
+from syncsummoner.compose import kriged
 from syncsummoner.compose.cut import Cut, cut_plan, spans_of
 from syncsummoner.compose.gating import gate_automation, model_gate
 from syncsummoner.compose.features import Features, Section, information_content, phrases
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
+from syncsummoner.compose.survived import dead_bars_over_budget, predict_survival
 from syncsummoner.compose.thinning import flush, reachable, settle_of, settled, thin, visible
 from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext, candidates
 
@@ -104,6 +105,10 @@ class Trajectory:
     si_ratio: np.ndarray | None = None
     ti_ratio: np.ndarray | None = None
     follow: np.ndarray | None = None
+    #: The survival responses kriged from the archive's records, by name, where it has them.
+    joint: Mapping[str, kriged.Kriged] = field(default_factory=dict)
+    #: Raw parameter values held at each frame.
+    settings: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,8 @@ class Objective:
     feasible: bool
     terms: dict[str, float] = field(default_factory=dict)
     violation: float = 0.0
+    #: Settings shown in dead bars whose verdict no record decides: what an archive would have to measure.
+    unmeasured: frozenset[tuple[int, ...]] = frozenset()
 
     @property
     def rank(self) -> tuple[float, float]:
@@ -221,12 +228,13 @@ def proxy_render(
     start: float = 0.0,
     slope_center: float = -1.2,
     slope_gain: float = 0.8,
+    survival: Mapping[str, kriged.Response] | None = None,
 ) -> Trajectory:
     """Predict per-frame metrics from the measured curves, the cliff atlas and the response.
 
-    Every metric the objective scores is read back from what the probe measured at
-    each setpoint. Where a profile predates those curves the older inferences stand
-    in, so an unrefitted profile still composes. The frames are those of
+    Every metric the objective scores is read back from what the probe measured at each setpoint,
+    and each response in ``survival`` is kriged jointly from the archive's records instead. Where a
+    profile predates those curves the older inferences stand in. The frames are those of
     ``[start, start + duration)``, frame ``n`` at ``n / fps``.
     """
     first = int(np.rint(start * fps))
@@ -268,7 +276,8 @@ def proxy_render(
         clip = inferred_clip if clip is None else clip
         illegal = inferred_illegal if illegal is None else illegal
 
-    kept = {name: _marginal(profile, raw, name) for name in SURVIVAL}
+    joint = {name: model.at(raw) for name, model in (survival or {}).items() if name in SURVIVAL}
+    kept = {name: joint[name].mean if name in joint else _marginal(profile, raw, name) for name in SURVIVAL}
     return Trajectory(
         times=times,
         state=resp,
@@ -281,6 +290,8 @@ def proxy_render(
         si_ratio=None if kept["si_ratio"] is None else np.maximum(kept["si_ratio"], 0.0),
         ti_ratio=None if kept["ti_ratio"] is None else np.maximum(kept["ti_ratio"], 0.0),
         follow=None if kept["motion_follow"] is None else np.clip(kept["motion_follow"], -1.0, 1.0),
+        joint=joint,
+        settings=raw,
     )
 
 
@@ -321,72 +332,6 @@ def _boredom(traj: Trajectory, bar_duration: float, *, floor: float) -> float:
     return float(np.max(np.maximum(floor - std, 0.0)) / floor)
 
 
-def bar_edges(features: Features, end: float, start: float = 0.0) -> np.ndarray:
-    """Bar boundaries in seconds over ``[start, end]``: the downbeats, else the bar period."""
-    audio = features.audio
-    marks = audio.downbeats if audio.downbeats.size > 1 else np.arange(0.0, end, audio.bar_duration)
-    return np.unique(np.r_[start, marks[(marks > start) & (marks < end)], end])
-
-
-@dataclass(frozen=True)
-class Kept:
-    """Predicted survival per bar: how much picture and motion the output keeps, and which bars die."""
-
-    starts: np.ndarray
-    ends: np.ndarray
-    ti_ratio: np.ndarray
-    dead: np.ndarray
-
-
-def predict_survival(traj: Trajectory, features: Features) -> Kept | None:
-    """Judge each bar of a predicted trajectory against the same bar of the source footage.
-
-    A bar is dead where the output's predicted SI or TI falls below
-    :func:`~syncsummoner.aesthetics.live_floor` of the source's, or where its predicted
-    following would not reach :func:`~syncsummoner.aesthetics.critical_z` over the bar's frames.
-    """
-    video = features.video
-    if traj.si_ratio is None or traj.ti_ratio is None or video is None or video.si is None:
-        return None
-    edges = bar_edges(features, float(traj.times[-1]) + (traj.times[1] - traj.times[0]), float(traj.times[0]))
-    frame = np.clip(np.rint(traj.times * video.fps).astype(np.int64), 0, video.si.size - 1)
-    source_si, source_ti = video.si[frame], np.nan_to_num(video.ti[frame])
-    follow = traj.follow if traj.follow is not None else np.ones_like(traj.ti_ratio)
-    owner = np.clip(np.searchsorted(edges, traj.times, side="right") - 1, 0, edges.size - 2)
-    ratio, dead = np.zeros(edges.size - 1), np.zeros(edges.size - 1, dtype=bool)
-    for b in range(edges.size - 1):
-        m = owner == b
-        if not m.any():
-            continue
-        lo, hi = np.clip(np.rint(edges[b : b + 2] * video.fps).astype(np.int64), 0, video.ti.size)
-        series = np.nan_to_num(video.ti[lo:hi])
-        si, ti = float(source_si[m].mean()), float(source_ti[m].mean())
-        ratio[b] = float(traj.ti_ratio[m].mean())
-        flat = traj.si_ratio[m].mean() * si < aesthetics.live_floor(si, aesthetics.quantisation_si())
-        frozen = ratio[b] * ti < aesthetics.live_floor(ti, aesthetics.quantisation_ti())
-        unfollowed = (
-            series.size > 3
-            and aesthetics.follow_z(float(follow[m].mean()), aesthetics.effective_samples(series, series))
-            <= aesthetics.critical_z()
-        )
-        dead[b] = bool(flat or frozen or unfollowed)
-    return Kept(edges[:-1], edges[1:], ratio, dead)
-
-
-def dead_bars_over_budget(kept: Kept, score: Score) -> float:
-    """Dead bars the score cannot afford, destruction being budgeted one bar at a time.
-
-    Any dead bar outside a destroy-marked section counts, and inside one every bar of a dead
-    run beyond its first.
-    """
-    inside = score.destroy_mask(0.5 * (kept.starts + kept.ends))
-    edges = np.flatnonzero(np.diff(np.r_[0, kept.dead.astype(np.int8), 0]))
-    over = 0
-    for a, b in zip(edges[::2], edges[1::2]):
-        over += int(np.count_nonzero(~inside[a:b])) + max(0, int(np.count_nonzero(inside[a:b])) - 1)
-    return float(over)
-
-
 def evaluate(
     traj: Trajectory,
     features: Features,
@@ -415,6 +360,7 @@ def evaluate(
     terms["levels"] = float((traj.clip_frac + traj.illegal_frac)[legal].mean())
     terms["motif"] = _motif_return(traj, score.sections)
     kept = predict_survival(traj, features)
+    unmeasured: frozenset[tuple[int, ...]] = frozenset()
     if kept is None:
         terms["boredom"] = _boredom(traj, audio.bar_duration, floor=boredom_floor)
         violation = 0.0
@@ -422,6 +368,7 @@ def evaluate(
         terms["boredom"] = float(np.max(1.0 - np.minimum(kept.ti_ratio, 1.0)))
         violation = dead_bars_over_budget(kept, score)
         terms["dead_bars"] = float(kept.dead.sum())
+        unmeasured = kept.unmeasured
     total = discount * (
         weights.av_corr * terms["av_corr"]
         + weights.motif * terms["motif"]
@@ -430,7 +377,9 @@ def evaluate(
         - weights.levels * terms["levels"]
         - weights.boredom * terms["boredom"]
     )
-    return Objective(total=float(total), feasible=True, terms=terms, violation=violation)
+    return Objective(
+        total=float(total), feasible=True, terms=terms, violation=violation, unmeasured=unmeasured
+    )
 
 
 def _bar_grid(audio, section: Section) -> np.ndarray:
@@ -596,6 +545,7 @@ def _combine(parts: Sequence[tuple[float, Objective]]) -> Objective:
         feasible=all(obj.feasible for _, obj in parts),
         terms=terms,
         violation=float(sum(obj.violation for _, obj in parts)),
+        unmeasured=frozenset().union(*(obj.unmeasured for _, obj in parts)),
     )
 
 
@@ -625,7 +575,8 @@ class _Planned(NamedTuple):
 class _Program:
     """One program being planned: its profile and gate, and the gestures, cuts and sent writes so far.
 
-    ``state`` is the gate's after every write sent so far, from the state the program loads in.
+    ``state`` is the gate's after every write sent so far, from the state the program loads in, and
+    ``survival`` the responses kriged from its archive's records.
     """
 
     name: str
@@ -633,6 +584,7 @@ class _Program:
     weights: dict[str, float]
     discount: float
     gate: Any = None
+    survival: Mapping[str, kriged.Response] = field(default_factory=dict)
     gestures: list[GestureInstance] = field(default_factory=list)
     raw: Automation = field(default_factory=Automation.empty)
     spans: list[tuple[float, float]] = field(default_factory=list)
@@ -654,10 +606,13 @@ class _Program:
                 scan = (scan[0] + settle_of(self.profile, idx, fps), scan[2], None)
             scans[idx] = scan
         tail = Automation(self.raw.times[~before], self.raw.indices[~before], self.raw.values[~before])
-        params = np.unique(self.sent.indices)
-        last = [int(self.sent.values[self.sent.indices == idx][-1]) for idx in params.tolist()]
+        if self.state is not None:
+            params, last = np.arange(1, len(self.state) + 1), np.asarray(self.state)
+        else:
+            params = np.unique(self.sent.indices)
+            last = np.asarray([self.sent.values[self.sent.indices == idx][-1] for idx in params.tolist()])
         held = Automation(
-            np.full(params.size, cut.start - 1.0), params.astype(np.int32), np.asarray(last, np.int32)
+            np.full(params.size, cut.start - 1.0), params.astype(np.int32), last.astype(np.int32)
         )
         return _Opening(scans, tail, held)
 
@@ -755,6 +710,7 @@ class _Plan:
                 start=cut.start,
                 duration=cut.duration,
                 rng=np.random.default_rng(program_key(prog.name)),
+                survival=prog.survival,
             )
             return evaluate(traj, self.features, self.base, weights=self.weights, discount=prog.discount)
 
@@ -783,7 +739,7 @@ class _Plan:
 def _standing(plan: _Plan, prog: _Program, sections: Sequence[Section], rng) -> Objective:
     """How a program fares over the whole piece: one generation of it showing every section."""
     trial = replace(plan, generations=1)
-    scratch = _Program(prog.name, prog.profile, prog.weights, prog.discount, prog.gate)
+    scratch = _Program(prog.name, prog.profile, prog.weights, prog.discount, prog.gate, prog.survival)
     parts = []
     for section in sections:
         cut = Cut(section.start, section.end, prog.name)
@@ -795,14 +751,16 @@ def _standing(plan: _Plan, prog: _Program, sections: Sequence[Section], rng) -> 
 
 def _assign(
     plan: _Plan, cuts: Sequence[Cut], programs: Mapping[str, _Program], rng
-) -> tuple[list[Cut], dict[str, Objective]]:
+) -> tuple[list[Cut], dict[str, Objective], dict[str, set]]:
     """Plan every cut in time order on its program, moving a cut predicted dead to one alive there.
 
     A cut is predicted dead when its bars die beyond the destruction budget; every other
     program is then planned for it, and the cut goes to the best ranked, its own program first
-    on a tie, so it moves only to a program that keeps more of the picture.
+    on a tie, so it moves only to a program that keeps more of the picture. Also returns, by program,
+    the settings its own plan or the plan kept showed in dead bars no record decides.
     """
     out, parts = [], {name: [] for name in programs}
+    unmeasured: dict[str, set] = {}
     for cut in track(sorted(cuts, key=lambda c: c.start), desc="cuts", unit="cut"):
         options = {cut.program: plan.cut(programs[cut.program], cut, rng)}
         own = options[cut.program].obj
@@ -812,6 +770,9 @@ def _assign(
             )
         name = min(options, key=lambda n, found=options: found[n].obj.rank)
         planned = options[name]
+        for program, found in ((cut.program, own), (name, planned.obj)):
+            if found.unmeasured:
+                unmeasured.setdefault(program, set()).update(found.unmeasured)
         if name != cut.program:
             LOG.info(
                 "%7.2f-%7.2fs: %s predicted dead over %g bars, planned on %s",
@@ -833,7 +794,7 @@ def _assign(
         programs[name].commit(moved, planned)
         parts[name].append((cut.duration, planned.obj))
         out.append(moved)
-    return out, {name: _combine(p) for name, p in parts.items() if p}
+    return out, {name: _combine(p) for name, p in parts.items() if p}, unmeasured
 
 
 def _mark_destroy(sections: Sequence[Section], audio, *, enabled: bool) -> list[Section]:
@@ -871,6 +832,7 @@ def search(
     weights: ObjectiveWeights | None = None,
     evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None,
     gates: Mapping[str, Any] | None = None,
+    survival: Mapping[str, Mapping[str, kriged.Response]] | None = None,
 ) -> Score:
     """Rank the programs, cut the best ``n_passes`` in rotation, and evolve each cut on its program.
 
@@ -880,7 +842,9 @@ def search(
     its program's earlier cuts leave, with ``density`` gestures a bar on screen, through the
     gate :func:`plan_automation` sends by (default: from the program model) and at the state it
     holds, so no gesture is kept that sends nothing; a cut predicted dead moves to a program
-    alive there (:func:`_assign`). A program whose
+    alive there (:func:`_assign`). Survival is kriged from ``survival`` (default: the records beside the
+    profiles, :func:`~syncsummoner.compose.kriged.from_directory`), and the settings dead bars showed that
+    no record decides are left in the score's ``unmeasured``, by program, to archive. A program whose
     parameters were never measured to move anything is skipped: a gesture drives a parameter,
     so a profile with none can only score as the absence of a change, which a passthrough wins.
     """
@@ -902,8 +866,11 @@ def search(
             "density": density,
             "bar": audio.bar_duration,
             "phrase_bars": audio.phrase_bars,
+            "downbeats": [float(t) for t in audio.downbeats[audio.downbeats < duration]],
         },
     )
+    if survival is None:
+        survival = kriged.from_directory(getattr(profiles, "directory", None))
     plan = _Plan(
         base=base,
         features=features,
@@ -933,7 +900,12 @@ def search(
             continue
         gate = model_gate(program) if gates is None else gates.get(program)
         prog = _Program(
-            program, profile, applicable, SIM_DISCOUNT if profile.source is Source.SIM else 1.0, gate
+            program,
+            profile,
+            applicable,
+            SIM_DISCOUNT if profile.source is Source.SIM else 1.0,
+            gate,
+            dict(survival.get(program, {})),
         )
         obj = _standing(plan, prog, sections, rng)
         LOG.debug("%s: standing %.3f", program, obj.total)
@@ -944,7 +916,10 @@ def search(
     kept = {prog.name: prog for _, prog in standing[:n_passes]}
     if not kept:
         return base
-    base.cuts, objectives = _assign(plan, cut_plan(base, list(kept)), kept, rng)
+    base.cuts, objectives, unmeasured = _assign(plan, cut_plan(base, list(kept)), kept, rng)
+    base.meta["unmeasured"] = {name: sorted(map(list, found)) for name, found in sorted(unmeasured.items())}
+    for name, found in sorted(unmeasured.items()):
+        LOG.info("%s: %d settings shown dead that no record decides; archive them", name, len(found))
     shown = [name for name in kept if name in objectives]
     base.layers = [Layer(program=name, index=i, gestures=kept[name].gestures) for i, name in enumerate(shown)]
     base.meta["objective"] = [objectives[name].terms for name in shown]

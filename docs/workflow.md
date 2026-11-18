@@ -473,6 +473,10 @@ or past the first bar of a dead run inside one, ranks a candidate below any that
 has fewer, whatever its score. A program whose layer still breaks that budget
 logs `N bars predicted dead outside the destruction budget`; one without survival
 logs `no survival measured, so its picture is unverified; refit from footage`.
+Survival is kriged jointly from the measurement records (`.parquet`) beside the
+profiles, so keep them together; settings shown in dead bars that no record
+decides are logged (`<program>: N settings shown dead that no record decides;
+archive them`) and listed in the score's `meta.unmeasured`, by program.
 Sections are split at the track's phrase length, which the score records as
 `phrase_bars`.
 
