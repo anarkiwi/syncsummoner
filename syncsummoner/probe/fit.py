@@ -453,11 +453,14 @@ def fit_profile(
     tongue_levels=4,
     max_denominator=8,
     lock_tol=None,
+    settle=None,
 ):
     """Fit a ``ProgramProfile`` from measurement records.
 
     Pass ``specs`` when device parameter metadata is available; otherwise kinds are
-    inferred from the values actually visited. Thresholds are noise-derived.
+    inferred from the values actually visited. Thresholds are noise-derived. ``settle``, in
+    frames, is the program's settle measured elsewhere, given to every swept parameter in place
+    of each record's frame-difference plateau, which on moving footage measures the footage.
     """
     if not records:
         raise ValueError("no measurement records to fit")
@@ -468,7 +471,7 @@ def fit_profile(
     modes = np.array([_mode(params[:, j]) for j in range(PARAM_COUNT)])
     regressed = _regression_effects(params, metrics, varying) if len(varying) > 1 and names else {}
     fitted = []
-    settle = {}
+    settled = {}
     for j in range(PARAM_COUNT):
         kind, steps = _infer_kind(params[:, j])
         spec = next((s for s in specs or [] if s.index == j + 1), None) or ParamSpec(
@@ -501,7 +504,9 @@ def fit_profile(
             axis_effect=None if isolated else regressed.get(j),
         )
         spec.hysteresis = _hysteresis(rows, params[:, j], metrics[:, driver], noise_floor)
-        settle[j + 1] = int(np.median([records[r].settle_frames for r in rows]))
+        settled[j + 1] = (
+            int(np.median([records[r].settle_frames for r in rows])) if settle is None else int(settle)
+        )
         fitted.append(spec)
     response = _principal_response(metrics) if names else None
     interactions = (
@@ -527,7 +532,7 @@ def fit_profile(
             lock_tol=lock_tol,
         ),
         stability_by_region=_stability_regions(params, records, varying),
-        settle_frames=settle,
+        settle_frames=settled,
         non_settling=bool(observed.max() > 0 and np.median(observed) >= 0.9 * observed.max()),
     )
 

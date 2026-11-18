@@ -9,6 +9,7 @@ are also scored on what they kept of the clip frames their captures show.
 from __future__ import annotations
 
 import importlib
+import json
 import multiprocessing
 import os
 from contextlib import closing, contextmanager
@@ -43,6 +44,7 @@ from syncsummoner.probe.harvest import HarvestConfig, stimulus_loop
 from syncsummoner.probe.names import archived_specs
 from syncsummoner.probe.patterns import read_timecode
 from syncsummoner.probe.runner import ANALYSIS_WIDTH, measurement
+from syncsummoner.probe.store import slug
 from syncsummoner.progress import LOG, track
 
 __all__ = [
@@ -312,6 +314,25 @@ def survival_metrics(
     ], how
 
 
+def hold_settle(meta: dict[str, Any], program: str, holds: str | Path | None) -> int | None:
+    """A footage archive's settle in frames, from its program's ``probe hold`` record; None for any other.
+
+    The hold record measures the program as a whole, so its settle stands for every parameter.
+    A footage archive without one is an error naming the missing file.
+    """
+    if not is_footage(meta):
+        return None
+    path = Path(holds or ".") / f"hold-{slug(program)}.json"
+    if holds is None or not path.is_file():
+        raise FileNotFoundError(
+            f"{program}: a footage archive settles by its hold record, and {path} is missing"
+        )
+    held = json.loads(path.read_text(encoding="utf-8"))
+    if held["program"] != program:
+        raise ValueError(f"{path} measured {held['program']}, not {program}")
+    return int(held["settle"])
+
+
 def replay_program(
     archive: Any,
     program: str,
@@ -321,13 +342,15 @@ def replay_program(
     source: Source = Source.HW,
     analysis_width: int = ANALYSIS_WIDTH,
     series: tuple[np.ndarray, np.ndarray] | None = None,
+    holds: str | Path | None = None,
     **metrics: Any,
 ) -> Replayed:
     """Measure, fit and read the loop behaviour of one program from a single decode.
 
     A failure is a note rather than the end of a library refit. An ``analyzer`` given as a module
     path is imported here, since a module cannot be sent to a worker. A footage archive is scored
-    against ``series``, its clip's :func:`clip_series`, read here when not given.
+    against ``series``, its clip's :func:`clip_series`, read here when not given, and settles
+    by its hold record in ``holds`` (:func:`hold_settle`).
     """
     if isinstance(analyzer, str):
         analyzer = importlib.import_module(analyzer)
@@ -337,6 +360,7 @@ def replay_program(
     if reader is None:
         return Replayed(records, profile, found, [f"{program}: no committed archive"])
     footage, stimulus = is_footage(reader.meta), stimulus_of(reader.meta)
+    settle = hold_settle(reader.meta, program, holds)
     live = np.array([row.setpoint != GAP for row in reader.rows], dtype=bool)
     named = bool(live.any()) and all(row.shown >= 0 for row in reader.rows if row.setpoint != GAP)
     spread = [] if footage else B.dwells(reader.rows)
@@ -391,7 +415,7 @@ def replay_program(
         else:
             if specs is None:
                 notes.append(f"{program}: no program info archived, so parameters stay unnamed")
-        profile = fit_profile(records, specs=specs)
+        profile = fit_profile(records, specs=specs, settle=settle)
     return Replayed(records, profile, found, notes)
 
 
@@ -430,10 +454,14 @@ def replay(
     """Every named program's refit, keyed by name; all committed ones by default.
 
     ``jobs`` workers each take a program whole, one per usable core by default.
-    A program that measured nothing is noted and left out.
+    A program that measured nothing is noted and left out. Every footage archive's hold record is
+    checked for before any decode.
     """
     committed = archive.committed()
     names = sorted(committed) if programs is None else list(programs)
+    for name in names:
+        if name in committed:
+            hold_settle(committed[name], name, kwargs.get("holds"))
     note = log if log is not None else lambda _message: None
     reference = stimulus_loop(HarvestConfig()) if loop is None else loop
     clips = {

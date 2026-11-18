@@ -221,7 +221,9 @@ def _refit_cmd(args: argparse.Namespace) -> int:
     archive = FrameArchive(args.archive, ffmpeg=args.ffmpeg, threads=1)
     archive.decode, why = archive.choose_decode(args.decode, programs)
     LOG.info("decoding on %s: %s", archive.decode, why)
-    measured = replay(archive, analyzer=aesthetics, programs=programs, jobs=args.jobs, log=LOG.warning)
+    measured = replay(
+        archive, analyzer=aesthetics, programs=programs, jobs=args.jobs, log=LOG.warning, holds=args.holds
+    )
     # A non-monotone value map kills the carrier as displacement does; only the fit tells them apart.
     styles, band = measured_styles({name: r.behaviour.pointwise for name, r in measured.items()}, {})
     LOG.info("analog above %.2f, digital below %.2f: no labels here, so the band is assumed", *band)
@@ -811,6 +813,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     refit.add_argument("--program", default="all")
     refit.add_argument("--archive", default="archive/")
     refit.add_argument("--out", default="profiles/")
+    refit.add_argument("--holds", help="the `probe hold` records a footage archive settles by")
     refit.add_argument("--ffmpeg", default="ffmpeg", help="decoder to read the archive with")
     refit.add_argument("--jobs", type=int, default=None, help="worker processes; one per core by default")
     refit.add_argument(
