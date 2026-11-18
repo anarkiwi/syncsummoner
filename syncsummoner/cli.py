@@ -91,14 +91,9 @@ def _as_mapping(obj) -> dict:
 
 
 def _profiles_in(directory: Path) -> dict:
-    from syncsummoner.device.profile import Profiles
-    from syncsummoner.probe.fit import load_profile
+    from syncsummoner.probe.fit import load_profiles
 
-    profiles = Profiles(directory=Path(directory))
-    for path in sorted(Path(directory).glob("*.yaml")):
-        profile = load_profile(path)
-        profiles[profile.program] = profile
-    return profiles
+    return load_profiles(directory)
 
 
 def _link(args: argparse.Namespace):
@@ -916,11 +911,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     lock.add_argument("--format", default="1080p30", help="session format the rig runs at")
     lock.add_argument("--seconds", type=float, help="length of the clip to play (default: all of it)")
     lock.add_argument("--start", type=float, default=0.0, help="where in the footage the clip starts")
-    lock.add_argument(
-        "--lead-in",
-        type=float,
-        help="seconds of strip-coded lead-in and lead-out (default: what a load needs)",
-    )
+    lock.add_argument("--lead-in", type=float, help="seconds of lead-in and lead-out (default: a load's)")
     lock.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     lock.add_argument("--stall", type=float, help="pyvmancer's stall guard for device waits, seconds")
     _add_route_arg(lock)
