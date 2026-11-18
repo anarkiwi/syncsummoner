@@ -8,6 +8,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 from fractions import Fraction
 from types import SimpleNamespace
@@ -512,3 +513,25 @@ def test_spans_play_as_one_stream_each_next_decoder_started_before_it_is_due(mon
     next(closed)
     closed.close()
     assert len(procs) == 2 and all(p.poll() is not None for p in procs), "closing early reaps both decoders"
+
+
+def test_a_decoder_chattering_on_stderr_never_stalls_its_frames():
+    chatter = (
+        "import sys; [sys.stderr.write('warning %d\\n' % i) for i in range(20000)]; "
+        "sys.stdout.buffer.write(b'abcdef')"
+    )
+    got, done = [], threading.Event()
+
+    def read():
+        got.extend(K.clip_frames([sys.executable, "-c", chatter], 2))
+        done.set()
+
+    threading.Thread(target=read, daemon=True).start()
+    assert done.wait(30), "the decoder blocked on its own stderr"
+    assert got == [b"ab", b"cd", b"ef"]
+
+
+def test_a_failing_decoder_faults_with_its_last_line():
+    argv = [sys.executable, "-c", "import sys; sys.stderr.write('first\\nlast words\\n\\n'); sys.exit(3)"]
+    with pytest.raises(K.PlayoutFault, match="decoding failed: last words$"):
+        list(K.clip_frames(argv, 2))

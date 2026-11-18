@@ -458,7 +458,23 @@ def decode_argv(
 
 
 def _decoder(argv: list[str]) -> subprocess.Popen:
-    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    """A decoder whose stderr a thread drains as it is written, keeping its last line in ``proc.said``.
+
+    Unread, a decoder's warnings fill the pipe and block it mid-clip, and the player underruns.
+    """
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    proc.said = []
+
+    def drain() -> None:
+        for line in proc.stderr:
+            if line.strip():
+                proc.said[:] = [line]
+
+    proc.drained = threading.Thread(target=drain, daemon=True)
+    proc.drained.start()
+    return proc
 
 
 def _frames(proc: subprocess.Popen, size: int) -> Iterator[bytes]:
@@ -469,9 +485,10 @@ def _frames(proc: subprocess.Popen, size: int) -> Iterator[bytes]:
                 yield frame
         finally:
             proc.kill()
-        said = proc.stderr.read().decode(errors="replace").strip()
+            proc.drained.join()
+    said = b"".join(proc.said).decode(errors="replace").strip()
     if proc.returncode not in (0, -signal.SIGKILL) and said:
-        raise PlayoutFault(f"decoding failed: {said.splitlines()[-1]}")
+        raise PlayoutFault(f"decoding failed: {said}")
 
 
 def clip_frames(argv: list[str], size: int) -> Iterator[bytes]:
