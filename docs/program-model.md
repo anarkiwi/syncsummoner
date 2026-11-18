@@ -170,10 +170,13 @@ query, on one incremental CaDiCaL instance (PySAT):
   constant where its next state with every enable fired is that constant for
   every value of the free signals and untied controls, else keeps its initial
   value where its next state from that value is that value, to the least
-  fixpoint. Random concrete lanes (64-bit words) refute most candidates, and
-  each sweep's model refutes more until one solve proves the rest together.
-  A free storage bit can differ where its next states can, to the least
-  fixpoint, grown from lanes that differ and then from models.
+  fixpoint. Random concrete lanes (64-bit words) refute most candidates; the
+  nets feeding the rest that the lanes show constant and propagation does not
+  are proven constant in topological order, then the candidates themselves.
+  A tie set that differs from a settled one only in some controls decides
+  again only the storage depending on them. A free storage bit can differ
+  where its next states can, to the least fixpoint, grown from lanes that
+  differ and then from models.
 - **Observability.** A source is observable where some model makes an output
   differ. The ternary simulator first screens every tie set in lanes, which
   proves most dead sources, and bounds the rest to the nets their sensitised
@@ -181,12 +184,15 @@ query, on one incremental CaDiCaL instance (PySAT):
   Random lanes then find most live sources. The nets that never differ in a
   lane are proven equal in topological order, each from those before, while
   the output query races them at a doubling share of the conflicts spent.
-- **Held controls.** A tie set settles storage only on its tied bits, so a
-  control left untied is free there, which over-approximates holding it. A
-  held setting is decided exactly by tying it: `ProgramModel.revivable` and
-  the cover's revivals refute a set of gates with its controls untied, then
-  complete it gate by gate over their resolution classes, the first class the
-  rest can still complete kept, as the conditions do.
+- **Held controls.** A tie set settles storage only on its tied bits. A
+  control left untied but held is free there, except that storage whose next
+  state reads only tied and held controls, through such storage, is linked to
+  that next state: it settles to it at every held setting. This
+  over-approximates holding the control. A held setting is decided exactly by
+  tying it: `ProgramModel.revivable` and the cover's revivals refute a set of
+  gates with its controls held untied, then complete it gate by gate over
+  their resolution classes, the first class the rest can still complete kept,
+  as the conditions do. The classes are screened in lanes first.
 
 SAT and the BDDs agree wherever the BDDs' leaves are exact; where a function of
 two free signals cancels (`x ^ x`), the miter calls dead what the BDDs call
