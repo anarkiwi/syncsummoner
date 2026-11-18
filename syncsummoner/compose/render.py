@@ -11,6 +11,7 @@ import queue
 import subprocess
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -19,6 +20,7 @@ import numpy as np
 from pyvmancer.const import ROUTE_HDMI_IN
 
 from syncsummoner.device.profile import ProgramProfile
+from syncsummoner.device.stored import captures
 from syncsummoner.device.recorder import (
     BlankTakeError,
     TakeReport,
@@ -579,7 +581,9 @@ class _Take:
     def __init__(self, path: str | Path, wanted: np.ndarray, *, config: RenderConfig, ffmpeg: str):
         self.path, self.wanted = str(path), wanted
         self.size = _frame_bytes(config.width, config.height)
-        argv = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", self.path, "-map", "0:v:0"]
+        self.source = ExitStack()
+        source = self.source.enter_context(captures(self.path, ffmpeg=ffmpeg))
+        argv = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", *source, "-map", "0:v:0"]
         argv += ["-fps_mode", "passthrough", "-s", f"{config.width}x{config.height}"]
         argv += ["-pix_fmt", SPLICE_PIX_FMT, "-f", "rawvideo", "pipe:1"]
         self.proc = subprocess.Popen(  # pylint: disable=consider-using-with
@@ -619,13 +623,14 @@ class _Take:
         return item
 
     def close(self) -> None:
-        """Stop decoding, free a hand-over left waiting, and reap the process."""
+        """Stop decoding, free a hand-over left waiting, and reap the process and its feed."""
         self.proc.kill()
         try:
             self.frames.get_nowait()
         except queue.Empty:
             pass
         self.proc.wait()
+        self.source.close()
 
 
 def splice(

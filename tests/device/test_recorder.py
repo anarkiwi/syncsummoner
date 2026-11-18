@@ -219,10 +219,10 @@ def test_inspection_point_samples_rgb_so_the_card_s_own_pixels_are_judged(monkey
     report = inspect_take(tmp_path / "take.mkv")
     assert report.frames == 4 and report.picture == 0, "uniform fields are dead at any brightness"
     assert report.luma == pytest.approx(np.mean([0, 90, 180, 255]) / 255.0, abs=1e-4)
-    assert option(argv[0], "-pix_fmt") == "rgb24" and option(argv[0], "-ss") == "0.000"
+    assert option(argv[0], "-pix_fmt") == "rgb24" and option(argv[0], "-ss") == "0.000000"
     assert "flags=neighbor" in option(argv[0], "-vf")
     inspect_take(tmp_path / "take.mkv", start_s=2.5)
-    assert option(argv[1], "-ss") == "2.500" and argv[1].index("-ss") < argv[1].index("-i")
+    assert option(argv[1], "-ss") == "2.500000" and argv[1].index("-ss") < argv[1].index("-i")
 
 
 def test_a_live_paused_picture_settles_but_is_not_a_usable_take():

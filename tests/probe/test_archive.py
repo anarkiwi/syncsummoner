@@ -717,3 +717,48 @@ def test_a_row_names_the_clip_frame_it_shows_and_old_rows_name_none():
     assert FrameRow.from_row(row.as_row()) == row
     old = {k: v for k, v in row.as_row().items() if k != "shown"}
     assert FrameRow.from_row(old).shown == GAP
+
+
+def deduplicated_pair(tmp_path, name, shades):
+    """An old take of ``shades`` and the same take deduplicated, beside each other."""
+    from syncsummoner.device.v4l2rec import sidecar  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe.dedupe import dedupe  # pylint: disable=import-outside-toplevel
+    from tests import takes  # pylint: disable=import-outside-toplevel
+
+    old = takes.old(tmp_path / f"{name}-old.mkv", takes.jpegs(shades))
+    new = tmp_path / f"{name}-new.mkv"
+    shutil.copy(old, new)
+    shutil.copy(sidecar(old), sidecar(new))
+    assert dedupe(new).status == "deduplicated"
+    return old, new
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_an_archive_of_deduplicated_takes_reads_as_one_of_the_old_takes(tmp_path):
+    """Parts linked with their sidecars, or one take moved in with its own, read as the old takes do."""
+    from syncsummoner.probe.archive import MJPEG_PIX_FMT  # pylint: disable=import-outside-toplevel
+    from tests import takes  # pylint: disable=import-outside-toplevel
+
+    one = deduplicated_pair(tmp_path, "a", [0, 0, 1, 1, 1, 2])
+    two = deduplicated_pair(tmp_path, "b", [3, 4, 4, 5])
+    read = {}
+    for era, parts in (("old", [one[0], two[0]]), ("new", [one[1], two[1]])):
+        archive = FrameArchive(tmp_path / era)
+        size = {"width": takes.WIDTH, "height": takes.HEIGHT, "fps": 60.0, "pix_fmt": MJPEG_PIX_FMT}
+        archive.commit("parts", KEY, parts, rows(10, program="parts"), **size)
+        single = tmp_path / f"{era}-single.mkv"
+        shutil.copy(parts[0], single)
+        shutil.copy(f"{parts[0]}.v4l2", f"{single}.v4l2")
+        archive.commit("single", KEY, single, rows(6, program="single"), **size)
+        reader = archive.reader("parts")
+        native = {}
+        read[era] = (
+            [f.tobytes() for f in reader.stream()],
+            [f.tobytes() for f in reader.passes(native=[1, 7], into=native)],
+            {k: v.tobytes() for k, v in native.items()},
+            [archive.reader("single").frame(k).tobytes() for k in range(6)],
+        )
+    assert read["new"] == read["old"] and len(read["old"][0]) == 10
+    assert (tmp_path / "new" / "single.mkv.v4l2").is_file() and not (
+        tmp_path / "new-single.mkv.v4l2"
+    ).exists()

@@ -126,9 +126,12 @@ def last_frame(path: str | Path, width: int, height: int, *, ffmpeg: str = "ffmp
     The card's chroma pair arrives exchanged in MJPEG too, so it is put back here
     as the archive recorder does, before any colour is read.
     """
-    argv = [ffmpeg, "-loglevel", "error", "-sseof", "-0.5", "-i", str(path), "-vf", "swapuv"]
-    argv += ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    data = subprocess.run(argv, check=False, capture_output=True).stdout
+    from .stored import captures  # pylint: disable=import-outside-toplevel
+
+    with captures(path, from_end_s=0.5, ffmpeg=ffmpeg) as source:
+        argv = [ffmpeg, "-loglevel", "error", *source, "-vf", "swapuv"]
+        argv += ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        data = subprocess.run(argv, check=False, capture_output=True).stdout
     size = width * height * 3
     if len(data) < size:
         return None

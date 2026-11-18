@@ -22,7 +22,8 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from syncsummoner.device.recorder import INSPECT_SIZE
-from syncsummoner.device.v4l2rec import FRAME, sidecar
+from syncsummoner.device.stored import Stored, captures
+from syncsummoner.device.v4l2rec import read_log, sidecar
 from syncsummoner.probe.patterns import read_codes
 from syncsummoner.progress import LOG, meter
 
@@ -182,21 +183,26 @@ def _drain(pipe, into: list[bytes]) -> None:
             into.append(chunk)
 
 
-def _segment(
-    path: str | Path,
+def _run_segment(
+    source: list[str],
     spec: Spec,
     *,
-    start_s: Fraction | None,
     count: int,
     width: int,
     ffmpeg: str,
     done: Callable[[int], None],
-) -> dict[str, np.ndarray]:
-    """One segment's ``count`` captures from ``start_s`` on: times, codes, luma and calibration YUV."""
+    copyts: bool,
+) -> tuple[list[bytes], bytes, list[bytes], list[np.ndarray], int]:
+    """Decode ``count`` captures from ``source``: ffmpeg's log, the two pictures, strip codes, exit status."""
     argv = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-threads", "1"]
-    if start_s is not None:
-        argv += ["-copyts", "-ss", f"{round(start_s * 1_000_000)}us"]
-    argv += ["-i", str(path), "-filter_threads", "1", "-filter_complex", spec.graph()]
+    argv += [
+        *(["-copyts"] if copyts else []),
+        *source,
+        "-filter_threads",
+        "1",
+        "-filter_complex",
+        spec.graph(),
+    ]
     small_r, small_w = os.pipe()
     strip_r, strip_w = os.pipe()
     for label, target in (("s", "pipe:1"), ("e", f"pipe:{small_w}"), ("t", f"pipe:{strip_w}")):
@@ -207,7 +213,7 @@ def _segment(
     )
     os.close(small_w)
     os.close(strip_w)
-    (sw, sh), (cw, ch), px = spec.survival, spec.calibration, spec.strip_px
+    px = spec.strip_px
     stride = px * width * 3
     small: list[bytes] = []
     said: list[bytes] = []
@@ -232,9 +238,28 @@ def _segment(
     proc.wait()
     for reader in readers:
         reader.join()
-    if proc.returncode:
+    return said, body, small, codes, proc.returncode
+
+
+def _segment(
+    path: str | Path,
+    spec: Spec,
+    *,
+    start_s: Fraction | None,
+    count: int,
+    width: int,
+    ffmpeg: str,
+    done: Callable[[int], None],
+) -> dict[str, np.ndarray]:
+    """One segment's ``count`` captures from ``start_s`` on: times, codes, luma and calibration YUV."""
+    with captures(path, start_s=start_s, ffmpeg=ffmpeg) as source:
+        said, body, small, codes, returncode = _run_segment(
+            source, spec, count=count, width=width, ffmpeg=ffmpeg, done=done, copyts=start_s is not None
+        )
+    (sw, sh), (cw, ch) = spec.survival, spec.calibration
+    if returncode:
         tail = b"".join(said).decode("utf-8", "replace").strip().splitlines()
-        raise RuntimeError(f"decoding {path} failed with exit {proc.returncode}: {tail[-1] if tail else ''}")
+        raise RuntimeError(f"decoding {path} failed with exit {returncode}: {tail[-1] if tail else ''}")
     times = np.array([float(m.group(1)) for line in said for m in [_PTS.search(line)] if m], dtype=np.float64)
     code = np.concatenate(codes) if codes else np.zeros(0, dtype=np.int64)
     blob = b"".join(small)
@@ -257,6 +282,10 @@ def decode(
     """
     workers = workers or len(os.sched_getaffinity(0))
     pts, key, base, width = packets(path, ffmpeg=ffmpeg)
+    stored = Stored.of(path)
+    if stored is not None:
+        shown = stored.index[stored.index < key.size]
+        pts, key, base = stored.rows["pts"][: shown.size], key[shown], stored.layout.tb
     if not pts.size:
         raise RuntimeError(f"{path} holds no video packets")
     bounds = segments(key, workers)
@@ -295,8 +324,7 @@ def decode(
     if out["times"].size != expected.size or not np.allclose(out["times"], expected, atol=0.5 * float(base)):
         LOG.warning("%s: %d frames decoded from %d packets", path, out["times"].size, pts.size)
     if sidecar(path).is_file():
-        data = sidecar(path).read_bytes()
-        out["log"] = np.frombuffer(data[: len(data) - len(data) % FRAME.itemsize], dtype=FRAME)
+        out["log"] = read_log(path)
     return out
 
 

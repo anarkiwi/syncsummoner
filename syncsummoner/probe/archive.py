@@ -22,6 +22,8 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.device.profile import PARAM_COUNT
+from syncsummoner.device.stored import captures
+from syncsummoner.device.v4l2rec import sidecar
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import ProgramKey, atomic_write, slug, temp_sibling
 
@@ -148,6 +150,14 @@ def link(source: str | Path, target: Path) -> None:
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _carry(source: Path, target: Path, publish: Callable[[Path, Path], None]) -> None:
+    """Publish ``source``'s frame log beside ``target`` ahead of it, or drop a stale one there."""
+    if sidecar(source).is_file():
+        publish(sidecar(source), sidecar(target))
+    else:
+        sidecar(target).unlink(missing_ok=True)
 
 
 def listing(parts: Sequence[str], durations: Sequence[str]) -> str:
@@ -288,21 +298,21 @@ class FrameReader:
             return (height, self.width, CHANNELS)
         return (2 * round(height * width / self.width / 2), int(width), CHANNELS)
 
-    def command(self, *, start: int = 0, count: int = 1, width: int | None = None) -> list[str]:
-        """Decoder argv emitting ``count`` frames from ``start`` as RGB on stdout.
+    def opened(self, start: int = 0) -> Any:
+        """The input arguments reading every capture from frame ``start`` on, while the block runs."""
+        return captures(self.video, start_s=max(0.0, start - 0.5) / self.fps, ffmpeg=self._ffmpeg)
+
+    def command(
+        self, *, start: int = 0, count: int = 1, width: int | None = None, source: list[str] | None = None
+    ) -> list[str]:
+        """Decoder argv emitting ``count`` frames from ``start`` as RGB on stdout, read from ``source``.
 
         Every frame is a keyframe, so the input seek lands on one directly rather
         than decoding from the beginning, and ffmpeg does any scaling asked for.
         """
-        argv = [
-            *self._head(),
-            "-ss",
-            f"{max(0.0, start - 0.5) / self.fps:.6f}",
-            "-i",
-            str(self.video),
-            "-frames:v",
-            str(int(count)),
-        ]
+        if source is None:
+            source = ["-ss", f"{max(0.0, start - 0.5) / self.fps:.6f}", "-i", str(self.video)]
+        argv = [*self._head(), *source, "-frames:v", str(int(count))]
         if self._download or (width and width < self.width):
             argv += ["-vf", self._download + self._scale(width)]
         return argv + [*_RAW_OUT, "pipe:1"]
@@ -346,35 +356,27 @@ class FrameReader:
             f"[0:v]{self._download}" + (f"split={len(sides) + 1}{heads};[o0]" if sides else "") + f"{body}[s]"
         )
         graph += "".join(f";[o{i + 1}]{chain}[x{i}]" for i, (chain, _) in enumerate(sides))
-        argv = [
-            *self._head(),
-            "-i",
-            str(self.video),
-            "-filter_complex",
-            graph,
-            "-map",
-            "[s]",
-            *_RAW_OUT,
-            "pipe:1",
-        ]
-        fds, threads = [], []
-        for i, (_, drain) in enumerate(sides):
-            read_fd, write_fd = os.pipe()
-            argv += ["-map", f"[x{i}]", *_RAW_OUT, f"pipe:{write_fd}"]
-            fds.append(write_fd)
-            threads.append(threading.Thread(target=_drained, args=(read_fd, drain), daemon=True))
-        try:
-            yield from self._frames(
-                argv,
-                self.shape(width, crop),
-                self.count,
-                tuple(fds),
-                started=lambda: [t.start() for t in threads],
-            )
-        finally:
-            for thread in threads:
-                if thread.is_alive():
-                    thread.join()
+        # pylint: disable-next=contextmanager-generator-missing-cleanup
+        with captures(self.video, ffmpeg=self._ffmpeg) as source:
+            argv = [*self._head(), *source, "-filter_complex", graph, "-map", "[s]", *_RAW_OUT, "pipe:1"]
+            fds, threads = [], []
+            for i, (_, drain) in enumerate(sides):
+                read_fd, write_fd = os.pipe()
+                argv += ["-map", f"[x{i}]", *_RAW_OUT, f"pipe:{write_fd}"]
+                fds.append(write_fd)
+                threads.append(threading.Thread(target=_drained, args=(read_fd, drain), daemon=True))
+            try:
+                yield from self._frames(
+                    argv,
+                    self.shape(width, crop),
+                    self.count,
+                    tuple(fds),
+                    started=lambda: [t.start() for t in threads],
+                )
+            finally:
+                for thread in threads:
+                    if thread.is_alive():
+                        thread.join()
 
     def _frames(
         self,
@@ -406,7 +408,10 @@ class FrameReader:
         if not 0 <= index < self.count:
             raise IndexError(f"frame {index} outside 0..{self.count - 1}")
         shape = self.shape(width)
-        result = self._run(self.command(start=index, width=width), capture_output=True, check=False)
+        with self.opened(index) as source:
+            result = self._run(
+                self.command(start=index, width=width, source=source), capture_output=True, check=False
+            )
         if result.returncode or len(result.stdout) != int(np.prod(shape)):
             raise ArchiveError(f"decoding frame {index} of {self.video} gave {len(result.stdout)} bytes")
         return np.frombuffer(bytearray(result.stdout), dtype=np.uint8).reshape(shape)
@@ -422,9 +427,11 @@ class FrameReader:
         want = self.count - start if count is None else min(int(count), self.count - start)
         if want <= 0:
             return
-        yield from self._frames(
-            self.command(start=start, count=want, width=width), self.shape(width), want, ()
-        )
+        # pylint: disable-next=contextmanager-generator-missing-cleanup
+        with self.opened(start) as source:
+            yield from self._frames(
+                self.command(start=start, count=want, width=width, source=source), self.shape(width), want, ()
+            )
 
     def select(self, *, params: Sequence[int] | None = None, setpoint: int | None = None) -> list[FrameRow]:
         """Rows matching every criterion given, in stream order."""
@@ -618,6 +625,7 @@ class FrameArchive:
         stale = set(self.files(program, previous)) if previous else set()
         meta_path.unlink(missing_ok=True)
         if sources is None:
+            _carry(Path(video), target, os.replace)
             os.replace(Path(video), target)
             parts = [target]
         else:
@@ -625,6 +633,7 @@ class FrameArchive:
                 target.with_name(f"{target.stem}.part{i:02d}{VIDEO_SUFFIX}") for i in range(len(sources))
             ]
             for source, part in zip(sources, parts):
+                _carry(source, part, link)
                 link(source, part)
             target = target.with_suffix(LISTING_SUFFIX)
             text = listing([p.name for p in parts], spans)
@@ -661,6 +670,7 @@ class FrameArchive:
         self._write_meta(meta_path, meta)
         for path in stale - set(self.files(program, meta)):
             path.unlink(missing_ok=True)
+            sidecar(path).unlink(missing_ok=True)
         self.dark_path(program).unlink(missing_ok=True)
         return meta
 
@@ -743,7 +753,10 @@ class FrameArchive:
         results, spans = [], []
         for count in (1, PROBE_FRAMES):
             start = timer()
-            results.append(self.run(reader.command(count=count), capture_output=True, check=False))
+            with reader.opened() as source:
+                results.append(
+                    self.run(reader.command(count=count, source=source), capture_output=True, check=False)
+                )
             spans.append(timer() - start)
         failed = next((result for result in results if result.returncode), results[-1])
         return failed, (PROBE_FRAMES - 1) / max(spans[1] - spans[0], 1e-9)

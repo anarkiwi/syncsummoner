@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from syncsummoner.probe import sweep_cmds
+from syncsummoner.probe import dedupe, sweep_cmds
 from syncsummoner.progress import LOG, configure
 
 
@@ -858,6 +858,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     _add_route_arg(collect)
     collect.set_defaults(func=_harvest_cmd)
     sweep_cmds.add_parsers(probe_sub)
+    dedupe.add_parser(probe_sub)
 
     profile = sub.add_parser("profile", help="inspect fitted profiles")
     profile_sub = profile.add_subparsers(dest="profile_cmd", required=True)
