@@ -60,7 +60,7 @@ def test_a_clip_too_short_for_its_session_is_refused_with_what_it_lacks(clip, sa
         SS.Layout(lead=10, counts=(30,), tail=4, source_lead=clip.lead).check(clip)
 
 
-def test_a_lead_in_holds_its_contents_and_a_load_only_without_a_dry_control(tmp_path):
+def test_a_lead_in_holds_its_contents_and_a_load_only_without_a_dry_control():
     """A dry lead-in holds no load; one without grows with the longest load timed and needs one timed."""
     dry = SS.lead_in_frames(LEAD_IN, FPS, dry=True, load_s=None)
     assert dry == SS.lead_in_frames(LEAD_IN, FPS, dry=True, load_s=30.0)

@@ -165,7 +165,7 @@ def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | N
 def session_frames(
     lead_in: LeadIn, fps: float, *, dry: bool, directory: str | Path, band: ev.Latency | None = None
 ) -> tuple[int, int]:
-    """A session's lead-in and lead-out frames, from the rig's loads and, with no dry control, the band on file."""
+    """A session's lead-in and lead-out frames, from the rig's loads and, without a dry control, its band."""
     loads = loadtimes.longest()
     if not dry:
         band = read_latency(directory) if band is None else band
@@ -247,13 +247,12 @@ def locked_session(
     band = None if dry is not None else read_latency(directory)
     park = np.asarray(rig.session.park_values, dtype=np.int64)
     played: list[dict] = []
-    firmware = _firmware(rig)
 
     def timed(name: str) -> Any:
         began = time.monotonic_ns()
         said = load(name)
         ended = time.monotonic_ns()
-        loadtimes.record(name, began, ended, firmware=firmware)
+        loadtimes.record(name, began, ended, firmware=_firmware(rig))
         if held["recording"]:
             played.append({"program": name, "t0_ns": began, "t1_ns": ended})
         return said

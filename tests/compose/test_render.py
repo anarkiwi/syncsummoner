@@ -53,7 +53,7 @@ def test_timecode_absent_or_washed_out_reads_none():
     assert read_timecode(burned * 0.1, bits=16, strip_px=4) is None
 
 
-def test_open_rig_builds_from_the_device_layer(monkeypatch, tmp_path):
+def test_open_rig_builds_from_the_device_layer(monkeypatch):
     built = {}
 
     def module(name, **attrs):

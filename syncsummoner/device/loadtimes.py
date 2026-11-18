@@ -173,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     added = seed(args.roots, args.record) if args.roots else 0
     print(
-        f"{added} loads added; {len(read(args.record))} on record in {record_path(args.record)}, longest {longest(args.record)} s"
+        f"{added} loads added; {len(read(args.record))} on record in {record_path(args.record)}, "
+        f"longest {longest(args.record)} s"
     )
     return 0
 
