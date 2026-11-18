@@ -137,7 +137,7 @@ ss lockcheck source.mkv --seconds 30 --program Pinwheel --source-host pi@videopi
 
 It timecodes the footage into `--scratch` (`--prepared` plays one already
 timecoded), plays it with the lead-in and lead-out a load inside each needs, sized by the
-loads `loads.json` beside `--take` has timed (`--lead-in` sets both),
+loads timed on the rig (`--lead-in` sets both),
 records `--take`, and prints one line, `LOCKED` or `NOT LOCKED`, with the Pi's
 flips and missed vblanks, the card's lost frames, gaps and picture changes off
 a frame start, strip agreement and, through Passthru, torn captures. It exits 1 unless

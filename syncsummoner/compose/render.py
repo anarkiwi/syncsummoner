@@ -377,7 +377,7 @@ def render_played(
         prepared=prepared,
     )
     owned = rig is None
-    rig = open_rig(config, capture=False, directory=Path(out).parent) if owned else rig
+    rig = open_rig(config, capture=False) if owned else rig
     if recorder is None:
         from syncsummoner.device.recorder import Recorder
 
@@ -867,13 +867,13 @@ def checked_plan(
     return report.cuts, {name: t.picked for name, t in report.traces.items()}
 
 
-def open_rig(config: RenderConfig, *, capture: bool = True, directory: str | Path | None = None) -> Rig:
+def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     """Build the real rig from the device layer, capture open and ready to grab.
 
     A recorded pass wants no capture: the recorder opens the card itself. A device wait seeing nothing for
-    longer than the longest load ``directory`` timed fails, unless ``stall_s`` says otherwise.
+    longer than ``stall_s``, else the longest load on the rig's record, fails; with neither it refuses.
     """
-    from syncsummoner.compose.session import load_bound  # pylint: disable=import-outside-toplevel
+    from syncsummoner.device.loadtimes import stall_guard  # pylint: disable=import-outside-toplevel
 
     from syncsummoner.device import capture as capture_mod
     from syncsummoner.device import link as link_mod
@@ -881,9 +881,7 @@ def open_rig(config: RenderConfig, *, capture: bool = True, directory: str | Pat
     from syncsummoner.device import session as session_mod
     from syncsummoner.device import transport as transport_mod
 
-    transport = transport_mod.Transport.open(
-        stall=load_bound(directory) if config.stall_s is None else config.stall_s
-    )
+    transport = transport_mod.Transport.open(stall=stall_guard(config.stall_s))
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         transport=transport,

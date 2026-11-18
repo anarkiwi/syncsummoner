@@ -18,7 +18,7 @@ from syncsummoner.compose import locktake
 from syncsummoner.compose import session as compose_session
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import GestureInstance, Layer, Score, Section
-from syncsummoner.compose.session import record_load
+from syncsummoner.device import loadtimes
 from syncsummoner.compose.timecode import ClipLayout
 from syncsummoner.compose.vocabulary import Automation
 from syncsummoner.device.profile import Profiles
@@ -27,6 +27,8 @@ from tests.compose import PROBED, rig_transport
 from tests.compose.locked import CLIP, LOCKED, Clock, Proof, locked_pass, render_locked
 
 CONFIG = R.RenderConfig(width=32, height=24, fps=10.0, strip_px=4, bits=16)
+#: The session above with a stall guard given, so a rig opens with no load on record.
+STALLED = dataclasses.replace(CONFIG, stall_s=4.0)
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +53,7 @@ def test_timecode_absent_or_washed_out_reads_none():
     assert read_timecode(burned * 0.1, bits=16, strip_px=4) is None
 
 
-def test_open_rig_builds_from_the_device_layer(monkeypatch, tmp_path):
+def test_open_rig_builds_from_the_device_layer(monkeypatch):
     built = {}
 
     def module(name, **attrs):
@@ -83,6 +85,11 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch, tmp_path):
     module("syncsummoner.device.capture", Capture=capture)
     module("syncsummoner.device.playout", ClipPlayer=record("playout"))
     module("syncsummoner.device.link", Link=record("link"))
+    with pytest.raises(loadtimes.NoLoadRecordError, match="--stall"):
+        R.open_rig(CONFIG)
+    assert not stalls, "with no load on record and no --stall, no device is opened"
+    loadtimes.record("Teletext", 0, 3_000_000_000, firmware="1.0.2")
+    loadtimes.record("Passthru", 10, 2_000_000_010, firmware="1.0.2")
     rig = R.open_rig(CONFIG)
     assert rig.session == (("transport",), {})
     assert built["capture"][1]["width"] == 32 and built["playout"][1]["height"] == 24
@@ -90,11 +97,8 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch, tmp_path):
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
     R.open_rig(dataclasses.replace(CONFIG, source_host="pi@rig"))
     assert built["link"][0] == ("pi@rig",) and built["playout"][0] == ("pi@rig",)
-    R.open_rig(dataclasses.replace(CONFIG, stall_s=5.0), directory=tmp_path)
-    record_load(tmp_path, "Teletext", 0, 3_000_000_000)
-    record_load(tmp_path, "Passthru", 0, 2_000_000_000)
-    R.open_rig(CONFIG, directory=tmp_path)
-    assert stalls == [None, None, 5.0, 3.0], "a wait seeing nothing past the longest load timed fails"
+    R.open_rig(dataclasses.replace(CONFIG, stall_s=5.0))
+    assert stalls == [3.0, 3.0, 5.0], "a wait seeing nothing past the longest load timed fails"
 
 
 def test_enforce_safety_passes_safe_output_through():
@@ -139,7 +143,7 @@ def test_open_rig_hands_back_an_open_capture(monkeypatch):
     monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
     monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
     monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
-    rig = R.open_rig(CONFIG)
+    rig = R.open_rig(STALLED)
     assert opened == ["open"] and isinstance(rig.capture, FakeCapture)
 
 
@@ -244,8 +248,8 @@ def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
     monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
     monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
     monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
-    assert R.open_rig(CONFIG, capture=False).capture is None and not opened
-    R.open_rig(CONFIG, capture=True)
+    assert R.open_rig(STALLED, capture=False).capture is None and not opened
+    R.open_rig(STALLED, capture=True)
     assert opened == [True], "the old path still gets one when it asks"
 
 

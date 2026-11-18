@@ -93,14 +93,21 @@ all contradict each other and stop the take.
 
 The lead-in holds exactly what it must (`session.lead_in_frames`): with a bypass, the start
 state's settle, the anchor and the toggles at their longest; without one, the anchor, the longest
-load timed (`loads.json`, every load of every session) and the settle. The clock is then measured
+load timed on the rig (`device.loadtimes`) and the settle. The clock is then measured
 from what was recorded, which the host decodes faster than real time, so it takes at most as long
 again; a bypass's wet stretch follows. The lead-out (`session.lead_out_frames`) holds the dry state
 as long as the lead-in held the wet one, or Passthru's load and its first landed frame, then the
 anchor. A clock measured after the first write was due is a `LeadInTimeError`, a load past the
 lead-in fails `loaded_before`, and a clip whose lead-in or lead-out is shorter than the session's
 is refused before anything plays. Device waits fail as stalled once they see nothing for longer
-than the longest load timed (`render.open_rig`), unless `--stall` says otherwise.
+than the longest load timed (`render.open_rig`), unless `--stall` says otherwise; with no load on
+record and no `--stall`, a rig is not opened at all.
+
+Every load a session times goes into one record per rig, `loads.jsonl` beside the program cache
+(`SYNCSUMMONER_LOADS` overrides it), keyed by program and firmware and appended under an exclusive
+lock, so every takes directory sizes its lead-ins and stall guard by every load timed on the rig.
+`python -m syncsummoner.device.loadtimes captures/` seeds it from the loads takes on disk recorded:
+takes directories' `loads.json` and wire records' `loads`.
 
 Each take's lock record carries the session's id, its whole capture log, the strips read on it
 (its anchors) and when a program processed the picture (`lock.session_record`). Takes 2..n carry
