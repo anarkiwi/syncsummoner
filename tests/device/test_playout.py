@@ -291,13 +291,15 @@ class FakeProc:
 def test_a_player_follows_its_live_flips_over_the_stream_it_was_given():
     started = []
     procs = iter([FakeProc(record(0) + record(1)), FakeProc()])
-    player = po.ClipPlayer(runner=FakeRunner(), stream=lambda command: started.append(command) or next(procs))
+    runner = FakeRunner()
+    player = po.ClipPlayer(runner=runner, stream=lambda command: started.append(command) or next(procs))
     command = player.command(Fraction(30))
     assert command.split("--live ")[1].split()[0] == player.path("live.fifo")
     assert command.split("--ask ")[1].split()[0] == player.path("ask.fifo")
     with player.following(clock=itertools.count().__next__) as shown:
         assert shown.wait(1) == 1 and shown.wait(2) is None
     assert started == [f"exec cat {player.path('live.fifo')}", f"exec cat > {player.path('ask.fifo')}"]
+    assert "mkfifo" in runner.calls[0][0], "its pipes are made before it is followed"
 
 
 def test_a_reply_pairs_with_the_request_before_it_and_never_counts_as_a_flip():
@@ -316,3 +318,12 @@ def test_a_reply_pairs_with_the_request_before_it_and_never_counts_as_a_flip():
     assert shown.log()["frame"].tolist() == [0, 1, 2]
     asked = shown.asked()
     assert asked.size == 1 and asked["t0_ns"][0] < asked["t1_ns"][0] and asked["frame"][0] == 1
+
+
+def test_a_player_heard_flipping_returns_before_its_status_says_so():
+    player = po.ClipPlayer(runner=lambda command, data=None: None, stream=lambda command: FakeProc())
+    player.status = lambda: {"state": "starting"}
+    player.pid = lambda: 42
+    player.stop = lambda: {}
+    heard = iter([False, True])
+    assert player.start(fps=Fraction(30), heard=lambda: next(heard)) == 42

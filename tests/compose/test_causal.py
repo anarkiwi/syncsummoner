@@ -111,7 +111,7 @@ def test_the_offset_is_pinned_by_pi_replies_and_floors_when_the_device_follows_t
     flips = np.arange(10, 110)
     shown = np.zeros(flips.size, dtype=SHOWN)
     shown["frame"], shown["t_ns"] = flips, flip_phase + flips * PERIOD + 1_000_000
-    found = ev.offset(latch, floors, asked, shown, ticks)
+    found = ev.offset(latch, floors, asked, shown, ticks, PERIOD)
     assert found.lo <= lead <= found.hi
     assert found.exact
 
@@ -126,13 +126,13 @@ def test_crossed_bounds_mean_the_device_and_player_disagree():
     ticks = ticks_of([(0, 10, 100), (30, 40, 101)])
     asked = asked_at(np.array([20]), [90])
     with pytest.raises(ev.EvidenceError, match="not locked"):
-        ev.offset(np.array([[105, 105]]), np.array([100]), asked, shown_at([25], [99]), ticks)
+        ev.offset(np.array([[105, 105]]), np.array([100]), asked, shown_at([25], [99]), ticks, PERIOD)
 
 
 def test_a_write_floor_tightens_the_upper_bound():
     ticks = ticks_of([(0, 10, 100), (30, 40, 103)])
     asked = asked_at(np.array([20]), [98])
-    found = ev.offset(np.array([[104, 104]]), np.array([102]), asked, shown_at([25], [99]), ticks)
+    found = ev.offset(np.array([[104, 104]]), np.array([102]), asked, shown_at([25], [99]), ticks, PERIOD)
     assert (found.lo, found.hi) == (2, 2) and found.exact
 
 
@@ -145,6 +145,7 @@ def test_no_replies_or_no_reports_leave_the_offset_unknown():
             asked_at(np.array([20]), [90]),
             shown_at([25], [99]),
             ticks,
+            PERIOD,
         )
 
 
@@ -173,8 +174,21 @@ def test_an_inexact_offset_widens_every_window():
     assert (got.rows["first"][0], got.rows["last"][0], got.ambiguous) == (10, 11, 1)
 
 
+def test_reads_within_two_frames_reading_one_count_are_not_yet_a_stopped_transport():
+    ticks = ticks_of([(0, 10, 100), (PERIOD, PERIOD + 10, 100)])
+    with pytest.raises(ev.UnboundError):
+        ev.offset(
+            np.zeros((0, 2), np.int64),
+            np.zeros(0, np.int64),
+            asked_at(np.array([20]), [90]),
+            shown_at([5e9], [99]),
+            ticks,
+            PERIOD,
+        )
+
+
 def test_a_stopped_transport_counts_no_frames_and_is_refused():
-    ticks = ticks_of([(0, 10, 100), (30, 40, 100), (60, 70, 100)])
+    ticks = ticks_of([(0, 10, 100), (3 * PERIOD, 3 * PERIOD + 10, 100)])
     with pytest.raises(ev.StoppedError, match="transport is stopped"):
         ev.offset(
             np.zeros((0, 2), np.int64),
@@ -182,6 +196,7 @@ def test_a_stopped_transport_counts_no_frames_and_is_refused():
             asked_at(np.array([20]), [90]),
             shown_at([25], [99]),
             ticks,
+            PERIOD,
         )
 
 
@@ -189,6 +204,10 @@ def test_a_reply_counts_only_once_the_frame_after_it_is_heard():
     ticks = ticks_of([(0, 10, 100), (30, 40, 103), (70, 80, 106)])
     asked = asked_at(np.array([20, 50]), [98, 99])
     with pytest.raises(ev.UnboundError):
-        ev.offset(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked[1:], shown_at([25], [99]), ticks)
-    found = ev.offset(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked, shown_at([25], [99]), ticks)
+        ev.offset(
+            np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked[1:], shown_at([25], [99]), ticks, PERIOD
+        )
+    found = ev.offset(
+        np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked, shown_at([25], [99]), ticks, PERIOD
+    )
     assert found.lo == 2, "the reply of 99, the last frame heard, is left out: the Pi may hold it"

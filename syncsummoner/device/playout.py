@@ -369,11 +369,13 @@ class KmsPlayer(Playout):
         *,
         fps: float | str | Fraction = DEFAULT_LOOP_FPS,
         spans: Sequence[tuple[int, int]] | None = None,
+        heard: Callable[[], bool] | None = None,
     ) -> int:
         """Restart the player at ``fps``, its pid once it is flipping; ``spans`` as for :meth:`command`.
 
         The pid is recorded by the shell that execs the player, so the pidfile holds the
-        player's own pid and survives the ssh session ending.
+        player's own pid and survives the ssh session ending. With ``heard``, true once a flip has
+        been heard live (:meth:`following`), it returns on that rather than on the status file.
         """
         exact = rate(fps)
         if exact <= 0:
@@ -387,6 +389,8 @@ class KmsPlayer(Playout):
         )
         deadline = self._clock() + self.timeout_s
         while (state := self.status().get("state")) not in SETTLED:
+            if heard is not None and heard():
+                return self.pid()
             if self._clock() >= deadline:
                 raise PlayoutError(
                     f"player did not start at {exact} fps after {self.timeout_s}s: {self.log()}"
@@ -424,9 +428,10 @@ class KmsPlayer(Playout):
         *,
         fps: float | str | Fraction = DEFAULT_LOOP_FPS,
         spans: Sequence[tuple[int, int]] | None = None,
+        heard: Callable[[], bool] | None = None,
     ) -> Iterator["KmsPlayer"]:
         """Play for the block, stopping afterwards; a fault fails the block unless it already failed."""
-        self.start(fps=fps, spans=spans)
+        self.start(fps=fps, spans=spans, heard=heard)
         try:
             yield self
         except BaseException:
@@ -439,7 +444,12 @@ class KmsPlayer(Playout):
 
     @contextmanager
     def following(self, *, clock: Callable[[], int] = time.monotonic_ns) -> Iterator[Shown]:
-        """Follow the playing player's flips live for the block; enter it once :meth:`start` has returned."""
+        """Follow the player's flips live for the block, from before it starts, its pipes made first."""
+        self._runner(
+            f"mkdir -p {self.directory} && for p in live ask; do f={self.directory}/$p.fifo; "
+            '[ -p "$f" ] || { rm -f "$f"; mkfifo "$f"; }; done',
+            None,
+        )
         proc = self._stream(f"exec cat {self.path('live.fifo')}")
         asker = self._stream(f"exec cat > {self.path('ask.fifo')}")
         shown = Shown(proc.stdout, asks=asker.stdin, procs=(proc, asker), clock=clock)

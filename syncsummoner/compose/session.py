@@ -290,8 +290,10 @@ def locked_session(
     try:
         with (
             recorder.recording(takes[0].out) as proc,
-            rig.playout.playing(fps=fps, spans=layout.spans()) as player,
-            player.following() as shown,
+            rig.playout.following() as shown,
+            rig.playout.playing(
+                fps=fps, spans=layout.spans(), heard=lambda: shown.latest() != W.NO_FLOOR
+            ) as player,
             _monitored(shell, poller, sender),
         ):
             held["recording"] = True
@@ -605,17 +607,18 @@ def _run(
     start = held["start"]
     for slot in np.flatnonzero(start != park) + 1:
         sender.send(int(slot), int(start[slot - 1]), ev.START)
-    time.sleep(lead_in.settle_s)
-    shift = _offset(poller, held, sender, dry, layout.lead)
+    shift = _offset(poller, held, sender, dry, layout.lead, period)
     held["shift"] = shift
     LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
     rows = held["rows"]
     first = int(rows["target"][0]) if rows.size else 0
+    settle = frames_of(lead_in.settle_s, float(config.fps))
     now = json.loads(poller.ask("transport", "status", timeout_s=5.0).payload or "{}").get("field_count")
-    if now is None or int(now) >= first + shift.lo - 1:
+    if now is None or int(now) >= first + shift.lo - 1 - settle:
         raise LeadInTimeError(
-            f"{program}: the device-to-clip offset was known after the device ticked for clip frame "
-            f"{first - 1}, past the lead-in this session derived"
+            f"{program}: the start state was written and the device-to-clip offset known after the device "
+            f"ticked for clip frame {first - 1 - settle}, leaving it less than its {settle}-frame settle "
+            "before the first write: past the lead-in this session derived"
         )
     sender.due = lambda target, stop: poller.wait_count(target + shift.lo - 1, stop)
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
@@ -656,7 +659,7 @@ def _transport_playing(shell: Any) -> str:
     return was
 
 
-def _offset(poller: Poller, held: dict, sender: Sender, dry: Any, frames: int) -> ev.Offset:
+def _offset(poller: Poller, held: dict, sender: Sender, dry: Any, frames: int, period_ns: float) -> ev.Offset:
     """The device-to-clip offset the session's events bound so far, waiting a frame tick while too few do.
 
     Waiting past ``frames`` ticks, the lead-in's length, is a :class:`LeadInTimeError`.
@@ -666,7 +669,12 @@ def _offset(poller: Poller, held: dict, sender: Sender, dry: Any, frames: int) -
         wire = _session_wire(held, sender, poller, [], dry)
         try:
             return ev.offset(
-                np.zeros((0, 2), np.int64), np.zeros(0, np.int64), wire["asked"], wire["shown"], wire["ticks"]
+                np.zeros((0, 2), np.int64),
+                np.zeros(0, np.int64),
+                wire["asked"],
+                wire["shown"],
+                wire["ticks"],
+                period_ns,
             )
         except ev.UnboundError as err:
             count = int(wire["ticks"]["field"][-1]) if wire["ticks"].size else 0

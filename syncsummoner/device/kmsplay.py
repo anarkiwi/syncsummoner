@@ -15,6 +15,7 @@ import os
 import queue
 import select
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -414,23 +415,30 @@ def read_exactly(stream: Any, size: int) -> bytes | None:
     return bytes(buf)
 
 
+def fifo(path: str) -> None:
+    """A named pipe at ``path``: the one there, else a new one in place of whatever is."""
+    try:
+        if stat.S_ISFIFO(os.stat(path).st_mode):
+            return
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(path)
+
+
 class LiveFeed:
     """A named pipe offered every flip record as its flip completes, never blocking or raising.
 
-    A fresh FIFO replaces whatever sits at ``path``, so a reader left on an earlier one gets nothing. A
-    record is dropped while no reader has the pipe open or while the pipe is full; once a reader leaves,
-    the next record waits for another.
+    The FIFO at ``path`` is kept if one is there, so a reader that opened it before the player started
+    gets every record. A record is dropped while no reader has the pipe open or while the pipe is full;
+    once a reader leaves, the next record waits for another.
     """
 
     def __init__(self, path: str):
         self.path = path
         self._fd: int | None = None
         self._lock = threading.Lock()
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        os.mkfifo(path)
+        fifo(path)
 
     def write(self, record: bytes) -> None:
         """Offer one record, smaller than ``PIPE_BUF`` so it lands whole or not at all."""
@@ -484,12 +492,8 @@ def answer(
 def serve_asks(
     path: str, last: Callable[[], bytes | None], live: LiveFeed, *, period_ns: Fraction, hold: int
 ) -> threading.Thread:
-    """Answer requests on a fresh named pipe at ``path`` from a thread of its own, for askers in turn."""
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    os.mkfifo(path)
+    """Answer requests on the named pipe at ``path`` from a thread of its own, for askers in turn."""
+    fifo(path)
 
     def serve() -> None:
         while True:

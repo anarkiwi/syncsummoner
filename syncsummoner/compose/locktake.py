@@ -33,17 +33,19 @@ class RebootError(RuntimeError):
 
 
 class LeadInTimeError(RuntimeError):
-    """The lead-in ended before the take's frame line was known."""
+    """The lead-in ended before the start state could settle and the device-to-clip offset was known."""
 
 
 @dataclass(frozen=True)
 class LeadIn:
-    """How the lead-in is spent, in seconds from playout start."""
+    """How the lead-in is spent, in seconds: the start state's settle before the first write, the wet
+    stretch before clip frame 0, the poll interval, and the start state's writes with the offset's bounding.
+    """
 
     settle_s: float = 1.0
     wet_s: float = 2.0
     poll_s: float = 0.005
-    bound_s: float = 0.1
+    bound_s: float = 0.5
 
 
 def program_bypass(info: Any) -> Any:
@@ -381,15 +383,9 @@ def take_evidence(
     found = attribute_take(take, config=config, features=features) if found is None else found
     frames = read_log(take)
     times = ev.frame_times(found)
-    sends = wire["sends"]
     echo, every = take_echo(wire), take_echo(whole)
-    resent = wire.get("resent")
     images = features.small
-    bracket = ev.taken(whole["sends"], every)
-    latch = ev.latches(whole["sends"], bracket, whole["ticks"], whole["reads"], whole["initial"])
-    shift = ev.offset(latch, whole["sends"]["floor"], whole["asked"], whole["shown"], whole["ticks"])
-    own = np.asarray(whole.get("own", np.ones(whole["sends"].size, dtype=bool)), dtype=bool)
-    landed_rows = ev.landed(wire["plan"], sends, echo=echo, resent=resent, latch=latch[own], shift=shift)
+    landed_rows = landing(whole, times.period)[2]
     reads = wire["reads"]
     reads = reads[(reads["t0_ns"] >= frames["t_ns"][0]) & (reads["t0_ns"] <= frames["t_ns"][-1])]
     applied_rows = ev.applied(
@@ -425,6 +421,26 @@ def take_evidence(
         loaded=loaded_before(program, wire),
         predicted=step_counts(rows, kinds),
     )
+
+
+def landing(whole: Mapping[str, Any], period_ns: float) -> tuple[ev.Offset, np.ndarray, ev.Landed]:
+    """From a take's wire record alone: the session's offset, every send's latch window, its writes landed."""
+    sends = whole["sends"]
+    latch = ev.latches(
+        sends, ev.taken(sends, take_echo(whole)), whole["ticks"], whole["reads"], whole["initial"]
+    )
+    shift = ev.offset(latch, sends["floor"], whole["asked"], whole["shown"], whole["ticks"], period_ns)
+    wire = own_wire(whole)
+    own = np.asarray(whole.get("own", np.ones(sends.size, dtype=bool)), dtype=bool)
+    landed = ev.landed(
+        wire["plan"],
+        wire["sends"],
+        echo=take_echo(wire),
+        resent=wire.get("resent"),
+        latch=latch[own],
+        shift=shift,
+    )
+    return shift, latch, landed
 
 
 def own_wire(wire: Mapping[str, Any]) -> dict:

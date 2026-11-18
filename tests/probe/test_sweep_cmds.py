@@ -283,3 +283,31 @@ def test_commit_refuses_rows_that_waited_no_measured_settle(tmp_path, monkeypatc
     assert seen[-1] == {"frames": 2, "source": str(hold), "measured": True} and sweep_cmds.settle_measured(
         take
     )
+
+
+def test_smoke_toggles_one_parameter_captures_it_and_lands_it_from_the_wire(tmp_path, monkeypatch, capsys):
+    plan, _ = sweep_dir(tmp_path)
+    captured = {}
+
+    def capture(args):
+        captured["chunks"], captured["said"] = L.read_plan(args.plan)
+        captured["chunk"] = args.chunk
+        return 0
+
+    rows = np.zeros(2, dtype=LANDED)
+    rows["target"], rows["param"], rows["value"], rows["sent"] = [4, 8], 3, [100, 900], [0, 1]
+    rows["first"], rows["last"] = [4, 8], [4, 8]
+    landed = LT.ev.Landed(rows=rows, missing=0, duplicated=0, out_of_order=0, late=0, early=0)
+    monkeypatch.setattr(sweep_cmds, "_sweep_cmd", capture)
+    monkeypatch.setattr(
+        LT, "landing", lambda wire, period: (LT.ev.Offset(50, 50), np.array([[54, 54], [58, 58]]), landed)
+    )
+    monkeypatch.setattr("syncsummoner.device.wire.load_wire", lambda take: {})
+    out = tmp_path / "smoke"
+    argv = ["probe", "sweep", "smoke", str(plan), "--param", "3", "--values", "100", "900", "--states", "4"]
+    assert cli.main(argv + ["--hold", "4", "--out", str(out)]) == 0
+    (chunk,) = captured["chunks"]
+    assert chunk.states[:, 2].tolist() == [100, 900, 100, 900] and captured["chunk"] == 0
+    assert captured["said"]["program"] == "p" and chunk.frames == 16
+    said = capsys.readouterr().out
+    assert "by 50..50" in said and "device [58, 58], clip 8..8" in said

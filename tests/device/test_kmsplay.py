@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -520,21 +521,23 @@ def test_the_live_feed_waits_for_a_new_reader_once_one_leaves(tmp_path):
     os.close(fd)
 
 
-def test_a_fresh_live_feed_leaves_a_reader_of_the_old_one_with_nothing(tmp_path):
+def test_a_live_feed_keeps_the_pipe_a_reader_opened_before_it_started(tmp_path):
     path = str(tmp_path / "live")
-    old = K.LiveFeed(path)
-    stale = reader(path)
-    old.write(packed(0)[0])
-    assert drain(stale) == packed(0)[0]
-    new = K.LiveFeed(path)
-    assert os.stat(path).st_ino != os.fstat(stale).st_ino
-    fresh = reader(path)
-    new.write(packed(1)[0])
-    old.close()
-    assert drain(stale) == b"" and drain(fresh) == packed(1)[0]
-    new.close()
-    os.close(stale)
-    os.close(fresh)
+    K.fifo(path)
+    early = reader(path)
+    feed = K.LiveFeed(path)
+    assert os.stat(path).st_ino == os.fstat(early).st_ino
+    feed.write(packed(0)[0])
+    assert drain(early) == packed(0)[0]
+    feed.close()
+    os.close(early)
+
+
+def test_a_file_where_the_pipe_belongs_is_replaced_by_one(tmp_path):
+    path = tmp_path / "live"
+    path.write_text("stale")
+    K.fifo(str(path))
+    assert stat.S_ISFIFO(os.stat(path).st_mode)
 
 
 @pytest.mark.parametrize("refused", [None, PermissionError, OSError])

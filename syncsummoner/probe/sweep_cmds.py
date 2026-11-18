@@ -230,6 +230,38 @@ def _sweep_cmd(args: argparse.Namespace) -> int:
     return 2 if any("fault" in r for r in records) else 0
 
 
+def _smoke_cmd(args: argparse.Namespace) -> int:
+    """A few frames toggling one parameter, captured as a sweep is, then landed from its wire alone."""
+    import numpy as np
+
+    from syncsummoner.compose.locktake import landing
+    from syncsummoner.device.wire import load_wire
+    from syncsummoner.probe.locked import plan_sweep, read_plan, write_plan
+    from syncsummoner.probe.store import slug
+
+    chunks, said = read_plan(args.plan)
+    states = np.tile(np.asarray(chunks[0].states[0], dtype=np.int64), (args.states, 1))
+    states[0::2, args.param - 1], states[1::2, args.param - 1] = args.values
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    plan = write_plan(
+        out / f"sweep-{slug(said['program'])}.json",
+        plan_sweep(states, settle=0, hold=args.hold, frames=args.states * args.hold),
+        **{k: v for k, v in said.items() if k != "regions"},
+    )
+    code = _sweep_cmd(argparse.Namespace(**{**vars(args), "plan": str(plan), "chunk": 0, "attempt": 1}))
+    shift, latch, landed = landing(load_wire(_sweep_take(str(out), said["program"], 0)), 1e9 / 30.0)
+    print(f"{said['program']}: device frames lead clip frames by {shift.lo}..{shift.hi}")
+    print(f"{said['program']}: {landed.summary()}")
+    for row in landed.rows:
+        window = latch[row["sent"]].tolist() if row["sent"] >= 0 else None
+        print(
+            f"  target {row['target']:4d} P{row['param']}={row['value']:4d}: "
+            f"device {window}, clip {row['first']}..{row['last']}"
+        )
+    return code or (0 if landed.ok and shift.exact else 3)
+
+
 def held_record(hold: str | Path, program: str) -> dict:
     """A ``probe hold`` record, refused when it measured another program."""
     held = json.loads(Path(hold).read_text(encoding="utf-8"))
@@ -350,6 +382,23 @@ def _add_timecode(probe_sub: Any) -> Any:
     return stamp
 
 
+def _add_smoke(sweep_sub: Any) -> Any:
+    smoke = sweep_sub.add_parser(
+        "smoke", help="capture a few seconds toggling one parameter and land every write by command order"
+    )
+    smoke.add_argument("plan", help="a sweep plan of the program, for its start state, clip and program")
+    smoke.add_argument("--param", type=int, required=True, help="the 1-based parameter toggled")
+    smoke.add_argument(
+        "--values", type=int, nargs=2, required=True, help="the two device values toggled between"
+    )
+    smoke.add_argument("--states", type=int, default=8, help="settings, each held --hold frames")
+    smoke.add_argument("--hold", type=int, default=8)
+    smoke.add_argument("--out", required=True, help="where the plan and take go")
+    smoke.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
+    smoke.set_defaults(func=_smoke_cmd)
+    return smoke
+
+
 def add_parsers(probe_sub: Any) -> None:
     """The ``probe hold``, ``probe timecode`` and ``probe sweep`` commands."""
     hold = probe_sub.add_parser("hold", help="each program's settle and archive hold from locked takes")
@@ -400,6 +449,7 @@ def add_parsers(probe_sub: Any) -> None:
     regions.add_argument("--seed", type=int, default=0, help="seed of the scrambled Sobol design")
     regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")
     regions.set_defaults(func=_sweep_regions_cmd)
+    smoke = _add_smoke(sweep_sub)
     run = sweep_sub.add_parser(
         "capture", help="capture a plan's takes back to back on the rig, its program loaded once"
     )
@@ -417,7 +467,7 @@ def add_parsers(probe_sub: Any) -> None:
     commit.add_argument("plan")
     commit.add_argument("--archive", required=True)
     commit.set_defaults(func=_sweep_commit_cmd)
-    for node in (hold, stamp, plan, regions, run, gather, commit):
+    for node in (hold, stamp, plan, regions, run, smoke, gather, commit):
         node.add_argument("--format", default="1080p30", help="the session format")
         node.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
     for node in (hold, plan, regions, run, gather, commit):

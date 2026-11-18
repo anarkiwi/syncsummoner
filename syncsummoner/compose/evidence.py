@@ -128,7 +128,12 @@ class StoppedError(EvidenceError):
 
 
 def offset(
-    latch: np.ndarray, floors: np.ndarray, asked: np.ndarray, shown: np.ndarray, ticks: np.ndarray
+    latch: np.ndarray,
+    floors: np.ndarray,
+    asked: np.ndarray,
+    shown: np.ndarray,
+    ticks: np.ndarray,
+    period_ns: float,
 ) -> Offset:
     """The offset from device frames to clip frames that every write, Pi reply and Pi report allow.
 
@@ -137,9 +142,10 @@ def offset(
     after the host heard frame ``f`` shown means ``O <= c' - f + 1``, and a write with floor ``F`` and
     latest latch ``L`` means ``O <= L - F``. Bounds that cross mean the device is not locked to the
     player, or an event is misordered, which is an error. A reply counts only once the host has heard
-    the frame after it shown, so the Pi was still flipping; one past the clip's end does not.
+    the frame after it shown, so the Pi was still flipping; one past the clip's end does not. Reads
+    two ``period_ns`` frames apart reading one count mean the transport is stopped.
     """
-    if ticks.size > 1 and ticks["field"][-1] == ticks["field"][0]:
+    if ticks.size and ticks["field"][-1] == ticks["field"][0] and np.ptp(ticks["t0_ns"]) > 2 * period_ns:
         raise StoppedError(
             f"field_count stayed at {int(ticks['field'][0])} over {ticks.size} reads: the device's transport "
             "is stopped, so its frame ticks cannot be counted"

@@ -494,10 +494,11 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
     played = []
 
     @contextlib.contextmanager
-    def playing(*, fps, spans=None):
+    def playing(*, fps, spans=None, heard=None):
         played.append((fps, spans))
+        assert heard is not None and not heard(), "followed before it plays, nothing heard yet"
         sim.played = sum(b - a for a, b in spans) if spans else sim.size // 2
-        yield types.SimpleNamespace(status=lambda: {"hold": 2}, following=lambda: following(sim))
+        yield types.SimpleNamespace(status=lambda: {"hold": 2})
 
     @contextlib.contextmanager
     def recording(path):
@@ -505,7 +506,9 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
         yield "proc"
         sim.now = max(sim.now, int(sim.frames["t_ns"][-1]))
 
-    playout = types.SimpleNamespace(playing=playing, flips=lambda: sim.flips, played=played)
+    playout = types.SimpleNamespace(
+        playing=playing, following=lambda: following(sim), flips=lambda: sim.flips, played=played
+    )
     recorder = types.SimpleNamespace(
         recording=recording, roll=lambda proc, path, opens, closes: sim.roll(path, opens, closes)
     )
@@ -551,10 +554,11 @@ def fixture_simulate(monkeypatch):
                 self._run_asked()
 
             def wait_count(self, count, stop):
-                at = sim.tick_at(count)
-                if not sim.peeking:
-                    sim.sleep(max(at - sim.now, 0) / 1e9)
-                return at
+                if sim.peeking:
+                    return sim.tick_at(count)
+                while not self.ticks or self.ticks[-1][2] < count:
+                    sim.sleep(max(sim.next_poll - sim.now, 1) / 1e9)
+                return self.ticks[-1][1]
 
         class SimSender(Sender):
             """Sent from the simulation's sleeps."""
