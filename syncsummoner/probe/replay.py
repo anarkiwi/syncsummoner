@@ -322,8 +322,13 @@ def hold_settle(meta: dict[str, Any], program: str, holds: str | Path | None) ->
     """
     if not is_footage(meta):
         return None
-    path = Path(holds or ".") / f"hold-{slug(program)}.json"
-    if holds is None or not path.is_file():
+    name = f"hold-{slug(program)}.json"
+    if holds is None:
+        raise FileNotFoundError(
+            f"{program}: a footage archive settles by its hold record {name}; give its directory"
+        )
+    path = Path(holds) / name
+    if not path.is_file():
         raise FileNotFoundError(
             f"{program}: a footage archive settles by its hold record, and {path} is missing"
         )
