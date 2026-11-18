@@ -652,7 +652,8 @@ def config_for(**kw):
     return types.SimpleNamespace(fps=FPS, strip_px=8, bits=16, tail_s=0.2, ffmpeg="ffmpeg", **kw)
 
 
-LEAD_IN = LT.LeadIn(toggles=3, toggle_s=(0.2, 0.25), settle_s=0.3, wet_s=0.5, poll_s=0.005)
+#: Polls off the frame grid, so no echo of one write ends a whole number of frames after another's.
+LEAD_IN = LT.LeadIn(toggles=3, toggle_s=(0.2, 0.25), settle_s=0.3, wet_s=0.5, poll_s=0.00493)
 PLAN_ROWS = np.array(
     [(0, 3, 512), (0, 4, 100), (5, 3, 600), (9, 4, 200), (20, 3, 100), (20, 5, 900)], dtype=LT.PLAN
 )
