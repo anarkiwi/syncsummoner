@@ -2,8 +2,10 @@
 
 # pylint: disable=missing-function-docstring
 
+import json
 import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,6 +18,7 @@ from syncsummoner.probe import replay as R
 from syncsummoner.probe.patterns import burn_timecode
 from syncsummoner.probe.archive import GAP, CHANNELS, ArchiveError, FrameRow
 from syncsummoner.probe.runner import ANALYSIS_WIDTH
+from syncsummoner.probe.store import slug
 from tests.probe.test_runner import FakeAnalyzer
 
 SIZE = (16, 24)
@@ -284,14 +287,28 @@ def replace_captured(row, captured):
     )
 
 
-def survival_of(clip, reader):
-    result = R.replay_program(Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), series=clip[1])
+def holds_for(directory, settle=4, **named):
+    """``probe hold`` records settling each named program in ``settle`` frames, as ``hold-<slug>.json``."""
+    for program in named or {"p": settle}:
+        path = Path(directory) / f"hold-{slug(program)}.json"
+        path.write_text(
+            json.dumps({"program": program, "settle": named.get(program, settle)}), encoding="utf-8"
+        )
+    return directory
+
+
+def survival_of(clip, reader, holds):
+    result = R.replay_program(
+        Archive({"p": reader}), "p", analyzer=FakeAnalyzer(), series=clip[1], holds=holds_for(holds)
+    )
     return result, [r.metrics for r in result.records]
 
 
-def test_footage_setpoints_are_scored_on_what_they_kept_of_the_clip(clip):
+def test_footage_setpoints_are_scored_on_what_they_kept_of_the_clip(clip, tmp_path):
     """Passthrough keeps the clip's picture, motion and its timing; a frozen dwell keeps no motion."""
-    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass", "freeze", "pass", "freeze"]))
+    result, metrics = survival_of(
+        clip, footage_reader(clip[0], ["pass", "freeze", "pass", "freeze"]), tmp_path
+    )
     assert "p: footage clock from strip" in result.notes
     assert [r.stimulus for r in result.records] == ["footage"] * 4
     for kept in metrics[::2]:
@@ -303,21 +320,23 @@ def test_footage_setpoints_are_scored_on_what_they_kept_of_the_clip(clip):
     assert all("concentration" in kept for kept in metrics), "the analyzer's own metrics stay"
 
 
-def test_a_clip_whose_strip_never_reads_is_aligned_by_its_motion(clip):
+def test_a_clip_whose_strip_never_reads_is_aligned_by_its_motion(clip, tmp_path):
     """Captured faster than it plays, a clip's motion fixes where each of its frames went up."""
-    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass", "pass"], wipe=True, rate=2))
+    result, metrics = survival_of(
+        clip, footage_reader(clip[0], ["pass", "pass"], wipe=True, rate=2), tmp_path
+    )
     assert "p: footage clock from motion" in result.notes
     for kept in metrics:
         assert kept["ti_ratio"] == pytest.approx(1.0, abs=1e-6) and kept["motion_follow"] > 0.99
 
 
-def test_with_no_clock_survival_is_left_out_rather_than_zero(clip):
-    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass"], wipe=True, captures=4))
+def test_with_no_clock_survival_is_left_out_rather_than_zero(clip, tmp_path):
+    result, metrics = survival_of(clip, footage_reader(clip[0], ["pass"], wipe=True, captures=4), tmp_path)
     assert "p: footage clock from none" in result.notes
     assert metrics and not {"si_ratio", "ti_ratio", "motion_follow"} & set(metrics[0])
 
 
-def test_the_refit_reads_each_played_clip_once_for_every_footage_program(clip, monkeypatch):
+def test_the_refit_reads_each_played_clip_once_for_every_footage_program(clip, monkeypatch, tmp_path):
     seen = []
 
     def series(path, *, strip_px):
@@ -326,11 +345,33 @@ def test_the_refit_reads_each_played_clip_once_for_every_footage_program(clip, m
 
     monkeypatch.setattr(R, "source_series", series)
     archive = Archive({name: footage_reader(clip[0], ["pass"]) for name in "ab"}, directory="/archive")
-    out = R.replay(archive, analyzer=FakeAnalyzer(), executor=ThreadPoolExecutor)
+    holds = holds_for(tmp_path, a=4, b=4)
+    out = R.replay(archive, analyzer=FakeAnalyzer(), executor=ThreadPoolExecutor, holds=holds)
     assert seen == [("/archive/stimulus.mkv", STRIP)]
     assert all(out[name].records[0].metrics["ti_ratio"] == pytest.approx(1.0, abs=1e-6) for name in "ab")
-    result = R.replay_program(archive, "a", analyzer=FakeAnalyzer())
+    result = R.replay_program(archive, "a", analyzer=FakeAnalyzer(), holds=holds)
     assert len(seen) == 2 and "si_ratio" in result.records[0].metrics
+
+
+def test_a_footage_profile_settles_by_its_programs_hold_record_on_every_parameter(clip, tmp_path):
+    """On moving footage the frame-difference plateau measures the footage; the hold measured the program."""
+    result, _ = survival_of(clip, footage_reader(clip[0], ["pass", "freeze", "pass", "freeze"]), tmp_path)
+    assert result.profile.settle_frames and set(result.profile.settle_frames.values()) == {4}
+    assert {r.settle_frames for r in result.records} != {4}
+
+
+def test_a_footage_archive_without_its_hold_record_is_refused_before_any_decode(clip, tmp_path):
+    archive = Archive({name: footage_reader(clip[0], ["pass"]) for name in "ab"}, directory="/archive")
+    holds = holds_for(tmp_path, a=4)
+    with pytest.raises(FileNotFoundError, match=r"b: .*hold-b\.json is missing"):
+        R.replay(archive, analyzer=FakeAnalyzer(), executor=ThreadPoolExecutor, holds=holds)
+    with pytest.raises(FileNotFoundError, match="hold record hold-a.json; give its directory"):
+        R.replay_program(archive, "a", analyzer=FakeAnalyzer())
+    holds_for(tmp_path, b=4)
+    (tmp_path / "hold-b.json").write_text(json.dumps({"program": "a", "settle": 4}), encoding="utf-8")
+    with pytest.raises(ValueError, match="measured a, not b"):
+        R.hold_settle(archive.reader("b").meta, "b", tmp_path)
+    assert R.hold_settle({}, "codeframes", None) is None
 
 
 def delayed(delay, count=150, seed=3):

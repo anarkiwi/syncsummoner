@@ -237,6 +237,14 @@ settle is the last lag departing; the hold is the settle plus the two settled
 frames a frame-to-frame measure needs. It is bounded when the next lag reached
 at least the steps the exact signed-rank test needs to reject at all.
 
+A footage archive is refitted with its programs' hold records, `ss probe refit
+--archive archive/ --holds holds/ --out profiles/`: each program's settle is its
+record's, one figure for the whole program, so it stands for every parameter, and it
+is what the planner spaces each parameter's writes by. A frame-difference plateau
+on moving footage measures the footage, so a footage archive with no hold record is
+refused, naming the missing file, before anything is decoded. A codeframe archive
+keeps the plateau measured on each setpoint.
+
 `probe sweep plan` takes the program's covering sweep (`Cover.vectors`, each
 parameter walked by `gates.tour`) and targets one setpoint every hold, all of a
 setpoint's changed slots on one frame, cut into takes no longer than the clip

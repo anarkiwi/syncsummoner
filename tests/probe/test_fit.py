@@ -490,3 +490,11 @@ def test_a_parameter_parked_while_the_others_move_is_fitted_from_the_whole_sweep
         )
     spec = param(fit.fit_profile(parked + swept), 1)
     assert len(spec.values) > 2 and spec.sensitivity > 0
+
+
+def test_a_settle_measured_elsewhere_stands_for_every_swept_parameter():
+    """A hold record's settle replaces each record's plateau, the same for every parameter."""
+    records = [record({1: v}, {"concentration": v / 1023}, settle=300) for v in GRID]
+    records += [record({2: v}, {"concentration": v / 2046}, settle=280) for v in GRID]
+    assert fit.fit_profile(records).settle_frames == {1: 300, 2: 280}
+    assert fit.fit_profile(records, settle=3).settle_frames == {1: 3, 2: 3}
