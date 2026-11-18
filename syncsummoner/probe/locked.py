@@ -439,7 +439,7 @@ def capture(
     from syncsummoner.device.v4l2rec import read_log, sidecar  # pylint: disable=import-outside-toplevel
 
     outs = [Path(out) for out in outs]
-    rig = render.open_rig(config, capture=False, directory=outs[0].parent)
+    rig = render.open_rig(config, capture=False)
     shell = rig.transport.device.shell
 
     def state() -> dict:

@@ -140,16 +140,17 @@ def clip_seconds(clip: str | Path, config: Any) -> float:
     return timecode.clip_layout(clip).frames / config.fps
 
 
-def check_frames(directory: str | Path, fps: float, lead_in_s: float | None = None) -> tuple[int, int]:
+def check_frames(fps: float, lead_in_s: float | None = None) -> tuple[int, int]:
     """A lockcheck clip's lead-in and lead-out: ``lead_in_s`` each, else what a load inside each needs.
 
-    A program loaded in the lead-in is a session with no dry control, sized by the loads ``directory`` timed.
+    A program loaded in the lead-in is a session with no dry control, sized by the rig's longest load.
     """
     from syncsummoner.compose import session  # pylint: disable=import-outside-toplevel
+    from syncsummoner.device import loadtimes  # pylint: disable=import-outside-toplevel
 
     if lead_in_s is not None:
         return (session.frames_of(lead_in_s, fps),) * 2
-    loads, lead_in = session.load_bound(directory), session.LeadIn()
+    loads, lead_in = loadtimes.longest(), session.LeadIn()
     return (
         session.lead_in_frames(lead_in, fps, dry=False, load_s=loads),
         session.lead_out_frames(lead_in, fps, dry=False, load_s=loads, latency_s=0.0),

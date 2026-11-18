@@ -11,7 +11,8 @@ import pytest
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import lockcheck as LC
 from syncsummoner.compose import render as R
-from syncsummoner.compose.session import NoLoadTimeError, record_load
+from syncsummoner.compose.session import NoLoadTimeError
+from syncsummoner.device import loadtimes
 from syncsummoner.compose.timecode import ClipLayout
 from syncsummoner.device import recorder as recorder_mod
 from syncsummoner.device.v4l2rec import sidecar
@@ -114,13 +115,13 @@ def test_a_clip_is_measured_between_its_lead_in_and_lead_out(monkeypatch):
     assert LC.clip_seconds("clip.mkv", R.RenderConfig(fps=30.0)) == pytest.approx(6 / 30)
 
 
-def test_a_lockcheck_clip_holds_a_load_in_each_end_or_what_it_was_asked(tmp_path):
+def test_a_lockcheck_clip_holds_a_load_in_each_end_or_what_it_was_asked():
     with pytest.raises(NoLoadTimeError):
-        LC.check_frames(tmp_path, 30.0)
-    record_load(tmp_path, "Passthru", 0, 2_000_000_000)
-    lead, tail = LC.check_frames(tmp_path, 30.0)
+        LC.check_frames(30.0)
+    loadtimes.record("Passthru", 0, 2_000_000_000)
+    lead, tail = LC.check_frames(30.0)
     assert lead > 2 * 60 and tail > 60, "each end holds the longest load timed and its anchor"
-    assert LC.check_frames(tmp_path, 30.0, 0.5) == (15, 15)
+    assert LC.check_frames(30.0, 0.5) == (15, 15)
 
 
 @pytest.mark.parametrize("program", [None, "Teletext"])

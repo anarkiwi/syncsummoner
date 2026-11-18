@@ -12,7 +12,7 @@ from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import locktake as LT
 from syncsummoner.compose import session as SS
-from syncsummoner.device import v4l2rec
+from syncsummoner.device import loadtimes, v4l2rec
 from syncsummoner.device.profile import PARAM_MAX, ParamSpec
 from syncsummoner.device.v4l2rec import FRAME
 from syncsummoner.device import wire as W
@@ -661,7 +661,7 @@ PLAN_ROWS = np.array(
 
 def ends_for(dry, directory):
     """The lead-in and lead-out a simulated session derives: its loads take no time."""
-    SS.record_load(directory, "Passthru", 0, 0)
+    loadtimes.record("Passthru", 0, 0)
     return SS.session_frames(LEAD_IN, FPS, dry=dry, directory=directory)
 
 

@@ -51,14 +51,13 @@ from syncsummoner.compose.locktake import (
     write_latency,
 )
 from syncsummoner.compose.timecode import ClipLayout, LayoutError
+from syncsummoner.device import loadtimes
 from syncsummoner.device import wire as W
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, snap_toggles
 from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
 from syncsummoner.probe.decoded import CALIBRATION_SIZE
 from syncsummoner.progress import LOG, meter
 
-#: Where a takes directory keeps every program load its sessions timed.
-LOADS_FILE = "loads.json"
 #: The program whose picture is its input, carrying the strips for a program with no dry control.
 PASSTHRU = "Passthru"
 #: Longest a session sleeps between carrying its frame line on over the captures since.
@@ -163,34 +162,11 @@ def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | N
     return frames_of(load_s + latency_s, fps) + 1 + ANCHOR_FRAMES
 
 
-def record_load(directory: str | Path, program: str, t0_ns: int, t1_ns: int) -> float:
-    """Keep a timed load in the directory's :data:`LOADS_FILE`; its seconds."""
-    path = Path(directory, LOADS_FILE)
-    held = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"loads": []}
-    seconds = (int(t1_ns) - int(t0_ns)) / 1e9
-    held["loads"].append({"program": program, "load_s": seconds})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(held, indent=1), encoding="utf-8")
-    return seconds
-
-
-def load_bound(directory: str | Path | None) -> float | None:
-    """The longest load on file, any program's: every load is one fixed-size bitstream to one FPGA.
-
-    None when no load is on file.
-    """
-    path = None if directory is None else Path(directory, LOADS_FILE)
-    if path is None or not path.is_file():
-        return None
-    loads = [float(x["load_s"]) for x in json.loads(path.read_text(encoding="utf-8"))["loads"]]
-    return max(loads) if loads else None
-
-
 def session_frames(
     lead_in: LeadIn, fps: float, *, dry: bool, directory: str | Path, band: ev.Latency | None = None
 ) -> tuple[int, int]:
-    """A session's lead-in and lead-out frames, from the loads and, with no dry control, the band on file."""
-    loads = load_bound(directory)
+    """A session's lead-in and lead-out frames, from the rig's loads and, with no dry control, the band on file."""
+    loads = loadtimes.longest()
     if not dry:
         band = read_latency(directory) if band is None else band
     after = 0.0 if band is None else (band.hi + band.period) / 1e9
@@ -271,12 +247,13 @@ def locked_session(
     band = None if dry is not None else read_latency(directory)
     park = np.asarray(rig.session.park_values, dtype=np.int64)
     played: list[dict] = []
+    firmware = _firmware(rig)
 
     def timed(name: str) -> Any:
         began = time.monotonic_ns()
         said = load(name)
         ended = time.monotonic_ns()
-        record_load(directory, name, began, ended)
+        loadtimes.record(name, began, ended, firmware=firmware)
         if held["recording"]:
             played.append({"program": name, "t0_ns": began, "t1_ns": ended})
         return said
@@ -355,6 +332,12 @@ def locked_session(
                 f"{program}: the device's boot count went from {booted} to {rebooted} during the session"
             )
     return [_take_record(index, layout, wire, held, park) for index in range(len(takes))]
+
+
+def _firmware(rig: Any) -> str | None:
+    """The firmware the rig's device runs, to key its loads by; None when the transport cannot say."""
+    said = getattr(rig.transport, "firmware", None)
+    return None if said is None else str(said())
 
 
 def _writer(rig: Any, park: np.ndarray) -> Callable[[int, int], int]:
