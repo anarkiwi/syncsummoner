@@ -657,7 +657,7 @@ def _program_cmd(args: argparse.Namespace) -> int:
             src = "rtl" if prog.sources else "bitstream"
             print(f"{prog.name:<40} {prog.package.config.program_id:<40} {src:<9} {prog.origin}")
         return 0
-    m = model(args.name, library, config=args.config, source=args.source)
+    m = model(args.name, library, config=args.config, source=args.source, method=args.method)
     sets = dict(tuple(map(int, s.split("=", 1))) for s in args.set)
     state = parse_state(m, args.state, sets)
     if args.program_cmd == "step":
@@ -785,6 +785,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         node.add_argument("--config", default="hd_hdmi", help="IO configuration (default: hd_hdmi)")
         node.add_argument(
             "--source", choices=("rtl", "bitstream"), help="netlist source (default: rtl if published)"
+        )
+        node.add_argument(
+            "--method",
+            choices=("bdd", "sat", "ternary"),
+            help="answer liveness by this method alone (default: BDDs, then SAT once they outgrow memory)",
         )
         node.add_argument("--json", action="store_true")
         node.add_argument(

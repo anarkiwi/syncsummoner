@@ -187,8 +187,7 @@ def test_revivals_from_the_condition_match_the_simulated_search(tiny):
 def test_a_cover_without_conditions_revives_by_the_ternary_simulator(tiny, tmp_path):
     from syncsummoner.program.model import ProgramModel  # pylint: disable=import-outside-toplevel
 
-    coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path)
-    coarse.memory = 0
+    coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path, method="ternary")
     found = cover(coarse)
     assert coarse.method == "ternary" and not found.uncovered
     assert found.gating()[1] == ["dead at the reference", "live when P7 in 512..1023"]

@@ -94,8 +94,7 @@ def test_with_no_switch_a_crossfader_at_the_end_that_returns_its_input_is_the_by
 
 
 def test_the_ternary_simulator_proves_a_crossfader_bypass_as_well(mixer, tmp_path):
-    coarse = ProgramModel(mixer.program, mixer.library, cache=tmp_path)
-    coarse.memory = 0
+    coarse = ProgramModel(mixer.program, mixer.library, cache=tmp_path, method="ternary")
     assert coarse.passes(12).tolist() == [0] and coarse.method == "ternary"
     assert not coarse.passes(7).size
 
@@ -129,12 +128,17 @@ def test_a_folded_state_is_reused_by_the_next_step(tiny, monkeypatch):
     assert tiny._folded(state.copy(), None) is first and len(calls) == 1  # pylint: disable=protected-access
 
 
-def test_bdds_beyond_memory_fall_back_to_the_ternary_simulator(tiny, tmp_path):
-    coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path)
-    coarse.memory = 0
+def test_bdds_beyond_memory_fall_back_to_sat(tiny, tmp_path):
+    spent = ProgramModel(tiny.program, tiny.library, cache=tmp_path / "spent")
+    spent.memory = 0
+    assert spent.live(gates=False) == tiny.live(gates=False)
+    assert spent.method == "sat" and (spent.cache / "observe.exhausted").exists()
+
+
+def test_the_ternary_simulator_over_approximates(tiny, tmp_path):
+    coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path, method="ternary")
     found, exact = coarse.live(gates=False), tiny.live(gates=False)
-    assert coarse.method == "ternary" and (coarse.cache / "observe.exhausted").exists()
-    assert tiny.method == "bdd"
+    assert coarse.method == "ternary" and tiny.method == "bdd"
     for p, liveness in exact.items():
         assert set(liveness.live_bits) <= set(found[p].live_bits)
     assert found[8].live and not exact[8].live, "the ternary simulator cannot see that both arms are data_in"
