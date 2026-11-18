@@ -1,8 +1,8 @@
-"""A locked take whose every CC is sent for a known clip frame, with the record to prove it landed.
+"""A locked take whose every CC is sent on a known clip frame, with the record to prove it landed.
 
 The program is loaded before playout and held dry for the lead-in, so the strip anchors the
-take; toggling the dry control times the device's tick and the CC-to-picture latency. Every
-write is then sent midway between the ticks around its frame's. See docs/evidence.md.
+take. Every write is sent once the Pi is seen showing its target frame and carries that frame as
+its floor, so no output earlier than its floor can show it. See docs/evidence.md.
 """
 
 from __future__ import annotations
@@ -28,8 +28,6 @@ from syncsummoner.progress import LOG
 BOOT_COUNT_KEY = 9
 #: Plan rows: target clip frame, 1-based parameter, device value.
 PLAN = np.dtype([("target", "<i8"), ("param", "<i8"), ("value", "<i8")])
-#: Where a take directory keeps the latest CC-to-picture latency a dry take measured.
-LATENCY_FILE = "ccpicture.json"
 
 
 class RebootError(RuntimeError):
@@ -37,24 +35,17 @@ class RebootError(RuntimeError):
 
 
 class LeadInTimeError(RuntimeError):
-    """The lead-in ended before the take's clock and latency were known."""
-
-
-class NoLatencyError(LeadInTimeError):
-    """A program with no dry control needs a CC-to-picture latency no dry take has measured yet."""
+    """The lead-in ended before the take's frame line was known."""
 
 
 @dataclass(frozen=True)
 class LeadIn:
-    """How the lead-in is spent, in seconds from playout start and in calibration writes."""
+    """How the lead-in is spent, in seconds from playout start."""
 
-    toggles: int = 8
-    toggle_s: tuple[float, float] = (0.3, 0.5)
     settle_s: float = 1.0
     wet_s: float = 2.0
     poll_s: float = 0.005
     probe_s: float = 0.1
-    seed: int = 0
 
 
 def program_bypass(info: Any) -> Any:
@@ -193,14 +184,13 @@ def boot_count(shell: Any) -> int:
 
 @dataclass
 class Clock:
-    """The take's clock as measured so far: the frame line, and the send-to-frame-start latency.
+    """The take's frame line as measured so far: when each clip frame's captures start on the host clock.
 
     ``first`` is the first capture of the run the clip plays in and ``seen`` the captures its line
     has looked at; the line is carried on as the card's log grows (:meth:`extend`).
     """
 
     times: ev.FrameTimes
-    lat: ev.Latency
     line: Any = None
     first: int = 0
     seen: int = 0
@@ -208,26 +198,16 @@ class Clock:
     resolution: float = 0.0
 
     @classmethod
-    def of(cls, found: Any, lat: ev.Latency) -> "Clock":
+    def of(cls, found: Any) -> "Clock":
         """The clock an attribution of the take so far gives."""
         return cls(
             times=ev.frame_times(found),
-            lat=lat,
             line=found.line,
             first=int(found.span[0]),
             seen=int(found.span[1]) + 1,
             jitter=float(found.jitter_ns),
             resolution=float(found.resolution),
         )
-
-    @property
-    def ticks(self) -> ev.Ticks:
-        """The instants a write must precede to land on each frame."""
-        return ev.grid(self.times, self.lat)
-
-    def when(self, target: int) -> int:
-        """Host time to send a write that should land on ``target``."""
-        return int(ev.send_time(np.array([target]), self.ticks, self.times, self.lat.delta)[0])
 
     def extend(self, log: np.ndarray) -> None:
         """Carry the frame line on over the frame starts the clip's run has gained, by its bytes.
@@ -260,88 +240,10 @@ class Record:
     initial: np.ndarray
     sends: np.ndarray
     arrays: dict
-    delta: float
     dry: dict | None
     loaded: dict
     cc_map: np.ndarray
     resent: np.ndarray
-
-
-def measure_latency(
-    images: np.ndarray,
-    frames: np.ndarray,
-    found: Any,
-    toggles: np.ndarray,
-    times: ev.FrameTimes,
-    until: float | None = None,
-    taken: np.ndarray | None = None,
-) -> ev.Latency:
-    """The latency from when the device took each calibration write to where it showed in the picture.
-
-    ``taken`` brackets each toggle's taking (:func:`wire.echoed`), else its send interval does.
-    """
-    size = min(images.shape[0], frames.size, found.shown.size)
-    landed = ev.toggle_landings(
-        images[:size], frames["t_ns"][:size], found.starts[:size], found.shown[:size], toggles, until
-    )
-    lat = ev.latency(ev.taken(toggles, taken), landed, times)
-    shown = np.unique(np.r_[landed, landed - 1][np.r_[landed, landed] >= -times.lead])
-    least, most = found.line.polygon.at(shown + times.lead)
-    line = times.at(shown)
-    return replace(lat, line_lo=float(np.min(least - line)), line_hi=float(np.max(most - line)))
-
-
-def write_latency(directory: str | Path, measured: ev.Latency, program: str) -> None:
-    """Keep a dry take's measured latency for the takes without a dry control, one a program and basis."""
-    path = Path(directory, LATENCY_FILE)
-    takes = json.loads(path.read_text(encoding="utf-8")).get("takes", []) if path.is_file() else []
-    entry = {"program": program, **measured.as_dict()}
-    takes = [t for t in takes if (t.get("program"), t.get("basis")) != (program, entry["basis"])] + [entry]
-    path.write_text(json.dumps({"takes": takes}, indent=1), encoding="utf-8")
-
-
-def read_latency(directory: str | Path) -> ev.Latency:
-    """The send-to-frame-start latency for a take with no dry control: the band every dry take admits.
-
-    Each dry take bounds the device's latency whichever line its captures admit
-    (:attr:`~syncsummoner.compose.evidence.Latency.bounds`), so it lies where they all meet. Only takes
-    measured to the frame line count. However wide the band, it only widens each write's landing window
-    (:func:`~syncsummoner.compose.evidence.window`); bands that do not meet contradict each other.
-    """
-    path = Path(directory, LATENCY_FILE)
-    held = json.loads(path.read_text(encoding="utf-8"))["takes"] if path.is_file() else []
-    takes = [t for t in held if t.get("basis") == ev.BASIS]
-    if not takes:
-        raise NoLatencyError(
-            f"no {ev.BASIS}-basis latency in {path}: a program without a dry control needs a dry take's "
-            "measured CC-to-picture latency; render a program with a bypass first"
-        )
-    lo = max(t["lo"] + t.get("line_lo", 0.0) for t in takes)
-    hi = min(t["hi"] + t.get("line_hi", 0.0) for t in takes)
-    period = float(np.median([t["period"] for t in takes]))
-    if hi < lo:
-        raise LeadInTimeError(
-            f"dry takes in {path} put the CC-to-picture latency over {lo / 1e6:.2f}..{hi / 1e6:.2f} ms, "
-            "an empty band, so the dry takes contradict each other"
-        )
-    found = ev.Latency(lo=lo, hi=hi, samples=0, period=period)
-    LOG.info(
-        "CC-to-picture %.2f ms from %d dry takes, within %.2f ms",
-        found.delta / 1e6,
-        len(takes),
-        found.spread / 1e6,
-    )
-    return found
-
-
-def calibrate(sender: Sender, dry: Mapping[int, int], initial: Mapping[int, int], lead_in: LeadIn) -> None:
-    """Toggle the dry control between dry and the take's wet value at random intervals, ending dry."""
-    rng = np.random.default_rng(lead_in.seed)
-    ((slot, dry_value),) = dry.items()
-    wet = int(initial.get(slot, 0))
-    for index in range(2 * lead_in.toggles):
-        time.sleep(float(rng.uniform(*lead_in.toggle_s)))
-        sender.send(slot, wet if index % 2 == 0 else dry_value, int(ev.CALIBRATION))
 
 
 def plan_rows(
@@ -370,12 +272,19 @@ def state_at(initial: np.ndarray, plan: np.ndarray, frame: int) -> np.ndarray:
     return state
 
 
-def loaded_before(
-    program: str, wire: Mapping[str, Any], ticks: ev.Ticks, times: ev.FrameTimes, delta: float
-) -> dict:
-    """Whether the device ran ``program`` and read back frame 0's parameters before frame 0's tick.
+def shown_at(wire: Mapping[str, Any], frame: int) -> float:
+    """When the host first saw the Pi show ``frame`` or a later one, from the take's ``shown`` log; inf
+    when it never did."""
+    shown = wire["shown"]
+    at = np.flatnonzero(shown["frame"] >= frame)
+    return float(shown["t_ns"][at[0]]) if at.size else np.inf
 
-    A later take of a session reads back the state the take before left; its frame 0 lands on the tick.
+
+def loaded_before(program: str, wire: Mapping[str, Any]) -> dict:
+    """Whether the device ran ``program`` and read back frame 0's parameters before frame 0 was seen shown.
+
+    A later take of a session reads back the state the take before left; its frame 0's writes go once
+    frame 0 shows.
     """
     said = json.loads(str(wire["loaded"]))
     try:
@@ -389,15 +298,14 @@ def loaded_before(
     later = "session" in wire and json.loads(str(wire["session"])).get("index", 0) > 0
     want = state_at(wire["start"], wire["plan"], -1 if later else 0)
     reads = wire["reads"]
-    tick0 = np.rint((times.at(0) - delta - ticks.phase) / ticks.period)
-    cutoff = ticks.lo + tick0 * ticks.period
+    cutoff = shown_at(wire, 0)
     before = np.flatnonzero(reads["t1_ns"] < cutoff)
     last = reads["o"][before[-1]] if before.size else None
     agree = last is not None and bool(np.array_equal(last, want))
     early = said.get("t1_ns", 0) < cutoff
     summary = (
         f"fpga {'runs' if running else 'does not run'} {program} "
-        f"({'before' if early else 'after'} frame 0's tick); last readback before it "
+        f"({'before' if early else 'after'} frame 0 showed); last readback before it "
         + ("matches" if agree else f"{None if last is None else last.tolist()} against {want.tolist()}")
     )
     return {"ok": bool(running and agree and early), "summary": summary, "want": want.tolist()}
@@ -433,46 +341,6 @@ def step_counts(rows: np.ndarray, kinds: np.ndarray | None) -> dict[int, dict[st
     return out
 
 
-def take_latency(
-    take: str | Path, wire: Mapping[str, Any], seen: tuple, echo: np.ndarray | None
-) -> ev.Latency:
-    """A take's CC-to-picture latency: its calibration's when its picture shows it, else the one it used.
-
-    ``seen`` is the take's ``(images, frames, attribution, frame times)``; ``echo`` brackets its sends.
-    """
-    images, frames, found, times = seen
-    sends = wire["sends"]
-    toggled = sends["target"] == ev.CALIBRATION
-    calibration = sends[toggled]
-    used = json.loads(str(wire["latency"])) if "latency" in wire else {}
-    lat = None
-    if used.get("basis") == ev.BASIS:
-        lat = ev.Latency(lo=used["lo"], hi=used["hi"], samples=used.get("samples", 0), period=times.period)
-    if json.loads(str(wire["dry"])) is not None and calibration.size:
-        later = sends["t0_ns"][(sends["target"] > ev.START) & (sends["t0_ns"] > calibration["t1_ns"].max())]
-        until = float(later.min()) if later.size else None
-        try:
-            taken = None if echo is None else echo[toggled]
-            lat = measure_latency(images, frames, found, calibration, times, until, taken)
-            write_latency(Path(take).parent, lat, str(wire.get("program", Path(take).stem)))
-        except ev.EvidenceError as err:
-            if lat is None:
-                raise
-            LOG.warning("%s: %s; using the band measured live in the lead-in", take, err)
-    if lat is None:
-        try:
-            lat = read_latency(Path(take).parent)
-        except NoLatencyError:
-            lat = None
-        except LeadInTimeError as err:
-            raise ev.EvidenceError(f"{take}: {err}") from err
-    if lat is None:
-        raise ev.EvidenceError(
-            f"{take}: no CC-to-picture latency, measured or on file, to land its writes by"
-        )
-    return lat
-
-
 def take_evidence(
     take: str | Path,
     *,
@@ -489,7 +357,9 @@ def take_evidence(
 
     ``found`` is the take's attribution and ``features`` and ``source`` the take's and the clip's
     decodes, each made here when not given. With ``predict``, the program model judges each step from
-    the state it was taken in, and only the steps it leaves live test a parameter.
+    the state it was taken in, and only the steps it leaves live test a parameter. A take recorded
+    before writes carried their floor has nothing to land them by, which is an
+    :class:`~syncsummoner.compose.evidence.EvidenceError`.
     """
     from syncsummoner.compose.lock import attribute_take  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
@@ -500,6 +370,11 @@ def take_evidence(
     features = decoded.features(take, spec, ffmpeg=ffmpeg) if features is None else features
     source = decoded.features(clip, spec, ffmpeg=ffmpeg) if source is None else source
     whole = load_wire(take)
+    if "floor" not in (whole["sends"].dtype.names or ()) or "shown" not in whole:
+        raise ev.EvidenceError(
+            f"{take}: recorded before each write carried the frame the Pi showed as it was sent, so its "
+            "writes have no floor to land by; record it again"
+        )
     wire = own_wire(whole)
     if names is None:
         names = {int(k): v for k, v in json.loads(str(wire["names"])).items()} if "names" in wire else {}
@@ -510,16 +385,11 @@ def take_evidence(
     echo, every = take_echo(wire), take_echo(whole)
     resent = wire.get("resent")
     images = features.small
-    lat = take_latency(take, wire, (images, frames, found, times), echo)
-    ticks, delta = ev.grid(times, lat), lat.delta
-    plan = wire["plan"]
-    landed_rows = ev.landed(
-        plan, sends, ticks, times, delta, echo=echo, resent=resent, spread=line_spread(found)
-    )
+    landed_rows = ev.landed(wire["plan"], sends, echo=echo, resent=resent)
     reads = wire["reads"]
     reads = reads[(reads["t0_ns"] >= frames["t_ns"][0]) & (reads["t0_ns"] <= frames["t_ns"][-1])]
     applied_rows = ev.applied(
-        reads, whole["sends"], wire["initial"], ticks, times, delta, echo=every, resent=whole.get("resent")
+        reads, whole["sends"], wire["initial"], times, echo=every, resent=whole.get("resent")
     )
     got = None
     if echo is not None:
@@ -544,23 +414,13 @@ def take_evidence(
     )
     return ev.Evidence(
         program=program,
-        latency=lat.as_dict(),
-        ticks={"width_ms": ticks.width / 1e6, "count": ticks.count, "period_ns": ticks.period},
         landed=landed_rows,
         applied=applied_rows,
         received=got,
         moved=moved,
-        loaded=loaded_before(program, wire, ticks, times, delta),
+        loaded=loaded_before(program, wire),
         predicted=step_counts(rows, kinds),
     )
-
-
-def line_spread(found: Any) -> tuple[float, float]:
-    """How far before and after its frame line the take's captures admit its clip frames' starts."""
-    n = np.arange(found.lead, found.lead + found.picked.size)
-    least, most = found.line.polygon.at(n)
-    line = found.line.origin + n * found.line.period
-    return float(np.min(least - line, initial=0.0)), float(np.max(most - line, initial=0.0))
 
 
 def own_wire(wire: Mapping[str, Any]) -> dict:

@@ -1,6 +1,6 @@
 """What crosses the wire during a take: every CC sent, every readback, every receipt.
 
-A :class:`Sender` writes CCs at scheduled host ``CLOCK_MONOTONIC`` instants; a :class:`Poller`
+A :class:`Sender` writes each CC once the Pi shows its target frame, stamped with the frame shown; a :class:`Poller`
 keeps the serial shell busy with one ``modulation status`` at a time and collects the receipts
 ``midi monitor`` logs. :class:`Echoes` turns the receipts into acknowledgements, so the sender
 keeps one write in flight. Their records are numpy arrays in the dtypes below, saved beside the take.
@@ -21,7 +21,8 @@ import numpy as np
 
 from syncsummoner.progress import LOG
 
-#: One CC write: send interval, parameter (1-based), value on the wire, target clip frame, when it was due.
+#: One CC write: send interval, parameter (1-based), value on the wire, target clip frame, when it was due,
+#: and the floor: the latest clip frame the host had seen the Pi show before the write left it.
 SEND = np.dtype(
     [
         ("t0_ns", "<i8"),
@@ -30,8 +31,11 @@ SEND = np.dtype(
         ("value", "<i8"),
         ("target", "<i8"),
         ("due_ns", "<i8"),
+        ("floor", "<i8"),
     ]
 )
+#: The floor of a write sent before the host had seen any frame shown.
+NO_FLOOR = int(np.iinfo(np.int64).min)
 #: One ``modulation status`` reply: its request interval and the 12 combined values.
 READ = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("o", "<i8", (12,))])
 #: One CC message the firmware logged receiving, at the latest host time it can have arrived.
@@ -435,22 +439,23 @@ class Poller:
 
 
 class Sender:
-    """Writes CCs at scheduled host instants from a thread of its own, recording each.
+    """Writes CCs from a thread of its own as their frames come up, recording each with its floor.
 
-    ``write(param, value)`` puts one parameter on the wire and returns the value it encoded.
-    Rows are ``(target, param, value)``, sent in order at ``when(target)``, asked as each comes up.
-    With ``echoes``, one write is in flight: each waits for its messages, ``encode(param, value)``,
-    to come back, and an overdue one is written once more, the copy's row listed in :meth:`resent`.
+    ``write(param, value)`` puts one parameter on the wire and returns the value it encoded. ``floor()``
+    is the latest clip frame seen shown, read before each write leaves, so a write can only show on
+    that frame or later. Rows are ``(target, param, value)``, sent in order once ``due(target, stop)``
+    returns, the host time the target was seen shown (None to stop). With ``echoes``, one write is in
+    flight: each waits for its messages, ``encode(param, value)``, to come back, and an overdue one is
+    written once more, the copy's row listed in :meth:`resent`.
     """
 
     def __init__(
         self,
         write: Callable[[int, int], int],
         *,
-        when: Callable[[int], int] | None = None,
+        floor: Callable[[], int] = lambda: NO_FLOOR,
+        due: Callable[[int, threading.Event], int | None] | None = None,
         clock: Callable[[], int] = time.monotonic_ns,
-        sleep: Callable[[float], Any] | None = None,
-        spin_ns: int = 2_000_000,
         echoes: Echoes | None = None,
         encode: Callable[[int, int], Sequence[tuple[int, int]]] | None = None,
     ):
@@ -460,29 +465,20 @@ class Sender:
         self.resends: list[int] = []
         self._stop = threading.Event()
         self.write = write
-        self.when = when
+        self.floor = floor
+        self.due = due
         self.clock = clock
-        self.sleep = self._stop.wait if sleep is None else sleep
-        self.spin_ns = int(spin_ns)
-        self.sent: list[tuple[int, int, int, int, int, int]] = []
+        self.sent: list[tuple[int, int, int, int, int, int, int]] = []
         self.queued = 0
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
 
-    def _wait(self, t_ns: int) -> bool:
-        while not self._stop.is_set():
-            left = t_ns - self.clock()
-            if left <= 0:
-                return True
-            if left > self.spin_ns:
-                self.sleep((left - self.spin_ns) / 1e9)
-        return False
-
     def _put(self, param: int, value: int, target: int, due: int | None) -> tuple[int, int]:
+        floor = int(self.floor())
         t0 = self.clock()
         wire = self.write(int(param), int(value))
         t1 = self.clock()
-        self.sent.append((t0, t1, int(param), int(wire), int(target), t0 if due is None else int(due)))
+        self.sent.append((t0, t1, int(param), int(wire), int(target), t0 if due is None else int(due), floor))
         return int(wire), t1
 
     def send(self, param: int, value: int, target: int, due: int | None = None) -> None:
@@ -507,10 +503,10 @@ class Sender:
                 target, param, value = self._queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            due = None if target is None else int(self.when(target))
-            if due is None or not self._wait(due):
+            due = None if target is None or self.due is None else self.due(target, self._stop)
+            if due is None or self._stop.is_set():
                 return
-            self.send(param, value, target, due)
+            self.send(param, value, target, int(due))
 
     def plan(self, rows: Sequence[tuple[int, int, int]]) -> None:
         """Queue ``(target, param, value)`` rows, in send order."""

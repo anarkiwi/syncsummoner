@@ -412,6 +412,41 @@ def read_exactly(stream: Any, size: int) -> bytes | None:
     return bytes(buf)
 
 
+class LiveFeed:
+    """A named pipe offered every flip record as its flip completes, never blocking or raising.
+
+    A fresh FIFO replaces whatever sits at ``path``, so a reader left on an earlier one gets nothing. A
+    record is dropped while no reader has the pipe open or while the pipe is full; once a reader leaves,
+    the next record waits for another.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fd: int | None = None
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        os.mkfifo(path)
+
+    def write(self, record: bytes) -> None:
+        """Offer one record, smaller than ``PIPE_BUF`` so it lands whole or not at all."""
+        try:
+            if self._fd is None:
+                self._fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(self._fd, record)
+        except BlockingIOError:
+            pass
+        except OSError:
+            self.close()
+
+    def close(self) -> None:
+        """Let go of the reader, if one is held."""
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
 def decode_argv(
     path: str,
     width: int,
@@ -590,6 +625,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--connector", default="HDMI-A-1")
     parser.add_argument("--preroll-s", type=float, default=2.0)
     parser.add_argument("--flips", required=True, help="binary log of every flip")
+    parser.add_argument("--live", help="named pipe offered every flip record as it completes")
     parser.add_argument("--status", required=True, help="JSON status file")
     parser.add_argument("--fb", default="/dev/fb0", help="fbdev left holding the last frame")
     return parser.parse_args(argv)
@@ -608,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         signal.signal(sig, lambda *_, key=name: signals.__setitem__(key, True))
     status: dict = {"state": "starting", "pid": os.getpid()}
     write_status(args.status, status)
-    player = display = None
+    player = display = live = None
     try:
         if args.clip and clip_rate(args.clip) != args.fps:
             raise PlayoutFault(f"{args.clip} runs at {clip_rate(args.clip)} fps, not {args.fps}")
@@ -627,13 +663,21 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
             frames = dir_frames(args.frames, loop=args.loop)
         preroll = Prerolled(frames, max(2, round(float(args.preroll_s * args.fps))))
         preroll.wait_full(timeout_s=60.0)
+        live = LiveFeed(args.live) if args.live else None
         with open(args.flips, "wb", buffering=0) as log:
+
+            def record(*fields: int) -> None:
+                data = RECORD.pack(*fields)
+                log.write(data)
+                if live is not None:
+                    live.write(data)
+
             player = Player(
                 display,
                 preroll,
                 hold=display.hold,
                 period_ns=display.period_ns,
-                record=lambda *fields: log.write(RECORD.pack(*fields)),
+                record=record,
                 signals=signals,
             )
             status.update(
@@ -659,6 +703,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         status.update(state="failed", error=said)
         return 2
     finally:
+        if live is not None:
+            live.close()
         if player is not None:
             status.update(
                 flips=player.flips,

@@ -4,6 +4,7 @@
 
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -446,6 +447,94 @@ def test_arguments_name_one_source():
     assert args.fps == 30 and args.loop and args.frames is None
     with pytest.raises(SystemExit):
         K.parse_args(["--clip", "c", "--frames", "d", "--fps", "30", "--flips", "f", "--status", "s"])
+    assert args.live is None
+    assert (
+        K.parse_args(["--frames", "d", "--fps", "30", "--flips", "f", "--status", "s", "--live", "p"]).live
+        == "p"
+    )
+
+
+def packed(*indices):
+    return [K.RECORD.pack(f, f, f, f, 0) for f in indices]
+
+
+def drain(fd):
+    """Everything a non-blocking reader can take now."""
+    out = b""
+    while True:
+        try:
+            more = os.read(fd, 1 << 16)
+        except BlockingIOError:
+            return out
+        if not more:
+            return out
+        out += more
+
+
+def reader(path):
+    return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+
+
+def test_the_live_feed_drops_records_until_a_reader_comes_then_delivers_them_whole(tmp_path):
+    path = str(tmp_path / "live")
+    feed = K.LiveFeed(path)
+    for rec in packed(0, 1):
+        feed.write(rec)
+    fd = reader(path)
+    sent = packed(2, 3, 4)
+    for rec in sent:
+        feed.write(rec)
+    assert drain(fd) == b"".join(sent)
+    feed.close()
+    assert drain(fd) == b""
+    os.close(fd)
+
+
+def test_a_full_live_pipe_drops_whole_records_instead_of_blocking(tmp_path):
+    path = str(tmp_path / "live")
+    feed = K.LiveFeed(path)
+    fd = reader(path)
+    sent = packed(*range(4 * (1 << 16) // K.RECORD.size))
+    for rec in sent:
+        feed.write(rec)
+    got = drain(fd)
+    assert 0 < len(got) < len(b"".join(sent)) and len(got) % K.RECORD.size == 0
+    assert got == b"".join(sent)[: len(got)]
+    feed.write(sent[0])
+    assert drain(fd) == sent[0]
+    feed.close()
+    os.close(fd)
+
+
+def test_the_live_feed_waits_for_a_new_reader_once_one_leaves(tmp_path):
+    path = str(tmp_path / "live")
+    feed = K.LiveFeed(path)
+    fd = reader(path)
+    feed.write(packed(0)[0])
+    os.close(fd)
+    feed.write(packed(1)[0])
+    fd = reader(path)
+    feed.write(packed(2)[0])
+    assert drain(fd) == packed(2)[0]
+    feed.close()
+    os.close(fd)
+
+
+def test_a_fresh_live_feed_leaves_a_reader_of_the_old_one_with_nothing(tmp_path):
+    path = str(tmp_path / "live")
+    old = K.LiveFeed(path)
+    stale = reader(path)
+    old.write(packed(0)[0])
+    assert drain(stale) == packed(0)[0]
+    new = K.LiveFeed(path)
+    assert os.stat(path).st_ino != os.fstat(stale).st_ino
+    fresh = reader(path)
+    new.write(packed(1)[0])
+    old.close()
+    assert drain(stale) == b"" and drain(fresh) == packed(1)[0]
+    new.close()
+    os.close(stale)
+    os.close(fresh)
 
 
 @pytest.mark.parametrize("refused", [None, PermissionError, OSError])

@@ -3,6 +3,11 @@
 # pylint: disable=missing-function-docstring
 
 import hashlib
+import io
+import itertools
+import os
+import queue
+import threading
 from fractions import Fraction
 
 import numpy as np
@@ -200,3 +205,96 @@ def test_a_loop_player_refuses_spans():
     assert "--spans" not in player.command(Fraction(10), None)
     with pytest.raises(ValueError, match="plays no spans"):
         player.command(Fraction(10), [(0, 3)])
+
+
+def record(index):
+    return po.RECORD.pack(index, index, index, 0, 0)
+
+
+class Probe:
+    """A raw pipe reader that reports how many bytes each read handed back."""
+
+    def __init__(self, fd):
+        self.raw, self.reads = os.fdopen(fd, "rb", buffering=0), queue.Queue()
+
+    def readinto(self, buf):
+        got = self.raw.readinto(buf)
+        self.reads.put(got)
+        return got
+
+    def close(self):
+        self.raw.close()
+
+
+@pytest.fixture(name="feed")
+def fixture_feed():
+    """A Shown over a pipe, its write end, its reads and a clock counting from 100."""
+    r, w = os.pipe()
+    probe = Probe(r)
+    shown = po.Shown(probe, clock=itertools.count(100).__next__)
+    yield shown, w, probe.reads
+    try:
+        os.close(w)
+    except OSError:
+        pass
+    shown.close()
+
+
+def test_shown_reports_a_frame_only_once_its_whole_record_is_in(feed):
+    shown, w, reads = feed
+    assert shown.latest() == po.NONE
+    os.write(w, record(7)[:13])
+    assert reads.get() == 13 and shown.latest() == po.NONE
+    os.write(w, record(7)[13:])
+    assert reads.get() == po.RECORD.size - 13
+    assert shown.wait(7) == 100 and shown.latest() == 7
+
+
+def test_shown_logs_each_distinct_frame_when_first_heard_and_waits_for_one(feed):
+    shown, w, _ = feed
+    got = []
+    waiter = threading.Thread(target=lambda: got.append(shown.wait(2)))
+    waiter.start()
+    for index in (0, 0, 1, 3):
+        os.write(w, record(index))
+    waiter.join()
+    assert got == [103] and shown.wait(1) == 102 and shown.wait(0) == 100 and shown.latest() == 3
+    assert shown.log().tolist() == [(0, 100), (1, 102), (3, 103)] and shown.log().dtype == po.SHOWN
+
+
+def test_shown_stops_waiting_when_asked_or_when_the_stream_ends(feed):
+    shown, w, _ = feed
+    stop, got = threading.Event(), []
+    waiter = threading.Thread(target=lambda: got.append(shown.wait(5, stop)))
+    waiter.start()
+    os.write(w, record(4))
+    stop.set()
+    waiter.join()
+    assert got == [None] and shown.wait(5, stop) is None
+    os.close(w)
+    assert shown.wait(5) is None and shown.latest() == 4
+
+
+class FakeProc:
+    """A streamed command whose stdout holds the given bytes."""
+
+    def __init__(self, data):
+        self.stdout, self.done = io.BytesIO(data), []
+
+    def terminate(self):
+        self.done.append("terminate")
+
+    def wait(self):
+        self.done.append("wait")
+
+
+def test_a_player_follows_its_live_flips_over_the_stream_it_was_given():
+    started = []
+    proc = FakeProc(record(0) + record(1))
+    player = po.ClipPlayer(runner=FakeRunner(), stream=lambda command: started.append(command) or proc)
+    command = player.command(Fraction(30))
+    assert command.split("--live ")[1].split()[0] == player.path("live.fifo")
+    with player.following(clock=itertools.count().__next__) as shown:
+        assert shown.wait(1) == 1 and shown.wait(2) is None
+    assert started == [f"exec cat {player.path('live.fifo')}"]
+    assert proc.done == ["terminate", "wait"] and proc.stdout.closed

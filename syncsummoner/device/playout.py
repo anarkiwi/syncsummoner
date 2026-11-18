@@ -2,7 +2,8 @@
 
 The Pi runs :mod:`syncsummoner.device.kmsplay`, which flips one frame per vblank and fails
 loudly on any missed one. The host uploads the stimulus once, starts and stops the player
-by its pidfile, and reads back its status and its log of every flip.
+by its pidfile, and reads back its status and its log of every flip. While it plays, the host
+follows every flip live (:class:`Shown`), so it knows a frame that was on screen at any moment.
 """
 
 from __future__ import annotations
@@ -10,7 +11,10 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import bisect
 import json
+import subprocess
+import threading
 import time
 from contextlib import contextmanager
 from fractions import Fraction
@@ -21,8 +25,8 @@ import numpy as np
 
 from syncsummoner.progress import LOG
 
-from .host import DEFAULT_HOST, DEFAULT_TIMEOUT, Runner, ssh_runner
-from .kmsplay import RECORD, SEGMENT
+from .host import DEFAULT_HOST, DEFAULT_TIMEOUT, Runner, ssh_runner, ssh_stream
+from .kmsplay import RECORD, SEGMENT, read_exactly
 
 DEFAULT_FB = "/dev/fb0"
 #: 565 quantisation levels per channel, for an RGB-ordered source frame.
@@ -46,6 +50,10 @@ assert FLIP.itemsize == RECORD.size
 RTPRIO_LIMIT = 20
 #: Status states the player settles in once started.
 SETTLED = ("playing", "failed", "stopped")
+#: One distinct frame followed live: the player's stream frame and when the host first heard of it.
+SHOWN = np.dtype([("frame", "<i8"), ("t_ns", "<i8")])
+#: The frame :meth:`Shown.latest` reports before any flip has been heard of.
+NONE = int(np.iinfo(np.int64).min)
 
 
 def file_digest(path: str | Path, chunk: int = 1 << 22) -> str:
@@ -106,8 +114,98 @@ def flip_summary(flips: np.ndarray, hold: int) -> dict:
     return {"flips": int(flips.size), "segments": int(start.sum()), "missed": missed, "out_of_cadence": off}
 
 
+class Shown:
+    """The host's view of the frame on screen, from the player's live flip records on ``stream``.
+
+    A record counts only once it has been read whole, and is stamped with ``clock`` then, so every frame
+    reported was on screen no later than the moment it is reported. ``proc``, when given, is the process
+    feeding ``stream``, terminated on :meth:`close`; a stream owned by no process must end for it to return.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        proc: subprocess.Popen | None = None,
+        clock: Callable[[], int] = time.monotonic_ns,
+    ):
+        self._stream, self._proc, self._clock = stream, proc, clock
+        self._frames: list[int] = []
+        self._times: list[int] = []
+        self._ended = False
+        self._cond = threading.Condition()
+        self._watched: set[threading.Event] = set()
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
+
+    def _read(self) -> None:
+        """Note each distinct frame as its record completes, until the stream ends."""
+        try:
+            while (record := read_exactly(self._stream, RECORD.size)) is not None:
+                t_ns, frame = self._clock(), RECORD.unpack(record)[2]
+                with self._cond:
+                    if not self._frames or frame > self._frames[-1]:
+                        self._frames.append(frame)
+                        self._times.append(t_ns)
+                        self._cond.notify_all()
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self._cond:
+                self._ended = True
+                self._cond.notify_all()
+
+    def latest(self) -> int:
+        """The frame of the last record received, or :data:`NONE` before any."""
+        with self._cond:
+            return self._frames[-1] if self._frames else NONE
+
+    def _watch(self, stop: threading.Event) -> None:
+        """Wake every waiter once ``stop`` is set."""
+
+        def wake() -> None:
+            stop.wait()
+            with self._cond:
+                self._cond.notify_all()
+
+        with self._cond:
+            if stop not in self._watched:
+                self._watched.add(stop)
+                threading.Thread(target=wake, daemon=True).start()
+
+    def wait(self, frame: int, stop: threading.Event | None = None) -> int | None:
+        """When the host first heard of a frame at or after ``frame``, blocking until it has.
+
+        None once ``stop`` is set or the stream has ended without one.
+        """
+        if stop is not None:
+            self._watch(stop)
+        with self._cond:
+            while (at := bisect.bisect_left(self._frames, frame)) == len(self._frames):
+                if self._ended or (stop is not None and stop.is_set()):
+                    return None
+                self._cond.wait()
+            return self._times[at]
+
+    def log(self) -> np.ndarray:
+        """Every distinct frame heard of so far, as :data:`SHOWN` records."""
+        with self._cond:
+            out = np.empty(len(self._frames), dtype=SHOWN)
+            out["frame"], out["t_ns"] = self._frames, self._times
+        return out
+
+    def close(self) -> None:
+        """Stop following: end the feeding process, if owned, and wait for the reader."""
+        if self._proc is not None:
+            self._proc.terminate()
+        self._thread.join()
+        if self._proc is not None:
+            self._proc.wait()
+            self._stream.close()
+
+
 class Playout:
-    """Geometry and frame packing shared by the players; ``runner`` reaches the Pi."""
+    """Geometry and frame packing shared by the players; ``runner`` and ``stream`` reach the Pi."""
 
     def __init__(
         self,
@@ -117,10 +215,12 @@ class Playout:
         height: int = 1080,
         ssh_timeout_s: float = DEFAULT_TIMEOUT,
         runner: Runner | None = None,
+        stream: Callable[[str], subprocess.Popen] | None = None,
     ):
         self.width = int(width)
         self.height = int(height)
         self._runner = ssh_runner(host, timeout=ssh_timeout_s) if runner is None else runner
+        self._stream = ssh_stream(host) if stream is None else stream
 
     @property
     def frame_bytes(self) -> int:
@@ -190,8 +290,8 @@ class KmsPlayer(Playout):
         return (
             f"python3 {self.path('kmsplay.py')} {self.source_args()}{self.span_args(spans)} --fps {fps} "
             f"--width {self.width} --height {self.height} --preroll-s {self.preroll_s:g} "
-            f"--flips {self.path('flips.bin')} --status {self.path('status.json')}"
-            + (" --loop" if self.loop else "")
+            f"--flips {self.path('flips.bin')} --live {self.path('live.fifo')} "
+            f"--status {self.path('status.json')}" + (" --loop" if self.loop else "")
         )
 
     def pid(self) -> int | None:
@@ -308,6 +408,16 @@ class KmsPlayer(Playout):
                 pass
             raise
         self.stop()
+
+    @contextmanager
+    def following(self, *, clock: Callable[[], int] = time.monotonic_ns) -> Iterator[Shown]:
+        """Follow the playing player's flips live for the block; enter it once :meth:`start` has returned."""
+        proc = self._stream(f"exec cat {self.path('live.fifo')}")
+        shown = Shown(proc.stdout, proc=proc, clock=clock)
+        try:
+            yield shown
+        finally:
+            shown.close()
 
 
 class ClipPlayer(KmsPlayer):

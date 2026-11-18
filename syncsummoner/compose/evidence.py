@@ -1,8 +1,8 @@
 """Frame-indexed evidence that every parameter of a take was sent, applied and acted upon.
 
-The device latches CCs on a frame tick; capture timestamps say when each clip frame reached the
-card. A CC lands on the first tick after the device took it, as its echo bounds, so sends,
-readbacks and pictures are joined on one clip-frame index (docs/evidence.md).
+Each CC carries its floor, the clip frame the host had seen the Pi show before sending it, so no
+output earlier than that frame can show it; capture timestamps say when each clip frame reached the
+card. Sends, readbacks and pictures are joined on one clip-frame index (docs/evidence.md).
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ from syncsummoner.program.predict import DEAD, LIVE, NOOP, UNCHANGED
 CALIBRATION = int(np.iinfo(np.int64).min)
 #: Target of a write setting the lead-in's starting state, which no clip frame schedules either.
 START = CALIBRATION + 1
-#: Lags, in frames after the modelled landing, at which a step's picture is tested.
+#: Lags, in frames after a write's floor, at which a step's picture is tested.
 LAGS = (0, 1)
+#: The lag, before a write's floor, at which a picture moving would contradict the floor.
+BEFORE = -1
 #: Luma range, in 8-bit codes, at or below which a frame is a uniform field (docs/hardware.md).
 FLAT_CODES = 1
 
@@ -58,186 +60,8 @@ def frame_times(found: Any) -> FrameTimes:
 
 
 @dataclass(frozen=True)
-class Ticks:
-    """The device's frame tick: one lies in ``(lo, hi] + n * period`` for every integer ``n``."""
-
-    lo: float
-    hi: float
-    period: float
-    count: int
-
-    @property
-    def phase(self) -> float:
-        """Midpoint of the bracket."""
-        return 0.5 * (self.lo + self.hi)
-
-    @property
-    def width(self) -> float:
-        """How far the bracket leaves a tick unknown, in ns."""
-        return self.hi - self.lo
-
-    def after(self, t_ns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Index of the first tick at or after each time, and how far that tick's bracket clears it.
-
-        A negative clearance means the tick may fall before the time, so the landing is ambiguous.
-        """
-        t = np.asarray(t_ns, dtype=np.float64)
-        n = np.ceil((t - self.hi) / self.period).astype(np.int64)
-        return n, self.lo + n * self.period - t
-
-    def at(self, n: np.ndarray) -> np.ndarray:
-        """Midpoint time of tick ``n``."""
-        return self.phase + np.asarray(n, dtype=np.float64) * self.period
-
-
-def frame_of_tick(n: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) -> np.ndarray:
-    """The clip frame tick ``n`` latches: the one whose first capture lands ``delta`` after it."""
-    return times.frame_of(ticks.at(n) + delta)
-
-
-def send_time(frames: np.ndarray, ticks: Ticks, times: FrameTimes, delta: float) -> np.ndarray:
-    """When to send a CC so it lands on each frame: midway between the ticks either side of its own.
-
-    The clock's prediction can err either way and a send can wake late, so half a frame each side.
-    """
-    tick = np.rint((times.at(frames) - delta - ticks.phase) / ticks.period)
-    return ticks.phase + (tick - 0.5) * ticks.period
-
-
-def toggle_landings(
-    images: np.ndarray,
-    t_ns: np.ndarray,
-    starts: np.ndarray,
-    shown: np.ndarray,
-    toggles: np.ndarray,
-    until: float | None = None,
-) -> np.ndarray:
-    """The clip frame each calibration write first shows in; :data:`CALIBRATION` where the picture can't say.
-
-    Each write's window runs to the next; a state's picture is the mean of its windows' second
-    halves, every capture goes to the nearer state, and a window must switch once, on a frame start.
-    The last window ends at ``until``, the next write of any kind.
-    """
-    t = np.asarray(t_ns, dtype=np.float64)
-    flat = np.asarray(images, dtype=np.float32).reshape(len(images), -1)
-    sent = toggles["t1_ns"].astype(np.float64)
-    ends = np.r_[toggles["t0_ns"][1:].astype(np.float64), t[-1] + 1 if until is None else until]
-    windows = [np.flatnonzero((t > a) & (t < b)) for a, b in zip(sent, ends)]
-    values = np.unique(toggles["value"])
-    if values.size != 2:
-        return np.full(len(toggles), CALIBRATION, dtype=np.int64)
-    centre = {}
-    for value in values:
-        tails = [w[w.size // 2 :] for w, v in zip(windows, toggles["value"]) if v == value and w.size]
-        centre[value] = flat[np.concatenate(tails)].mean(axis=0) if tails else None
-    if any(c is None for c in centre.values()):
-        return np.full(len(toggles), CALIBRATION, dtype=np.int64)
-    near = np.abs(flat - centre[values[1]]).mean(axis=1) < np.abs(flat - centre[values[0]]).mean(axis=1)
-    out = np.full(len(toggles), CALIBRATION, dtype=np.int64)
-    for m, (w, value) in enumerate(zip(windows, toggles["value"])):
-        state = near[w] == (value == values[1])
-        if not w.size or not state[-1]:
-            continue
-        k = w[int(np.flatnonzero(~state)[-1]) + 1] if (~state).any() else w[0]
-        if (~state).any() and np.flatnonzero(~state)[-1] != np.flatnonzero(~state).size - 1:
-            continue
-        if starts[k]:
-            out[m] = shown[k]
-    return out
-
-
-#: What a latency is measured to: the start of the frame a write lands on, on the frame line.
-BASIS = "start"
-
-
-@dataclass(frozen=True)
-class Latency:
-    """From a write leaving the host to the start of the frame it lands on, per take.
-
-    Each calibration write that showed in the picture bounds it: after the start of the frame
-    before the one it landed on, at or before its own. ``lo`` and ``hi`` are those bounds
-    intersected; where writes disagree by a little, they are the band they disagree over.
-    ``delta`` is the band's middle, in ns. Frame starts lie ``line_lo..line_hi`` off the take's line.
-    """
-
-    lo: float
-    hi: float
-    samples: int
-    period: float
-    line_lo: float = 0.0
-    line_hi: float = 0.0
-
-    @property
-    def bounds(self) -> tuple[float, float]:
-        """The band the device's own latency lies in, whichever line the take's captures admit."""
-        return self.lo + self.line_lo, self.hi + self.line_hi
-
-    @property
-    def delta(self) -> float:
-        """The middle of the band."""
-        return 0.5 * (self.lo + self.hi)
-
-    @property
-    def spread(self) -> float:
-        """Half the band's width."""
-        return 0.5 * abs(self.hi - self.lo)
-
-    @property
-    def frames(self) -> float:
-        """Send to capture, in frames."""
-        return self.delta / self.period
-
-    def as_dict(self) -> dict:
-        """JSON-ready."""
-        return {
-            "lo": self.lo,
-            "hi": self.hi,
-            "samples": self.samples,
-            "period": self.period,
-            "delta": self.delta,
-            "spread": self.spread,
-            "frames": self.frames,
-            "line_lo": self.line_lo,
-            "line_hi": self.line_hi,
-            "basis": BASIS,
-        }
-
-
-def latency(sent: np.ndarray, shown_at: np.ndarray, times: FrameTimes) -> Latency:
-    """The send-to-capture latency from where each calibration write first showed in the picture.
-
-    A write taken at ``t`` and first shown in frame ``F`` puts it in ``(T(F-1) - t, T(F) - t]``; with
-    ``(n, 2)`` brackets on ``t`` (``wire.echoed``) the later end bounds it below and the earlier above.
-    Bounds that cross by more than half a frame mean no single latency holds, which is an error.
-    """
-    t = np.asarray(sent, dtype=np.float64)
-    first, last = (t, t) if t.ndim == 1 else (t[:, 0], t[:, 1])
-    ok = (shown_at >= -times.lead) & np.isfinite(last)
-    if not ok.any():
-        raise EvidenceError(
-            "no calibration write showed in the picture, so the CC-to-picture latency is unknown"
-        )
-    lo = float((times.at(shown_at[ok] - 1) - last[ok]).max())
-    hi = float((times.at(shown_at[ok]) - first[ok]).min())
-    if lo - hi >= times.period / 2:
-        raise EvidenceError(
-            f"calibration writes disagree on the CC-to-picture latency by {(lo - hi) / 1e6:.2f} ms, "
-            "half a frame or more, so no single latency holds"
-        )
-    return Latency(lo=min(lo, hi), hi=max(lo, hi), samples=int(ok.sum()), period=times.period)
-
-
-def grid(times: FrameTimes, lat: Latency) -> Ticks:
-    """The instants a write must precede to land on each frame: every frame's capture less the latency.
-
-    The bracket is the latency band; tick ``n`` is frame ``n``'s, on the frame line.
-    """
-    return Ticks(lo=times.origin - lat.hi, hi=times.origin - lat.lo, period=times.period, count=lat.samples)
-
-
-@dataclass(frozen=True)
 class Landed:
-    """Intended against realized: each scheduled write matched to its send and the frame it took effect on."""
+    """Intended against realized: each scheduled write matched to its send and the floor it was sent on."""
 
     rows: np.ndarray
     missing: int
@@ -245,30 +69,30 @@ class Landed:
     out_of_order: int
     late: int
     early: int
-    ambiguous: int
     wake_ms: float = float("nan")
     unechoed: int = 0
-    slack_ms: float = float("nan")
+    unstamped: int = 0
 
     @property
     def ok(self) -> bool:
-        """Every write sent once, in order, taken by the device, and its landing window holding its target.
-
-        A window wider than one frame (``ambiguous``) is counted, not failed: a setting's measured
-        frames start after the window's end.
-        """
+        """Every write sent once, in order, on its target frame, and taken by the device."""
         return not (
-            self.missing or self.duplicated or self.out_of_order or self.late or self.early or self.unechoed
+            self.missing
+            or self.duplicated
+            or self.out_of_order
+            or self.late
+            or self.early
+            or self.unechoed
+            or self.unstamped
         )
 
     def summary(self) -> str:
         """One line of counts."""
         return (
             f"{len(self.rows)} writes scheduled: {self.missing} missing, {self.unechoed} never echoed, "
-            f"{self.duplicated} duplicated, {self.out_of_order} out of order, {self.late} late, "
-            f"{self.early} early, {self.ambiguous} over more than one frame; "
-            f"sends woke at worst {self.wake_ms:.2f} ms "
-            f"after due; least slack, echo to its target's tick, {self.slack_ms:.2f} ms"
+            f"{self.duplicated} duplicated, {self.out_of_order} out of order, {self.late} sent after their "
+            f"frame left the screen, {self.early} before it showed, {self.unstamped} before any frame was "
+            f"seen; sends left at worst {self.wake_ms:.2f} ms after their frame was seen"
         )
 
 
@@ -280,9 +104,6 @@ LANDED = np.dtype(
         ("wire", "<i8"),
         ("sent", "<i8"),
         ("t1_ns", "<i8"),
-        ("tick", "<i8"),
-        ("seen", "<i8"),
-        ("clear_ns", "<f8"),
         ("landed", "<i8"),
         ("echo_ns", "<i8"),
         ("first", "<i8"),
@@ -298,68 +119,31 @@ def taken(sends: np.ndarray, echo: np.ndarray | None) -> np.ndarray:
     return np.asarray(echo, dtype=np.float64).reshape(len(sends), 2)
 
 
-def landing(bracket: np.ndarray, ticks: Ticks) -> tuple[np.ndarray, np.ndarray]:
-    """The tick each bracketed write takes effect on, and the least clearance of either end from a tick.
-
-    The tick is the first after the bracket's end; a negative clearance means a tick's bracket
-    overlaps the write's, so it may have taken effect a tick earlier or later.
-    """
-    n, after = ticks.after(bracket[:, 1])
-    before = bracket[:, 0] - (ticks.hi + (n - 1) * ticks.period)
-    return n, np.minimum(after, before)
-
-
-def window(
-    bracket: np.ndarray,
-    ticks: Ticks,
-    times: FrameTimes,
-    delta: float,
-    spread: tuple[float, float] = (0.0, 0.0),
-) -> tuple[np.ndarray, np.ndarray]:
-    """The earliest and latest clip frame each bracketed write may take effect on.
-
-    The device takes it somewhere in its bracket and applies it on the first tick after. A tick lies
-    in its bracket widened by ``spread``, how far the frame starts the take's captures admit lie
-    either side of its line, so the window holds every landing the echo and the line allow.
-    """
-    lo, hi = ticks.lo + spread[0], ticks.hi + spread[1]
-    early = np.ceil((bracket[:, 0] - hi) / ticks.period)
-    late = np.ceil((bracket[:, 1] - lo) / ticks.period)
-    return frame_of_tick(early, ticks, times, delta), frame_of_tick(
-        np.maximum(late, early), ticks, times, delta
-    )
-
-
 def landed(
     plan: np.ndarray,
     sends: np.ndarray,
-    ticks: Ticks,
-    times: FrameTimes,
-    delta: float,
-    seen: np.ndarray | None = None,
     *,
     echo: np.ndarray | None = None,
     resent: np.ndarray | None = None,
-    spread: tuple[float, float] = (0.0, 0.0),
 ) -> Landed:
-    """Match scheduled ``(target, param, value)`` rows to sends in order, and land each where it took effect.
+    """Match scheduled ``(target, param, value)`` rows to sends in order, and land each on its floor.
 
     The k-th send of a ``(target, param)`` pair answers its k-th scheduled row, resent copies aside; a
-    send nothing scheduled is a duplicate. ``echo`` (``wire.echoed``) brackets when the device took each
-    send, else its send interval does; ``seen`` is each send's tick as read back, which lands it when known.
-    ``first`` and ``last`` are each write's landing window (:func:`window`, widened by ``spread``); a write
-    is late only when its window starts after its target, early only when it ends before.
+    send nothing scheduled is a duplicate. A write lands on its floor (:data:`~.wire.SEND`), the earliest
+    frame it can show on: one sent on a later frame than its target is late, on an earlier one early,
+    and one sent before any frame was seen has no floor. ``echo`` (``wire.echoed``) says whether the
+    device took each send; its picture is tested from the floor on (:func:`acted_upon`).
     """
+    from syncsummoner.device.wire import NO_FLOOR  # pylint: disable=import-outside-toplevel
+
     rows = np.zeros(len(plan), dtype=LANDED)
     rows["target"], rows["param"], rows["value"] = plan["target"], plan["param"], plan["value"]
-    rows["sent"], rows["wire"], rows["tick"], rows["seen"], rows["landed"] = -1, -1, -1, -1, CALIBRATION
-    rows["first"], rows["last"] = CALIBRATION, CALIBRATION
-    rows["clear_ns"], rows["echo_ns"] = np.nan, -1
+    rows["sent"], rows["wire"], rows["echo_ns"] = -1, -1, -1
+    rows["landed"], rows["first"], rows["last"] = CALIBRATION, CALIBRATION, CALIBRATION
     keep = sends["target"] > START
     copy = np.isin(np.arange(len(sends)), [] if resent is None else resent)[keep]
     live, bracket = sends[keep], taken(sends, echo)[keep]
-    live_seen = np.full(len(live), -1, dtype=np.int64) if seen is None else np.asarray(seen)[keep]
-    keys = {}
+    keys: dict[tuple[int, int], list[int]] = {}
     for i, (target, param) in enumerate(zip(plan["target"], plan["param"])):
         keys.setdefault((int(target), int(param)), []).append(i)
     used = {key: 0 for key in keys}
@@ -373,40 +157,29 @@ def landed(
         if used.get(key, 0) >= len(slots):
             duplicated += 1
             continue
-        i = slots[used[key]]
+        hit[slots[used[key]]] = j
         used[key] += 1
-        hit[i] = j
-        rows["sent"][i], rows["wire"][i], rows["t1_ns"][i] = j, live["value"][j], live["t1_ns"][j]
-        rows["seen"][i] = live_seen[j]
     sent = hit >= 0
+    mine = live[hit[sent]]
+    rows["sent"][sent], rows["wire"][sent], rows["t1_ns"][sent] = hit[sent], mine["value"], mine["t1_ns"]
     took = bracket[hit[sent]]
     heard = np.isfinite(took[:, 1])
-    ok = np.flatnonzero(sent)[heard]
-    n, clear = landing(took[heard], ticks)
-    rows["tick"][ok], rows["clear_ns"][ok], rows["echo_ns"][ok] = n, clear, took[heard, 1]
-    seen_ok = rows["seen"][ok]
-    rows["landed"][ok] = frame_of_tick(np.where(seen_ok >= 0, seen_ok, n), ticks, times, delta)
-    first, last = window(took[heard], ticks, times, delta, spread)
-    rows["first"][ok] = np.minimum(first, rows["landed"][ok])
-    rows["last"][ok] = np.maximum(last, rows["landed"][ok])
-    due = np.rint((times.at(rows["target"][ok]) - delta - ticks.phase) / ticks.period)
-    slack = ticks.lo + due * ticks.period - took[heard, 1]
-    order = rows["sent"][sent]
+    rows["echo_ns"][np.flatnonzero(sent)[heard]] = took[heard, 1]
+    stamped = mine["floor"] != NO_FLOOR
+    ok = np.flatnonzero(sent)[stamped]
+    for name in ("landed", "first", "last"):
+        rows[name][ok] = mine["floor"][stamped]
+    off = rows["landed"][ok] - rows["target"][ok]
     return Landed(
         rows=rows,
         missing=int((~sent).sum()),
         duplicated=duplicated,
-        out_of_order=int(np.count_nonzero(np.diff(order) < 0)),
-        late=int(np.count_nonzero(rows["first"][ok] > rows["target"][ok])),
-        early=int(np.count_nonzero(rows["last"][ok] < rows["target"][ok])),
-        ambiguous=int(np.count_nonzero(rows["last"][ok] > rows["first"][ok])),
+        out_of_order=int(np.count_nonzero(np.diff(rows["sent"][sent]) < 0)),
+        late=int(np.count_nonzero(off > 0)),
+        early=int(np.count_nonzero(off < 0)),
         unechoed=int((~heard).sum()),
-        slack_ms=float(slack.min()) / 1e6 if slack.size else float("nan"),
-        wake_ms=(
-            float((live["t0_ns"] - live["due_ns"]).max()) / 1e6
-            if "due_ns" in (live.dtype.names or ()) and live.size
-            else float("nan")
-        ),
+        unstamped=int((~stamped).sum()),
+        wake_ms=float((mine["t0_ns"] - mine["due_ns"]).max()) / 1e6 if mine.size else float("nan"),
     )
 
 
@@ -442,35 +215,30 @@ def applied(
     reads: np.ndarray,
     sends: np.ndarray,
     initial: Sequence[int],
-    ticks: Ticks,
     times: FrameTimes,
-    delta: float,
-    seen: np.ndarray | None = None,
     *,
     echo: np.ndarray | None = None,
     resent: np.ndarray | None = None,
 ) -> Applied:
     """Check every readback slot against the values its frames held while the read was in flight.
 
-    A read's request interval, widened by a frame each side for the readback's own lag, spans the
-    frames it can report; any value the slot held over them agrees. A write lands on its ``seen``
-    tick where one is given, else where :func:`landing` puts it; one never echoed held nothing.
+    The device holds a write from its next frame tick, a frame at most after it took it, so a write
+    changes the slot within a frame of its bracket's end; a read's request interval, widened by a frame
+    each side for that and for the readback's own lag, spans the values it can report, and any of them
+    agrees. A write never echoed held nothing.
     """
     o = np.asarray(reads["o"], dtype=np.int64)
     t0, t1 = reads["t0_ns"].astype(np.float64), reads["t1_ns"].astype(np.float64)
     disagree, checked, ambiguous, confirmed, unconfirmed = [], 0, 0, 0, 0
     bracket = taken(sends, echo)
     took = np.isfinite(bracket[:, 1]) & ~np.isin(np.arange(len(sends)), [] if resent is None else resent)
-    n_send, _ = landing(np.where(took[:, None], bracket, 0.0), ticks)
-    if seen is not None:
-        n_send = np.where(np.asarray(seen) >= 0, seen, n_send)
-    lands = ticks.at(n_send)
+    lands, period = np.where(took, bracket[:, 1], 0.0), times.period
     for slot in range(1, 13):
         mine = np.flatnonzero((sends["param"] == slot) & took)
         values = np.r_[int(initial[slot - 1]), sends["value"][mine]]
         at = lands[mine]
-        before = np.searchsorted(at, t0 - ticks.period, side="right")
-        after = np.searchsorted(at, t1 + ticks.period, side="right")
+        before = np.searchsorted(at, t0 - period, side="right")
+        after = np.searchsorted(at, t1 + period, side="right")
         got = o[:, slot - 1]
         ok = values[before] == got
         span = after != before
@@ -480,10 +248,10 @@ def applied(
         ambiguous += int(span.sum())
         for k in np.flatnonzero(~ok):
             disagree.append(
-                (k, slot, int(times.frame_of(t0[k] + delta)), int(values[before[k]]), int(got[k]))
+                (k, slot, int(times.frame_of(t0[k])), int(values[before[k]]), int(got[k]))
             )
         changed = np.r_[True, values[1:] != values[:-1]][1:]
-        first = np.searchsorted(t0, at + ticks.period, side="left")
+        first = np.searchsorted(t0, at + period, side="left")
         shown = (first < o.shape[0]) & (got[np.clip(first, 0, o.shape[0] - 1)] == values[1:])
         confirmed += int((shown & changed).sum())
         unconfirmed += int((~changed).sum())
@@ -547,11 +315,18 @@ class Moved:
     pool: str = ALL_POOL
     #: Steps left untested because their regime has too few step-free frames for a null.
     unmatched: int = 0
+    #: The z at lag :data:`BEFORE`, over the steps no other step's window reaches there.
+    before: float = float("nan")
 
     @property
     def moved(self) -> bool:
         """Whether the steps moved the picture beyond chance, family-wise."""
         return self.z > self.critical
+
+    @property
+    def moved_before(self) -> bool:
+        """Whether the steps moved the picture before their floor, which no CC sent on it can do."""
+        return self.before > self.critical
 
     @property
     def detectable(self) -> float:
@@ -707,7 +482,8 @@ def acted_upon(
     long. With ``kinds``, a parameter's steps the model leaves live and those it proves no-ops are
     tested apart; steps that change no value are not tested. With ``regime``, each step is scored
     against the step-free frames of its own regime (:class:`Regime`), each regime's controls forming
-    its own null. Family-wise over all tests.
+    its own null. Each pool is also tested at lag :data:`BEFORE`, where only a picture change the
+    floor rules out can show. Family-wise over all tests.
     """
     count = len(out)
     frames = np.asarray(landed_frames, dtype=np.int64)
@@ -723,7 +499,7 @@ def acted_upon(
     frames, params, spans = frames[inside], np.asarray(params)[inside], spans[inside]
     scored = _Scorer(out, src, stepped, Regime(np.zeros(count, dtype=np.int64)) if regime is None else regime)
     groups = _groups(frames, spans, params, kinds, max(lags))
-    limit = critical(len(groups) * len(lags))
+    limit = critical(len(groups) * (len(lags) + 1))
     verdicts = []
     for param, pool, mine, alone, partners in groups:
         best = (np.zeros(0), 0.0, -math.inf, lags[0], np.zeros(0), math.nan, 0)
@@ -736,6 +512,8 @@ def acted_upon(
             if z > best[2]:
                 best = (p_e, n_eff, z, lag, residual, scatter, kept - p_e.size)
         p_e, n_eff, z, lag, residual, scatter, unmatched = best
+        early = alone[~stepped[np.clip(alone[:, 0] + BEFORE, 0, count - 1)]]
+        p_b = scored.tested(param, early[:, 0] + BEFORE, early[:, 1])[0] if early.size else np.zeros(0)
         verdicts.append(
             Moved(
                 param=param,
@@ -753,6 +531,7 @@ def acted_upon(
                 scatter=scatter,
                 pool=pool,
                 unmatched=int(unmatched),
+                before=float(fisher_z(p_b)[0]) if p_b.size else float("nan"),
             )
         )
     return verdicts
@@ -796,8 +575,6 @@ class Evidence:
     """The three links for one take, and what was loaded before its clip began."""
 
     program: str
-    latency: dict
-    ticks: dict
     landed: Landed
     applied: Applied
     received: Received | None
@@ -829,6 +606,8 @@ class Evidence:
         ``never live`` or ``untested`` (live steps, none inside the clip); ``moved`` or ``not seen``
         when no model judged the steps."""
         dead, live = pools.get(DEAD_POOL), pools.get(LIVE_POOL)
+        if any(m.moved_before for m in pools.values()):
+            return "moved before sent"
         if dead is not None and dead.moved:
             return "dead, moved"
         if live is not None:
@@ -840,6 +619,13 @@ class Evidence:
     def _why(
         self, verdict: str, test: Moved | None, dead: Moved | None, counts: Mapping, ok: tuple
     ) -> str | None:
+        if verdict == "moved before sent":
+            early = max((m for m in (test, dead) if m is not None), key=lambda m: m.before)
+            return (
+                f"contradiction: its steps moved the picture the frame before their floor (z {early.before:+.2f}, "
+                f"critical {early.critical:.2f}), before the CC left the host; the change is not this "
+                "parameter's, or the device shows a CC on frames it had already taken in"
+            )
         if verdict == "dead, moved":
             return (
                 f"contradiction: {dead.steps} steps the model proves cannot change the picture moved it "
@@ -901,8 +687,8 @@ class Evidence:
 
     @property
     def contradictions(self) -> list[int]:
-        """Parameters whose steps the model proves cannot change the picture, that moved it anyway."""
-        return [row["param"] for row in self.table() if row["verdict"] == "dead, moved"]
+        """Parameters whose steps moved the picture where they cannot: proven dead, or before their floor."""
+        return [row["param"] for row in self.table() if row["verdict"] in ("dead, moved", "moved before sent")]
 
     def schedule(self) -> list[dict]:
         """Parameters this take could not show: steps a sweep needs for each, 0 for every level where live."""
@@ -919,11 +705,7 @@ class Evidence:
 
     def lines(self) -> list[str]:
         """The report as log lines."""
-        lat, tick = self.latency, self.ticks
         said = [
-            f"{self.program}: CC-to-picture {lat.get('frames', float('nan')):.3f} frames send to capture, "
-            f"known to {tick.get('width_ms', float('nan')):.2f} ms from {lat.get('samples', 0)} calibration "
-            "writes (0: the dry takes' range)",
             f"{self.program}: loaded before clip frame 0: {self.loaded.get('summary', 'not checked')}",
             f"{self.program}: {self.landed.summary()}",
             f"{self.program}: {self.applied.summary()}",
@@ -960,8 +742,6 @@ class Evidence:
             {
                 "program": self.program,
                 "ok": self.ok,
-                "latency": self.latency,
-                "ticks": self.ticks,
                 "loaded": self.loaded,
                 "landed": self.landed.summary(),
                 "applied": self.applied.summary(),
