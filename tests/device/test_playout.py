@@ -278,8 +278,8 @@ def test_shown_stops_waiting_when_asked_or_when_the_stream_ends(feed):
 class FakeProc:
     """A streamed command whose stdout holds the given bytes."""
 
-    def __init__(self, data):
-        self.stdout, self.done = io.BytesIO(data), []
+    def __init__(self, data=b""):
+        self.stdout, self.stdin, self.done = io.BytesIO(data), io.BytesIO(), []
 
     def terminate(self):
         self.done.append("terminate")
@@ -290,11 +290,29 @@ class FakeProc:
 
 def test_a_player_follows_its_live_flips_over_the_stream_it_was_given():
     started = []
-    proc = FakeProc(record(0) + record(1))
-    player = po.ClipPlayer(runner=FakeRunner(), stream=lambda command: started.append(command) or proc)
+    procs = iter([FakeProc(record(0) + record(1)), FakeProc()])
+    player = po.ClipPlayer(runner=FakeRunner(), stream=lambda command: started.append(command) or next(procs))
     command = player.command(Fraction(30))
     assert command.split("--live ")[1].split()[0] == player.path("live.fifo")
+    assert command.split("--ask ")[1].split()[0] == player.path("ask.fifo")
     with player.following(clock=itertools.count().__next__) as shown:
         assert shown.wait(1) == 1 and shown.wait(2) is None
-    assert started == [f"exec cat {player.path('live.fifo')}"]
-    assert proc.done == ["terminate", "wait"] and proc.stdout.closed
+    assert started == [f"exec cat {player.path('live.fifo')}", f"exec cat > {player.path('ask.fifo')}"]
+
+
+def test_a_reply_pairs_with_the_request_before_it_and_never_counts_as_a_flip():
+    read, write = os.pipe()
+    asks = io.BytesIO()
+    with os.fdopen(read, "rb", buffering=0) as stream, os.fdopen(write, "wb", buffering=0) as pi:
+        shown = po.Shown(stream, asks=asks, clock=itertools.count(10).__next__)
+        pi.write(record(0) + record(1))
+        assert shown.wait(1) is not None
+        shown.ask()
+        pi.write(po.RECORD.pack(1, 1, 1, 0, po.REPLY) + record(2))
+        assert shown.wait(2) is not None
+        pi.close()
+        shown.close()
+    assert asks.getvalue() == b"?"
+    assert shown.log()["frame"].tolist() == [0, 1, 2]
+    (asked,) = shown.asked().tolist()
+    assert asked[0] < asked[1] and asked[2] == 1

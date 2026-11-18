@@ -39,8 +39,11 @@ SEND = np.dtype(
 NO_FLOOR = int(np.iinfo(np.int64).min)
 #: One ``modulation status`` reply: its request interval and the 12 combined values.
 READ = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("o", "<i8", (12,))])
-#: One ``transport status`` reply: its request interval and the device's ``field_count``, its frame tick.
-TICK = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("field", "<i8")])
+#: One ``transport status`` reply: its request interval, the device's ``field_count`` (its frame tick), and
+#: the transport's beat phase, tempo in hundredths of a bpm and whether it plays, as of that frame.
+TICK = np.dtype(
+    [("t0_ns", "<i8"), ("t1_ns", "<i8"), ("field", "<i8"), ("phase", "<i8"), ("bpm_x100", "<i8"), ("playing", "?")]
+)
 #: One CC message the firmware logged receiving, at the latest host time it can have arrived.
 RECEIPT = np.dtype([("t_ns", "<i8"), ("cc", "<i8"), ("value", "<i8")])
 #: ``midi monitor on`` logs each channel message it receives in this form.
@@ -238,7 +241,8 @@ def encoder(cc_map: Sequence[int], *, high_resolution: bool = True) -> Callable[
     """``(param, value) -> [(cc, value), ...]``: the messages one write puts on the wire."""
 
     def encode(param: int, value: int) -> list[tuple[int, int]]:
-        row = np.array([(0, 0, param, value, 0, 0)], dtype=SEND)
+        row = np.zeros(1, dtype=SEND)
+        row["param"], row["value"] = param, value
         out = expected_messages(row, cc_map, high_resolution=high_resolution)
         return [(int(c), int(v)) for c, v in zip(out["cc"], out["value"])]
 
@@ -352,7 +356,9 @@ class Poller:
         self.clock = clock
         self.sleep = sleep
         self.reads: list[tuple] = []
-        self.ticks: list[tuple[int, int, int]] = []
+        self.ticks: list[tuple[int, int, int, int, int, bool]] = []
+        self._ticked = threading.Condition()
+        self.on_tick: Callable[[], Any] | None = None
         self.receipts: list[tuple[int, int, int]] = []
         self.asked: list[Asked] = []
         self.errors: list[tuple[int, str]] = []
@@ -386,18 +392,36 @@ class Poller:
             item.done.set()
 
     def tick_once(self) -> None:
-        """One ``field_count``, and the monitor lines that came with it."""
+        """One ``transport status``, its frame tick and beat phase, and the monitor lines that came with it.
+
+        :attr:`on_tick` is called once it is read.
+        """
         t0 = self.clock()
         try:
-            count = int(json.loads(self.shell.command("transport", "status").payload)["field_count"])
+            said = json.loads(self.shell.command("transport", "status").payload)
+            count = int(said["field_count"])
+            transport = (int(said.get("phase", -1)), int(said.get("bpm_x100", -1)), said.get("state") == "playing")
         except Exception as err:  # pylint: disable=broad-exception-caught
             t1 = self.clock()
             self.errors.append((t1, f"{type(err).__name__}: {err}"))
             self._drain_log(t1, t0)
             return
         t1 = self.clock()
-        self.ticks.append((t0, t1, count))
+        with self._ticked:
+            self.ticks.append((t0, t1, count, *transport))
+            self._ticked.notify_all()
         self._drain_log(t1, t0)
+        if self.on_tick is not None:
+            self.on_tick()
+
+    def wait_count(self, count: int, stop: threading.Event) -> int | None:
+        """When a ``field_count`` of at least ``count`` was read, blocking until one is; None once stopped."""
+        with self._ticked:
+            while not self.ticks or self.ticks[-1][2] < count:
+                if stop.is_set() or self._stop.is_set():
+                    return None
+                self._ticked.wait(self.interval_s or None)
+            return int(self.ticks[-1][1])
 
     def poll_once(self) -> None:
         """Any asked-for commands, one frame tick, one readback, and the monitor lines that came with them."""
@@ -442,6 +466,8 @@ class Poller:
     def stop(self) -> None:
         """Stop polling and wait for the thread; anything still asked for is run first."""
         self._stop.set()
+        with self._ticked:
+            self._ticked.notify_all()
         if self._thread is not None:
             self._thread.join()
             self._thread = None

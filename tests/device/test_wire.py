@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring,protected-access
 
+import json
 import threading
 import time
 import types
@@ -33,6 +34,7 @@ class Shell:
         self.log_lines = []
         self.commands = []
         self.polls = 0
+        self.fields = 0
 
     def modulation_status(self):
         self.polls += 1
@@ -43,6 +45,10 @@ class Shell:
         return self.statuses[(self.polls - 1) % len(self.statuses)]
 
     def command(self, *words):
+        if words == ("transport", "status"):
+            self.fields += 1
+            said = {"field_count": self.fields, "phase": 1343 * self.fields, "bpm_x100": 3689, "state": "playing"}
+            return types.SimpleNamespace(payload=json.dumps(said))
         self.commands.append(words)
         self.log_lines.append("[MIDI USB] CC  ch=1 cc=7 val=99")
         if words[0] == "bad":
@@ -66,7 +72,7 @@ def test_receipts_parse_only_monitor_lines_stamped_with_their_reply():
 
 def test_a_wire_record_round_trips_beside_its_take(tmp_path):
     take = tmp_path / "take.mkv"
-    sends = np.array([(1, 2, 3, 4, 5, 0)], dtype=W.SEND)
+    sends = np.array([(1, 2, 3, 4, 5, 0, 7)], dtype=W.SEND)
     path = W.save_wire(take, sends=sends, program=np.array("Edge"))
     assert path == tmp_path / "take.mkv.wire.npz" == W.wire_path(take)
     back = W.load_wire(take)
@@ -78,11 +84,13 @@ def test_a_poll_records_its_interval_values_and_the_receipts_that_came_with_it()
     shell = Shell([status(range(12))], lines=["[MIDI USB] CC  ch=1 cc=0 val=12"])
     poller = W.Poller(shell, interval_s=0.01, clock=Ticker())
     poller.poll_once()
-    assert poller.reads == [(1000, 2000, list(range(12)))]
-    assert poller.receipts == [(2000, 0, 12)] and not shell.log_lines
+    assert poller.ticks == [(1000, 2000, 1, 1343, 3689, True)], "the frame tick is read before the readback"
+    assert poller.reads == [(3000, 4000, list(range(12)))]
+    assert poller.receipts == [(4000, 0, 12)] and not shell.log_lines
     arrays = poller.arrays()
     assert arrays["reads"]["o"][0].tolist() == list(range(12))
-    assert arrays["receipts"].tolist() == [(2000, 0, 12)] and arrays["read_errors"].size == 0
+    assert arrays["ticks"].tolist() == [(1000, 2000, 1, 1343, 3689, True)]
+    assert arrays["receipts"].tolist() == [(4000, 0, 12)] and arrays["read_errors"].size == 0
 
 
 def test_a_failed_poll_is_an_error_at_its_reply_time_and_still_drains_the_log():
@@ -90,10 +98,41 @@ def test_a_failed_poll_is_an_error_at_its_reply_time_and_still_drains_the_log():
     poller = W.Poller(shell, interval_s=0.01, clock=Ticker())
     poller.poll_once()
     poller.poll_once()
-    assert len(poller.reads) == 1
-    assert poller.errors == [(4000, "TimeoutError: no reply")]
-    assert poller.receipts == [(4000, 3, 4)]
-    assert poller.arrays()["read_errors"].tolist() == [4000]
+    assert len(poller.reads) == 1 and len(poller.ticks) == 2
+    assert poller.errors == [(8000, "TimeoutError: no reply")]
+    assert poller.receipts == [(8000, 3, 4)]
+    assert poller.arrays()["read_errors"].tolist() == [8000]
+
+
+def test_a_failed_tick_is_an_error_and_the_readback_still_runs():
+    shell = Shell([status([0] * 12)])
+    shell.command = lambda *words: types.SimpleNamespace(payload="not json")
+    poller = W.Poller(shell, interval_s=0.01, clock=Ticker())
+    poller.poll_once()
+    assert not poller.ticks and len(poller.reads) == 1
+    assert poller.errors[0][0] == 2000 and poller.errors[0][1].startswith("JSONDecodeError")
+
+
+def test_each_tick_read_calls_its_hook_after_the_reply():
+    shell = Shell([status([0] * 12)])
+    poller = W.Poller(shell, interval_s=0.01, clock=Ticker())
+    seen = []
+    poller.on_tick = lambda: seen.append(len(poller.ticks))
+    poller.poll_once()
+    poller.poll_once()
+    assert seen == [1, 2]
+
+
+def test_waiting_for_a_count_returns_the_reply_that_reached_it_or_none_once_stopped():
+    shell = Shell([status([0] * 12)])
+    poller = W.Poller(shell, interval_s=0.001).start()
+    try:
+        assert poller.wait_count(3, threading.Event()) >= poller.ticks[2][1]
+    finally:
+        poller.stop()
+    stop = threading.Event()
+    stop.set()
+    assert poller.wait_count(10**9, stop) is None
 
 
 def test_asking_without_a_thread_runs_the_command_at_once_and_records_failures():
@@ -142,27 +181,23 @@ def test_a_send_records_its_interval_and_the_value_the_wire_encoded():
     sender.send(3, 500, 7)
     sender.send(4, 9, 8, due=5)
     assert written == [(3, 500), (4, 9)]
-    assert sender.array().tolist() == [(10, 20, 3, 499, 7, 10), (30, 40, 4, 8, 8, 5)]
+    none = W.NO_FLOOR
+    assert sender.array().tolist() == [(10, 20, 3, 499, 7, 10, none), (30, 40, 4, 8, 8, 5, none)]
 
 
-def test_waiting_sleeps_to_within_the_spin_window_then_spins():
-    now = [0]
-    sleeps = []
+def test_each_send_carries_the_floor_read_before_it_left():
+    shown = iter([4, 9])
+    order = []
 
-    def clock():
-        now[0] += 100_000
-        return now[0]
+    def floor():
+        order.append("floor")
+        return next(shown)
 
-    def sleep(seconds):
-        sleeps.append(seconds)
-        now[0] += int(seconds * 1e9)
-
-    sender = W.Sender(lambda p, v: v, clock=clock, sleep=sleep, spin_ns=1_000_000)
-    assert sender._wait(10_000_000)
-    assert sleeps and sleeps[0] == pytest.approx((10_000_000 - 100_000 - 1_000_000) / 1e9)
-    assert now[0] >= 10_000_000
-    sender._stop.set()
-    assert not sender._wait(10**12)
+    sender = W.Sender(lambda p, v: order.append("write") or v, floor=floor)
+    sender.send(1, 2, 5)
+    sender.send(1, 3, 10)
+    assert order == ["floor", "write", "floor", "write"]
+    assert sender.array()["floor"].tolist() == [4, 9]
 
 
 def test_a_threaded_sender_writes_each_row_in_order_no_earlier_than_due():
@@ -175,7 +210,14 @@ def test_a_threaded_sender_writes_each_row_in_order_no_earlier_than_due():
         return value
 
     base = time.monotonic_ns() + 20_000_000
-    sender = W.Sender(write, when=lambda target: base + target * 2_000_000, spin_ns=500_000)
+
+    def due(target, stop):
+        at = base + target * 2_000_000
+        while time.monotonic_ns() < at and not stop.is_set():
+            time.sleep(0.0005)
+        return at
+
+    sender = W.Sender(write, due=due)
     sender.plan([(0, 1, 10), (2, 2, 20), (1, 3, 30)])
     sender.start()
     assert sender.drain(timeout_s=5.0)
@@ -188,7 +230,7 @@ def test_a_threaded_sender_writes_each_row_in_order_no_earlier_than_due():
 
 
 def test_drain_times_out_while_rows_are_not_yet_due():
-    sender = W.Sender(lambda p, v: v, when=lambda target: time.monotonic_ns() + 200_000_000)
+    sender = W.Sender(lambda p, v: v, due=lambda target, stop: None if stop.wait(0.2) else time.monotonic_ns())
     sender.plan([(0, 1, 1)])
     sender.start()
     assert not sender.drain(timeout_s=0.02, poll_s=0.005)
@@ -197,7 +239,7 @@ def test_drain_times_out_while_rows_are_not_yet_due():
 
 
 def test_stopping_does_not_wait_for_a_row_far_in_the_future():
-    sender = W.Sender(lambda p, v: v, when=lambda target: time.monotonic_ns() + 3_000_000_000)
+    sender = W.Sender(lambda p, v: v, due=lambda target, stop: stop.wait(3.0) and None)
     sender.plan([(0, 1, 1)])
     sender.start()
     time.sleep(0.05)
@@ -296,7 +338,7 @@ def test_every_reply_feeds_the_echoes_with_its_request_time():
     poller.poll_once()
     poller.poll_once()
     poller.ask("fpga", "status")
-    assert echoes._asked_ns == 5000 and len(echoes._heard) == 2
+    assert echoes._asked_ns == 9000 and len(echoes._heard) == 2
 
 
 class Acks:

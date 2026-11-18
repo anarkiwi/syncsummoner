@@ -351,9 +351,7 @@ def applied(
         checked += int(o.shape[0])
         ambiguous += int(span.sum())
         for k in np.flatnonzero(~ok):
-            disagree.append(
-                (k, slot, int(times.frame_of(t0[k])), int(values[before[k]]), int(got[k]))
-            )
+            disagree.append((k, slot, int(times.frame_of(t0[k])), int(values[before[k]]), int(got[k])))
         changed = np.r_[True, values[1:] != values[:-1]][1:]
         first = np.searchsorted(t0, at + period, side="left")
         shown = (first < o.shape[0]) & (got[np.clip(first, 0, o.shape[0] - 1)] == values[1:])
@@ -792,7 +790,9 @@ class Evidence:
     @property
     def contradictions(self) -> list[int]:
         """Parameters whose steps moved the picture where they cannot: proven dead, or before their floor."""
-        return [row["param"] for row in self.table() if row["verdict"] in ("dead, moved", "moved before sent")]
+        return [
+            row["param"] for row in self.table() if row["verdict"] in ("dead, moved", "moved before sent")
+        ]
 
     def schedule(self) -> list[dict]:
         """Parameters this take could not show: steps a sweep needs for each, 0 for every level where live."""

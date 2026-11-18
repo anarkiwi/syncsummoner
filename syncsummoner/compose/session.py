@@ -11,6 +11,7 @@ import gc
 import json
 import math
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -38,22 +39,20 @@ from syncsummoner.compose.locktake import (
     Record,
     RebootError,
     boot_count,
-    calibrate,
     declared_bypass,
     dry_state,
     initial_state,
-    measure_latency,
     plan_rows,
-    read_latency,
     schedule,
     state_at,
     wet_at,
-    write_latency,
 )
 from syncsummoner.compose.timecode import ClipLayout, LayoutError
 from syncsummoner.device import loadtimes
 from syncsummoner.device import wire as W
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, snap_toggles
+from syncsummoner.device.playout import ASKED
+from syncsummoner.device.playout import SHOWN as PLAYED
 from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
 from syncsummoner.probe.decoded import CALIBRATION_SIZE
 from syncsummoner.progress import LOG, meter
@@ -135,23 +134,22 @@ def frames_of(seconds: float, fps: float) -> int:
 def lead_in_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None) -> int:
     """The frames a lead-in must hold: what comes before the clock, the clock, then any wet stretch.
 
-    Dry: settle, :data:`~.lock.ANCHOR_FRAMES` and the toggles at their longest. Otherwise: the anchor under
-    Passthru, the longest load timed and settle. The host decodes faster than real time, so the clock takes
-    at most as long again.
+    Dry: settle and :data:`~.lock.ANCHOR_FRAMES`. Otherwise: the anchor under Passthru, the longest load
+    timed and settle. The host decodes faster than real time, so the clock takes at most as long again.
     """
     if dry:
-        before = frames_of(lead_in.settle_s + 2 * lead_in.toggles * lead_in.toggle_s[1], fps) + ANCHOR_FRAMES
+        before = frames_of(lead_in.settle_s, fps) + ANCHOR_FRAMES
         return 2 * before + frames_of(lead_in.wet_s, fps)
     if load_s is None:
         raise NoLoadTimeError("a program with no dry control loads inside the lead-in, and no load is timed")
     return 2 * (ANCHOR_FRAMES + frames_of(load_s + lead_in.settle_s, fps))
 
 
-def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None, latency_s: float) -> int:
+def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None) -> int:
     """The frames a lead-out must hold after the last clip frame, ending in :data:`~.lock.ANCHOR_FRAMES`.
 
     Dry: held dry as long as the lead-in held the take value before clip frame 0. Otherwise: the longest
-    load timed, then the frame ``latency_s`` lands Passthru's first picture on.
+    load timed, then the frame the device latches Passthru's first picture on.
     """
     if dry:
         return frames_of(lead_in.wet_s, fps) + ANCHOR_FRAMES
@@ -159,7 +157,7 @@ def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | N
         raise NoLoadTimeError(
             "a program with no dry control reloads Passthru in its lead-out, and no load is timed"
         )
-    return frames_of(load_s + latency_s, fps) + 1 + ANCHOR_FRAMES
+    return frames_of(load_s, fps) + 1 + ANCHOR_FRAMES
 
 
 def session_frames(
@@ -167,19 +165,13 @@ def session_frames(
     fps: float,
     *,
     dry: bool,
-    directory: str | Path,
-    band: ev.Latency | None = None,
     load_s: float | None = None,
 ) -> tuple[int, int]:
-    """A session's lead-in and lead-out frames, for a load of ``load_s`` (else the rig's longest timed) and,
-    without a dry control, its band."""
+    """A session's lead-in and lead-out frames, for a load of ``load_s``, else the rig's longest timed."""
     loads = loadtimes.longest() if load_s is None else load_s
-    if not dry:
-        band = read_latency(directory) if band is None else band
-    after = 0.0 if band is None else (band.hi + band.period) / 1e9
     return (
         lead_in_frames(lead_in, fps, dry=dry, load_s=loads),
-        lead_out_frames(lead_in, fps, dry=dry, load_s=loads, latency_s=after),
+        lead_out_frames(lead_in, fps, dry=dry, load_s=loads),
     )
 
 
@@ -248,10 +240,8 @@ def locked_session(
     """
     shell, midi = rig.transport.device.shell, rig.transport.device.midi
     fps = float(config.fps)
-    directory = Path(takes[0].out).parent
     booted = boot_count(shell)
     dry = dry_state(program, bypass)
-    band = None if dry is not None else read_latency(directory)
     park = np.asarray(rig.session.park_values, dtype=np.int64)
     played: list[dict] = []
 
@@ -266,7 +256,6 @@ def locked_session(
 
     held: dict[str, Any] = {
         "recording": False,
-        "delta": float("nan"),
         "loaded": None,
         "codes": [],
         "dry": dry,
@@ -280,8 +269,9 @@ def locked_session(
         program,
         takes,
         clip,
-        session_frames(lead_in, fps, dry=dry is not None, directory=directory, band=band),
+        session_frames(lead_in, fps, dry=dry is not None),
     )
+    held["lead"] = layout.lead
     plan = np.concatenate([np.zeros(0, PLAN)] + [_shifted(t.plan, o) for t, o in zip(takes, layout.offsets)])
 
     def prepare(info: Any) -> None:
@@ -306,14 +296,18 @@ def locked_session(
         with (
             recorder.recording(takes[0].out) as proc,
             rig.playout.playing(fps=fps, spans=layout.spans()) as player,
+            player.following() as shown,
             _monitored(shell, poller, sender),
         ):
             held["recording"] = True
+            held["shown"] = shown
+            sender.floor = lambda: _session_frame(shown.latest(), layout.lead)
             _play(
                 rig,
                 Live(recorder, proc, takes, layout),
                 sender=sender,
                 poller=poller,
+                shown=shown,
                 shell=shell,
                 player=player,
                 held=held,
@@ -403,14 +397,25 @@ def _shifted(plan: np.ndarray, offset: int) -> np.ndarray:
     return moved
 
 
+def _session_frame(frame: int, lead: int) -> int:
+    """A player stream frame as a session clip frame; :data:`~.wire.NO_FLOOR` stays as it is."""
+    return frame if frame == W.NO_FLOOR else frame - lead
+
+
 def _session_wire(held: dict, sender: Sender, poller: Poller, played: list[dict], dry: Any) -> dict:
-    """The session's wire record so far, in session clip frames."""
+    """The session's wire record so far, in session clip frames: the Pi's reports and replies among it."""
+    shown = held.get("shown")
+    reports = np.zeros(0, PLAYED) if shown is None else shown.log()
+    replies = np.zeros(0, ASKED) if shown is None else shown.asked()
+    reports["frame"] -= held.get("lead", 0)
+    replies["frame"] -= held.get("lead", 0)
     return {
         "sends": sender.array(),
         "resent": sender.resent(),
-        "latency": np.array(json.dumps(held.get("latency", {}))),
         "dry": np.array(json.dumps(dry)),
         "loads": np.array(json.dumps(played)),
+        "shown": reports,
+        "asked": replies,
         **poller.arrays(),
     }
 
@@ -435,7 +440,15 @@ def _take_sends(wire: dict, layout: Layout, index: int) -> np.ndarray:
     sends = np.array(wire["sends"], copy=True)
     framed = sends["target"] > ev.START
     sends["target"][framed] -= int(layout.offsets[index])
+    sends["floor"] = [_session_frame(int(f), int(layout.offsets[index])) for f in sends["floor"]]
     return sends
+
+
+def _take_frames(records: np.ndarray, layout: Layout, index: int) -> np.ndarray:
+    """The Pi's reports or replies, their frames in the take's own clip frames."""
+    out = np.array(records, copy=True)
+    out["frame"] -= int(layout.offsets[index])
+    return out
 
 
 def _save_take_wire(
@@ -459,7 +472,6 @@ def _save_take_wire(
         start=start,
         sends=_take_sends(wire, layout, index),
         own=_owned(wire["sends"], layout, index),
-        delta=np.float64(held["delta"]),
         cc_map=np.asarray(held.get("cc_map", []), dtype=np.int64),
         loaded=np.array(
             json.dumps(
@@ -473,7 +485,9 @@ def _save_take_wire(
             json.dumps({} if info is None else {int(spec.index): spec.name for spec in info.params})
         ),
         session=np.array(json.dumps({**session, "index": index})),
-        **{k: v for k, v in wire.items() if k != "sends"},
+        **{k: v for k, v in wire.items() if k not in ("sends", "shown", "asked")},
+        shown=_take_frames(wire["shown"], layout, index),
+        asked=_take_frames(wire["asked"], layout, index),
     )
 
 
@@ -486,8 +500,7 @@ def _take_record(index: int, layout: Layout, wire: dict, held: dict, park: np.nd
         plan=_take_rows(held, layout, index)[0],
         initial=np.asarray(park, dtype=np.int64),
         sends=_take_sends(wire, layout, index)[own],
-        arrays={k: v for k, v in wire.items() if k not in ("sends", "resent", "latency", "dry", "loads")},
-        delta=held["delta"],
+        arrays={k: v for k, v in wire.items() if k not in ("sends", "resent", "dry", "loads")},
         dry=held["dry"],
         loaded={} if held["loaded"] is None else {"fpga": held["loaded"].payload},
         cc_map=np.asarray(held.get("cc_map", []), dtype=np.int64),
@@ -571,6 +584,7 @@ def _run(
     *,
     sender: Sender,
     poller: Poller,
+    shown: Any,
     shell: Any,
     player: Any,
     held: dict,
@@ -583,12 +597,14 @@ def _run(
     prepare: Callable[[Any], None],
     began: int,
 ) -> None:
-    """The session's body: anchor, start state, calibration, the live clock, every take's plan, the lead-out.
+    """The session's body: anchor, start state, the device-to-clip offset, every take's plan, the lead-out.
 
     Without a dry control the program is loaded once the lead-in's anchor has shown under Passthru, before
     the poller starts and the monitor is on, and Passthru again once the last take has played, the sender,
-    poller and monitor stopped first, so each load is the shell's only client. Every write is acknowledged
-    before the next goes.
+    poller and monitor stopped first, so each load is the shell's only client. The Pi is asked for its
+    last flip after every frame tick read, and each write goes once the device has ticked for the clip
+    frame before its target, the offset the lead-in's events bound (docs/evidence.md); every write is
+    acknowledged before the next goes.
     """
     layout, period = live.layout, 1e9 / float(config.fps)
     held["cc_map"] = rig.transport.device.midi.cc_map
@@ -597,6 +613,7 @@ def _run(
         prepare(load(program))
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
+    poller.on_tick = shown.ask
     poller.start()
     start = held["start"]
     for slot in np.flatnonzero(start != park) + 1:
@@ -604,31 +621,34 @@ def _run(
     time.sleep(lead_in.settle_s)
     if dry is not None:
         _await_starts(live, time.monotonic_ns(), ANCHOR_FRAMES, period)
-        calibrate(sender, dry, held["initial"], lead_in)
     hold = int(player.status().get("hold", 1))
     ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    codes, images = read_live(
+    codes, _ = read_live(
         live.first, strip_px=config.strip_px, bits=config.bits, size=CALIBRATION_SIZE, ffmpeg=ffmpeg
     )
     held["codes"] = codes
-    found, frames = live_attribution(
+    found, _ = live_attribution(
         live.first, rig.playout.flips(), codes, config=config, hold=hold, lead=layout.lead, count=layout.count
     )
-    lat = _live_latency(rig, live, sender, poller, (images, frames, found), dry=dry, program=program)
-    held["delta"], held["latency"] = lat.delta, lat.as_dict()
-    clock = Clock.of(found, lat)
+    clock = Clock.of(found)
+    wire = _session_wire(held, sender, poller, [], dry)
+    shift = ev.offset(
+        np.zeros((0, 2), np.int64), np.zeros(0, np.int64), wire["asked"], wire["shown"], wire["ticks"]
+    )
+    held["shift"] = shift
+    LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
     rows = held["rows"]
-    first_due = clock.when(int(rows["target"][0])) if rows.size else clock.when(0)
-    if time.monotonic_ns() >= first_due:
+    first = int(rows["target"][0]) if rows.size else 0
+    if wire["ticks"]["field"][-1] >= first + shift.lo - 1:
         raise LeadInTimeError(
-            f"{program}: the clock was measured {(time.monotonic_ns() - first_due) / 1e9:.2f}s after the "
-            "first write was due, past the lead-in this session derived"
+            f"{program}: the device-to-clip offset was known after the device ticked for clip frame {first - 1}, "
+            "past the lead-in this session derived"
         )
     clock.extend(live.log())
-    sender.when = clock.when
+    sender.due = lambda target, stop: poller.wait_count(target + shift.lo - 1, stop)
     sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
     sender.start()
-    _sleep_until(clock.when(-1) - int(clock.ticks.period))
+    poller.wait_count(shift.lo - 2, threading.Event())
     held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
     end = int(clock.times.at(layout.count + (0 if dry is None else layout.tail))) + int(config.tail_s * 1e9)
     rolls = list(range(1, len(live.takes)))
@@ -642,29 +662,6 @@ def _run(
     if dry is None:
         _reload_quiet(sender, poller, shell, load)
         _sleep_until(int(clock.times.at(layout.count + layout.tail)) + int(config.tail_s * 1e9))
-
-
-def _live_latency(
-    rig: Any, live: Live, sender: Sender, poller: Poller, seen: tuple, *, dry: Any, program: str
-) -> ev.Latency:
-    """The CC-to-picture latency the lead-in's calibration measured, else the band on file."""
-    images, frames, found = seen
-    directory = live.first.parent
-    if dry is None:
-        return read_latency(directory)
-    sends, wire = sender.array(), poller.arrays()
-    toggled = sends["target"] == ev.CALIBRATION
-    echo = W.echoed(sends, wire["receipts"], wire["reads"], rig.transport.device.midi.cc_map)
-    try:
-        lat = measure_latency(
-            images, frames, found, sends[toggled], ev.frame_times(found), taken=echo[toggled]
-        )
-    except ev.EvidenceError as err:
-        LOG.warning("%s: %s; landing by the band dry takes measured", program, err)
-        return read_latency(directory)
-    write_latency(directory, lat, program)
-    LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
-    return lat
 
 
 def _roll_due(live: Live, clock: Clock, rolls: list[int], now: int, period: float) -> list[int]:

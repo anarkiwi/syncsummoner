@@ -624,3 +624,12 @@ def test_a_failing_decoder_faults_with_its_last_line():
     argv = [sys.executable, "-c", "import sys; sys.stderr.write('first\\nlast words\\n\\n'); sys.exit(3)"]
     with pytest.raises(K.PlayoutFault, match="decoding failed: last words$"):
         list(K.clip_frames(argv, 2))
+
+
+def test_each_request_is_answered_with_the_last_flip_flagged_as_a_reply():
+    sent = []
+    live = SimpleNamespace(write=sent.append)
+    last = [None, K.RECORD.pack(4, 4, 4, 99, K.SEGMENT)]
+    K.answer(io.BytesIO(b"??"), lambda: last.pop(0), live)
+    assert len(sent) == 1, "nothing to answer before the first flip"
+    assert K.RECORD.unpack(sent[0]) == (4, 4, 4, 99, K.SEGMENT | K.REPLY)

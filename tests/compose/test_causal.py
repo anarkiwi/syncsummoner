@@ -8,6 +8,14 @@ from syncsummoner.device.wire import NO_FLOOR, READ, SEND, TICK
 PERIOD = 33_333_333
 
 
+def ticks_of(rows):
+    """Frame ticks from ``(t0, t1, field)`` rows, the transport fields left at zero."""
+    out = np.zeros(len(rows), dtype=TICK)
+    if len(rows):
+        out["t0_ns"], out["t1_ns"], out["field"] = np.array(rows, dtype=np.int64).T
+    return out
+
+
 def device(seconds: float, *, phase: int = 0, poll: int = 4_000_000, rtt: int = 1_900_000):
     """Alternate field_count and readback polls against a device ticking every PERIOD from ``phase``."""
     t, ticks, reads = 0, [], []
@@ -16,7 +24,7 @@ def device(seconds: float, *, phase: int = 0, poll: int = 4_000_000, rtt: int = 
         t += poll
         reads.append((t, t + rtt))
         t += poll
-    return np.array(ticks, dtype=TICK), reads
+    return ticks_of(ticks), reads
 
 
 def readbacks(reads, sends, start, latch_of):
@@ -40,7 +48,7 @@ def sends_at(times, values, floors):
 
 
 def test_counts_respect_command_order():
-    ticks = np.array([(0, 10, 5), (20, 30, 6), (40, 50, 6)], dtype=TICK)
+    ticks = ticks_of([(0, 10, 5), (20, 30, 6), (40, 50, 6)])
     assert ev.count_before(ticks, np.array([9, 10, 11, 45])).tolist() == [-1, -1, 5, 6]
     assert ev.count_after(ticks, np.array([0, 19, 40])).tolist() == [6, 6, ev.UNBOUNDED]
 
@@ -111,23 +119,29 @@ def shown_at(times, frames):
 
 
 def test_crossed_bounds_mean_the_device_and_player_disagree():
-    ticks = np.array([(0, 10, 100), (30, 40, 101)], dtype=TICK)
+    ticks = ticks_of([(0, 10, 100), (30, 40, 101)])
     asked = asked_at(np.array([20]), [90])
     with pytest.raises(ev.EvidenceError, match="not locked"):
         ev.offset(np.array([[105, 105]]), np.array([100]), asked, shown_at([25], [99]), ticks)
 
 
 def test_a_write_floor_tightens_the_upper_bound():
-    ticks = np.array([(0, 10, 100), (30, 40, 103)], dtype=TICK)
+    ticks = ticks_of([(0, 10, 100), (30, 40, 103)])
     asked = asked_at(np.array([20]), [98])
     found = ev.offset(np.array([[104, 104]]), np.array([102]), asked, shown_at([25], [99]), ticks)
     assert (found.lo, found.hi) == (2, 2) and found.exact
 
 
 def test_no_replies_or_no_reports_leave_the_offset_unknown():
-    ticks = np.array([(0, 10, 100)], dtype=TICK)
+    ticks = ticks_of([(0, 10, 100)])
     with pytest.raises(ev.EvidenceError, match="both are needed"):
-        ev.offset(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked_at(np.array([20]), [90]), shown_at([25], [99]), ticks)
+        ev.offset(
+            np.zeros((0, 2), np.int64),
+            np.zeros(0, np.int64),
+            asked_at(np.array([20]), [90]),
+            shown_at([25], [99]),
+            ticks,
+        )
 
 
 def plan_of(targets):

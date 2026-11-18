@@ -370,10 +370,12 @@ def take_evidence(
     features = decoded.features(take, spec, ffmpeg=ffmpeg) if features is None else features
     source = decoded.features(clip, spec, ffmpeg=ffmpeg) if source is None else source
     whole = load_wire(take)
-    if "floor" not in (whole["sends"].dtype.names or ()) or "shown" not in whole:
+    if "floor" not in (whole["sends"].dtype.names or ()) or any(
+        k not in whole for k in ("shown", "asked", "ticks")
+    ):
         raise ev.EvidenceError(
-            f"{take}: recorded before each write carried the frame the Pi showed as it was sent, so its "
-            "writes have no floor to land by; record it again"
+            f"{take}: recorded before writes carried their floor and the device its frame ticks, so its "
+            "writes cannot be landed by command order; record it again"
         )
     wire = own_wire(whole)
     if names is None:
@@ -385,7 +387,11 @@ def take_evidence(
     echo, every = take_echo(wire), take_echo(whole)
     resent = wire.get("resent")
     images = features.small
-    landed_rows = ev.landed(wire["plan"], sends, echo=echo, resent=resent)
+    bracket = ev.taken(whole["sends"], every)
+    latch = ev.latches(whole["sends"], bracket, whole["ticks"], whole["reads"], whole["initial"])
+    shift = ev.offset(latch, whole["sends"]["floor"], whole["asked"], whole["shown"], whole["ticks"])
+    own = np.asarray(whole.get("own", np.ones(whole["sends"].size, dtype=bool)), dtype=bool)
+    landed_rows = ev.landed(wire["plan"], sends, echo=echo, resent=resent, latch=latch[own], shift=shift)
     reads = wire["reads"]
     reads = reads[(reads["t0_ns"] >= frames["t_ns"][0]) & (reads["t0_ns"] <= frames["t_ns"][-1])]
     applied_rows = ev.applied(
@@ -399,7 +405,7 @@ def take_evidence(
     src = source.small[found.source_offset : found.source_offset + count].astype(np.float32)
     luma_range = np.ptp(out[:, 0].reshape(count, -1), axis=1)
     rows = landed_rows.rows
-    sent = (rows["sent"] >= 0) & (rows["landed"] != ev.CALIBRATION)
+    sent = (rows["sent"] >= 0) & (rows["landed"] != ev.CALIBRATION) & (rows["last"] != ev.UNBOUNDED)
     kinds, regime = (judged_steps(program, wire["start"], rows, count) if predict else None) or (None, None)
     moved = ev.acted_upon(
         out,
