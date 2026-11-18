@@ -9,7 +9,9 @@ import numpy as np
 import pytest
 
 from syncsummoner import cli
+from syncsummoner.compose import locktake as LT
 from syncsummoner.compose import response as response_mod
+from syncsummoner.compose import session as SS
 from syncsummoner.compose import timecode
 from syncsummoner.compose.evidence import DISAGREE, LANDED
 from syncsummoner.probe import decoded
@@ -180,13 +182,13 @@ def test_a_measured_hold_overrides_a_plans_settle_and_says_so(tmp_path):
 
 
 def test_judge_offline_writes_nothing(tmp_path, monkeypatch):
-    from syncsummoner.compose import lock, locktake  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import lock  # pylint: disable=import-outside-toplevel
     from syncsummoner.device import wire  # pylint: disable=import-outside-toplevel
 
     monkeypatch.setattr(decoded, "features", lambda *a, **k: fake_features(4))
     monkeypatch.setattr(wire, "load_wire", lambda take: {"program": np.array("p"), "start": np.zeros(12)})
     monkeypatch.setattr(lock, "attribute_take", lambda *a, **k: "found")
-    monkeypatch.setattr(locktake, "take_evidence", lambda *a, **k: "proof")
+    monkeypatch.setattr(LT, "take_evidence", lambda *a, **k: "proof")
     seen = response_mod.judge_offline(
         tmp_path / "t.mkv",
         clip="c.mkv",
@@ -209,3 +211,47 @@ def test_sweep_plan_takes_a_recorded_cover_and_joint_moves(tmp_path, monkeypatch
     chunks, _ = L.read_plan(tmp_path / "sweep-p.json")
     states = np.concatenate([c.states for c in chunks])
     assert set(states[:, 0].tolist()) == {0, 512} and set(states[:, 10].tolist()) == {0, 1023}
+
+
+def test_timecode_sizes_the_clip_by_the_stall_guard(tmp_path, monkeypatch, capsys):
+    lat = LT.ev.Latency(lo=30e6, hi=40e6, samples=3, period=1e9 / 30)
+    LT.write_latency(tmp_path, lat, "dry")
+    made = {}
+
+    def write(source, out, *, config, lead, tail, **_kw):
+        made.update(source=source, out=out, fps=config.fps, lead=lead, tail=tail)
+        return 90
+
+    monkeypatch.setattr(timecode, "write_timecoded", write)
+    argv = ["--stall", "40", "probe", "timecode", "f.mkv", "--out", "c.mkv", "--latency", str(tmp_path)]
+    assert cli.main(argv) == 0
+    after = (lat.hi + lat.period) / 1e9
+    assert made == {
+        "source": "f.mkv",
+        "out": "c.mkv",
+        "fps": 30.0,
+        "lead": SS.lead_in_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0),
+        "tail": SS.lead_out_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0, latency_s=after),
+    }
+    assert "for a 40.0 s load" in capsys.readouterr().out
+
+
+def test_sweep_capture_passes_the_stall_guard_and_keeps_each_attempt(tmp_path, monkeypatch):
+    plan, chunks = sweep_dir(tmp_path)
+    seen = {}
+
+    def capture(config, picked, outs, *, program, clip):
+        seen.update(stall=config.stall_s, frames=[c.frames for c in picked], program=program, clip=clip)
+        return [{"fault": "LeadInTimeError: late"} for _ in outs]
+
+    monkeypatch.setattr(L, "capture", capture)
+    argv = ["--stall", "40", "probe", "sweep", "capture", str(plan), "--chunk", "0", "--attempt", "2"]
+    assert cli.main(argv) == 2
+    assert seen == {
+        "stall": 40.0,
+        "frames": [chunks[0].frames],
+        "program": "p",
+        "clip": str(tmp_path / "c.mkv"),
+    }
+    meta = json.loads((tmp_path / "take-p-00.mkv.meta.json").read_text())
+    assert meta == {"attempt-2": {"fault": "LeadInTimeError: late"}}
