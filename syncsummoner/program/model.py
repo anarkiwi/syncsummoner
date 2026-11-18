@@ -542,8 +542,19 @@ class ProgramModel:
 
         A declared switch turned on that leaves every other control dead at ``state`` comes first; else
         the first control with settings :meth:`passes` proves, written at the middle of their longest run.
+        The proof is kept in the program's cache, so a model answered by SAT proves it once.
         """
         base = self.initial() if state is None else np.asarray(state, dtype=np.int64)
+
+        def proof() -> list | None:
+            found = self._bypass(base, timing)
+            return None if found is None else [found.parameter_id, found.value, list(found.proven)]
+
+        found = self._cached("bypass", [base.tolist(), timing, self.prefer], proof)
+        return None if found is None else Bypass(int(found[0]), int(found[1]), tuple(found[2]))
+
+    def _bypass(self, base: np.ndarray, timing: int | None) -> Bypass | None:
+        """:meth:`bypass` proven afresh."""
         for decl in self.params:
             if kind(decl)[0] is not Kind.BOOLEAN:
                 continue
