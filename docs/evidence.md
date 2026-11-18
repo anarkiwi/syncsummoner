@@ -15,36 +15,39 @@ sidecars.
 
 ## Where a write lands
 
-The device latches MIDI CCs once per output frame: the picture changes on a frame
-start, never part way down it (docs/hardware.md). So a write lands on the first frame
-that starts at least a fixed latency after the device took it. Frame starts are the
-take's frame line on the capture clock (`evidence.frame_times`,
-[hardware.md](hardware.md#the-cards-clock)), so they carry no capture phase. The latency
-is measured from the picture in every dry take's lead-in, and is the only thing the
-landing frame rests on; the serial readback's timing is not used.
+Nothing is timed by synchronized or fitted clocks. Every host-side event (CC send, serial
+request and reply, MIDI receipt, capture buffer, Pi report received) is stamped on the host's
+one `CLOCK_MONOTONIC`; the Pi's and the device's own clocks are never compared with it. They
+contribute only counters, ordered against host events by causality:
 
-Each calibration write taken at `t` and first shown in frame `F` puts the latency in
-`(T(F-1) - t, T(F) - t]`, `T` being the frame's start on the line; the bounds of all
-writes intersect in one band (`evidence.latency`). Writes that disagree by half a
-frame or more stop the take. Every frame's start less the band gives the instants a
-write must precede to land on it (`evidence.grid`). Where the take's captures admit
-lines other than the one fitted, frame starts lie within `line_lo..line_hi` of it, so
-the device's own latency lies in `Latency.bounds`, the band widened by them; each record
-says its basis (`"basis": "start"`). A dry take whose start setting looks like its dry picture shows no
-calibration write; it lands by the band the take directory's dry takes measured, as a take
-with no dry control does, and keeps no latency of its own.
+| Channel | Hook | What it proves |
+| --- | --- | --- |
+| Pi player | each flip's clip frame, streamed live and stamped on receipt (`playout.Shown`) | a frame reported by `t` was on screen by `t` |
+| Pi player | request and reply: the last flip done when the request arrived | the next flip came after the request left |
+| Videomancer serial | `transport status` `field_count`, polled between readbacks (`wire.Poller`) | replies keep command order, so each readback and each send lies between two counts |
+| Videomancer MIDI | `midi monitor` receipts (`wire.echoed`) | the device took the write by its echo |
+| Capture card | buffer timestamps | a capture done before a send cannot show it |
 
-A landing is a window, not a frame (`evidence.window`). The device took a write somewhere
-in its echo bracket and applies it on the first tick after; a tick lies in its band
-widened by how far the take's captures admit frame starts either side of its line
-(`locktake.line_spread`). The window runs from the first frame any such tick can land it
-on (`first`) to the last (`last`); `landed` is the point estimate inside it. Nothing
-depends on the window being one frame: a write is late only if its window starts after
-its target, early only if it ends before, and windows wider than a frame are counted
-(`ambiguous`) without failing the take. A setting is measured only once its writes'
-windows have closed and the program has settled, so a frame either way costs guard
-frames, not attribution. A program the CC acts on a frame or two later than the write
-lands gains nothing from a narrower window.
+The device latches CCs on its frame tick, the frame `field_count` counts: its readback never
+changes between two polls that read the same count (docs/hardware.md). For each write:
+
+- **Floor** `F`: the clip frame the host last heard the Pi show before sending it. No output
+  of an earlier clip frame can show it. A write sent before any frame was heard has no floor
+  and faults its take.
+- **Latch** `L`: the device frame it takes effect on. A count `c` read before the send means
+  `L >= c + 1`; a count `c'` asked for after its echo means `L <= c' + 1`; the readback change,
+  between the counts read either side of it, pins `L` itself.
+- **Offset** `O`: device frame `n` processes clip frame `n - O`, one integer per session as the
+  device genlocks to the Pi. `L - O >= F` for every write bounds it above; a Pi reply of `f` to a
+  request sent at `t0`, with a count `c` read before `t0`, bounds it below (`O >= c - f`), as the
+  device cannot tick for a frame before the Pi has flipped it. A session whose bounds do not meet
+  on one integer, or whose `field_count` steps differ from its flips, faults.
+- **Response**: the clip frames after `L - O` until the picture shows the write, from that
+  write's own captures. It is the program's processing of that CC; it is never pooled across
+  writes, parameters or programs.
+
+Each of these faults its take: a picture change attributed to a write before its floor; a floor
+after its target frame (sent late); an echo before its send; a gap in the Pi's flip reports.
 
 ## Frame-locked sends
 
