@@ -190,3 +190,15 @@ def test_without_a_miter_the_ternary_simulator_answers(tiny, tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="ternary"):
         _ = coarse.exact
     assert gates.Gating(coarse).revivals(tiny.initial(), Status(1, ())) is not None
+
+
+def test_a_bypass_proven_once_is_read_from_the_cache(tiny, tmp_path, monkeypatch):
+    first = ProgramModel(tiny.program, tiny.library, cache=tmp_path, method="sat")
+    found = first.bypass()
+    again = ProgramModel(tiny.program, tiny.library, cache=tmp_path, method="sat")
+    monkeypatch.setattr(again, "_bypass", lambda *a: pytest.fail("proven again"))
+    assert again.bypass() == found == tiny.bypass()
+    held = tiny.initial()
+    held[0] = 1023
+    monkeypatch.setattr(again, "_bypass", lambda *a: None)
+    assert again.bypass(held) is None, "another state is another proof"
