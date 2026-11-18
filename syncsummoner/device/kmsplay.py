@@ -27,6 +27,8 @@ from typing import Any, Callable, Iterable, Iterator
 RECORD = struct.Struct("<qqqqq")
 #: Flag on the first flip of a segment, after the start or after the link came back up.
 SEGMENT = 1
+#: Flag on a copy of the last flip done, sent in reply to a request on the ``--ask`` pipe.
+REPLY = 2
 #: ``DRM_MODE_FLAG_INTERLACE``: such a mode has no single frame per vblank.
 INTERLACE = 0x10
 #: The framebuffer layout bgr565le words land in, as fbdev and the device chain expect.
@@ -423,6 +425,7 @@ class LiveFeed:
     def __init__(self, path: str):
         self.path = path
         self._fd: int | None = None
+        self._lock = threading.Lock()
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -431,20 +434,56 @@ class LiveFeed:
 
     def write(self, record: bytes) -> None:
         """Offer one record, smaller than ``PIPE_BUF`` so it lands whole or not at all."""
-        try:
-            if self._fd is None:
-                self._fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
-            os.write(self._fd, record)
-        except BlockingIOError:
-            pass
-        except OSError:
-            self.close()
+        with self._lock:
+            try:
+                if self._fd is None:
+                    self._fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+                os.write(self._fd, record)
+            except BlockingIOError:
+                pass
+            except OSError:
+                self._release()
 
-    def close(self) -> None:
-        """Let go of the reader, if one is held."""
+    def _release(self) -> None:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+
+    def close(self) -> None:
+        """Let go of the reader, if one is held."""
+        with self._lock:
+            self._release()
+
+
+def answer(asks: Any, last: Callable[[], bytes | None], live: LiveFeed) -> None:
+    """For each byte read from ``asks``, offer ``live`` the last flip done then, flagged :data:`REPLY`.
+
+    A reply is made only after its request was read, so the flip after the one it reports came after
+    the request was sent. Returns when ``asks`` ends.
+    """
+    while asks.read(1):
+        record = last()
+        if record is not None:
+            fields = RECORD.unpack(record)
+            live.write(RECORD.pack(*fields[:4], fields[4] | REPLY))
+
+
+def serve_asks(path: str, last: Callable[[], bytes | None], live: LiveFeed) -> threading.Thread:
+    """Answer requests on a fresh named pipe at ``path`` from a thread of its own, for any number of askers."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(path)
+
+    def serve() -> None:
+        while True:
+            with open(path, "rb", buffering=0) as asks:
+                answer(asks, last, live)
+
+    thread = threading.Thread(target=serve, name="asks", daemon=True)
+    thread.start()
+    return thread
 
 
 def decode_argv(
@@ -626,6 +665,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preroll-s", type=float, default=2.0)
     parser.add_argument("--flips", required=True, help="binary log of every flip")
     parser.add_argument("--live", help="named pipe offered every flip record as it completes")
+    parser.add_argument("--ask", help="named pipe whose every byte is answered on --live with the last flip")
     parser.add_argument("--status", required=True, help="JSON status file")
     parser.add_argument("--fb", default="/dev/fb0", help="fbdev left holding the last frame")
     return parser.parse_args(argv)
@@ -664,11 +704,15 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         preroll = Prerolled(frames, max(2, round(float(args.preroll_s * args.fps))))
         preroll.wait_full(timeout_s=60.0)
         live = LiveFeed(args.live) if args.live else None
+        last: list[bytes] = []
+        if live is not None and args.ask:
+            serve_asks(args.ask, lambda: last[-1] if last else None, live)
         with open(args.flips, "wb", buffering=0) as log:
 
             def record(*fields: int) -> None:
                 data = RECORD.pack(*fields)
                 log.write(data)
+                last[:] = [data]
                 if live is not None:
                     live.write(data)
 

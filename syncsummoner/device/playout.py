@@ -26,7 +26,7 @@ import numpy as np
 from syncsummoner.progress import LOG
 
 from .host import DEFAULT_HOST, DEFAULT_TIMEOUT, Runner, ssh_runner, ssh_stream
-from .kmsplay import RECORD, SEGMENT, read_exactly
+from .kmsplay import RECORD, REPLY, SEGMENT, read_exactly
 
 DEFAULT_FB = "/dev/fb0"
 #: 565 quantisation levels per channel, for an RGB-ordered source frame.
@@ -52,6 +52,8 @@ RTPRIO_LIMIT = 20
 SETTLED = ("playing", "failed", "stopped")
 #: One distinct frame followed live: the player's stream frame and when the host first heard of it.
 SHOWN = np.dtype([("frame", "<i8"), ("t_ns", "<i8")])
+#: One request to the player: when the host sent it, when the reply came, and the last flip done between.
+ASKED = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("frame", "<i8")])
 #: The frame :meth:`Shown.latest` reports before any flip has been heard of.
 NONE = int(np.iinfo(np.int64).min)
 
@@ -118,20 +120,25 @@ class Shown:
     """The host's view of the frame on screen, from the player's live flip records on ``stream``.
 
     A record counts only once it has been read whole, and is stamped with ``clock`` then, so every frame
-    reported was on screen no later than the moment it is reported. ``proc``, when given, is the process
-    feeding ``stream``, terminated on :meth:`close`; a stream owned by no process must end for it to return.
+    reported was on screen no later than the moment it is reported. :meth:`ask` writes one byte to
+    ``asks``, which the player answers with the last flip done once it has read it, so the flip after
+    that one came after the request left. ``procs`` are the processes feeding ``stream`` and reading
+    ``asks``, terminated on :meth:`close`; with none, ``stream`` must end for it to return.
     """
 
     def __init__(
         self,
         stream: Any,
         *,
-        proc: subprocess.Popen | None = None,
+        asks: Any = None,
+        procs: Sequence[subprocess.Popen] = (),
         clock: Callable[[], int] = time.monotonic_ns,
     ):
-        self._stream, self._proc, self._clock = stream, proc, clock
+        self._stream, self._asks, self._procs, self._clock = stream, asks, tuple(procs), clock
         self._frames: list[int] = []
         self._times: list[int] = []
+        self._sent: list[int] = []
+        self._replies: list[tuple[int, int]] = []
         self._ended = False
         self._cond = threading.Condition()
         self._watched: set[threading.Event] = set()
@@ -142,9 +149,12 @@ class Shown:
         """Note each distinct frame as its record completes, until the stream ends."""
         try:
             while (record := read_exactly(self._stream, RECORD.size)) is not None:
-                t_ns, frame = self._clock(), RECORD.unpack(record)[2]
+                t_ns, fields = self._clock(), RECORD.unpack(record)
+                frame = fields[2]
                 with self._cond:
-                    if not self._frames or frame > self._frames[-1]:
+                    if fields[4] & REPLY:
+                        self._replies.append((t_ns, frame))
+                    elif not self._frames or frame > self._frames[-1]:
                         self._frames.append(frame)
                         self._times.append(t_ns)
                         self._cond.notify_all()
@@ -187,6 +197,23 @@ class Shown:
                 self._cond.wait()
             return self._times[at]
 
+    def ask(self) -> None:
+        """Ask the player for the last flip it has done, stamping the request as it leaves."""
+        with self._cond:
+            self._sent.append(self._clock())
+            self._asks.write(b"?")
+            self._asks.flush()
+
+    def asked(self) -> np.ndarray:
+        """Every request answered so far, paired with its reply in order, as :data:`ASKED` records."""
+        with self._cond:
+            n = min(len(self._sent), len(self._replies))
+            out = np.empty(n, dtype=ASKED)
+            out["t0_ns"] = self._sent[:n]
+            out["t1_ns"] = [t for t, _ in self._replies[:n]]
+            out["frame"] = [f for _, f in self._replies[:n]]
+        return out
+
     def log(self) -> np.ndarray:
         """Every distinct frame heard of so far, as :data:`SHOWN` records."""
         with self._cond:
@@ -195,12 +222,13 @@ class Shown:
         return out
 
     def close(self) -> None:
-        """Stop following: end the feeding process, if owned, and wait for the reader."""
-        if self._proc is not None:
-            self._proc.terminate()
+        """Stop following: end the processes owned, and wait for the reader."""
+        for proc in self._procs:
+            proc.terminate()
         self._thread.join()
-        if self._proc is not None:
-            self._proc.wait()
+        for proc in self._procs:
+            proc.wait()
+        if self._procs:
             self._stream.close()
 
 
@@ -290,7 +318,7 @@ class KmsPlayer(Playout):
         return (
             f"python3 {self.path('kmsplay.py')} {self.source_args()}{self.span_args(spans)} --fps {fps} "
             f"--width {self.width} --height {self.height} --preroll-s {self.preroll_s:g} "
-            f"--flips {self.path('flips.bin')} --live {self.path('live.fifo')} "
+            f"--flips {self.path('flips.bin')} --live {self.path('live.fifo')} --ask {self.path('ask.fifo')} "
             f"--status {self.path('status.json')}" + (" --loop" if self.loop else "")
         )
 
@@ -413,7 +441,8 @@ class KmsPlayer(Playout):
     def following(self, *, clock: Callable[[], int] = time.monotonic_ns) -> Iterator[Shown]:
         """Follow the playing player's flips live for the block; enter it once :meth:`start` has returned."""
         proc = self._stream(f"exec cat {self.path('live.fifo')}")
-        shown = Shown(proc.stdout, proc=proc, clock=clock)
+        asker = self._stream(f"exec cat > {self.path('ask.fifo')}")
+        shown = Shown(proc.stdout, asks=asker.stdin, procs=(proc, asker), clock=clock)
         try:
             yield shown
         finally:

@@ -59,6 +59,100 @@ def frame_times(found: Any) -> FrameTimes:
     return FrameTimes(lead=int(found.lead), origin=float(found.frame0_ns), period=float(found.period_ns))
 
 
+#: A device frame no event bounds.
+UNBOUNDED = int(np.iinfo(np.int64).max)
+
+
+def count_before(ticks: np.ndarray, t_ns: np.ndarray) -> np.ndarray:
+    """The last ``field_count`` whose reply came before each time; -1 where none did."""
+    k = np.searchsorted(ticks["t1_ns"], np.asarray(t_ns), side="left") - 1
+    return np.where(k >= 0, ticks["field"][np.maximum(k, 0)], -1)
+
+
+def count_after(ticks: np.ndarray, t_ns: np.ndarray) -> np.ndarray:
+    """The first ``field_count`` asked for after each time; :data:`UNBOUNDED` where none was."""
+    k = np.searchsorted(ticks["t0_ns"], np.asarray(t_ns), side="right")
+    return np.where(k < ticks.size, ticks["field"][np.minimum(k, ticks.size - 1)], UNBOUNDED)
+
+
+def latches(
+    sends: np.ndarray, bracket: np.ndarray, ticks: np.ndarray, reads: np.ndarray, start: Sequence[int]
+) -> np.ndarray:
+    """``(n, 2)`` device frames each write takes effect between, inclusive, by command order alone.
+
+    The device latches a CC on the first frame tick after taking it: a count read before the send
+    bounds it below, a count asked for after the device took it (``bracket``'s end) above. A readback
+    first showing the written value, between counts read either side of it and of the read before,
+    pins it within those, when the value differs from the slot's before.
+    """
+    lo = count_before(ticks, sends["t0_ns"]) + 1
+    hi = np.where(np.isfinite(bracket[:, 1]), count_after(ticks, np.nan_to_num(bracket[:, 1])) + 1, UNBOUNDED)
+    lo = np.where(lo > 0, lo, 0)
+    o = np.asarray(reads["o"], dtype=np.int64)
+    held = np.asarray(start, dtype=np.int64).copy()
+    for j, send in enumerate(sends):
+        slot = int(send["param"]) - 1
+        if not 0 <= slot < held.size:
+            continue
+        before, held[slot] = held[slot], int(send["value"])
+        if before == held[slot] or not o.size:
+            continue
+        later = np.flatnonzero((reads["t1_ns"] > send["t0_ns"]) & (o[:, slot] == held[slot]))
+        if not later.size or later[0] == 0:
+            continue
+        k = later[0]
+        lo[j] = max(lo[j], int(count_before(ticks, reads["t0_ns"][k - 1 : k])[0]) + 1)
+        hi[j] = min(hi[j], int(count_after(ticks, reads["t1_ns"][k : k + 1])[0]))
+    return np.c_[lo, hi]
+
+
+@dataclass(frozen=True)
+class Offset:
+    """Device frame ``n`` processes clip frame ``n - O``, ``O`` in ``lo..hi``, as the session's events bound it."""
+
+    lo: int
+    hi: int
+
+    @property
+    def exact(self) -> bool:
+        """Whether the events pin one offset."""
+        return self.lo == self.hi
+
+
+def offset(
+    latch: np.ndarray, floors: np.ndarray, asked: np.ndarray, shown: np.ndarray, ticks: np.ndarray
+) -> Offset:
+    """The offset from device frames to clip frames that every write, Pi reply and Pi report allow.
+
+    The device ticks for clip frame ``g`` after the Pi flips it and before it flips ``g + 1``. A Pi reply
+    ``f`` to a request sent after a count ``c`` was read means ``O >= c - f``. A count ``c'`` asked for
+    after the host heard frame ``f`` shown means ``O <= c' - f + 1``, and a write with floor ``F`` and
+    latest latch ``L`` means ``O <= L - F``. Bounds that cross mean the device is not locked to the
+    player, or an event is misordered, which is an error.
+    """
+    c = count_before(ticks, asked["t0_ns"])
+    told = c >= 0
+    after = count_after(ticks, shown["t_ns"])
+    heard = after != UNBOUNDED
+    known = (latch[:, 1] != UNBOUNDED) & (floors > np.iinfo(np.int64).min)
+    if not told.any() or not heard.any():
+        raise EvidenceError(
+            f"{int(told.sum())} Pi replies after a frame tick and {int(heard.sum())} Pi reports before one: "
+            "both are needed to tie device frames to clip frames"
+        )
+    hi = int((after[heard] - shown["frame"][heard]).min()) + 1
+    if known.any():
+        hi = min(hi, int((latch[known, 1] - floors[known]).min()))
+    found = Offset(lo=int((c[told] - asked["frame"][told]).max()), hi=hi)
+    if found.lo > found.hi:
+        raise EvidenceError(
+            f"device frames lead clip frames by at least {found.lo} by the Pi's replies and at most {found.hi} "
+            "by its reports and the writes' floors: the device is not locked to the player, or events are "
+            "misordered"
+        )
+    return found
+
+
 @dataclass(frozen=True)
 class Landed:
     """Intended against realized: each scheduled write matched to its send and the floor it was sent on."""
@@ -69,6 +163,7 @@ class Landed:
     out_of_order: int
     late: int
     early: int
+    ambiguous: int = 0
     wake_ms: float = float("nan")
     unechoed: int = 0
     unstamped: int = 0
@@ -90,9 +185,9 @@ class Landed:
         """One line of counts."""
         return (
             f"{len(self.rows)} writes scheduled: {self.missing} missing, {self.unechoed} never echoed, "
-            f"{self.duplicated} duplicated, {self.out_of_order} out of order, {self.late} sent after their "
-            f"frame left the screen, {self.early} before it showed, {self.unstamped} before any frame was "
-            f"seen; sends left at worst {self.wake_ms:.2f} ms after their frame was seen"
+            f"{self.duplicated} duplicated, {self.out_of_order} out of order, {self.late} late, "
+            f"{self.early} early, {self.ambiguous} over more than one frame, {self.unstamped} sent before "
+            f"any frame was seen; sends left at worst {self.wake_ms:.2f} ms after due"
         )
 
 
@@ -125,14 +220,17 @@ def landed(
     *,
     echo: np.ndarray | None = None,
     resent: np.ndarray | None = None,
+    latch: np.ndarray | None = None,
+    shift: Offset | None = None,
 ) -> Landed:
-    """Match scheduled ``(target, param, value)`` rows to sends in order, and land each on its floor.
+    """Match scheduled ``(target, param, value)`` rows to sends in order, and land each where it took effect.
 
     The k-th send of a ``(target, param)`` pair answers its k-th scheduled row, resent copies aside; a
-    send nothing scheduled is a duplicate. A write lands on its floor (:data:`~.wire.SEND`), the earliest
-    frame it can show on: one sent on a later frame than its target is late, on an earlier one early,
-    and one sent before any frame was seen has no floor. ``echo`` (``wire.echoed``) says whether the
-    device took each send; its picture is tested from the floor on (:func:`acted_upon`).
+    send nothing scheduled is a duplicate. Each write's clip frames run from its device latch window
+    (``latch``, one row per send, :func:`latches`) less the session's ``shift`` (:func:`offset`), never
+    before its floor (:data:`~.wire.SEND`). It is late if it cannot have landed by its target or was
+    sent on a later frame, early if it must have landed before; one sent before any frame was seen
+    has no floor. ``echo`` (``wire.echoed``) says whether the device took each send.
     """
     from syncsummoner.device.wire import NO_FLOOR  # pylint: disable=import-outside-toplevel
 
@@ -167,16 +265,22 @@ def landed(
     rows["echo_ns"][np.flatnonzero(sent)[heard]] = took[heard, 1]
     stamped = mine["floor"] != NO_FLOOR
     ok = np.flatnonzero(sent)[stamped]
-    for name in ("landed", "first", "last"):
-        rows[name][ok] = mine["floor"][stamped]
-    off = rows["landed"][ok] - rows["target"][ok]
+    floor = mine["floor"][stamped]
+    first, last = floor, floor
+    if latch is not None and shift is not None:
+        window = np.asarray(latch)[keep][hit[sent]][stamped]
+        first = np.maximum(window[:, 0] - shift.hi, floor)
+        last = np.where(window[:, 1] == UNBOUNDED, UNBOUNDED, window[:, 1] - shift.lo)
+    rows["first"][ok], rows["last"][ok], rows["landed"][ok] = first, last, first
+    target = rows["target"][ok]
     return Landed(
         rows=rows,
         missing=int((~sent).sum()),
         duplicated=duplicated,
         out_of_order=int(np.count_nonzero(np.diff(rows["sent"][sent]) < 0)),
-        late=int(np.count_nonzero(off > 0)),
-        early=int(np.count_nonzero(off < 0)),
+        late=int(np.count_nonzero((first > target) | (floor > target))),
+        early=int(np.count_nonzero(last < target)),
+        ambiguous=int(np.count_nonzero(last > first)),
         unechoed=int((~heard).sum()),
         unstamped=int((~stamped).sum()),
         wake_ms=float((mine["t0_ns"] - mine["due_ns"]).max()) / 1e6 if mine.size else float("nan"),

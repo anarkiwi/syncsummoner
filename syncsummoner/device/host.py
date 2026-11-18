@@ -64,7 +64,7 @@ def ssh_runner(host: str = DEFAULT_HOST, *, timeout: float = DEFAULT_TIMEOUT) ->
 
 
 def ssh_stream(host: str = DEFAULT_HOST) -> Callable[[str], subprocess.Popen]:
-    """Return a starter of long-running commands over BatchMode ssh, each one's stdout a pipe to read.
+    """Return a starter of long-running commands over BatchMode ssh, each one's stdin and stdout a pipe.
 
     Its stderr is discarded, so a diagnosis no one reads can never block the command.
     """
@@ -72,7 +72,7 @@ def ssh_stream(host: str = DEFAULT_HOST) -> Callable[[str], subprocess.Popen]:
     def stream(command: str) -> subprocess.Popen:
         return subprocess.Popen(  # pylint: disable=consider-using-with
             ["ssh", "-o", "BatchMode=yes", host, command],
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )

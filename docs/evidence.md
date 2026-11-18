@@ -38,10 +38,11 @@ changes between two polls that read the same count (docs/hardware.md). For each 
   `L >= c + 1`; a count `c'` asked for after its echo means `L <= c' + 1`; the readback change,
   between the counts read either side of it, pins `L` itself.
 - **Offset** `O`: device frame `n` processes clip frame `n - O`, one integer per session as the
-  device genlocks to the Pi. `L - O >= F` for every write bounds it above; a Pi reply of `f` to a
-  request sent at `t0`, with a count `c` read before `t0`, bounds it below (`O >= c - f`), as the
-  device cannot tick for a frame before the Pi has flipped it. A session whose bounds do not meet
-  on one integer, or whose `field_count` steps differ from its flips, faults.
+  device genlocks to the Pi: it ticks for clip frame `g` after the Pi flips `g` and before it
+  flips `g + 1`. A Pi reply of `f` to a request sent after a count `c` was read gives `O >= c - f`;
+  a count `c'` asked for after the host heard `f` shown gives `O <= c' - f + 1`; a write with
+  floor `F` and latest latch `L` gives `O <= L - F` (`evidence.offset`). Bounds that cross fault
+  the session; bounds a frame apart widen every write's window by that frame.
 - **Response**: the clip frames after `L - O` until the picture shows the write, from that
   write's own captures. It is the program's processing of that CC; it is never pooled across
   writes, parameters or programs.

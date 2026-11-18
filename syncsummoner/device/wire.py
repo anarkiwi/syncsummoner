@@ -9,6 +9,7 @@ keeps one write in flight. Their records are numpy arrays in the dtypes below, s
 from __future__ import annotations
 
 import difflib
+import json
 import queue
 import re
 import threading
@@ -38,6 +39,8 @@ SEND = np.dtype(
 NO_FLOOR = int(np.iinfo(np.int64).min)
 #: One ``modulation status`` reply: its request interval and the 12 combined values.
 READ = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("o", "<i8", (12,))])
+#: One ``transport status`` reply: its request interval and the device's ``field_count``, its frame tick.
+TICK = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("field", "<i8")])
 #: One CC message the firmware logged receiving, at the latest host time it can have arrived.
 RECEIPT = np.dtype([("t_ns", "<i8"), ("cc", "<i8"), ("value", "<i8")])
 #: ``midi monitor on`` logs each channel message it receives in this form.
@@ -327,9 +330,10 @@ class Asked:
 
 
 class Poller:
-    """Polls ``modulation status`` from one thread, the only client the shell has meanwhile.
+    """Polls ``field_count`` and ``modulation status`` in turn from one thread, the shell's only client.
 
-    One command is ever in flight, so the device never holds more than one queued line.
+    One command is ever in flight, so the device never holds more than one queued line, and every
+    readback lies between the frame ticks read either side of it (docs/evidence.md).
     :meth:`ask` runs another command between polls; monitor lines are stamped with the reply they came in on.
     """
 
@@ -348,6 +352,7 @@ class Poller:
         self.clock = clock
         self.sleep = sleep
         self.reads: list[tuple] = []
+        self.ticks: list[tuple[int, int, int]] = []
         self.receipts: list[tuple[int, int, int]] = []
         self.asked: list[Asked] = []
         self.errors: list[tuple[int, str]] = []
@@ -380,9 +385,24 @@ class Poller:
             self.asked.append(item)
             item.done.set()
 
+    def tick_once(self) -> None:
+        """One ``field_count``, and the monitor lines that came with it."""
+        t0 = self.clock()
+        try:
+            count = int(json.loads(self.shell.command("transport", "status").payload)["field_count"])
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            t1 = self.clock()
+            self.errors.append((t1, f"{type(err).__name__}: {err}"))
+            self._drain_log(t1, t0)
+            return
+        t1 = self.clock()
+        self.ticks.append((t0, t1, count))
+        self._drain_log(t1, t0)
+
     def poll_once(self) -> None:
-        """One readback, any asked-for commands, and the monitor lines that came with them."""
+        """Any asked-for commands, one frame tick, one readback, and the monitor lines that came with them."""
         self._run_asked()
+        self.tick_once()
         t0 = self.clock()
         try:
             values = combined(self.shell.modulation_status())
@@ -430,9 +450,10 @@ class Poller:
             self.echoes.close()
 
     def arrays(self) -> dict[str, np.ndarray]:
-        """Readbacks, receipts and the times of failed reads, as arrays."""
+        """Readbacks, frame ticks, receipts and the times of failed reads, as arrays."""
         return {
             "reads": np.array([(a, b, tuple(o)) for a, b, o in self.reads], dtype=READ),
+            "ticks": np.array(self.ticks, dtype=TICK),
             "receipts": np.array(self.receipts, dtype=RECEIPT),
             "read_errors": np.array([t for t, _ in self.errors], dtype=np.int64),
         }
