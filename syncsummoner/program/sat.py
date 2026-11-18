@@ -259,6 +259,7 @@ class Miter:
             c.outs["Q"][0]: [b for bits in c.ins.values() for b in bits if isinstance(b, int)]
             for c in self.storage
         }
+        self.gate_fanin = {n: self.fanin[n] for n in self.gate_nets}
         self.solver = Solver(name=solver, bootstrap_with=cnf.clauses)
         self.flushed = len(cnf.clauses)
         self.solves = 0
@@ -275,6 +276,68 @@ class Miter:
         self.qs = list(self.cells)
         self.start = np.array([circuit.init.get(q, False) for q in self.qs])
         self.lanes = Lanes(circuit)
+        self.support = self._supports(order)
+        self._links: dict[int, int] = {}
+
+    def _supports(self, order: Sequence[Cell]) -> dict[int, tuple[int, int, bool]]:
+        """Per storage output, what its next state with enables fired reads through gates: control bits
+        and storage outputs as bit masks, and whether anything else (an input, a box, an undefined bit).
+        """
+        ctl = {net: k for k, net in self.controls.items()}
+        reg = {q: i for i, q in enumerate(self.qs)}
+        sup: dict[int, tuple[int, int, bool]] = {}
+
+        def of(b) -> tuple[int, int, bool]:
+            if b in ctl:
+                return 1 << ctl[b], 0, False
+            if b in reg:
+                return 0, 1 << reg[b], False
+            if b in sup:
+                return sup[b]
+            return 0, 0, b not in ("0", "1")
+
+        def union(bits) -> tuple[int, int, bool]:
+            c = r = 0
+            o = False
+            for b in bits:
+                bc, br, bo = of(b)
+                c, r, o = c | bc, r | br, o or bo
+            return c, r, o
+
+        for g in order:
+            sup[next(iter(g.outs.values()))[0]] = union(b for bits in g.ins.values() for b in bits)
+        return {
+            c.outs["Q"][0]: union(b for p, bits in c.ins.items() if p not in ("C", "E") for b in bits)
+            for c in self.storage
+        }
+
+    def links(self, ties: Mapping[int, int], held: Iterable[int], settled: Mapping[int, bool]) -> frozenset:
+        """Storage that loads a function of tied and ``held`` control bits alone, through such storage:
+        it settles to that function's value at every setting of the held bits, so it is linked to it.
+        """
+        allowed = sum(1 << k for k in {*ties, *held})
+        reg = {q: i for i, q in enumerate(self.qs)}
+        known = sum(1 << reg[q] for q in settled)
+        todo = [
+            q
+            for q in self.qs
+            if q not in settled and not self.support[q][2] and not self.support[q][0] & ~allowed
+        ]
+        linked: set[int] = set()
+        while True:
+            more = {q for q in todo if q not in linked and not self.support[q][1] & ~known}
+            if not more:
+                return frozenset(linked)
+            linked |= more
+            known |= sum(1 << reg[q] for q in more)
+
+    def _link(self, q: int) -> int:
+        """A literal that, assumed, makes storage output ``q`` its next state with enables fired."""
+        if q not in self._links:
+            lit, a, f = self.cnf.var(), self.pairs[q][0], self.fire[q]
+            self.cnf.clauses += [[-lit, -a, f], [-lit, a, -f]]
+            self._links[q] = lit
+        return self._links[q]
 
     def _box(self, val: tuple[dict, dict]) -> None:
         """Each black box's outputs equal in both copies wherever all its inputs are."""
@@ -397,8 +460,9 @@ class Miter:
         """Storage outputs that settle, and their values, with the untied controls free.
 
         The least fixpoint of the load rule (next state with enables fired constant over every free
-        signal), then the keep rule (the initial value is kept). Random lanes and then models refute
-        candidates until a solve proves the rest together. Given ``known``, settled at ties that differ
+        signal), then the keep rule (the initial value is kept). Random lanes refute candidates; the
+        nets they feed that the lanes show constant, and propagation does not, are proven constant in
+        order, then the candidates, models refuting more. Given ``known``, settled at ties that differ
         only in the control bits ``moved``, only storage depending on those bits is decided again.
         """
         lanes, init = self.lanes, self.circuit.init
@@ -410,6 +474,8 @@ class Miter:
             self._const(x, self._controls(ties) | settled)
             lanes.forward(x)
             fired = lanes.steps(x, x[lanes.q], True)
+            steady = (x == x[:, :1]).all(axis=1) & ((x[:, 0] == 0) | (x[:, 0] == ~np.uint64(0)))
+            level = x[:, 0] != 0
             free = [q for q in init if q not in settled]
             self._const(x, {q: init[q] for q in free})
             lanes.forward(x)
@@ -425,23 +491,52 @@ class Miter:
                 for i, q in enumerate(self.qs)
                 if q in init and q in open_ and q not in settled and kept[i].all()
             }
-            fixed = base + [self.pairs[q][0] * (1 if v else -1) for q, v in settled.items()]
-            while loads or keeps:
-                act = self._any(
-                    [-self.fire[q] if v else self.fire[q] for q, v in loads.items()]
-                    + [-self.keep[q] if init[q] else self.keep[q] for q in keeps]
-                )
-                model = self.solve([*fixed, act])
-                self.cnf.clauses.append([-act])
-                if model is None:
-                    break
-                value = _reader(model)
-                loads = {q: v for q, v in loads.items() if value(self.fire[q]) == v}
-                keeps = {q for q in keeps if value(self.keep[q]) == init[q]}
-            new = loads | {q: init[q] for q in keeps if q not in loads}
+            ctx = self._under(base + [self.pairs[q][0] * (1 if v else -1) for q, v in settled.items()])
+            plain = self._known(ties, settled)
+            cone = _closure(self.gate_fanin, [b for q in (*loads, *keeps) for b in self.fanin[q]])
+            nets = [
+                n for n in self.gate_nets if n in cone and steady[lanes.row(n)] and not plain[lanes.row(n)]
+            ]
+            items = [(self._val[0][n], bool(level[lanes.row(n)])) for n in nets]
+            items += [(self.fire[q], v) for q, v in loads.items()]
+            items += [(self.keep[q], init[q]) for q in keeps]
+            proven = self._constants(ctx, items)
+            self.cnf.clauses.append([-ctx])
+            loads = {q: v for q, v in loads.items() if (self.fire[q], v) in proven}
+            new = loads | {q: init[q] for q in keeps if q not in loads and (self.keep[q], init[q]) in proven}
             if not new:
                 return settled
             settled |= new
+
+    def _known(self, ties: Mapping[int, int], settled: Mapping[int, bool]) -> np.ndarray:
+        """Rows the ternary simulator knows, by propagation alone, at ``ties`` with ``settled`` held."""
+        t = self.lanes.ternary
+        row = np.full((1, max(self.controls, default=0) + 1), -1, dtype=np.int8)
+        for k, v in ties.items():
+            if k < row.shape[1]:
+                row[0, k] = v
+        z, o = t.rails(row, [settled])
+        return (z | o)[:, 0]
+
+    def _constants(self, ctx: int, items: Sequence[tuple[int, bool]]) -> set[tuple[int, bool]]:
+        """The literals of ``items`` proven at their values under ``ctx``, in order, each from those
+        before; a model refutes every later item it contradicts.
+        """
+        proven: set[tuple[int, bool]] = set()
+        refuted: set[int] = set()
+        for lit, v in track(items, desc="constants", unit="net"):
+            if lit in refuted or abs(lit) == 1:
+                if abs(lit) == 1 and (lit == 1) == v:
+                    proven.add((lit, v))
+                continue
+            model = self.solve([ctx, -lit if v else lit])
+            if model is None:
+                proven.add((lit, v))
+                self.cnf.clauses.append([-ctx, lit if v else -lit])
+                continue
+            value = _reader(model)
+            refuted |= {m for m, w in items if value(m) != w}
+        return proven
 
     def observable(
         self,
@@ -450,9 +545,11 @@ class Miter:
         source: Sequence[int],
         video: bool = False,
         reach: set[int] | None = None,
+        linked: frozenset = frozenset(),
     ) -> bool:
         """Whether flipping control bits ``source`` (or every input bit, with ``video``) can change an
-        output, storage in ``settled`` held and the rest free; no net outside ``reach`` can differ.
+        output, storage in ``settled`` held, in ``linked`` at its next state, and the rest free; no net
+        outside ``reach`` can differ.
 
         A free storage bit may differ between the copies once its next states can, to a least fixpoint.
         Random lanes find differences; the nets that never differ in them are proven equal in order.
@@ -464,54 +561,62 @@ class Miter:
         rest = {k: v for k, v in ties.items() if k not in source}
         if reach is None:
             reach = self.lanes.sensitised([rest], [settled], [nets])[0]
-        return self._decided(rest, settled, nets, flip, reach)
+        return self._decided(rest, settled, nets, flip, reach, linked)
 
-    def _decided(self, rest, settled, nets, flip, reach) -> bool:
+    def _decided(self, rest, settled, nets, flip, reach, linked) -> bool:
         outs = [o for o in self.outputs if o in reach]
         if not outs:
             return False
         open_ = set(nets)
-        free = {q for q in self.cells if q in reach and q not in settled}
+        free = {q for q in self.cells if q in reach and q not in settled and q not in linked}
         held = self._controls(rest) | dict(settled)
         base = self.tied(rest) + flip + [self.pairs[q][0] * (1 if v else -1) for q, v in settled.items()]
+        base += [self._link(q) for q in linked]
         inner = [n for n in self.gate_nets if n in reach]
         border = {b for n in reach for b in self.fanin.get(n, ()) if b not in reach}
         base += [self._eq(b) for b in border if b in self._val[0]]
         while True:
-            differ = self._witness(held, nets, open_, free, outs)
+            differ = self._witness(held, nets, open_, free, outs, linked)
             if differ is None:
                 return True
             pinned = [-p[2] for n, p in self.pairs.items() if n not in open_]
             todo = [n for n in [*inner, *sorted(free - open_)] if n not in differ]
+            ctx = self._under([*base, *pinned])
             watch = self._any(self.outputs[o] for o in outs)
             try:
-                found = self._sweep([*base, *pinned], todo, differ, watch, open_, free, outs)
+                found = self._sweep(ctx, todo, differ, watch, open_, free, outs)
             finally:
-                self.cnf.clauses.append([-watch])
+                self.cnf.clauses += [[-watch], [-ctx]]
             if found is not None:
                 return found
 
-    def _sweep(self, base, todo, differ: set, watch: int, open_: set, free: set, outs) -> bool | None:
-        """Prove the nets in ``todo`` equal in both copies in order, each from those before, racing the
-        output query at a doubling share of the conflicts spent. True when an output can differ, False
-        when none can, None when a storage bit is found to differ (it joins ``open_``).
+    def _under(self, lits: Iterable[int]) -> int:
+        """An activation literal that, assumed, implies every one of ``lits``."""
+        ctx = self.cnf.var()
+        self.cnf.clauses += [[-ctx, lit] for lit in lits if lit != 1]
+        return ctx
+
+    def _sweep(self, ctx: int, todo, differ: set, watch: int, open_: set, free: set, outs) -> bool | None:
+        """Prove the nets in ``todo`` equal in both copies in order under ``ctx``, each from those before,
+        racing the output query at a doubling share of the conflicts spent. True when an output can
+        differ, False when none can, None when a storage bit is found to differ (it joins ``open_``).
         """
-        proven: list[int] = []
         start, due, quiet = self.conflicts, 0, False
-        for n in todo:
+        for n in track(todo, desc="sweep", unit="net"):
             if n in differ or (quiet and n not in self.cells):
                 continue
             spent = self.conflicts - start
             if not quiet and spent >= due:
-                found = self.solve([*base, *proven, watch], budget=spent + 1)
+                found = self.solve([ctx, watch], budget=spent + 1)
                 if found:
                     return True
                 quiet, due = found is None, 2 * spent + 1
             goal = self.moves[n] if n in self.cells else self.cnf.xor2(self._val[0][n], self._val[1][n])
-            model = self.solve([*base, *proven, goal])
+            model = self.solve([ctx, goal])
             if model is None:
                 if n not in self.cells:
-                    proven.append(self._eq(n))
+                    a, b = self._val[0][n], self._val[1][n]
+                    self.cnf.clauses += [[-ctx, -a, b], [-ctx, a, -b]]
                 continue
             value = _reader(model)
             if any(value(self.outputs[o]) for o in outs):
@@ -523,7 +628,7 @@ class Miter:
             differ |= {
                 m for m in todo if m not in self.cells and value(self._val[0][m]) != value(self._val[1][m])
             }
-        return not (quiet or self.solve([*base, *proven, watch]) is None)
+        return not (quiet or self.solve([ctx, watch]) is None)
 
     def _eq(self, net: int) -> int:
         """A literal that, assumed, makes ``net`` equal in both copies."""
@@ -536,42 +641,47 @@ class Miter:
             self._eqs[(a, b)] = e
         return self._eqs[(a, b)]
 
-    def _witness(self, held, nets, open_: set, free: set, outs) -> set[int] | None:
+    def _witness(self, held, nets, open_: set, free: set, outs, linked: frozenset) -> set[int] | None:
         """Grow ``open_`` from random lanes to their fixpoint: the nets that differ in some lane, or
-        None once an output does.
+        None once an output does. Lanes are drawn again while each draw shows a net differing anew.
         """
         lanes = self.lanes
-        a = lanes.draw()
-        self._const(a, held)
-        b, fresh = a.copy(), lanes.draw()
-        rows = [lanes.row(q) for q in open_ if q in self.cells or q in self.inputs]
-        b[rows] = fresh[rows]
-        for n in nets:
-            if n not in self.inputs:
-                a[lanes.row(n)], b[lanes.row(n)] = lanes.alg.const(False), lanes.alg.const(True)
         out_rows = [lanes.row(o) for o in outs]
+        diff = np.zeros(lanes.rows, dtype=bool)
         while True:
-            lanes.forward(a)
-            lanes.forward(b)
-            if (a[out_rows] != b[out_rows]).any():
-                return None
-            moved = (lanes.steps(a, a[lanes.q], False) != lanes.steps(b, b[lanes.q], False)).any(axis=1)
-            more = {q for i, q in enumerate(self.qs) if moved[i] and q in free and q not in open_}
-            if not more:
-                break
-            open_ |= more
-            rows = [lanes.row(q) for q in more]
+            a = lanes.draw()
+            self._const(a, held)
+            self._settle_links(a, np.array([q in linked for q in self.qs], dtype=bool)[:, None], lanes.alg)
+            b, fresh = a.copy(), lanes.draw()
+            rows = [lanes.row(q) for q in open_ if q in self.cells or q in self.inputs]
             b[rows] = fresh[rows]
-        diff = (a != b).any(axis=1)
-        return {n for n, r in lanes.ternary.index.items() if diff[r]} | {
-            q for i, q in enumerate(self.qs) if moved[i]
-        }
+            for n in nets:
+                if n not in self.inputs:
+                    a[lanes.row(n)], b[lanes.row(n)] = lanes.alg.const(False), lanes.alg.const(True)
+            while True:
+                lanes.forward(a)
+                lanes.forward(b)
+                if (a[out_rows] != b[out_rows]).any():
+                    return None
+                moved = (lanes.steps(a, a[lanes.q], False) != lanes.steps(b, b[lanes.q], False)).any(axis=1)
+                more = {q for i, q in enumerate(self.qs) if moved[i] and q in free and q not in open_}
+                if not more:
+                    break
+                open_ |= more
+                rows = [lanes.row(q) for q in more]
+                b[rows] = fresh[rows]
+            seen = (a != b).any(axis=1)
+            seen[lanes.q] |= moved
+            if not (seen & ~diff).any():
+                return {n for n, r in lanes.ternary.index.items() if diff[r]}
+            diff |= seen
 
     def witnesses(
         self,
         ties: Sequence[Mapping[int, int]],
         settled: Sequence[Mapping[int, bool]],
         sources: Sequence[Sequence[int] | None],
+        linked: Sequence[frozenset],
     ) -> np.ndarray:
         """Per tie set, its settled storage and its source (control bits flipped, or None for the inputs),
         whether random lanes, one word of them per tie set, make an output differ. A free storage bit
@@ -582,10 +692,24 @@ class Miter:
         chunk = max(1, observe.memory_limit() // (8 * self.lanes.rows * 8 * hdl.cpus()))
         for start in range(0, n, chunk):
             part = slice(start, min(n, start + chunk))
-            found[part] = self._witnesses(ties[part], settled[part], sources[part])
+            found[part] = self._witnesses(ties[part], settled[part], sources[part], linked[part])
         return found
 
-    def _witnesses(self, ties, settled, sources) -> np.ndarray:
+    def _settle_links(self, x: np.ndarray, linked: np.ndarray, alg: Words) -> None:
+        """Linked storage outputs (a mask by storage bit and word) at their next states with enables
+        fired, to the fixpoint, in place.
+        """
+        lanes = self.lanes
+        if not linked.any():
+            return
+        while True:
+            lanes.forward(x, alg)
+            q = np.where(linked, lanes.steps(x, x[lanes.q], True, alg), x[lanes.q])
+            if np.array_equal(q, x[lanes.q]):
+                return
+            x[lanes.q] = q
+
+    def _witnesses(self, ties, settled, sources, linked) -> np.ndarray:
         lanes, n = self.lanes, len(ties)
         alg = Words(n)
         ones = ~np.uint64(0)
@@ -619,12 +743,16 @@ class Miter:
             return x
 
         a, fresh = draw(), draw()
+        link = np.zeros((len(self.qs), n), dtype=bool)
+        for j, ls in enumerate(linked):
+            link[[at[q] for q in ls], j] = True
+        self._settle_links(a, link, alg)
         a[rows] = np.where(flip, np.uint64(0), a[rows])
         b = a.copy()
         b[rows] = np.where(flip, ones, b[rows])
         b[vrows] = np.where(video, fresh[vrows], b[vrows])
         outs = [lanes.row(o) for o in self.outputs]
-        free = held < 0
+        free = (held < 0) & ~link
         found = np.zeros(n, dtype=bool)
         while True:
             lanes.forward(a, alg)
@@ -719,7 +847,11 @@ class Exact:
         return out
 
     def _decide(
-        self, ties: Sequence[Mapping[int, int]], sources: Sequence[int | None], first: bool = False
+        self,
+        ties: Sequence[Mapping[int, int]],
+        sources: Sequence[int | None],
+        first: bool = False,
+        held: Sequence[int] = (),
     ) -> list[list[bool]]:
         """Per tie set, per source (a control bit, or None for every input bit), whether it is observable.
 
@@ -741,17 +873,20 @@ class Exact:
             return out
         miter = self.miter
         settled = [self.settled(t) for t, _ in track(lanes, desc="settle", unit="tie set")]
-        seen = miter.witnesses([t for t, _ in lanes], settled, [None if k is None else [k] for _, k in lanes])
+        linked = [miter.links(t, held, s) if held else frozenset() for (t, _), s in zip(lanes, settled)]
+        seen = miter.witnesses(
+            [t for t, _ in lanes], settled, [None if k is None else [k] for _, k in lanes], linked
+        )
         for (i, j), hit in zip(where, seen):
             out[i][j] = bool(hit)
         left = [
-            (lane, s, (i, j))
-            for lane, s, (i, j) in zip(lanes, settled, where)
+            (lane, s, ls, (i, j))
+            for lane, s, ls, (i, j) in zip(lanes, settled, linked, where)
             if not (out[i][j] or first and any(out[i]))
         ]
         if not left:
             return out
-        lanes, settled, where = [x[0] for x in left], [x[1] for x in left], [x[2] for x in left]
+        lanes, settled, linked, where = (list(x) for x in zip(*left))
         nets = [
             (
                 [n for n, name in miter.inputs.items() if name.startswith(VIDEO)]
@@ -761,21 +896,28 @@ class Exact:
             for _, k in lanes
         ]
         reach = miter.lanes.sensitised([t for t, _ in lanes], settled, nets)
-        for (t, k), s, r, (i, j) in track(
-            list(zip(lanes, settled, reach, where)), desc="miter", unit="source"
-        ):
+        queries = list(zip(lanes, settled, linked, reach, where))
+        for (t, k), s, ls, r, (i, j) in track(queries, desc="miter", unit="source"):
             if first and any(out[i]):
                 continue
-            out[i][j] = miter.observable(t, s, [] if k is None else [k], video=k is None, reach=r)
+            out[i][j] = miter.observable(t, s, [] if k is None else [k], video=k is None, reach=r, linked=ls)
         return out
+
+    def screen(self, ties: Sequence[Mapping[int, int]], bits: Sequence[int]) -> np.ndarray:
+        """Per tie set, False where the ternary simulator proves every control bit in ``bits`` dead."""
+        return self._screen(ties, [[f"c{k}" for k in bits]])[0]
 
     def live(self, ties: Mapping[int, int], bits: Sequence[int]) -> list[bool]:
         """Whether each control bit in ``bits`` (untied) is observable at ``ties``."""
         return self._decide([ties], list(bits))[0]
 
-    def alive(self, ties: Sequence[Mapping[int, int]], bits: Sequence[int]) -> list[bool]:
-        """Per tie set, whether any control bit in ``bits`` (untied) is observable there."""
-        return [any(row) for row in self._decide(ties, list(bits), first=True)]
+    def alive(
+        self, ties: Sequence[Mapping[int, int]], bits: Sequence[int], held: Sequence[int] = ()
+    ) -> list[bool]:
+        """Per tie set, whether any control bit in ``bits`` (untied) is observable there; the untied
+        control bits in ``held`` are held at some setting rather than varying.
+        """
+        return [any(row) for row in self._decide(ties, list(bits), first=True, held=held)]
 
     def carries(self, ties: Sequence[Mapping[int, int]]) -> list[bool]:
         """Per tie set, whether some input bit is observable there."""

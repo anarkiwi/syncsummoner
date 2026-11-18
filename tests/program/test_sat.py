@@ -77,6 +77,28 @@ def test_a_paged_control_is_live_only_while_its_page_is_free():
     assert exact.live({}, [S]) == [True], "a free control is never settled on"
 
 
+#: Two pipelines of one control whose agreement masks another control.
+TWINS = design(
+    [
+        cell("$_DFF_P_", C=1, D=4, Q=20),
+        cell("$_DFF_P_", C=1, D=4, Q=21),
+        cell("$_XOR_", A=20, B=21, Y=22),
+        cell("$_AND_", A=22, B=2, Y=23),
+        cell("$_XOR_", A=23, B=10, Y=24),
+    ],
+    {S: 2, G: 4},
+    data=[10, 1],
+    outputs=[24],
+)
+
+
+def test_a_held_control_links_its_pipelines_where_a_varying_one_frees_them():
+    exact = sat.Exact(observe.Circuit.read(TWINS, "top"))
+    assert exact.alive([{}], [S], held=[G]) == [False], "both pipelines hold the same setting"
+    assert exact.alive([{}], [S]) == [True], "a varying control settles neither"
+    assert exact.alive([{G: 1}], [S]) == [False] and exact.miter.links({}, [G], {}) == {20, 21}
+
+
 def test_settling_needs_every_free_signal_and_takes_a_load_before_a_kept_value():
     miter = sat.Miter(observe.Circuit.read(SEQUENTIAL, "top"))
     assert miter.settle({G: 1, M: 1, E: 0, K: 0}) == {20: True, 23: False, 25: False}

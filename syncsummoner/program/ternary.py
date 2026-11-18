@@ -211,14 +211,11 @@ class Ternary:
                 held.append((row, b, live))
         return sens, held
 
-    def reach(
-        self, ties: np.ndarray, fixed: Sequence[Mapping[int, bool]], sources: Sequence[Iterable[int]]
-    ) -> np.ndarray:
-        """Rows each lane's ``sources`` (nets) can change, through every pin sensitised in that lane:
-        controls at ``ties`` (0/1, or -1 for X), the nets in ``fixed`` at their values, the rest X.
+    def rails(self, ties: np.ndarray, fixed: Sequence[Mapping[int, bool]]) -> tuple[np.ndarray, np.ndarray]:
+        """Rails of every row by lane, without settling: controls at ``ties`` (0/1, or -1 for X), the
+        nets in ``fixed`` at their values, every other storage bit X.
         """
         lanes = ties.shape[0]
-        alg = Rails(lanes)
         z = np.zeros((self.size, lanes), dtype=bool)
         o = np.zeros((self.size, lanes), dtype=bool)
         z[self.zero], o[self.one] = True, True
@@ -227,7 +224,16 @@ class Ternary:
         for i, nets in enumerate(fixed):
             for net, v in nets.items():
                 z[self.index[net], i], o[self.index[net], i] = not v, v
-        self._forward(z, o, alg)
+        self._forward(z, o, Rails(lanes))
+        return z, o
+
+    def reach(
+        self, ties: np.ndarray, fixed: Sequence[Mapping[int, bool]], sources: Sequence[Iterable[int]]
+    ) -> np.ndarray:
+        """Rows each lane's ``sources`` (nets) can change, through every pin sensitised in that lane:
+        controls at ``ties`` (0/1, or -1 for X), the nets in ``fixed`` at their values, the rest X.
+        """
+        z, o = self.rails(ties, fixed)
         x = ~(z | o)
         sens, held = self._edges(z, o, x)
         src = [src for _, src, _ in sens] + [np.array([b]) for _, b, _ in held]
@@ -270,7 +276,7 @@ class Ternary:
         while True:
             before = int(seen.sum())
             for outs, src, live in reversed(sens):
-                np.logical_or.at(seen, src, seen[outs] & live)
+                _merge(seen, src, seen[outs] & live)
             for row, b, live in held:
                 seen[b] |= seen[row] & live
             for box in self.boxes:
@@ -291,3 +297,11 @@ class Ternary:
         out = {f"c{k}": seen[self.index[net]] for k, net in self.circuit.controls().items()}
         out |= {name: seen[self.index[b]] for b, name in self.circuit.inputs_named().items()}
         return out
+
+
+def _merge(seen: np.ndarray, rows: np.ndarray, hits: np.ndarray) -> None:
+    """``seen[rows] |= hits``, each row taking the OR of all its hits."""
+    order = np.argsort(rows, kind="stable")
+    rows = rows[order]
+    starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+    seen[rows[starts]] |= np.logical_or.reduceat(hits[order], starts, axis=0)

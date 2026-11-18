@@ -316,9 +316,10 @@ class Gating:
         return found
 
     def _alive(self, states: Sequence[np.ndarray], p: int, free: Sequence[int]) -> list[bool]:
-        """Per state, whether ``p`` is live by SAT with the controls in ``free`` left free."""
+        """Per state, whether ``p`` is live by SAT with the controls in ``free`` held at any setting."""
         ties = [self.m.ties(s, self.timing, [p, *free]) for s in states]
-        return self.m.exact.alive(ties, declared.field(p).flat)
+        held = [k for q in free for k in declared.field(q).flat]
+        return self.m.exact.alive(ties, declared.field(p).flat, held)
 
     def _solved(self, state: np.ndarray, p: int, others: list[int]) -> list[Revival]:
         """:meth:`revivals` by SAT, in the order and form the conditions give them.
@@ -345,9 +346,11 @@ class Gating:
         groups, reps = self._classes[gate]
         if len(picks) < len(qs) - 1:
             rest = qs[len(picks) + 1 :]
-            for j, v in enumerate(reps):
-                nxt = _apply(moved, [(gate, v)])
-                if self._alive([nxt], p, rest)[0]:
+            nexts = [_apply(moved, [(gate, v)]) for v in reps]
+            ties = [self.m.ties(s, self.timing, [p, *rest]) for s in nexts]
+            maybe = self.m.exact.screen(ties, declared.field(p).flat)
+            for j in track(np.flatnonzero(maybe).tolist(), desc=f"P{p} by P{gate}", unit="setting"):
+                if self._alive([nexts[j]], p, rest)[0]:
                     found = self._complete(state, p, qs, (*picks, j))
                     if found:
                         return found

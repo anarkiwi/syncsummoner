@@ -242,19 +242,17 @@ class ProgramModel:
     def _ties(self, state: np.ndarray, timing: int | None, free: Iterable[int]) -> tuple[dict, dict]:
         words = registers(self.params, state, timing)
         loose = set(free)
-        ties, named = {}, {}
-        for pid in loose:
-            if pid == TIMING:
-                continue
-            f = field(pid)
-            named[f"p{pid}"] = list(f.flat)
+        named = {f"p{pid}": list(field(pid).flat) for pid in loose if pid != TIMING}
+        named_bits = {k for ks in named.values() for k in ks}
+        ties = {}
         for reg in range(REGISTER_COUNT):
             if reg in CORE_REGISTERS or (reg == TIMING_REGISTER and (timing is None or TIMING in loose)):
                 continue
+            word = words.get(reg, 0) if reg < LATCHED_REGISTERS else 0
             for bit in range(REGISTER_BITS):
                 k = flat_bit(reg, bit)
-                if not any(k in ks for ks in named.values()):
-                    ties[k] = (words.get(reg, 0) >> bit) & 1 if reg < LATCHED_REGISTERS else 0
+                if k not in named_bits:
+                    ties[k] = (word >> bit) & 1
         return ties, named
 
     def ties(self, state: np.ndarray, timing: int | None, free: Iterable[int]) -> dict[int, int]:
@@ -417,7 +415,8 @@ class ProgramModel:
         or None. Each prefix is kept only when the rest, left free, can still complete it.
         """
         bits = field(param).flat
-        if not self._exact.alive([self._ties(state, timing, [param, *free])[0]], bits)[0]:
+        held = [k for q in free for k in field(q).flat]
+        if not self._exact.alive([self._ties(state, timing, [param, *free])[0]], bits, held)[0]:
             return None
         if not free:
             return []
