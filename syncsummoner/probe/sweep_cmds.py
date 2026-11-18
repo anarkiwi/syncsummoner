@@ -234,6 +234,7 @@ def _smoke_cmd(args: argparse.Namespace) -> int:
     """A few frames toggling one parameter, captured as a sweep is, then landed from its wire alone."""
     import numpy as np
 
+    from syncsummoner.compose.evidence import START
     from syncsummoner.compose.locktake import landing
     from syncsummoner.device.wire import load_wire
     from syncsummoner.probe.locked import plan_sweep, read_plan, write_plan
@@ -250,7 +251,9 @@ def _smoke_cmd(args: argparse.Namespace) -> int:
         **{k: v for k, v in said.items() if k != "regions"},
     )
     code = _sweep_cmd(argparse.Namespace(**{**vars(args), "plan": str(plan), "chunk": 0, "attempt": 1}))
-    shift, latch, landed = landing(load_wire(_sweep_take(str(out), said["program"], 0)), 1e9 / 30.0)
+    wire = load_wire(_sweep_take(str(out), said["program"], 0))
+    shift, latch, landed = landing(wire, 1e9 / 30.0)
+    latch = latch[wire["sends"]["target"] > START] if "sends" in wire else latch
     print(f"{said['program']}: device frames lead clip frames by {shift.lo}..{shift.hi}")
     print(f"{said['program']}: {landed.summary()}")
     for row in landed.rows:

@@ -327,3 +327,20 @@ def test_a_player_heard_flipping_returns_before_its_status_says_so():
     player.stop = lambda: {}
     heard = iter([False, True])
     assert player.start(fps=Fraction(30), heard=lambda: next(heard)) is None
+
+
+def test_asking_a_player_that_stopped_reading_goes_quiet():
+    class Gone:
+        """A pipe whose reader has gone."""
+
+        def write(self, data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            pass
+
+    shown = po.Shown(io.BytesIO(), asks=Gone(), clock=itertools.count().__next__)
+    shown.ask()
+    shown.ask()
+    shown.close()
+    assert shown.asked().size == 0

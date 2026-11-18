@@ -198,11 +198,17 @@ class Shown:
             return self._times[at]
 
     def ask(self) -> None:
-        """Ask the player for the last flip it has done, stamping the request as it leaves."""
+        """Ask the player for the frame on screen, stamped before it leaves; quiet once the Pi stops."""
         with self._cond:
+            if self._asks is None:
+                return
             self._sent.append(self._clock())
-            self._asks.write(b"?")
-            self._asks.flush()
+            try:
+                self._asks.write(b"?")
+                self._asks.flush()
+            except (BrokenPipeError, ValueError):
+                self._sent.pop()
+                self._asks = None
 
     def asked(self) -> np.ndarray:
         """Every request answered so far, paired with its reply in order, as :data:`ASKED` records."""
