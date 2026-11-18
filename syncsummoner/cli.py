@@ -479,18 +479,15 @@ def _lockcheck_cmd(args: argparse.Namespace) -> int:
     else:
         seconds = args.seconds
         if not args.prepared:
+            lead, tail = lockcheck_mod.check_frames(Path(args.take).parent, config.fps, args.lead_in)
             frames = render_mod.write_timecoded(
                 args.source,
                 args.scratch,
                 config=config,
                 seconds=args.seconds,
                 start=args.start,
-                **dict(
-                    zip(
-                        ("lead", "tail"),
-                        lockcheck_mod.check_frames(Path(args.take).parent, config.fps, args.lead_in),
-                    )
-                ),
+                lead=lead,
+                tail=tail,
             )
             seconds = frames / config.fps
         report = lockcheck_mod.lockcheck(
