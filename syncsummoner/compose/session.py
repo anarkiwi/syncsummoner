@@ -585,18 +585,19 @@ def _run(
 ) -> None:
     """The session's body: anchor, start state, calibration, the live clock, every take's plan, the lead-out.
 
-    Without a dry control the program is loaded once the lead-in's anchor has shown under Passthru, and
-    Passthru again once the last take has played, the sender, poller and monitor stopped first so each
-    load is the shell's only client. Every write is acknowledged before the next goes.
+    Without a dry control the program is loaded once the lead-in's anchor has shown under Passthru, before
+    the poller starts and the monitor is on, and Passthru again once the last take has played, the sender,
+    poller and monitor stopped first, so each load is the shell's only client. Every write is acknowledged
+    before the next goes.
     """
     layout, period = live.layout, 1e9 / float(config.fps)
     held["cc_map"] = rig.transport.device.midi.cc_map
-    shell.command("midi", "monitor", "on")
-    del shell.log_lines[:]
-    poller.start()
     if dry is None:
         _await_starts(live, began, ANCHOR_FRAMES, period)
         prepare(load(program))
+    shell.command("midi", "monitor", "on")
+    del shell.log_lines[:]
+    poller.start()
     start = held["start"]
     for slot in np.flatnonzero(start != park) + 1:
         sender.send(int(slot), int(start[slot - 1]), ev.START)

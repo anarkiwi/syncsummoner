@@ -203,8 +203,11 @@ def test_a_program_with_no_dry_control_has_passthru_only_at_the_sessions_ends(
     assert timed[1]["t0_ns"] > sim.frames["t_ns"][2 * (sim.lead + sum(COUNTS)) - 1]
     assert_each_take_shows_its_own_frames(sim, takes, found)
     assert all(p.landed.ok and p.applied.ok for p in proofs), [p.lines() for p in proofs]
-    at, quiet = rig.transport.device.shell.loads[-1]
-    assert quiet and rig.transport.device.shell.said[at - 1] == ("midi", "monitor", "off")
+    shell = rig.transport.device.shell
+    assert all(quiet for _, quiet in shell.loads), "no load shares the shell with the poller or the sender"
+    (lead_in, _), (lead_out, _) = shell.loads[-2:]
+    assert ("midi", "monitor", "on") not in shell.said[:lead_in], "the lead-in's load precedes the monitor"
+    assert shell.said[lead_out - 1] == ("midi", "monitor", "off")
 
 
 def test_a_lead_in_whose_strips_name_too_few_frames_fails_the_session(simulate, tmp_path):
