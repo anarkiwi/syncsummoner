@@ -260,26 +260,12 @@ class Miter:
             for c in self.storage
         }
         self.gate_fanin = {n: self.fanin[n] for n in self.gate_nets}
-        self.gate_readers: dict[int, list[int]] = defaultdict(list)
-        for net, ins in self.gate_fanin.items():
-            for b in ins:
-                self.gate_readers[b].append(net)
-        for box in self.boxes:
-            outs = [b for bits in box.outs.values() for b in bits if isinstance(b, int)]
-            for b in (b for bits in box.ins.values() for b in bits if isinstance(b, int)):
-                self.gate_readers[b] += outs
         self.solver = Solver(name=solver, bootstrap_with=cnf.clauses)
         self.flushed = len(cnf.clauses)
         self.solves = 0
         self.cells = {c.outs["Q"][0]: c for c in self.storage}
-        self.readers: dict[int, list[int]] = defaultdict(list)
-        for net, ins in self.fanin.items():
-            for b in ins:
-                self.readers[b].append(net)
-        for box in self.boxes:
-            outs = [b for bits in box.outs.values() for b in bits if isinstance(b, int)]
-            for b in (b for bits in box.ins.values() for b in bits if isinstance(b, int)):
-                self.readers[b] += outs
+        self.readers = self._readers(self.fanin)
+        self.gate_readers = self._readers(self.gate_fanin)
         self._after: dict[int, frozenset] = {}
         self.qs = list(self.cells)
         self.start = np.array([circuit.init.get(q, False) for q in self.qs])
@@ -346,6 +332,18 @@ class Miter:
             self.cnf.clauses += [[-lit, -a, f], [-lit, a, -f]]
             self._links[q] = lit
         return self._links[q]
+
+    def _readers(self, fanin: Mapping[int, Iterable[int]]) -> dict[int, list[int]]:
+        """Nets each net feeds within a step: by ``fanin``, and every output of a box it is an input of."""
+        out: dict[int, list[int]] = defaultdict(list)
+        for net, ins in fanin.items():
+            for b in ins:
+                out[b].append(net)
+        for box in self.boxes:
+            outs = [b for bits in box.outs.values() for b in bits if isinstance(b, int)]
+            for b in (b for bits in box.ins.values() for b in bits if isinstance(b, int)):
+                out[b] += outs
+        return out
 
     def _box(self, val: tuple[dict, dict]) -> None:
         """Each black box's outputs equal in both copies wherever all its inputs are."""
