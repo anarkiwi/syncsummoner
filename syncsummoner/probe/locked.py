@@ -397,11 +397,17 @@ def capture(
 ) -> list[dict]:  # pragma: no cover - needs the rig
     """Record the chunks as one session of ``program`` on the clip; per take, its device state and any fault.
 
-    The program is loaded once for them all; a fault anywhere is every take's, since they share one session.
+    The program is loaded once for them all; a fault of the session is every take's, since they share it, and
+    a vblank the Pi missed is only the takes resting on the frame it fell on (:func:`~.lock.take_fault`).
     """
     from pyvmancer.ccmap import cc_map_report  # pylint: disable=import-outside-toplevel
 
-    from syncsummoner.compose import locktake, render, session  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import (  # pylint: disable=import-outside-toplevel
+        lock,
+        locktake,
+        render,
+        session,
+    )
     from syncsummoner.compose.timecode import clip_layout  # pylint: disable=import-outside-toplevel
     from syncsummoner.device.recorder import (  # pylint: disable=import-outside-toplevel
         Recorder,
@@ -468,6 +474,8 @@ def capture(
         mine["frames_lost_by_driver"] = lost
         if lost:
             mine.setdefault("fault", f"TakeFaultError: the capture driver lost {lost} frames")
+        if "fault" not in mine and (fault := lock.take_fault(out)):
+            mine["fault"] = fault
         said.append(mine)
     return said
 

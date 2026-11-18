@@ -1,8 +1,9 @@
 """Stimulus playout: a vsync-locked DRM/KMS player on the Pi feeding the device's input.
 
-The Pi runs :mod:`syncsummoner.device.kmsplay`, which flips one frame per vblank and fails
-loudly on any missed one. The host uploads the stimulus once, starts and stops the player
-by its pidfile, and reads back its status and its log of every flip.
+The Pi runs :mod:`syncsummoner.device.kmsplay`, which flips one frame per vblank and logs any
+flip that misses its vblank, flagged :data:`~syncsummoner.device.kmsplay.MISSED`. The host
+uploads the stimulus once, starts and stops the player by its pidfile, and reads back its status
+and its log of every flip.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import numpy as np
 from syncsummoner.progress import LOG
 
 from .host import DEFAULT_HOST, DEFAULT_TIMEOUT, Runner, ssh_runner
-from .kmsplay import RECORD, SEGMENT
+from .kmsplay import MISSED, RECORD, SEGMENT
 
 DEFAULT_FB = "/dev/fb0"
 #: 565 quantisation levels per channel, for an RGB-ordered source frame.
@@ -94,16 +95,44 @@ def player_source() -> bytes:
     return Path(__file__).with_name("kmsplay.py").read_bytes()
 
 
-def flip_summary(flips: np.ndarray, hold: int) -> dict:
-    """Counts a flip log is judged by: flips, segments, and any vblank or frame out of cadence."""
-    if not flips.size:
-        return {"flips": 0, "segments": 0, "missed": 0, "out_of_cadence": 0}
+def _late(flips: np.ndarray) -> np.ndarray:
+    """Indices of the flips in a segment flagged :data:`MISSED` or off the vblank after the one before."""
+    flags, v, seq = flips["flags"], flips["v"], flips["seq"]
+    late = 1 + np.flatnonzero(((flags[1:] & MISSED) != 0) | (np.diff(seq) != 1) | (np.diff(v) != 1))
+    return late[(flags[late] & SEGMENT) == 0]
+
+
+def misses(flips: np.ndarray, hold: int) -> np.ndarray:
+    """Per late flip, the first and last played frame due on a vblank it left showing another, ``(n, 2)``.
+
+    Every vblank from the one after the flip before's to the late flip's own showed a frame other than
+    the one due, so every frame due on them, and only those, may be mis-shown.
+    """
+    late = _late(flips)
+    return np.c_[(flips["v"][late - 1] + 1) // hold, flips["v"][late] // hold].astype(np.int64)
+
+
+def flip_summary(flips: np.ndarray, hold: int, spans: Sequence[tuple[int, int]] | None = None) -> dict:
+    """Counts a flip log is judged by: flips, segments, late flips and frames shown out of cadence.
+
+    ``spans`` are the played frames ``a..b-1`` the judgement rests on, all by default: a late flip counts
+    when a frame it may have mis-shown is in one, any other flip when the frame due on it is.
+    """
+    lo, hi = (
+        (np.array(spans, dtype=np.int64).reshape(-1, 2).T) if spans is not None else ([-np.inf], [np.inf])
+    )
+    late = misses(flips, hold)
     start = (flips["flags"] & SEGMENT) != 0
-    inside = ~start[1:]
-    missed = int(np.count_nonzero(np.diff(flips["seq"])[inside] != np.diff(flips["v"])[inside]))
+    regular = ~start
+    regular[_late(flips)] = False
     due = flips["v"] // hold
-    off = int(np.count_nonzero((flips["frame"] != due)[np.r_[False, inside]]))
-    return {"flips": int(flips.size), "segments": int(start.sum()), "missed": missed, "out_of_cadence": off}
+    off = regular & (flips["frame"] != due) & np.any((due[:, None] >= lo) & (due[:, None] < hi), axis=1)
+    return {
+        "flips": int(flips.size),
+        "segments": int(np.count_nonzero(start)),
+        "missed": int(np.count_nonzero(np.any((late[:, :1] < hi) & (late[:, 1:] >= lo), axis=1))),
+        "out_of_cadence": int(np.count_nonzero(off)),
+    }
 
 
 class Playout:

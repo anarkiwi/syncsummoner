@@ -395,9 +395,10 @@ class Sim:
     Played frame ``f`` starts at ``T0 + f * P``, is captured a quarter frame either side of
     ``T0 + (f + 0.5) * P`` and shows the state latched at tick ``f - 2``; a write latches on the
     first tick at or after it is sent; ``counts`` lays the frames out as a session's takes from frame 0.
+    The Pi's flip for played frame ``miss`` lands a vblank late, so its first capture shows the frame before.
     """
 
-    def __init__(self, *, lead, count, tail=20, drop=None, counts=None):
+    def __init__(self, *, lead, count, tail=20, drop=None, counts=None, miss=None):
         counts = [count] if counts is None else list(counts)
         self.now, self.lead, self.count, self.counts = S0, lead, sum(counts), counts
         self.dry = switch(1)
@@ -423,6 +424,12 @@ class Sim:
         self.frames["digest"] = np.arange(self.size) // 2 + 1
         self.codes = np.repeat(code, 2) & locked.WRAP
         self.flips = locked.flip_log(frames, 2)
+        self.showing = np.arange(self.size) // 2
+        if miss is not None:
+            self.flips = locked.late(self.flips, 2 * miss, 2)
+            self.showing[2 * miss] -= 1
+            for field in (self.codes, self.frames["digest"]):
+                field[2 * miss] = field[2 * miss - 1]
         self.files = {}
 
     def source(self, lead):
@@ -451,9 +458,10 @@ class Sim:
         """Capture ``k``: the clip frame, or its processed form when bypass is off."""
         f = k // 2
         s = self.state(TAU + (f - 2) * P)
+        base = self.base[self.showing[k]]
         if self.dry.holds(s[self.dry.parameter_id - 1]):
-            return self.base[f]
-        return 0.2 * self.base[f] + 100 + 0.1 * s[2]
+            return base
+        return 0.2 * base + 100 + 0.1 * s[2]
 
     def stored(self):
         """Captures the card has delivered by now."""

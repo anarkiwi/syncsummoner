@@ -1,8 +1,9 @@
 """Acceptance check of the locked frame clock: a timecoded take judged capture by capture.
 
-Every flip must land on its vblank, every clip frame must have its captures in one gap-free
-run, every picture change must fall on a frame start of the frame line, every legible strip must
-read the frame the line says, and, under Passthru, no capture may show a neighbour in its upper bands.
+Every flip the take rests on must land on its vblank, every clip frame must have its captures in
+one gap-free run, every picture change must fall on a frame start of the frame line, every legible
+strip must read the frame the line says, and, under Passthru, no capture may show a neighbour in its
+upper bands.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from syncsummoner.compose import render, timecode
-from syncsummoner.compose.lock import signed
+from syncsummoner.compose.lock import rests_on, signed
 from syncsummoner.probe import decoded
 from syncsummoner.progress import LOG, stage
 
@@ -123,7 +124,7 @@ def judge(take: str | Path, *, config: Any, clip: str | Path | None = None) -> L
     return LockReport(
         frames=int(found.picked.size),
         attributed=int(np.count_nonzero(found.picked >= 0)),
-        flips=flip_summary(record["flips"], int(record["hold"])),
+        flips=flip_summary(record["flips"], int(record["hold"]), rests_on(record)),
         drops=int(np.clip(np.diff(frames["sequence"][first : last + 1]) - 1, 0, None).sum()),
         gaps=gaps,
         off_cadence=int(np.count_nonzero(new & ~found.starts[span])),

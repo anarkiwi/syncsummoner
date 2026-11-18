@@ -116,6 +116,15 @@ session, then cut to its own captures and clip frames (`lock.View`). Each take's
 every send of the session, those it owns marked (`own`): its landings and receipts are judged on
 its own sends, its readbacks against every send while it recorded.
 
+A take rests on its own clip frames and on the session's lead-in and lead-out (`lock.rests_on`): their
+strips fix and pin the one frame line every take is attributed on, and the lead-in's calibration and
+clock land every take's writes. A flip the Pi logged `MISSED` may have mis-shown every frame due from
+the vblank after the flip before's to its own (`playout.misses`); a take resting on one of them is a
+`MissedVblankError` (`lock.require_flips`), the `fault` of its `sweep run` record and refused by
+`attribute_take`, so `collect` and `evidence` refuse it too. A miss in a take's span faults that take
+alone, and only it is recaptured; a miss in the lead-in or lead-out faults every take of the session.
+The Pi lag numbering a strip-less run leaves out every frame a miss may have mis-shown.
+
 The boot count (settings key 9) is read before and after every take; any rise is a
 `RebootError`.
 

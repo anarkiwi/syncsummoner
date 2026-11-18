@@ -155,9 +155,26 @@ def test_the_screen_shows_the_frame_that_was_due():
     assert len({display.shown[v][0] for v in range(3)}) == 3, "three buffers in rotation"
 
 
-def test_a_late_flip_is_a_fault_not_a_slip():
-    with pytest.raises(K.PlayoutFault, match="vblank 7.*1 vblank.*missed"):
-        play(FakeDisplay(late={7}), 20)
+@pytest.mark.parametrize("hold, late", [(1, 7), (2, 14), (2, 15)], ids=["frame", "first-vblank", "held"])
+def test_a_late_flip_is_logged_missed_and_play_keeps_to_the_grid(hold, late):
+    """The late flip is flagged on the vblank it landed on; every later one lands on its own vblank."""
+    display = FakeDisplay(period_ns=PERIOD / hold, late={late})
+    player, records = play(display, 40, hold=hold, stop_after=30)
+    flagged = [k for k, r in enumerate(records) if r[4] & K.MISSED]
+    assert flagged == [late] and player.missed == 1 and player.segments == 1
+    assert records[late][0] == late + 1 and records[late][2] == late // hold, "the late frame, a vblank on"
+    assert [r[0] for r in records] == [*range(late), *range(late + 1, 31)], "no vblank is committed twice"
+    assert [r[1] - r[0] for r in records] == [1001] * 30, "every flip on the grid's own vblank"
+    after = records[late + 1 :]
+    assert [r[2] for r in after] == [r[0] // hold for r in after], "and each later one shows the frame due"
+    assert all(display.shown[r[0] - (k == late)][1] == struct.pack("<q", r[2]) for k, r in enumerate(records))
+
+
+def test_a_flip_landing_early_is_a_fault():
+    timeline = K.Timeline(1, PERIOD)
+    timeline.anchor(100, 0)
+    with pytest.raises(K.PlayoutFault, match="landed early"):
+        timeline.check(104, int(4 * PERIOD), 5)
 
 
 def test_a_flip_that_never_completes_is_a_fault():

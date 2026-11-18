@@ -1,7 +1,8 @@
 """Vsync-locked clip player for a DRM/KMS display, run on the stimulus source host.
 
 One atomic flip per vblank, each clip frame held for exactly ``refresh / fps`` vblanks, every
-flip-complete event checked against the vblank it was committed for; any miss is a fault.
+flip-complete event checked against the vblank it was committed for; a late one is logged as
+:data:`MISSED` and play goes on on the same grid.
 Imports only the standard library at module level: it runs under the host's system python.
 """
 
@@ -27,6 +28,8 @@ from typing import Any, Callable, Iterable, Iterator
 RECORD = struct.Struct("<qqqqq")
 #: Flag on the first flip of a segment, after the start or after the link came back up.
 SEGMENT = 1
+#: Flag on a flip that landed on a later vblank than it was committed for.
+MISSED = 2
 #: ``DRM_MODE_FLAG_INTERLACE``: such a mode has no single frame per vblank.
 INTERLACE = 0x10
 #: The framebuffer layout bgr565le words land in, as fbdev and the device chain expect.
@@ -145,8 +148,8 @@ class Timeline:
     """Maps the display's vblanks to the clip's, and checks every flip against it.
 
     Vblank ``v`` counts from the first flip at ``t0`` and shows frame ``v // hold``. Within a
-    segment each flip must land on the vblank it was committed for, within half a vblank of the
-    segment's own grid; ``phases_ns`` keeps where each segment's grid sits against ``t0``'s.
+    segment each flip lands on its own vblank of the segment's grid, within half a vblank;
+    ``phases_ns`` keeps where each segment's grid sits against ``t0``'s.
     """
 
     def __init__(self, hold: int, period_ns: Fraction):
@@ -171,21 +174,22 @@ class Timeline:
         self.phases_ns.append(int(t_ns - self.t0 - v * self.period_ns))
         return v
 
-    def check(self, seq: int, t_ns: int, v: int) -> None:
-        """Raise unless the flip committed for vblank ``v`` landed on it, on its segment's grid."""
-        if seq - self.base != v:
+    def check(self, seq: int, t_ns: int, v: int) -> int:
+        """The vblank the flip committed for vblank ``v`` landed on, ``v`` or later, on its segment's grid."""
+        landed = seq - self.base
+        if landed < v:
             raise PlayoutFault(
-                f"flip for vblank {v} (frame {v // self.hold}) landed on vblank {seq - self.base}: "
-                f"{seq - self.base - v} vblank(s) missed"
+                f"flip for vblank {v} (frame {v // self.hold}) landed early, on vblank {landed}"
             )
-        late = abs(t_ns - self.start[1] - (v - self.start[0]) * self.period_ns)
+        late = abs(t_ns - self.start[1] - (landed - self.start[0]) * self.period_ns)
         self.worst_ns = max(self.worst_ns, int(late))
         if 2 * late >= self.period_ns:
             raise PlayoutFault(
-                f"vblank {v} came {float(late) / 1e6:.3f} ms off a grid of "
+                f"vblank {landed} came {float(late) / 1e6:.3f} ms off a grid of "
                 f"{float(self.period_ns) / 1e6:.3f} ms "
                 "vblanks: the display clock and the event clock disagree"
             )
+        return landed
 
 
 class Player:
@@ -193,6 +197,8 @@ class Player:
 
     ``signals`` holds pending ``stop``, ``down`` and ``up`` requests set by signal handlers.
     While the link is down the timeline runs on the event clock and due frames are discarded.
+    A flip landing late is logged :data:`MISSED` on the vblank it landed on, which is counted in ``missed``,
+    and the next commit is for the vblank after it, so frames due meanwhile are skipped.
     """
 
     def __init__(
@@ -218,6 +224,7 @@ class Player:
         self.event_timeout_s = float(event_timeout_s)
         self.flips = 0
         self.segments = 0
+        self.missed = 0
         self.ended = False
         self.shown: tuple[int, int] | None = None
         self._ready: tuple[int, int] | None = None
@@ -311,12 +318,13 @@ class Player:
                 self._hold()
                 continue
             seq, t_ns, v = self._event()
-            self.timeline.check(seq, t_ns, v)
-            self._land(seq, t_ns, v)
+            landed = self.timeline.check(seq, t_ns, v)
+            self.missed += landed != v
+            self._land(seq, t_ns, landed, MISSED if landed != v else 0)
             if self.signals.pop("down", False):
                 self._down()
             else:
-                self._commit(v + 1)
+                self._commit(landed + 1)
 
 
 class KmsDisplay:  # pragma: no cover - needs a DRM device and pykms
@@ -663,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
             status.update(
                 flips=player.flips,
                 segments=player.segments,
+                missed=player.missed,
                 ended=player.ended,
                 worst_us=player.timeline.worst_ns / 1e3,
                 phases_us=[p / 1e3 for p in player.timeline.phases_ns],

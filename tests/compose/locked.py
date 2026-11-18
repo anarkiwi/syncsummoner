@@ -15,7 +15,7 @@ from syncsummoner.compose import session as session_mod
 from syncsummoner.compose import render as R
 from syncsummoner.compose.score import Layer, Score, Section
 from syncsummoner.compose.timecode import ClipLayout
-from syncsummoner.device.playout import FLIP
+from syncsummoner.device.playout import FLIP, MISSED
 from syncsummoner.device.v4l2rec import FRAME, sidecar
 from syncsummoner.probe import decoded
 from tests.compose import PROBED, rig_transport
@@ -64,6 +64,14 @@ def flip_log(frames: int, hold: int) -> np.ndarray:
     out["frame"] = v // hold
     out["t_ns"] = PI_T0 + v * VBLANK_NS
     out["flags"][0] = 1
+    return out
+
+
+def late(flips: np.ndarray, v: int, hold: int) -> np.ndarray:
+    """``flips`` with the flip committed for vblank ``v`` landing one vblank late, as the Pi logs it."""
+    out = np.delete(flips, v)
+    out["flags"][v] |= MISSED
+    out["frame"][v] = v // hold
     return out
 
 

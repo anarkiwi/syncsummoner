@@ -794,7 +794,8 @@ doing it twice, which is what the audition is for.
 | `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
 | `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, the frame line against the jitter, slips, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |
 | `LeadInError: ...` | the program's load ran past the lead-in, or clip frame 0 reached the card before it ended; raise `RenderConfig.lead_in_s` (`lockcheck --program NAME --lead-in S` tries a value) |
-| `PlayoutError: the Pi player faulted ...` | the player missed a vblank, ran out of decoded frames or met a mode that does not divide the clip rate; read its `status.json` and log in the Pi's `/dev/shm` player directory |
+| `PlayoutError: the Pi player faulted ...` | the player ran out of decoded frames, saw no flip complete or met a mode that does not divide the clip rate; read its `status.json` and log in the Pi's `/dev/shm` player directory |
+| `MissedVblankError: ... the Pi missed a vblank showing clip frames a..b` | a Pi flip landed late on a frame the take rests on; only that take is faulted and recaptured, unless the frames are the lead-in's or lead-out's, which every take of the session rests on |
 | `source.drm_free` fails | another DRM master holds `/dev/dri/card1` (a compositor or a stray player); stop the pid it names |
 | pass dies uploading the clip | `/dev/shm` on the Pi is half its RAM; a long scratch at `crf 14` will not fit |
 | `Host key verification failed` | the mounted `known_hosts` has no entry for the Pi; `BatchMode` will not prompt for one |
