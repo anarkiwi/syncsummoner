@@ -128,7 +128,9 @@ output frame (30.02 per second on the host clock at 1080p30). Polled alternately
 `modulation status` (round trip about 1.9 ms each), over 66 MIDI writes to Sidewinder's P1 the
 readback changed 66 times, never between two polls reading the same count, and each write's
 latch frame was pinned to one count: the count after the last one read before the send for 55
-writes, the one after that for 11 (`captures/diag/latchtick.py`).
+writes, the one after that for 11 (`captures/diag/latchtick.py`). The count advances only while the
+transport plays: stopped, it holds its value, and the beat phase steps by a fixed amount per frame
+at the set tempo while it plays.
 
 Render therefore sends each write half a frame before the instant it must precede
 to land on its target frame, and proves where it landed ([evidence.md](evidence.md)). The early bias

@@ -119,6 +119,14 @@ class Offset:
         return self.lo == self.hi
 
 
+class UnboundError(EvidenceError):
+    """Too few events yet to bound the device-to-clip offset."""
+
+
+class StoppedError(EvidenceError):
+    """The device's ``field_count`` did not advance: its transport was stopped, so it counted no frames."""
+
+
 def offset(
     latch: np.ndarray, floors: np.ndarray, asked: np.ndarray, shown: np.ndarray, ticks: np.ndarray
 ) -> Offset:
@@ -128,15 +136,22 @@ def offset(
     ``f`` to a request sent after a count ``c`` was read means ``O >= c - f``. A count ``c'`` asked for
     after the host heard frame ``f`` shown means ``O <= c' - f + 1``, and a write with floor ``F`` and
     latest latch ``L`` means ``O <= L - F``. Bounds that cross mean the device is not locked to the
-    player, or an event is misordered, which is an error.
+    player, or an event is misordered, which is an error. A reply counts only once the host has heard
+    the frame after it shown, so the Pi was still flipping; one past the clip's end does not.
     """
+    if ticks.size > 1 and ticks["field"][-1] == ticks["field"][0]:
+        raise StoppedError(
+            f"field_count stayed at {int(ticks['field'][0])} over {ticks.size} reads: the device's transport "
+            "is stopped, so its frame ticks cannot be counted"
+        )
     c = count_before(ticks, asked["t0_ns"])
-    told = c >= 0
+    flipped = asked["frame"] < (shown["frame"].max() if shown.size else np.iinfo(np.int64).min)
+    told = (c >= 0) & flipped
     after = count_after(ticks, shown["t_ns"])
     heard = after != UNBOUNDED
     known = (latch[:, 1] != UNBOUNDED) & (floors > np.iinfo(np.int64).min)
     if not told.any() or not heard.any():
-        raise EvidenceError(
+        raise UnboundError(
             f"{int(told.sum())} Pi replies after a frame tick and {int(heard.sum())} Pi reports before one: "
             "both are needed to tie device frames to clip frames"
         )

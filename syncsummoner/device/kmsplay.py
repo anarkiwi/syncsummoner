@@ -455,20 +455,35 @@ class LiveFeed:
             self._release()
 
 
-def answer(asks: Any, last: Callable[[], bytes | None], live: LiveFeed) -> None:
-    """For each byte read from ``asks``, offer ``live`` the last flip done then, flagged :data:`REPLY`.
+def answer(
+    asks: Any,
+    last: Callable[[], bytes | None],
+    live: LiveFeed,
+    *,
+    period_ns: Fraction,
+    hold: int,
+    clock: Callable[[], int] = time.monotonic_ns,
+) -> None:
+    """For each byte read from ``asks``, offer ``live`` the frame on screen then, flagged :data:`REPLY`.
 
-    A reply is made only after its request was read, so the flip after the one it reports came after
-    the request was sent. Returns when ``asks`` ends.
+    The last flip recorded is carried on by the vblanks its event time puts before now, on this host's
+    own clock, so a flip completed but not yet recorded still counts. A reply is made only after its
+    request was read, so the flip after the frame it reports came after the request was sent. Returns
+    when ``asks`` ends.
     """
     while asks.read(1):
         record = last()
         if record is not None:
-            fields = RECORD.unpack(record)
-            live.write(RECORD.pack(*fields[:4], fields[4] | REPLY))
+            v, seq, frame, t_ns, flags = RECORD.unpack(record)
+            passed = int((clock() - t_ns) // period_ns)
+            now = v + max(passed, 0)
+            frame += now // hold - v // hold
+            live.write(RECORD.pack(now, seq + max(passed, 0), frame, t_ns, flags | REPLY))
 
 
-def serve_asks(path: str, last: Callable[[], bytes | None], live: LiveFeed) -> threading.Thread:
+def serve_asks(
+    path: str, last: Callable[[], bytes | None], live: LiveFeed, *, period_ns: Fraction, hold: int
+) -> threading.Thread:
     """Answer requests on a fresh named pipe at ``path`` from a thread of its own, for askers in turn."""
     try:
         os.unlink(path)
@@ -479,18 +494,20 @@ def serve_asks(path: str, last: Callable[[], bytes | None], live: LiveFeed) -> t
     def serve() -> None:
         while True:
             with open(path, "rb", buffering=0) as asks:
-                answer(asks, last, live)
+                answer(asks, last, live, period_ns=period_ns, hold=hold)
 
     thread = threading.Thread(target=serve, name="asks", daemon=True)
     thread.start()
     return thread
 
 
-def recorder(log: Any, live: LiveFeed | None, ask: str | None) -> Callable[..., None]:
+def recorder(
+    log: Any, live: LiveFeed | None, ask: str | None, *, period_ns: Fraction = Fraction(1), hold: int = 1
+) -> Callable[..., None]:
     """Each flip's record written to ``log`` and offered ``live``, the last kept to answer ``ask`` with."""
     last: list[bytes] = []
     if live is not None and ask:
-        serve_asks(ask, lambda: last[-1] if last else None, live)
+        serve_asks(ask, lambda: last[-1] if last else None, live, period_ns=period_ns, hold=hold)
 
     def record(*fields: int) -> None:
         data = RECORD.pack(*fields)
@@ -721,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         preroll.wait_full(timeout_s=60.0)
         live = LiveFeed(args.live) if args.live else None
         with open(args.flips, "wb", buffering=0) as log:
-            record = recorder(log, live, args.ask)
+            record = recorder(log, live, args.ask, period_ns=display.period_ns, hold=display.hold)
 
             player = Player(
                 display,

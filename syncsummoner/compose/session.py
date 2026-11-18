@@ -318,11 +318,7 @@ def locked_session(
         wire = _session_wire(held, sender, poller, played, dry)
         for index, take in enumerate(takes):
             _save_take_wire(take, index, layout, wire, held, program=program, park=park, session=session)
-        rebooted = boot_count(shell)
-        if rebooted != booted:
-            raise RebootError(
-                f"{program}: the device's boot count went from {booted} to {rebooted} during the session"
-            )
+        _leave(shell, held, booted, program)
     return [_take_record(index, layout, wire, held, park) for index in range(len(takes))]
 
 
@@ -601,6 +597,7 @@ def _run(
     if dry is None:
         _await_starts(live, began, ANCHOR_FRAMES, period)
         prepare(load(program))
+    held["transport"] = _transport_playing(shell)
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
     poller.on_tick = shown.ask
@@ -609,7 +606,7 @@ def _run(
     for slot in np.flatnonzero(start != park) + 1:
         sender.send(int(slot), int(start[slot - 1]), ev.START)
     time.sleep(lead_in.settle_s)
-    shift = _offset(poller, held, sender, dry)
+    shift = _offset(poller, held, sender, dry, layout.lead)
     held["shift"] = shift
     LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
     rows = held["rows"]
@@ -640,17 +637,43 @@ def _run(
         time.sleep(config.tail_s)
 
 
-def _offset(poller: Poller, held: dict, sender: Sender, dry: Any) -> ev.Offset:
-    """The device-to-clip offset the session's events bound so far, waiting for a frame tick while none do."""
+def _leave(shell: Any, held: dict, booted: int, program: str) -> None:
+    """Leave the transport as the session found it; a rise in the boot count is a :class:`RebootError`."""
+    if held.get("transport") not in (None, "playing"):
+        shell.command("transport", "stop")
+    rebooted = boot_count(shell)
+    if rebooted != booted:
+        raise RebootError(
+            f"{program}: the device's boot count went from {booted} to {rebooted} during the session"
+        )
+
+
+def _transport_playing(shell: Any) -> str:
+    """Put the device's transport in play, so its ``field_count`` counts frames; returns its state before."""
+    was = str(json.loads(shell.command("transport", "status").payload).get("state"))
+    if was != "playing":
+        shell.command("transport", "play")
+    return was
+
+
+def _offset(poller: Poller, held: dict, sender: Sender, dry: Any, frames: int) -> ev.Offset:
+    """The device-to-clip offset the session's events bound so far, waiting a frame tick while too few do.
+
+    Waiting past ``frames`` ticks, the lead-in's length, is a :class:`LeadInTimeError`.
+    """
+    began = None
     while True:
         wire = _session_wire(held, sender, poller, [], dry)
         try:
             return ev.offset(
                 np.zeros((0, 2), np.int64), np.zeros(0, np.int64), wire["asked"], wire["shown"], wire["ticks"]
             )
-        except ev.EvidenceError:
-            count = int(wire["ticks"]["field"][-1]) + 1 if wire["ticks"].size else 0
-            if poller.wait_count(count, threading.Event()) is None:
+        except ev.UnboundError as err:
+            count = int(wire["ticks"]["field"][-1]) if wire["ticks"].size else 0
+            began = count if began is None else began
+            if count - began > frames:
+                raise LeadInTimeError(f"{err}, after the lead-in's {frames} frames") from err
+            if poller.wait_count(count + 1, threading.Event()) is None:
                 raise
 
 

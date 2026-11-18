@@ -171,3 +171,24 @@ def test_an_inexact_offset_widens_every_window():
     sends["target"] = [10]
     got = ev.landed(plan, sends, latch=np.array([[112, 112]]), shift=ev.Offset(101, 102))
     assert (got.rows["first"][0], got.rows["last"][0], got.ambiguous) == (10, 11, 1)
+
+
+def test_a_stopped_transport_counts_no_frames_and_is_refused():
+    ticks = ticks_of([(0, 10, 100), (30, 40, 100), (60, 70, 100)])
+    with pytest.raises(ev.StoppedError, match="transport is stopped"):
+        ev.offset(
+            np.zeros((0, 2), np.int64),
+            np.zeros(0, np.int64),
+            asked_at(np.array([20]), [90]),
+            shown_at([25], [99]),
+            ticks,
+        )
+
+
+def test_a_reply_counts_only_once_the_frame_after_it_is_heard():
+    ticks = ticks_of([(0, 10, 100), (30, 40, 103), (70, 80, 106)])
+    asked = asked_at(np.array([20, 50]), [98, 99])
+    with pytest.raises(ev.UnboundError):
+        ev.offset(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked[1:], shown_at([25], [99]), ticks)
+    found = ev.offset(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked, shown_at([25], [99]), ticks)
+    assert found.lo == 2, "the reply of 99, the last frame heard, is left out: the Pi may hold it"

@@ -28,7 +28,10 @@ contribute only counters, ordered against host events by causality:
 | Videomancer MIDI | `midi monitor` receipts (`wire.echoed`) | the device took the write by its echo |
 | Capture card | buffer timestamps | a capture done before a send cannot show it |
 
-The device latches CCs on its frame tick, the frame `field_count` counts: its readback never
+`field_count` is the transport's counter: it advances once per frame only while the transport
+plays, so a session puts the transport in play and leaves it as it found it, and a take whose count
+never advanced is refused (`evidence.StoppedError`). Each tick read also records the transport's beat
+phase, tempo and play state. The device latches CCs on its frame tick, the frame `field_count` counts: its readback never
 changes between two polls that read the same count (docs/hardware.md). For each write:
 
 - **Floor** `F`: the clip frame the host last heard the Pi show before sending it. No output

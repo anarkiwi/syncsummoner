@@ -447,7 +447,7 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
     lost = [] if lose is None else [lose]
     boots, said, loads = list(boots), [], []
     offsets = [0] * 12
-    shell = types.SimpleNamespace(log_lines=[], said=said, loads=[])
+    shell = types.SimpleNamespace(log_lines=[], said=said, loads=[], transport="playing")
 
     def status():
         values = sim.state(sim.now)
@@ -459,9 +459,13 @@ def rigged(sim, info, *, boots=(7, 7), cc_map=tuple(range(1, 13)), lose=None):
             count = sim.field()
             sim.now += 1_000_000
             return types.SimpleNamespace(
-                payload=json.dumps({"field_count": count, "phase": 0, "bpm_x100": 12000, "state": "stopped"})
+                payload=json.dumps(
+                    {"field_count": count, "phase": 0, "bpm_x100": 12000, "state": shell.transport}
+                )
             )
         said.append(words)
+        if words[0] == "transport":
+            shell.transport = {"play": "playing", "stop": "stopped"}[words[1]]
         if words == ("fpga", "status"):
             return types.SimpleNamespace(payload=json.dumps({"state": "running", "program": "Teletext"}))
         return types.SimpleNamespace(payload="")
@@ -822,3 +826,27 @@ def test_an_offset_known_too_late_is_a_lead_in_error(monkeypatch, simulate, tmp_
     assert rig.transport.device.shell.said[-1] == ("midi", "monitor", "off")
     assert (tmp_path / "t.mkv.wire.npz").is_file()
     assert sim.sender is None and sim.poller is None
+
+
+def test_a_stopped_transport_is_played_for_the_session_and_stopped_after(simulate, tmp_path):
+    """The field_count counts only while the transport plays: the session plays it, then restores it."""
+    sim, clip = session_for(simulate, tmp_path, dry=True, counts=[30])
+    rig, recorder, load, _ = rigged(sim, info_with(1))
+    shell = rig.transport.device.shell
+    shell.transport = "stopped"
+    SS.locked_take(
+        rig,
+        recorder,
+        tmp_path / "t.mkv",
+        program="Teletext",
+        seconds=1.0,
+        config=config_for(),
+        plan=PLAN_ROWS,
+        working=lambda info: {1: 0},
+        load=load,
+        clip=clip,
+        lead_in=LEAD_IN,
+        bypass=lambda name: info_with(1).dry,
+    )
+    assert shell.said[0] == ("transport", "play") and ("transport", "stop") in shell.said
+    assert shell.transport == "stopped"

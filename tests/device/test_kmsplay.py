@@ -626,13 +626,22 @@ def test_a_failing_decoder_faults_with_its_last_line():
         list(K.clip_frames(argv, 2))
 
 
-def test_each_request_is_answered_with_the_last_flip_flagged_as_a_reply():
+def test_each_request_is_answered_with_the_frame_on_screen_flagged_as_a_reply():
     sent = []
     live = SimpleNamespace(write=sent.append)
-    last = [None, K.RECORD.pack(4, 4, 4, 99, K.SEGMENT)]
-    K.answer(io.BytesIO(b"??"), lambda: last.pop(0), live)
-    assert len(sent) == 1, "nothing to answer before the first flip"
-    assert K.RECORD.unpack(sent[0]) == (4, 4, 4, 99, K.SEGMENT | K.REPLY)
+    last = [None, K.RECORD.pack(4, 4, 4, 1000, K.SEGMENT), K.RECORD.pack(4, 4, 4, 1000, 0)]
+    now = iter([1000 + 99, 1000 + 250])
+    K.answer(
+        io.BytesIO(b"???"),
+        lambda: last.pop(0),
+        live,
+        period_ns=Fraction(100),
+        hold=1,
+        clock=lambda: next(now),
+    )
+    assert len(sent) == 2, "nothing to answer before the first flip"
+    assert K.RECORD.unpack(sent[0]) == (4, 4, 4, 1000, K.SEGMENT | K.REPLY)
+    assert K.RECORD.unpack(sent[1])[:3] == (6, 6, 6), "two vblanks past the flip recorded, unrecorded yet"
 
 
 def test_each_flip_is_logged_offered_live_and_kept_for_replies():
