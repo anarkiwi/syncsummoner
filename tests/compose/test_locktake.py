@@ -741,7 +741,8 @@ def test_every_write_waits_for_the_previous_ones_echo_and_lands_on_its_frame(mon
     rows = proof.landed.rows
     assert sorted(rows[rows["target"] == 20][["landed", "param"]].tolist()) == [(20, 3), (20, 5)]
     assert proof.ok, proof.lines()
-    assert collecting and not any(collecting) and gc.isenabled()
+    started = int((sends["target"] == ev.START).sum())
+    assert collecting[started:] and not any(collecting[started:]) and gc.isenabled(), "planned writes only"
     assert sim.sender is None
 
 

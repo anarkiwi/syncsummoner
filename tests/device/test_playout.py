@@ -326,4 +326,4 @@ def test_a_player_heard_flipping_returns_before_its_status_says_so():
     player.pid = lambda: 42
     player.stop = lambda: {}
     heard = iter([False, True])
-    assert player.start(fps=Fraction(30), heard=lambda: next(heard)) == 42
+    assert player.start(fps=Fraction(30), heard=lambda: next(heard)) is None

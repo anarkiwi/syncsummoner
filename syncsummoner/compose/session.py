@@ -291,29 +291,31 @@ def locked_session(
         with (
             recorder.recording(takes[0].out) as proc,
             rig.playout.following() as shown,
-            rig.playout.playing(
-                fps=fps, spans=layout.spans(), heard=lambda: shown.latest() != W.NO_FLOOR
-            ) as player,
             _monitored(shell, poller, sender),
         ):
             held["recording"] = True
-            _play(
-                rig,
-                Live(recorder, proc, takes, layout),
-                sender=sender,
-                poller=poller,
-                shown=shown,
-                shell=shell,
-                held=held,
-                program=program,
-                config=config,
-                dry=dry,
-                park=park,
-                lead_in=lead_in,
-                load=timed,
-                prepare=prepare,
-            )
-            hold = int(player.status().get("hold", 1))
+            if dry is not None:
+                _arm(shell, poller, sender, held, park, shown)
+            with rig.playout.playing(
+                fps=fps, spans=layout.spans(), heard=lambda: shown.latest() != W.NO_FLOOR
+            ) as player:
+                _play(
+                    rig,
+                    Live(recorder, proc, takes, layout),
+                    sender=sender,
+                    poller=poller,
+                    shown=shown,
+                    shell=shell,
+                    held=held,
+                    program=program,
+                    config=config,
+                    dry=dry,
+                    park=park,
+                    lead_in=lead_in,
+                    load=timed,
+                    prepare=prepare,
+                )
+                hold = int(player.status().get("hold", 1))
         wire = _session_wire(held, sender, poller, played, dry)
         _save_locks(takes, layout, session, rig.playout.flips(), hold, wire, held, config)
     finally:
@@ -599,20 +601,13 @@ def _run(
     if dry is None:
         _await_starts(live, began, ANCHOR_FRAMES, period)
         prepare(load(program))
-    held["transport"] = _transport_playing(shell)
-    shell.command("midi", "monitor", "on")
-    del shell.log_lines[:]
-    poller.on_tick = shown.ask
-    poller.start()
-    start = held["start"]
-    for slot in np.flatnonzero(start != park) + 1:
-        sender.send(int(slot), int(start[slot - 1]), ev.START)
+        _arm(shell, poller, sender, held, park, shown)
     shift = _offset(poller, held, sender, dry, layout.lead, period)
     held["shift"] = shift
     LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
     rows = held["rows"]
     first = int(rows["target"][0]) if rows.size else 0
-    settle = frames_of(lead_in.settle_s, float(config.fps))
+    settle = 0 if dry is not None else frames_of(lead_in.settle_s, float(config.fps))
     now = json.loads(poller.ask("transport", "status", timeout_s=5.0).payload or "{}").get("field_count")
     if now is None or int(now) >= first + shift.lo - 1 - settle:
         raise LeadInTimeError(
@@ -649,6 +644,22 @@ def _leave(shell: Any, held: dict, booted: int, program: str) -> None:
         raise RebootError(
             f"{program}: the device's boot count went from {booted} to {rebooted} during the session"
         )
+
+
+def _arm(shell: Any, poller: Poller, sender: Sender, held: dict, park: np.ndarray, shown: Any) -> None:
+    """Play the transport, turn the monitor on, start polling, and write the start state.
+
+    Each frame tick read asks the Pi for its last flip once one has been heard. With a bypass this is
+    done before playout, so the start state settles before the lead-in begins.
+    """
+    held["transport"] = _transport_playing(shell)
+    shell.command("midi", "monitor", "on")
+    del shell.log_lines[:]
+    poller.on_tick = lambda: shown.ask() if shown.latest() != W.NO_FLOOR else None
+    poller.start()
+    start = held["start"]
+    for slot in np.flatnonzero(start != park) + 1:
+        sender.send(int(slot), int(start[slot - 1]), ev.START)
 
 
 def _transport_playing(shell: Any) -> str:

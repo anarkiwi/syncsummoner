@@ -370,12 +370,12 @@ class KmsPlayer(Playout):
         fps: float | str | Fraction = DEFAULT_LOOP_FPS,
         spans: Sequence[tuple[int, int]] | None = None,
         heard: Callable[[], bool] | None = None,
-    ) -> int:
+    ) -> int | None:
         """Restart the player at ``fps``, its pid once it is flipping; ``spans`` as for :meth:`command`.
 
         The pid is recorded by the shell that execs the player, so the pidfile holds the
         player's own pid and survives the ssh session ending. With ``heard``, true once a flip has
-        been heard live (:meth:`following`), it returns on that rather than on the status file.
+        been heard live (:meth:`following`), it returns None on that, asking the Pi nothing more.
         """
         exact = rate(fps)
         if exact <= 0:
@@ -388,9 +388,11 @@ class KmsPlayer(Playout):
             f"exec {self.command(exact, spans)}' < /dev/null > {self.path('player.log')} 2>&1 &"
         )
         deadline = self._clock() + self.timeout_s
-        while (state := self.status().get("state")) not in SETTLED:
+        while True:
             if heard is not None and heard():
-                return self.pid()
+                return None
+            if (state := self.status().get("state")) in SETTLED:
+                break
             if self._clock() >= deadline:
                 raise PlayoutError(
                     f"player did not start at {exact} fps after {self.timeout_s}s: {self.log()}"
