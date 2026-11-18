@@ -300,6 +300,20 @@ Objective terms:
 
 Sections are split at the phrase grid before gestures are drawn (§9.5).
 
+The cut plan is composed, not left to the render. Programs are ranked by one
+generation over every section, the kept ones cut over the sections in rank order,
+and the plan stored in the score; the render splices by it (`compose.cut.cut_plan`
+is the one function both call). A take is shown only in its cuts, so each cut is
+evolved on its own program and judged on its own frames, from the state the
+program's earlier cuts leave (thinning continues across the cut boundary as it
+does over the whole layer), and a layer sends no write outside its cuts. A cut
+predicted dead beyond the destruction budget is planned on every other kept
+program and goes to the best ranked, so the render's cover (§9.6) is a check and a
+last resort. Density is planned writes per second on screen. A gesture is aimed at
+a parameter drawn from every one it can drive that was measured to move
+something: left to its axis it would drive only that axis's most sensitive
+parameter, and none assigned no axis.
+
 ---
 
 ## 5. Render

@@ -29,7 +29,7 @@ from syncsummoner.device.recorder import (
     rig_state,
 )
 from syncsummoner.compose import timecode
-from syncsummoner.compose.cut import Cut
+from syncsummoner.compose.cut import Cut, cut_plan
 from syncsummoner.compose.master import DEFAULT_CRF, X264
 from syncsummoner.compose.planner import plan_automation
 from syncsummoner.compose.score import Layer, Score
@@ -449,19 +449,6 @@ def unknown_programs(programs: Sequence[str], available: Sequence[str] | None) -
     return [name for name in dict.fromkeys(programs) if name not in offered]
 
 
-def cut_plan(score: Score, programs: Sequence[str]) -> list[Cut]:
-    """Assign programs to the score's sections in rotation.
-
-    Cutting inside a pass is not open to us: a program change blacks this device
-    out for seconds, so each program renders the whole take and the spans are
-    taken from those afterwards. Sections are where the music already changes.
-    """
-    if not programs:
-        raise ValueError("cutting needs at least one program")
-    spans = [(s.start, s.end) for s in score.sections] or [(0.0, score.duration)]
-    return [Cut(start, end, programs[i % len(programs)]) for i, (start, end) in enumerate(spans)]
-
-
 #: 4:2:0 at full range, what the card's MJPEG decodes to, so a splice converts no level.
 SPLICE_PIX_FMT = "yuvj420p"
 
@@ -641,7 +628,7 @@ def render_cuts(
     out: str | Path,
     *,
     profiles: Mapping[str, ProgramProfile],
-    programs: Sequence[str],
+    programs: Sequence[str] = (),
     config: RenderConfig | None = None,
     scratch: str | Path = "timecoded.mkv",
     prepared: bool = False,
@@ -655,8 +642,9 @@ def render_cuts(
 
     A program the score already evolved a layer for is driven by that layer;
     anything else falls back to the first. The timecoded source is built once and
-    replayed by every pass. Programs are assigned to sections in rotation, so
-    naming more than there are sections leaves the surplus unrendered, which is
+    replayed by every pass. The cuts are :func:`~syncsummoner.compose.cut.cut_plan`'s: the
+    plan the score was composed against, else ``programs`` in rotation over its sections,
+    where naming more than there are sections leaves the surplus unrendered, which is
     said rather than silently done. With ``reuse``, a program whose take is
     already in ``takes`` is measured and cut from that take without a pass, and
     ``available`` (a list, or a callable asked only when a pass is due) is
@@ -666,6 +654,7 @@ def render_cuts(
 
     config = RenderConfig() if config is None else config
     plan = cut_plan(score, programs)
+    programs = list(programs) or list(dict.fromkeys(cut.program for cut in plan))
     ordered = list(dict.fromkeys(cut.program for cut in plan))
     paths = {p: str(Path(takes) / f"take-{slug(p)}.mkv") for p in ordered}
     fresh = [p for p in ordered if not (reuse and Path(paths[p]).is_file())]

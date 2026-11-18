@@ -518,13 +518,14 @@ def _render_cmd(args: argparse.Namespace) -> int:
     )
     take, start, lead = _take_path(args), getattr(args, "start", 0.0), 0.0
     _make_room(take, args.output, args.scratch)
-    if args.cut_programs:
+    cut = bool(args.cut_programs or score.cuts)
+    if cut:
         plan = render_mod.render_cuts(
             score,
             args.source,
             take,
             profiles=profiles,
-            programs=[p.strip() for p in args.cut_programs.split(",") if p.strip()],
+            programs=[p.strip() for p in (args.cut_programs or "").split(",") if p.strip()],
             config=config,
             scratch=args.scratch,
             prepared=args.prepared,
@@ -552,7 +553,7 @@ def _render_cmd(args: argparse.Namespace) -> int:
         LOG.info("%s: %s", take, report)
         if not report.usable:
             return 1
-    if not args.cut_programs:
+    if not cut:
         lead = render_mod.take_start(take, config=config)
         LOG.info("clip frame 0 is %.3fs into the take", lead)
     if args.no_master:
@@ -600,7 +601,7 @@ def _check_cmd(args: argparse.Namespace) -> int:
 
     score = Score.load(Path(args.score))
     programs = [p.strip() for p in (args.cut_programs or "").split(",") if p.strip()]
-    planned = render_mod.cut_plan(score, programs) if programs else []
+    planned = render_mod.cut_plan(score, programs) if programs or score.cuts else []
     takes = {
         p: str(Path(args.takes) / f"take-{slug(p)}.mkv") for p in dict.fromkeys(c.program for c in planned)
     }
@@ -890,7 +891,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--style", default="default")
     compose.add_argument("--seed", type=int, default=0)
     compose.add_argument("--budget", type=int, default=48)
-    compose.add_argument("--density", type=float, default=0.5, help="gestures per section, 0 to 1")
+    compose.add_argument("--density", type=float, default=0.5, help="planned writes per second on screen")
     compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
     compose.add_argument("--format", help="session format the score is written for, e.g. 1080p30")
     compose.add_argument("-o", "--output", default="score.yaml")
@@ -925,7 +926,10 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         node.add_argument("--played", action="store_true", help="play the source from the rig, one pass")
         node.add_argument("--scratch", default="timecoded.mkv", help="where the timecoded source is built")
         node.add_argument("--prepared", action="store_true", help="take --scratch as timecoded already")
-        node.add_argument("--cut-programs", help="cut between these programs on the score's sections")
+        node.add_argument(
+            "--cut-programs",
+            help="cut between these programs on the score's sections; a score's own cuts by default",
+        )
         node.add_argument("--takes", default=".", help="where the per-program passes are written")
         node.add_argument("--reuse-takes", action="store_true", help="cut from takes already on disk")
         node.add_argument("--fade", type=float, help="seconds of fade at each edge (default: 1)")
@@ -958,7 +962,10 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     check.add_argument("score")
     check.add_argument("--source", required=True, help="the timecoded clip the takes were played from")
     check.add_argument("--takes", default=".", help="where the per-program takes are")
-    check.add_argument("--cut-programs", help="the programs the cut rotates through, as rendered")
+    check.add_argument(
+        "--cut-programs",
+        help="the programs the cut rotates through, as rendered; a score's own cuts by default",
+    )
     check.add_argument("--master", help="judge one spliced clip, frame for frame the source's, instead")
     check.add_argument("--splice", metavar="OUT", help="splice the covered cut plan into OUT")
     check.add_argument("--as-planned", action="store_true", help="splice the plan as rendered, dead and all")

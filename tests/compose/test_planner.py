@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from syncsummoner.compose import planner as P
+from syncsummoner.compose.cut import Cut, spans_of
 from syncsummoner.compose.features import Features, Section, VideoFeatures
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
 from syncsummoner.compose.vocabulary import Automation
@@ -206,16 +207,18 @@ def test_search_keeps_program_as_the_outermost_variable(features):
     assert score.meta["style"] == "default" and len(score.meta["objective"]) == 2
 
 
-def test_mutation_never_changes_the_program(features):
+def test_mutation_keeps_every_gesture_inside_its_span(features):
     profile = make_profile()
     rng = np.random.default_rng(6)
     audio = features.audio
     weights = P._applicable(profile, P.STYLES["default"], rng)
-    layer = P._sample_layer("glitch", profile, audio, audio.sections, weights, rng, density=1.0)
-    mutated = P._mutate(layer, profile, audio, audio.sections, weights, rng, rate=1.0)
-    assert mutated.program == layer.program == "glitch"
-    assert len(mutated.gestures) == len(layer.gestures)
-    assert [g.arrival for g in mutated.gestures] == sorted(g.arrival for g in mutated.gestures)
+    span = Section(2.0, 4.5, "")
+    gestures = [P._sample_instance(name, audio, span, profile, rng) for name in weights for _ in range(4)]
+    mutated = P._mutate(gestures, profile, audio, span, weights, rng, rate=1.0)
+    assert len(mutated) == len(gestures)
+    assert [g.arrival for g in mutated] == sorted(g.arrival for g in mutated)
+    for inst in gestures + mutated:
+        assert span.start <= inst.arrival - inst.duration <= inst.arrival < span.end
 
 
 def test_glitchy_style_marks_destroy_sections(features):
@@ -542,3 +545,132 @@ def test_search_cuts_sections_at_the_phrase_grid(features):
     bars = features.audio.phrase_bars * features.audio.bar_duration
     assert score.meta["phrase_bars"] == features.audio.phrase_bars and score.meta["bar"] > 0
     assert all(s.duration <= bars + 1e-6 for s in score.sections)
+
+
+def _inside(times, spans):
+    return np.array([any(a <= t < b for a, b in spans) for t in times], dtype=bool)
+
+
+def test_every_write_a_layer_plays_lands_inside_its_own_cuts(features):
+    profiles = {"alpha": make_profile("alpha"), "beta": make_profile("beta")}
+    score = P.search(profiles, features, rng=np.random.default_rng(4), budget=12, fps=FPS, n_passes=2)
+    assert {cut.program for cut in score.cuts} == {"alpha", "beta"}
+    assert [(c.start, c.end) for c in score.cuts] == [(s.start, s.end) for s in score.sections]
+    plans = P.plan_automation(score, profiles, fps=FPS, gates={})
+    unclipped = P.plan_automation(replace(score, cuts=[]), profiles, fps=FPS, gates={})
+    for layer in score.layers:
+        spans = spans_of(score.cuts, layer.program)
+        assert len(plans[layer.index]) and _inside(plans[layer.index].times, spans).all()
+        assert all(
+            any(a <= g.arrival - g.duration <= g.arrival < b for a, b in spans) for g in layer.gestures
+        )
+        assert len(unclipped[layer.index]) >= len(plans[layer.index])
+
+
+def test_no_gesture_is_kept_whose_writes_settle_past_its_cut(features):
+    """A release deferred past a cut lands unseen and leaves its toggle latched into the next one."""
+    slow = make_profile("slow")
+    slow.settle_frames = {index: 45 for index in slow.settle_frames}
+    profiles = {"slow": slow, "other": make_profile("other")}
+    score = P.search(profiles, features, rng=np.random.default_rng(5), budget=12, fps=FPS, n_passes=2)
+    plans = P.plan_automation(score, profiles, fps=FPS, gates={})
+    whole = P.plan_automation(replace(score, cuts=[]), profiles, fps=FPS, gates={})
+    for layer in score.layers:
+        assert len(plans[layer.index]) and len(whole[layer.index]) == len(plans[layer.index])
+
+
+def test_each_cut_is_planned_to_its_share_of_writes_per_second_on_screen(features):
+    profiles = {"alpha": make_profile("alpha")}
+    for density in (0.5, 4.0):
+        score = P.search(
+            profiles, features, rng=np.random.default_rng(2), budget=12, fps=FPS, density=density
+        )
+        auto = P.plan_automation(score, profiles, fps=FPS, gates={})[0]
+        for cut in score.cuts:
+            writes = int(((auto.times >= cut.start) & (auto.times < cut.end)).sum())
+            assert writes >= max(1, int(np.rint(density * cut.duration)))
+        assert score.meta["density"] == density
+
+
+def _survival_profiles():
+    alive = _measured_profile("alive", si_ratio=[1.0] * 5, ti_ratio=[1.0] * 5, motion_follow=[0.9] * 5)
+    dead = _measured_profile("dead", si_ratio=[0.0] * 5, ti_ratio=[0.0] * 5, motion_follow=[0.0] * 5)
+    return {"alive": alive, "dead": dead}
+
+
+def test_a_cut_predicted_dead_moves_to_a_program_alive_there_and_is_planned_on_it(features, caplog):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    with caplog.at_level("INFO", logger="syncsummoner"):
+        score = P.search(
+            _survival_profiles(), both, rng=np.random.default_rng(3), budget=12, fps=FPS, n_passes=2
+        )
+    assert len(score.cuts) == len(score.sections) > 1
+    assert {cut.program for cut in score.cuts} == {"alive"} and [l.program for l in score.layers] == ["alive"]
+    gestures = score.layers[0].gestures
+    assert all(any(cut.start <= g.arrival < cut.end for g in gestures) for cut in score.cuts)
+    moved = [m for m in caplog.messages if "dead predicted dead" in m]
+    assert len(moved) == len(score.cuts) // 2 and all(m.endswith("planned on alive") for m in moved)
+
+
+def test_a_cut_no_program_is_alive_in_stays_and_is_said(features, caplog):
+    both = Features(audio=features.audio, video=_footage(features.audio.duration))
+    profiles = {"dead": _survival_profiles()["dead"]}
+    with caplog.at_level("WARNING", logger="syncsummoner"):
+        score = P.search(profiles, both, rng=np.random.default_rng(3), budget=6, fps=FPS)
+    assert {cut.program for cut in score.cuts} == {"dead"}
+    assert any("no program is alive there" in m for m in caplog.messages)
+
+
+def test_a_cut_thinned_on_from_its_opening_is_the_whole_layer_thinned_then_shown():
+    profile = make_profile()
+    profile.settle_frames = {1: 20, 2: 45, 7: 30}
+    rng = np.random.default_rng(8)
+    requests = P.Automation.concat(
+        P.Automation.of(np.sort(rng.uniform(0.0, 6.0, 40)), index, rng.integers(0, 1024, 40))
+        for index in (1, 2, 7)
+    )
+    head, cut = requests.within(0.0, 2.0), Cut(3.0, 5.0, "glitch")
+    prog = P._Program("glitch", profile, {}, 1.0)
+    prog.commit(Cut(0.0, 2.0, "glitch"), [], head)
+    opening = prog.opening(cut, FPS)
+    shown = P._continued(opening, requests.within(3.0, 6.0), profile, FPS).within(3.0, 5.0)
+    whole = P.visible(
+        P.thin(P.Automation.concat([head, requests.within(3.0, 6.0)]), profile, fps=FPS),
+        [(0.0, 2.0), (3.0, 5.0)],
+    )
+    expect = whole.within(3.0, 5.0)
+    order, want = np.lexsort((shown.indices, shown.times)), np.lexsort((expect.indices, expect.times))
+    assert np.allclose(shown.times[order], expect.times[want])
+    assert (shown.indices[order] == expect.indices[want]).all() and (
+        shown.values[order] == expect.values[want]
+    ).all()
+    before = whole.within(0.0, 3.0)
+    held = {int(i): int(before.values[before.indices == i][-1]) for i in np.unique(before.indices)}
+    assert dict(zip(opening.held.indices.tolist(), opening.held.values.tolist())) == held
+
+
+def test_only_writes_inside_the_spans_are_shown():
+    auto = Automation.of([0.0, 1.0, 1.5, 2.0, 2.5, 3.0], 2, [1, 2, 3, 4, 5, 6])
+    assert P.visible(auto, None) is auto
+    assert P.visible(auto, [(2.0, 3.0), (1.0, 2.0)]).values.tolist() == [2, 3, 4, 5]
+    assert len(P.visible(auto, [])) == 0
+
+
+def test_every_parameter_measured_to_move_is_aimed_at_whatever_its_axis():
+    profile = make_profile()
+    rng = np.random.default_rng(0)
+    aimed = {P._aim("hold", profile, rng) for _ in range(200)}
+    assert {t for _, t in aimed} == {(1,), (2,), (3,), (12,)}
+    assert ("unassigned", (12,)) in aimed
+    assert {P._aim("punch", profile, rng)[1] for _ in range(20)} == {(7,)}
+    assert not P._aim("cliff_cross", profile, rng)[1]
+
+
+def test_objectives_over_cuts_weigh_by_length_and_sum_dead_bars():
+    parts = [
+        (1.0, P.Objective(total=1.0, feasible=True, terms={"mud": 1.0, "dead_bars": 2.0}, violation=1.0)),
+        (3.0, P.Objective(total=-1.0, feasible=True, terms={"mud": 0.0, "dead_bars": 1.0})),
+    ]
+    both = P._combine(parts)
+    assert both.total == pytest.approx(-0.5) and both.violation == 1.0
+    assert both.terms == {"mud": pytest.approx(0.25), "dead_bars": 3.0}

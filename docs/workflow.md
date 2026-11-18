@@ -437,11 +437,21 @@ ss compose source.mkv --audio track.flac --profiles profiles/ --format 1080p30 \
      --style glitchy --seed 7 --passes 8 --density 0.5 -o score.yaml
 ```
 
-For every program with a usable profile, the planner evolves a layer of gestures
-anchored to the track's beats, downbeats and section edges, scores it against the
-measured response of that program, and keeps the best. `--passes 8` keeps the
-eight strongest programs, one capture pass each; `--style` biases which gestures
-are drawn on; `--seed` makes the whole search reproducible.
+Every program with a usable profile is first ranked by one generation of gestures
+over every section, anchored to the track's beats, downbeats and section edges and
+scored against the measured response of that program. `--passes 8` keeps the eight
+strongest, one capture pass each, and cuts them over the sections in rank order;
+that cut plan is stored in the score (`cuts:`), and the render splices by it. Each
+cut is then evolved on its own program, judged on its own frames from the state the
+program's earlier cuts leave, so every gesture and write a layer makes lands while
+its take is on screen. A cut whose bars are predicted dead beyond the destruction
+budget is planned on every other kept program too and goes to the one alive there
+(`  67.11-  68.27s: czartroniks/Quilt predicted dead over 1 bars, planned on
+teletect/Teletect RamBend`). `--density` is planned writes per second on screen:
+each cut is filled to `density x its length` writes. Each gesture is aimed at a
+parameter drawn from every one it can drive that was measured to move something,
+whatever its axis. `--style` biases which gestures are drawn on; `--seed` makes the
+whole search reproducible.
 
 With profiles refit from footage, the planner predicts, bar by bar, whether each
 program keeps the clip's picture and motion, using the clip's own SI and TI, so
@@ -518,10 +528,11 @@ is one program load plus 30 seconds. `--start` has to sit inside the score, so
 against the 60 s synthesized clip use something like `--start 20 --seconds 10`.
 
 To hear the cut as well as the effect, audition across programs — one pass each,
-so the cost scales with how many are named. Programs are assigned to the score's
-sections in rotation, so a 30 second window with three sections renders three of
-them however many are named; the surplus is reported rather than silently
-dropped:
+so the cost scales with how many programs the window shows. A score carrying its
+cuts is auditioned on them, windowed, with no `--cut-programs`; an older score is cut
+over the named programs in rotation, so a 30 second window with three sections
+renders three of them however many are named, the surplus reported rather than
+silently dropped:
 
 ```sh
 ss audition score.yaml --source source.mkv --audio track.flac \
@@ -558,10 +569,13 @@ Iterate here, not on the full render. A different `--seed`, `--style` or
 ```sh
 ss render score.yaml --source source.mkv --audio track.flac \
      --format 1080p30 --source-host pi@videopi \
-     --cut-programs Derez,Lorenz,Scramble,Sfumato,Kaledos,Folio,Isotherm,Howler \
      --takes takes/ --scratch timecoded.mkv \
      --fade 1.5 -o final.mp4
 ```
+
+The cuts are the score's own. `--cut-programs` cuts a score composed without them
+in rotation over the programs named, and for a score with them may only name the
+programs its cuts show.
 
 What happens, in order:
 
@@ -601,12 +615,14 @@ What happens, in order:
    a `LeadInError`.
 6. Each pass lands in `--takes` as `take-<program>.mkv` (an `author/Name` program
    becomes `take-author_Name-<digest>.mkv`, the archive's name for it), and they are spliced
-   together on the score's sections, in rotation, into `final.take.mp4`.
+   together on the score's cuts into `final.take.mp4`.
 7. Before the takes are spliced together, each is checked against the timecoded
    clip it was fed, frame for frame by its attribution, and every bar is judged `flat`, `frozen` or `unfollowed` on what it kept of the
    same bar of the clip. A dead run inside a cut is covered from another
    program's take alive across it (`Derez:   42.10-  46.20s frozen, covered by
-   Lorenz`); a lone dead bar inside a `destroy` section stays. A run no take
+   Lorenz`); a lone dead bar inside a `destroy` section stays. Compose already moved
+   every cut predicted dead, so this is the check of that prediction and the last
+   resort: a cover plays a take outside its own cuts, where its layer sends nothing. A run no take
    covers stops the render with `DeadTakeError: dead picture no take can cover:`
    and the program and time range, before anything is mastered.
 8. The splice writes one frame per clip frame at the clip's rate: frame `n` is the
@@ -664,8 +680,8 @@ allows are brought forward into their own slots, never sent late. See
 [hardware.md](hardware.md#midi-write-timing) for the measured figures and how to
 re-derive them with `device doctor --latency`.
 
-Without `--cut-programs` the render is a single pass through the score's first
-layer: one program for the whole piece, and one pass of rig time instead of one
+A score without cuts rendered without `--cut-programs` is a single pass through its
+first layer: one program for the whole piece, and one pass of rig time instead of one
 per program.
 
 ## 5. What runs without the rig

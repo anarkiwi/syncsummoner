@@ -2,6 +2,8 @@
 
 # pylint: disable=missing-function-docstring
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -198,3 +200,22 @@ def test_cliff_cross_never_latches_a_toggle_across_its_cliff():
     profile = cliffed()
     for intensity in np.linspace(0.0, 1.0, 11):
         assert 7 not in GESTURES["cliff_cross"](profile, ctx(intensity=intensity)).indices.tolist()
+
+
+def test_a_gesture_is_aimed_only_at_parameters_it_drives_that_were_measured_to_move():
+    from syncsummoner.compose.vocabulary import candidates
+
+    profile = make_profile()
+    profile.params[0].sensitivity = 0.0
+    assert {p.index for p in candidates(profile, "hold")} == {2, 3, 12}
+    assert {p.index for p in candidates(profile, "punch")} == {7}
+    assert {p.index for p in candidates(profile, "hysteresis_loop")} == {3}
+    assert candidates(profile, "cliff_cross") == []
+
+
+def test_a_hysteresis_loop_aimed_elsewhere_drives_its_target():
+    profile = make_profile()
+    plain = GestureContext(arrival=2.0, duration=1.0, rate=8.0, intensity=0.5, axis=Axis.UNASSIGNED, rng=None)
+    assert set(GESTURES["hysteresis_loop"](profile, plain).indices) == {3}
+    aimed = dataclasses.replace(plain, targets=(12,))
+    assert set(GESTURES["hysteresis_loop"](profile, aimed).indices) == {12}

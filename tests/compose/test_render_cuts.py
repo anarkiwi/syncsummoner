@@ -234,3 +234,42 @@ def test_a_take_losing_frames_twice_fails_the_render(monkeypatch, tmp_path):
     with pytest.raises(R.TakeFaultError, match="Derez: the capture driver lost"):
         _cut_run(monkeypatch, tmp_path, ["Derez", "Lorenz"], pass_render=fake_render)
     assert seen["tried"] == ["Derez", "Derez"]
+
+
+def test_a_composed_plan_is_what_the_render_cuts_and_what_every_pass_plays(monkeypatch, tmp_path):
+    from syncsummoner.compose.cut import Cut
+
+    plan = [Cut(0.0, 10.0, "Lorenz"), Cut(10.0, 20.0, "Lorenz"), Cut(20.0, 30.0, "Derez")]
+    score = Score(
+        duration=30.0,
+        fps=30.0,
+        sections=[Section(10.0 * i, 10.0 * (i + 1), "A") for i in range(3)],
+        layers=[Layer("Lorenz", 0, []), Layer("Derez", 1, [])],
+        cuts=plan,
+    )
+    played = []
+
+    def fake_render(score, source, out, **kw):
+        del source, kw
+        played.append((score.layers[0].program, score.cuts))
+        Path(out).write_bytes(b"take")
+        return R.TakeReport(frames=10, picture=10, frozen=False, luma=0.4)
+
+    seen = {}
+    monkeypatch.setattr(R, "splice", lambda cuts, *a, **kw: seen.update(spliced=cuts))
+    _checked(monkeypatch)
+    cut = R.render_cuts(
+        score,
+        "clip.mkv",
+        tmp_path / "out.mkv",
+        profiles={},
+        takes=tmp_path,
+        prepared=True,
+        pass_render=fake_render,
+    )
+    assert cut == seen["spliced"] == plan
+    assert played == [("Lorenz", plan), ("Derez", plan)]
+    with pytest.raises(ValueError, match="composed for cuts over Lorenz, Derez"):
+        R.render_cuts(
+            score, "clip.mkv", tmp_path / "out.mkv", profiles={}, programs=["Pinwheel"], takes=tmp_path
+        )

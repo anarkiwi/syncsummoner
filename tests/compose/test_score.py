@@ -132,3 +132,21 @@ def test_no_slot_is_clamped_and_an_old_score_wet_band_is_ignored():
     auto = old.render_layer(old.layers[0], profile)
     assert set(auto.indices.tolist()) == {12} and auto.values.max() == 1023
     assert auto.values.tolist() == plain.render_layer(plain.layers[0], profile).values.tolist()
+
+
+def test_a_score_keeps_its_cut_plan_through_yaml_and_an_audition_window():
+    from syncsummoner.compose.cut import Cut, cut_plan
+
+    score = Score(
+        duration=9.0,
+        sections=[Section(0.0, 3.0, "A"), Section(3.0, 9.0, "B")],
+        cuts=[Cut(0.0, 3.0, "x"), Cut(3.0, 9.0, "y")],
+    )
+    back = Score.from_yaml(score.to_yaml())
+    assert back.cuts == score.cuts == cut_plan(back) == cut_plan(back, ["y", "x"])
+    assert score.window(2.0, 5.0).cuts == [Cut(0.0, 1.0, "x"), Cut(1.0, 3.0, "y")]
+    assert cut_plan(Score(duration=9.0, sections=score.sections), ["x"]) == [
+        Cut(0.0, 3.0, "x"),
+        Cut(3.0, 9.0, "x"),
+    ]
+    assert not Score.from_dict({"duration": 1.0}).cuts

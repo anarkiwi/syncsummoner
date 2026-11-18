@@ -52,9 +52,8 @@ syncsummoner score show score.yaml --profiles profiles/   # what each layer driv
 
 syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4
 syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
-                    --cut-programs Derez,Lorenz,Scramble --fade 1.5 -o final.mp4
-syncsummoner check score.yaml --source timecoded.mkv --takes takes/ \
-                   --cut-programs Derez,Lorenz,Scramble [--splice cut.mp4]   # dead picture per take
+                    --fade 1.5 -o final.mp4   # cut by the score's own cut plan
+syncsummoner check score.yaml --source timecoded.mkv --takes takes/ [--splice cut.mp4]   # dead picture per take
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
 syncsummoner judge takes/take-*.mkv --source timecoded.mkv [--score score.yaml] [--jobs 2]   # offline: lock, evidence, picture, bars; steps judged by the program model
 ```
