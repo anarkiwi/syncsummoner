@@ -295,8 +295,8 @@ Objective terms:
   survival, penalize the least share of the source's motion kept in any bar
 - ranked constraint: bars predicted dead beyond the destruction budget (§9.4),
   compared before the weighted total
-- hard constraint: reachability, given measured settle times and a CC budget of
-  roughly 200 msg/s aggregate
+- hard constraint: reachability, given measured settle times; the locked take's
+  link is paced by its echoes, not by a planned rate
 
 Sections are split at the phrase grid before gestures are drawn (§9.5).
 
@@ -309,7 +309,9 @@ program's earlier cuts leave (thinning continues across the cut boundary as it
 does over the whole layer), and a layer sends no write outside its cuts. A cut
 predicted dead beyond the destruction budget is planned on every other kept
 program and goes to the best ranked, so the render's cover (§9.6) is a check and a
-last resort. Density is planned writes per second on screen. A gesture is aimed at
+last resort. Density is gestures per bar on screen, and every candidate is judged through the
+program model's gate at the state the plan holds, so a gesture adding no sent
+write is not chosen. A gesture is aimed at
 a parameter drawn from every one it can drive that was measured to move
 something: left to its axis it would drive only that axis's most sensitive
 parameter, and none assigned no axis.

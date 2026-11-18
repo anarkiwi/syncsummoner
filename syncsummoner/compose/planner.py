@@ -8,7 +8,7 @@ the outermost loop variable and is never mutated inside the inner loop.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 import numpy as np
 
@@ -16,7 +16,7 @@ from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, P
 from syncsummoner.progress import LOG, track
 from syncsummoner import aesthetics
 from syncsummoner.compose.cut import Cut, cut_plan, spans_of
-from syncsummoner.compose.gating import model_gate
+from syncsummoner.compose.gating import gate_automation, model_gate
 from syncsummoner.compose.features import Features, Section, information_content, phrases
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
 from syncsummoner.compose.thinning import flush, reachable, settle_of, settled, thin, visible
@@ -466,17 +466,24 @@ def _axes(profile: ProgramProfile) -> list[Axis]:
     return found or [Axis.UNASSIGNED]
 
 
-def _aim(name: str, profile: ProgramProfile, rng) -> tuple[str, tuple[int, ...]]:
+def _aim(name: str, profile: ProgramProfile, rng, banned=frozenset()) -> tuple[str, tuple[int, ...]] | None:
     """The axis and parameter a gesture is aimed at, drawn alike from every parameter it can drive.
 
     A gesture left to its axis drives only that axis's most sensitive parameter, so every other
-    parameter, and every one assigned no axis, would never move.
+    parameter, and every one assigned no axis, would never move. None when every aim is ``banned``.
     """
-    pool = candidates(profile, name)
+    pool = [p for p in candidates(profile, name) if (name, (p.index,)) not in banned]
     if not pool:
+        if candidates(profile, name) or (name, ()) in banned:
+            return None
         return str(rng.choice(_axes(profile)).value), ()
     spec = pool[int(rng.integers(len(pool)))]
     return spec.axis.value, (spec.index,)
+
+
+def _aims(profile: ProgramProfile, names) -> int:
+    """How many distinct aims the gestures ``names`` have: a parameter each, or the gesture itself."""
+    return sum(max(1, len(candidates(profile, name))) for name in names)
 
 
 def _fit_span(inst: GestureInstance, span: Section) -> GestureInstance:
@@ -484,35 +491,45 @@ def _fit_span(inst: GestureInstance, span: Section) -> GestureInstance:
     return replace(inst, duration=float(np.clip(inst.duration, 0.0, inst.arrival - span.start)))
 
 
-def _sample_instance(name: str, audio, span: Section, profile: ProgramProfile, rng) -> GestureInstance:
-    """One gesture arriving on its anchor inside ``span``, its approach inside it too."""
+def _sample_instance(
+    name: str, audio, span: Section, profile: ProgramProfile, rng, banned=frozenset()
+) -> GestureInstance | None:
+    """One gesture arriving on its anchor inside ``span``, its approach too; None if every aim is banned."""
+    aim = _aim(name, profile, rng, banned)
+    if aim is None:
+        return None
     anchor = GESTURES[name].anchor
     times = _anchor_times(audio, span, anchor)
     times = times[(times >= span.start) & (times < span.end)]
-    axis, aimed = _aim(name, profile, rng)
     inst = GestureInstance(
         gesture=name,
         arrival=float(rng.choice(times)) if times.size else span.start,
         duration=SPAN_BARS[anchor] * audio.bar_duration,
-        axis=axis,
+        axis=aim[0],
         intensity=float(rng.uniform(0.15, 0.95)),
-        targets=aimed,
+        targets=aim[1],
         seed=int(rng.integers(1 << 30)),
     )
     return _fit_span(inst, span)
 
 
+def _draw(weights, audio, span, profile, rng, banned=frozenset()) -> GestureInstance | None:
+    """A gesture drawn by style weight among those with an aim left, or None when none has."""
+    names = [n for n in weights if _aim(n, profile, rng, banned) is not None]
+    if not names:
+        return None
+    prob = np.asarray([weights[n] for n in names], dtype=np.float64)
+    return _sample_instance(str(rng.choice(names, p=prob / prob.sum())), audio, span, profile, rng, banned)
+
+
 def _mutate(gestures, profile, audio, span, weights, rng, *, rate=0.3) -> list[GestureInstance]:
     """Perturb gesture instances inside one span; the program is fixed and never mutated."""
-    names = list(weights)
-    prob = np.asarray([weights[n] for n in names], dtype=np.float64)
-    prob /= prob.sum()
     out = []
     for inst in gestures:
         if rng.random() > rate:
             out.append(inst)
         elif rng.random() < 0.5:
-            out.append(_sample_instance(str(rng.choice(names, p=prob)), audio, span, profile, rng))
+            out.append(_draw(weights, audio, span, profile, rng) or inst)
         else:
             axis, aimed = _aim(inst.gesture, profile, rng)
             moved = replace(
@@ -526,35 +543,35 @@ def _mutate(gestures, profile, audio, span, weights, rng, *, rate=0.3) -> list[G
     return sorted(out, key=lambda g: g.arrival)
 
 
-def _fill(gestures, sample, writes, target: int, rng) -> list[GestureInstance]:
-    """Gestures making at least ``target`` writes in the span and none past it, none of which
-    could go and leave enough.
+def _fill(gestures, draw, sent, target: int, aims: int) -> list[GestureInstance]:
+    """Up to ``target`` gestures, each adding a write that is sent inside the span and none past it.
 
-    ``writes`` counts a candidate's writes inside the span and past its end. One that thinning
-    defers past the end lands unseen, leaving the parameter where the span left it, such as a
-    toggle latched on, so a gesture making one is dropped and none is drawn that would. Each
-    kept draw lands at least one write, so ``target`` draws bound the fill; where they fall
-    short, only the draws that added a write stay.
+    ``sent`` counts a candidate's writes the gate sends inside the span, and those thinning defers
+    past its end, which land unseen and leave the parameter where the span left it, such as a
+    toggle latched on. A gesture adding no sent write, refused as dead or overwritten, is not
+    chosen, and its aim, a parameter or else the gesture, is not drawn again; with ``aims`` of
+    them, ``target + aims`` draws bound the fill.
     """
-    out = list(gestures)
-    for inst in list(out):
-        rest = [g for g in out if g is not inst]
-        if writes(rest)[1] < writes(out)[1]:
-            out = rest
-    for _ in range(target):
-        inside, spilled = writes(out)
-        if inside >= target:
+
+    def adds(more, base) -> bool:
+        (gained, spilled), (had, spill) = sent(more), sent(base)
+        return gained > had and spilled <= spill
+
+    out: list[GestureInstance] = []
+    for inst in gestures:
+        if inst is not None and adds(out + [inst], out):
+            out.append(inst)
+    banned: set = set()
+    for _ in range(target + aims):
+        if len(out) >= target:
             break
-        drawn = out + [sample()]
-        if writes(drawn)[1] <= spilled:
-            out = drawn
-    inside, spilled = writes(out)
-    need = min(target, inside)
-    for inst in [out[i] for i in rng.permutation(len(out))]:
-        rest = [g for g in out if g is not inst]
-        left = writes(rest)
-        if rest and left[0] >= need and left[1] <= spilled:
-            out = rest
+        inst = draw(frozenset(banned))
+        if inst is None:
+            break
+        if adds(out + [inst], out):
+            out.append(inst)
+        else:
+            banned.add((inst.gesture, inst.targets))
     return sorted(out, key=lambda g: g.arrival)
 
 
@@ -593,55 +610,70 @@ class _Opening:
     held: Automation
 
 
+class _Planned(NamedTuple):
+    """One cut's plan: its objective, gestures, the requests they render, what is sent, and the
+    gate state it leaves."""
+
+    obj: Objective
+    gestures: list[GestureInstance]
+    raw: Automation
+    sent: Automation
+    state: np.ndarray | None
+
+
 @dataclass
 class _Program:
-    """One program being planned: its profile, the gestures and cuts committed to it so far."""
+    """One program being planned: its profile and gate, and the gestures, cuts and sent writes so far.
+
+    ``state`` is the gate's after every write sent so far, from the state the program loads in.
+    """
 
     name: str
     profile: ProgramProfile
     weights: dict[str, float]
     discount: float
+    gate: Any = None
     gestures: list[GestureInstance] = field(default_factory=list)
     raw: Automation = field(default_factory=Automation.empty)
     spans: list[tuple[float, float]] = field(default_factory=list)
+    sent: Automation = field(default_factory=Automation.empty)
+    state: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.state is None and self.gate is not None:
+            self.state = self.gate.start()
 
     def opening(self, cut: Cut, fps: float) -> _Opening:
         """Scan every committed request before ``cut``; what a candidate for it continues from."""
-        scans, held_t, held_i, held_v = {}, [], [], []
+        scans = {}
         before = self.raw.times < cut.start
         for idx in np.unique(self.raw.indices[before]).tolist():
             m = before & (self.raw.indices == idx)
-            out_t, out_v, scan = settled(
-                self.raw.times[m], self.raw.values[m], settle_of(self.profile, idx, fps)
-            )
+            _, _, scan = settled(self.raw.times[m], self.raw.values[m], settle_of(self.profile, idx, fps))
             if scan[2] is not None and scan[0] < cut.start:
-                late_t, late_v = flush(scan)
-                out_t, out_v, scan = (
-                    out_t + late_t,
-                    out_v + late_v,
-                    (scan[0] + settle_of(self.profile, idx, fps), scan[2], None),
-                )
-            shown = visible(
-                Automation(
-                    np.asarray(out_t), np.full(len(out_t), idx, np.int32), np.asarray(out_v, np.int32)
-                ),
-                self.spans,
-            )
+                scan = (scan[0] + settle_of(self.profile, idx, fps), scan[2], None)
             scans[idx] = scan
-            if len(shown):
-                held_t.append(cut.start - 1.0)
-                held_i.append(idx)
-                held_v.append(int(shown.values[-1]))
         tail = Automation(self.raw.times[~before], self.raw.indices[~before], self.raw.values[~before])
+        params = np.unique(self.sent.indices)
+        last = [int(self.sent.values[self.sent.indices == idx][-1]) for idx in params.tolist()]
         held = Automation(
-            np.asarray(held_t, np.float64), np.asarray(held_i, np.int32), np.asarray(held_v, np.int32)
+            np.full(params.size, cut.start - 1.0), params.astype(np.int32), np.asarray(last, np.int32)
         )
         return _Opening(scans, tail, held)
 
-    def commit(self, cut: Cut, gestures: list[GestureInstance], raw: Automation) -> None:
-        """Take on ``cut`` with the gestures planned for it and what they render."""
-        self.gestures += gestures
-        self.raw = Automation.concat([self.raw, raw])
+    def send(self, shown: Automation) -> tuple[Automation, np.ndarray | None]:
+        """What the gate sends of a cut's writes from the state the plan holds, and the state after."""
+        if self.gate is None:
+            return shown, self.state
+        gated = gate_automation(shown, self.state, self.gate.live, self.gate.revive)
+        return gated.auto, gated.state
+
+    def commit(self, cut: Cut, planned: _Planned) -> None:
+        """Take on ``cut`` with its plan."""
+        self.gestures += planned.gestures
+        self.raw = Automation.concat([self.raw, planned.raw])
+        self.sent = Automation.concat([self.sent, planned.sent])
+        self.state = planned.state
         self.spans.append((cut.start, cut.end))
 
 
@@ -676,45 +708,48 @@ class _Plan:
     generations: int
     evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None
 
-    def cut(self, prog: _Program, cut: Cut, rng) -> tuple[Objective, list[GestureInstance], Automation]:
-        """Evolve ``prog``'s gestures for one cut, judged on that cut's frames alone.
+    def cut(self, prog: _Program, cut: Cut, rng) -> _Planned:
+        """Evolve ``prog``'s gestures for one cut, judged on that cut's frames alone, as the gate sends them.
 
-        Returns the best objective, its gestures, and what they render.
+        ``density`` gestures a bar are drawn, each adding a write that is sent.
         """
         audio, fps = self.features.audio, self.base.fps
         span = Section(cut.start, cut.end, "")
         rate = control_rate(fps)
         opening = prog.opening(cut, fps)
-        target = max(1, int(np.rint(self.density * cut.duration)))
-        names = list(prog.weights)
-        prob = np.asarray([prog.weights[n] for n in names], dtype=np.float64)
-        prob /= prob.sum()
+        target = max(1, int(np.rint(self.density * cut.duration / audio.bar_duration)))
+        aims = _aims(prog.profile, prog.weights)
+        found: dict[tuple, tuple] = {}
 
         def render(gestures) -> Automation:
             layer = Layer(prog.name, gestures=list(gestures))
             return self.base.render_layer(layer, prog.profile, rate=rate, offset=len(prog.gestures))
 
-        counted: dict[tuple, tuple[int, int]] = {}
-
-        def writes(gestures) -> tuple[int, int]:
+        def planned(gestures) -> tuple:
+            """The cut's thinned writes, those the gate sends, the state after, and the count past the end."""
             key = tuple(gestures)
-            if key not in counted:
-                after = _continued(opening, render(gestures), prog.profile, fps).times
-                counted[key] = (int((after < cut.end).sum()), int((after >= cut.end).sum()))
-            return counted[key]
+            if key not in found:
+                after = _continued(opening, render(gestures), prog.profile, fps)
+                shown = after.within(cut.start, cut.end)
+                found[key] = (shown, *prog.send(shown), int((after.times >= cut.end).sum()))
+            return found[key]
 
-        def sample() -> GestureInstance:
-            return _sample_instance(str(rng.choice(names, p=prob)), audio, span, prog.profile, rng)
+        def sent(gestures) -> tuple[int, int]:
+            _, out, _, spilled = planned(gestures)
+            return len(out), spilled
+
+        def draw(banned) -> GestureInstance | None:
+            return _draw(prog.weights, audio, span, prog.profile, rng, banned)
 
         def fitness(gestures) -> Objective:
             if self.evaluator is not None:
                 layer = Layer(prog.name, gestures=prog.gestures + list(gestures))
                 return self.evaluator(layer, prog.profile, replace(self.base, cuts=[cut]))
-            shown = _continued(opening, render(gestures), prog.profile, fps).within(cut.start, cut.end)
+            shown, out, _, _ = planned(gestures)
             if not reachable(shown, prog.profile, fps=fps):
                 return Objective(total=-np.inf, feasible=False, violation=np.inf)
             traj = proxy_render(
-                Automation.concat([opening.held, shown]),
+                Automation.concat([opening.held, out]),
                 prog.profile,
                 fps=fps,
                 start=cut.start,
@@ -723,17 +758,17 @@ class _Plan:
             )
             return evaluate(traj, self.features, self.base, weights=self.weights, discount=prog.discount)
 
-        pop = [_fill([], sample, writes, target, rng) for _ in range(self.population)]
+        pop = [_fill([], draw, sent, target, aims) for _ in range(self.population)]
         ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: p[0].rank)
         for _ in range(self.generations - 1):
             elite = [m for _, m in ranked[: max(1, self.population // 2)]]
             children = [
                 _fill(
                     _mutate(elite[i % len(elite)], prog.profile, audio, span, prog.weights, rng),
-                    sample,
-                    writes,
+                    draw,
+                    sent,
                     target,
-                    rng,
+                    aims,
                 )
                 for i in range(self.population - len(elite))
             ]
@@ -741,19 +776,20 @@ class _Plan:
                 ranked[: len(elite)] + [(fitness(m), m) for m in children], key=lambda p: p[0].rank
             )
         obj, gestures = ranked[0]
-        return obj, gestures, render(gestures)
+        _, out, state, _ = planned(gestures)
+        return _Planned(obj, gestures, render(gestures), out, state)
 
 
 def _standing(plan: _Plan, prog: _Program, sections: Sequence[Section], rng) -> Objective:
     """How a program fares over the whole piece: one generation of it showing every section."""
     trial = replace(plan, generations=1)
-    scratch = replace(prog, gestures=[], raw=Automation.empty(), spans=[])
+    scratch = _Program(prog.name, prog.profile, prog.weights, prog.discount, prog.gate)
     parts = []
     for section in sections:
         cut = Cut(section.start, section.end, prog.name)
-        obj, gestures, raw = trial.cut(scratch, cut, rng)
-        scratch.commit(cut, gestures, raw)
-        parts.append((cut.duration, obj))
+        planned = trial.cut(scratch, cut, rng)
+        scratch.commit(cut, planned)
+        parts.append((cut.duration, planned.obj))
     return _combine(parts)
 
 
@@ -769,13 +805,13 @@ def _assign(
     out, parts = [], {name: [] for name in programs}
     for cut in track(sorted(cuts, key=lambda c: c.start), desc="cuts", unit="cut"):
         options = {cut.program: plan.cut(programs[cut.program], cut, rng)}
-        own = options[cut.program][0]
+        own = options[cut.program].obj
         if own.violation > 0:
             options.update(
                 {name: plan.cut(programs[name], cut, rng) for name in programs if name != cut.program}
             )
-        name = min(options, key=lambda n, found=options: found[n][0].rank)
-        obj, gestures, raw = options[name]
+        name = min(options, key=lambda n, found=options: found[n].obj.rank)
+        planned = options[name]
         if name != cut.program:
             LOG.info(
                 "%7.2f-%7.2fs: %s predicted dead over %g bars, planned on %s",
@@ -785,17 +821,17 @@ def _assign(
                 own.violation,
                 name,
             )
-        elif obj.violation:
+        elif planned.obj.violation:
             LOG.warning(
                 "%7.2f-%7.2fs: %s predicted dead over %g bars and no program is alive there",
                 cut.start,
                 cut.end,
                 cut.program,
-                obj.violation,
+                planned.obj.violation,
             )
         moved = replace(cut, program=name)
-        programs[name].commit(moved, gestures, raw)
-        parts[name].append((cut.duration, obj))
+        programs[name].commit(moved, planned)
+        parts[name].append((cut.duration, planned.obj))
         out.append(moved)
     return out, {name: _combine(p) for name, p in parts.items() if p}
 
@@ -834,14 +870,17 @@ def search(
     density: float = 0.5,
     weights: ObjectiveWeights | None = None,
     evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None,
+    gates: Mapping[str, Any] | None = None,
 ) -> Score:
     """Rank the programs, cut the best ``n_passes`` in rotation, and evolve each cut on its program.
 
     Each program first shows every section for one generation, which ranks it; the kept ones
     are cut in rank order over the sections by :func:`~syncsummoner.compose.cut.cut_plan`,
     and that plan is the score's. Every cut is then evolved on its own frames, from the state
-    its program's earlier cuts leave, toward ``density`` writes per second on screen; a cut
-    predicted dead moves to a program alive there (:func:`_assign`). A program whose
+    its program's earlier cuts leave, with ``density`` gestures a bar on screen, through the
+    gate :func:`plan_automation` sends by (default: from the program model) and at the state it
+    holds, so no gesture is kept that sends nothing; a cut predicted dead moves to a program
+    alive there (:func:`_assign`). A program whose
     parameters were never measured to move anything is skipped: a gesture drives a parameter,
     so a profile with none can only score as the absence of a change, which a passthrough wins.
     """
@@ -892,7 +931,10 @@ def search(
         applicable = _applicable(profile, style_weights, rng)
         if not applicable:
             continue
-        prog = _Program(program, profile, applicable, SIM_DISCOUNT if profile.source is Source.SIM else 1.0)
+        gate = model_gate(program) if gates is None else gates.get(program)
+        prog = _Program(
+            program, profile, applicable, SIM_DISCOUNT if profile.source is Source.SIM else 1.0, gate
+        )
         obj = _standing(plan, prog, sections, rng)
         LOG.debug("%s: standing %.3f", program, obj.total)
         if "dead_bars" not in obj.terms:
