@@ -119,6 +119,64 @@ class Offset:
         return self.lo == self.hi
 
 
+def _projected(index: np.ndarray, lo: np.ndarray, hi: np.ndarray, period: tuple[float, float], at: int):
+    """Brackets ``(lo, hi)`` on events ``index`` moved by whole periods to event ``at`` and intersected.
+
+    Each move of ``k`` periods is widened by the period's own bracket, so the result holds the true time
+    of event ``at`` whichever period in ``period`` holds.
+    """
+    k = (at - index).astype(np.float64)
+    early = lo + k * np.where(k > 0, period[0], period[1])
+    late = hi + k * np.where(k > 0, period[1], period[0])
+    return float(early.max()), float(late.min())
+
+
+def tick_brackets(ticks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each frame tick the polls saw happen: its count, after the poll before was asked, by the poll after."""
+    step = np.flatnonzero(np.diff(ticks["field"]) == 1)
+    return (
+        ticks["field"][step + 1],
+        ticks["t0_ns"][step].astype(np.float64),
+        ticks["t1_ns"][step + 1].astype(np.float64),
+    )
+
+
+def phase_offset(asked: np.ndarray, shown: np.ndarray, ticks: np.ndarray) -> Offset | None:
+    """The device-to-clip offset from every tick and flip bracket at once, on the vblank both follow.
+
+    The period is bracketed by the first and last ticks seen; tick brackets are moved to one tick, and
+    flip brackets (after a reply's request, by a report's receipt) to one frame, each intersected. The
+    device ticks for a frame less than half a frame after the Pi flips it (docs/hardware.md), which
+    picks one frame for the tick unless the brackets leave two. None when too few brackets.
+    """
+    n, lo, hi = tick_brackets(ticks)
+    if n.size < 2 or n[-1] == n[0] or not asked.size or not shown.size:
+        return None
+    span = float(n[-1] - n[0])
+    period = ((lo[-1] - hi[0]) / span, (hi[-1] - lo[0]) / span)
+    if period[0] <= 0:
+        return None
+    n0 = int(n[n.size // 2])
+    t_lo, t_hi = _projected(n, lo, hi, period, n0)
+    f0 = int(shown["frame"][shown.size // 2])
+    after = asked["frame"] + 1
+    f_lo, _ = _projected(after, asked["t0_ns"].astype(np.float64), np.full(after.size, np.inf), period, f0)
+    _, f_hi = _projected(
+        shown["frame"], np.full(shown.size, -np.inf), shown["t_ns"].astype(np.float64), period, f0
+    )
+    if not (t_lo <= t_hi and f_lo <= f_hi):
+        raise EvidenceError("the frame ticks or the Pi's flips contradict one period")
+    d_lo, d_hi = t_lo - f_hi, t_hi - f_lo
+    g_lo = int(np.floor(d_lo / (period[1] if d_lo > 0 else period[0])))
+    g_hi = int(np.floor(d_hi / (period[0] if d_hi > 0 else period[1])))
+    near = [
+        g for g in range(g_lo, g_hi + 1) if d_hi - g * period[0] >= 0 and d_lo - g * period[1] < period[0] / 2
+    ]
+    if near:
+        g_lo, g_hi = min(near), max(near)
+    return Offset(lo=n0 - f0 - g_hi, hi=n0 - f0 - g_lo)
+
+
 class UnboundError(EvidenceError):
     """Too few events yet to bound the device-to-clip offset."""
 
@@ -165,6 +223,9 @@ def offset(
     if known.any():
         hi = min(hi, int((latch[known, 1] - floors[known]).min()))
     found = Offset(lo=int((c[told] - asked["frame"][told]).max()), hi=hi)
+    phased = phase_offset(asked[told], shown[heard], ticks)
+    if phased is not None:
+        found = Offset(lo=max(found.lo, phased.lo), hi=min(found.hi, phased.hi))
     if found.lo > found.hi:
         raise EvidenceError(
             f"device frames lead clip frames by at least {found.lo} by the Pi's replies and at most "

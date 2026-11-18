@@ -211,3 +211,15 @@ def test_a_reply_counts_only_once_the_frame_after_it_is_heard():
         np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked, shown_at([25], [99]), ticks, PERIOD
     )
     assert found.lo == 2, "the reply of 99, the last frame heard, is left out: the Pi may hold it"
+
+
+def test_a_tick_just_after_its_flip_is_told_from_one_just_before_the_next():
+    """Brackets that straddle the flip: the tick follows its own flip by under half a frame."""
+    flip_phase, tick_phase = 5_000_000, 5_800_000
+    ticks, _ = device(2.0, phase=tick_phase - 7 * PERIOD)
+    asks = np.arange(0.2e9, 1.8e9, 0.0137e9).astype(np.int64)
+    asked = asked_at(asks, pi_frame(asks + 1_000_000, flip_phase))
+    flips = np.arange(5, 55)
+    shown = np.zeros(flips.size, dtype=SHOWN)
+    shown["frame"], shown["t_ns"] = flips, flip_phase + flips * PERIOD + 1_500_000
+    assert ev.phase_offset(asked, shown, ticks) == ev.Offset(7, 7)

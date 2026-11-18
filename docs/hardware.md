@@ -128,7 +128,11 @@ output frame (30.02 per second on the host clock at 1080p30). Polled alternately
 `modulation status` (round trip about 1.9 ms each), over 66 MIDI writes to Sidewinder's P1 the
 readback changed 66 times, never between two polls reading the same count, and each write's
 latch frame was pinned to one count: the count after the last one read before the send for 55
-writes, the one after that for 11 (`captures/diag/latchtick.py`). The count advances only while the
+writes, the one after that for 11 (`captures/diag/latchtick.py`). Its tick follows the Pi's flip of the frame it outputs by
+under half a frame: over 446 frames of a session, the tick phase and the flip phase, each intersected
+from its brackets on the shared vblank, put the tick 0 to 4 ms after a flip, and boneoh/RGB Bit
+Rotator's bypass switched the picture on the clip frame the latch less that offset gives, at both
+switches of two sessions (`captures/validate-causal-20261118`). The count advances only while the
 transport plays: stopped, it holds its value, and the beat phase steps by a fixed amount per frame
 at the set tempo while it plays.
 

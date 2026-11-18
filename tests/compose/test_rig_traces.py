@@ -19,11 +19,16 @@ def trace(name):
         return {k: held[k] for k in held.files}
 
 
-def test_a_playing_transport_pins_the_offset_to_a_frame_within_a_second_of_polls():
-    """Boneoh RGB Bit Rotator on the rig: replies and reports alone bound the offset one frame wide."""
+def test_a_playing_transport_pins_the_offset_within_a_second_of_polls():
+    """Boneoh RGB Bit Rotator on the rig: pairwise bounds leave a frame; the vblank phase closes it."""
     w = trace("bitrotator-leadin")
     assert w["ticks"]["playing"].all() and np.ptp(w["ticks"]["t0_ns"]) < 1.1e9
-    assert ev.offset(*NONE, w["asked"], w["shown"], w["ticks"], PERIOD) == ev.Offset(50, 51)
+    told = (ev.count_before(w["ticks"], w["asked"]["t0_ns"]) >= 0) & (
+        w["asked"]["frame"] < w["shown"]["frame"].max()
+    )
+    phased = ev.phase_offset(w["asked"][told], w["shown"], w["ticks"])
+    assert phased == ev.Offset(50, 50)
+    assert ev.offset(*NONE, w["asked"], w["shown"], w["ticks"], PERIOD) == ev.Offset(50, 50)
 
 
 def test_each_recorded_start_write_latches_on_one_device_frame():
