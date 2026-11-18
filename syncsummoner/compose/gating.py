@@ -22,11 +22,12 @@ Revive = Callable[[np.ndarray, int], Sequence[Sequence[tuple[int, int]]]]
 
 @dataclass(frozen=True)
 class Gated:
-    """The automation to play and what gating did to it."""
+    """The automation to play, what gating did to it, and the state it leaves."""
 
     auto: Automation
     paired: int = 0
     refused: int = 0
+    state: np.ndarray | None = None
 
 
 def _states(auto: Automation, start: np.ndarray) -> np.ndarray:
@@ -69,7 +70,7 @@ def gate_automation(auto: Automation, start: np.ndarray, live: Live, revive: Rev
     out = Automation(
         np.asarray(times, np.float64), np.asarray(params, np.int32), np.asarray(values, np.int32)
     )
-    return Gated(out, paired, refused)
+    return Gated(out, paired, refused, state)
 
 
 def _moved(state: np.ndarray, moves: Sequence[tuple[int, int]]) -> np.ndarray:
@@ -102,6 +103,10 @@ class ModelGate:
             self._seen[key] = param in self.m.resolution() and bool(self.m.reach(state, [param])[param])
         return self._seen[key]
 
+    def start(self) -> np.ndarray:
+        """The state the program loads in, which every plan is gated from."""
+        return np.asarray(self.m.initial(), dtype=np.int64)
+
     def revive(self, _state: np.ndarray, param: int) -> list[tuple[tuple[int, int], ...]]:
         """Gate moves the program model found revive ``param``."""
         return list(self.revivals.get(param, []))
@@ -124,7 +129,7 @@ class ModelGate:
                 )
 
     def __call__(self, auto: Automation) -> Automation:
-        start = self.m.initial()
+        start = self.start()
         self.prefetch(auto, start)
         gated = gate_automation(auto, start, self.live, self.revive)
         if gated.paired or gated.refused:

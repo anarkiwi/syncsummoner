@@ -9,6 +9,7 @@ import pytest
 
 from syncsummoner.compose import planner as P
 from syncsummoner.compose.cut import Cut, spans_of
+from syncsummoner.compose.gating import gate_automation
 from syncsummoner.compose.features import Features, Section, VideoFeatures
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
 from syncsummoner.compose.vocabulary import Automation
@@ -579,17 +580,59 @@ def test_no_gesture_is_kept_whose_writes_settle_past_its_cut(features):
         assert len(plans[layer.index]) and len(whole[layer.index]) == len(plans[layer.index])
 
 
-def test_each_cut_is_planned_to_its_share_of_writes_per_second_on_screen(features):
+def test_each_cut_is_planned_to_its_share_of_gestures_a_bar_each_sending_a_write(features):
     profiles = {"alpha": make_profile("alpha")}
+    bar_s = features.audio.bar_duration
     for density in (0.5, 4.0):
         score = P.search(
             profiles, features, rng=np.random.default_rng(2), budget=12, fps=FPS, density=density
         )
         auto = P.plan_automation(score, profiles, fps=FPS, gates={})[0]
         for cut in score.cuts:
-            writes = int(((auto.times >= cut.start) & (auto.times < cut.end)).sum())
-            assert writes >= max(1, int(np.rint(density * cut.duration)))
+            mine = [g for g in score.layers[0].gestures if cut.start <= g.arrival < cut.end]
+            assert len(mine) == max(1, int(np.rint(density * cut.duration / bar_s)))
+            assert ((auto.times >= cut.start) & (auto.times < cut.end)).sum() >= len(mine)
         assert score.meta["density"] == density
+
+
+class _Gate:
+    """A program-model gate stand-in: ``dead`` parameters are live only once ``moves`` are written."""
+
+    def __init__(self, dead, moves=()):
+        self.dead, self.moves, self.paired, self.refused = set(dead), tuple(moves), 0, 0
+
+    def start(self):
+        return np.full(12, 512, dtype=np.int64)
+
+    def live(self, state, param):
+        return param not in self.dead or bool(self.moves) and all(state[g - 1] == w for g, w in self.moves)
+
+    def revive(self, _state, param):
+        return [self.moves] if param in self.dead and self.moves else []
+
+    def __call__(self, auto):
+        gated = gate_automation(auto, self.start(), self.live, self.revive)
+        self.paired, self.refused = self.paired + gated.paired, self.refused + gated.refused
+        return gated.auto
+
+
+def test_no_gesture_is_kept_whose_writes_the_gate_refuses(features):
+    profiles = {"alpha": make_profile("alpha")}
+    planning = {"alpha": _Gate({2, 3})}
+    score = P.search(profiles, features, rng=np.random.default_rng(2), budget=12, fps=FPS, gates=planning)
+    sending = {"alpha": _Gate({2, 3})}
+    auto = P.plan_automation(score, profiles, fps=FPS, gates=sending)[0]
+    assert len(auto) and sending["alpha"].refused == 0 and not {2, 3} & set(auto.indices.tolist())
+    assert sum(1 for g in score.layers[0].gestures if g.gesture == "cliff_cross") == 0
+
+
+def test_a_gesture_on_a_gated_parameter_is_sent_with_the_move_that_makes_it_live(features):
+    profiles = {"alpha": make_profile("alpha")}
+    gates = {"alpha": _Gate({2}, moves=((7, 1023),))}
+    score = P.search(profiles, features, rng=np.random.default_rng(4), budget=24, fps=FPS, gates=gates)
+    sending = {"alpha": _Gate({2}, moves=((7, 1023),))}
+    auto = P.plan_automation(score, profiles, fps=FPS, gates=sending)[0]
+    assert sending["alpha"].refused == 0 and sending["alpha"].paired > 0 and 2 in auto.indices
 
 
 def _survival_profiles():
@@ -631,7 +674,8 @@ def test_a_cut_thinned_on_from_its_opening_is_the_whole_layer_thinned_then_shown
     )
     head, cut = requests.within(0.0, 2.0), Cut(3.0, 5.0, "glitch")
     prog = P._Program("glitch", profile, {}, 1.0)
-    prog.commit(Cut(0.0, 2.0, "glitch"), [], head)
+    sent = P.visible(P.thin(head, profile, fps=FPS), [(0.0, 2.0)])
+    prog.commit(Cut(0.0, 2.0, "glitch"), P._Planned(P.Objective(0.0, True), [], head, sent, None))
     opening = prog.opening(cut, FPS)
     shown = P._continued(opening, requests.within(3.0, 6.0), profile, FPS).within(3.0, 5.0)
     whole = P.visible(
@@ -646,6 +690,7 @@ def test_a_cut_thinned_on_from_its_opening_is_the_whole_layer_thinned_then_shown
     ).all()
     before = whole.within(0.0, 3.0)
     held = {int(i): int(before.values[before.indices == i][-1]) for i in np.unique(before.indices)}
+    assert len(sent) == len(before)
     assert dict(zip(opening.held.indices.tolist(), opening.held.values.tolist())) == held
 
 

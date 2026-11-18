@@ -455,8 +455,11 @@ program's earlier cuts leave, so every gesture and write a layer makes lands whi
 its take is on screen. A cut whose bars are predicted dead beyond the destruction
 budget is planned on every other kept program too and goes to the one alive there
 (`  67.11-  68.27s: czartroniks/Quilt predicted dead over 1 bars, planned on
-teletect/Teletect RamBend`). `--density` is planned writes per second on screen:
-each cut is filled to `density x its length` writes. Each gesture is aimed at a
+teletect/Teletect RamBend`). `--density` is gestures per bar on screen: each cut
+is filled to `density x its bars` gestures, each of which must add a write that is
+sent. Every candidate is judged through the program model's gate at the state the
+plan holds, as the render sends it, so a gesture on a parameter dead there is sent
+with the move that makes it live or is not chosen. Each gesture is aimed at a
 parameter drawn from every one it can drive that was measured to move something,
 whatever its axis. `--style` biases which gestures are drawn on; `--seed` makes the
 whole search reproducible.
@@ -682,9 +685,10 @@ rig is never opened. Without `--cut-programs` it reuses `--take`.
 Writes are sent ahead of their cue by the device's write latency plus a 15 ms
 bias, so changes land on the beat rather than behind it; the default latency is
 one frame of `--format`, `--latency-ms` overrides it and `--measure-latency`
-measures it per program. `--cc-budget` caps parameter writes per second for both
-the planner and the session's pacing; writes due closer together than the budget
-allows are brought forward into their own slots, never sent late. See
+measures it per program. A locked take has no planned write rate: the device takes
+one value per slot a frame, and each write waits for the previous one's echo, so the
+link paces itself. The planner bounds each parameter by its control rate, half the
+frame rate, and its measured settle. See
 [hardware.md](hardware.md#midi-write-timing) for the measured figures and how to
 re-derive them with `device doctor --latency`.
 

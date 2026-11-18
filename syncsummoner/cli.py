@@ -894,7 +894,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     compose.add_argument("--style", default="default")
     compose.add_argument("--seed", type=int, default=0)
     compose.add_argument("--budget", type=int, default=48)
-    compose.add_argument("--density", type=float, default=0.5, help="planned writes per second on screen")
+    compose.add_argument("--density", type=float, default=0.5, help="gestures per bar on screen")
     compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
     compose.add_argument("--format", help="session format the score is written for, e.g. 1080p30")
     compose.add_argument("-o", "--output", default="score.yaml")
