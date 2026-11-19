@@ -17,7 +17,7 @@ from scipy.stats import qmc
 from syncsummoner.aesthetics.survival import SIGMA, critical_z, effective_samples
 from syncsummoner.compose.locktake import PLAN
 from syncsummoner.device.profile import PARAM_COUNT, snap_toggles
-from syncsummoner.probe.locked import Chunk, SweepError
+from syncsummoner.probe.locked import Chunk, SweepError, staggered
 
 __all__ = [
     "Slot",
@@ -88,12 +88,12 @@ def holds(ti: np.ndarray, edges: np.ndarray, starts: Sequence[int] | None = None
 
 
 def guard_frames(settle: int) -> int:
-    """Frames after a setting's writes before its picture is measured: its landing window, then ``settle``.
+    """Frames after a setting's start before its picture is measured: its writes, then ``settle``.
 
-    A write's device frame is pinned by command order, and its clip frame by the session's offset, which
-    its events bound to within a frame (docs/evidence.md); one more frame for the write's own frame.
+    A setting moves at most every slot, one a frame (:func:`~syncsummoner.probe.locked.staggered`), each
+    landing on its own frame by command order (docs/evidence.md); one more for the last write's frame.
     """
-    return int(settle) + 2
+    return int(settle) + PARAM_COUNT + 1
 
 
 @dataclass(frozen=True)
@@ -223,7 +223,7 @@ def design(
 def chunks_of(
     states: np.ndarray, placed: Sequence[Slot], *, settle: int, toggles: Sequence[int]
 ) -> list[Chunk]:
-    """The takes playing each state on its slot, every slot a setting moves written at its start."""
+    """The takes playing each state on its slot, its moved slots written one a frame from its start."""
     states = snap_toggles(np.arange(1, PARAM_COUNT + 1)[None, :], np.asarray(states, dtype=np.int64), toggles)
     if len(states) != len(placed):
         raise SweepError(f"{len(states)} settings for {len(placed)} slots")
@@ -233,9 +233,9 @@ def chunks_of(
         rows = [(0, p + 1, int(v)) for p, v in enumerate(states[mine[0]])]
         owner = [0] * PARAM_COUNT
         for j, i in enumerate(mine[1:], start=1):
-            moved = np.flatnonzero(states[i] != states[i - 1]) + 1
-            rows += [(placed[i].start, int(p), int(states[i][p - 1])) for p in moved]
-            owner += [j] * moved.size
+            moves = staggered(placed[i].start, states[i], states[i - 1])
+            rows += moves
+            owner += [j] * len(moves)
         end = placed[mine[-1]]
         out.append(
             Chunk(

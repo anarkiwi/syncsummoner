@@ -161,7 +161,10 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: {"t_ns": np.arange(n, dtype=np.int64)})
     monkeypatch.setattr(wire, "load_wire", lambda take: {"program": np.array("p")})
     said = L.collect(tmp_path / "t.mkv", chunk, clip="c.mkv", config=None)
-    assert said["setpoints_kept"] == len(chunk.states) and said["rows_measured"] == n
+    between = 2
+    assert (
+        said["setpoints_kept"] == len(chunk.states) and said["rows_measured"] == n - between
+    ), "a setpoint moving two slots is written a frame apart; the frame between is no setpoint's"
     assert said["evidence_ok"] and said["verdict"]["late"] == 2
     assert said["settle"] == {"frames": 0, "source": "plan"}
     kept = json.loads((tmp_path / "t.mkv.evidence.json").read_text())
@@ -332,3 +335,32 @@ def test_timecode_makes_a_synthetic_stimulus_clip_and_keeps_its_spec(tmp_path, m
     assert json.loads((tmp_path / "c.mkv.stimulus.json").read_text())["stimulus"]["seed"] == 7
     with pytest.raises(SystemExit, match="not both"):
         cli.main(["probe", "timecode", "f.mkv", "--synthetic", "7", "--out", str(out)])
+def test_a_setpoint_moving_several_slots_writes_one_a_frame_and_holds_after_the_last():
+    states = np.zeros((3, 12), dtype=np.int64)
+    states[1, [0, 3, 5]] = [10, 20, 30]
+    states[2, 0] = 40
+    chunks = L.plan_sweep(states, settle=0, hold=5, frames=40)
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    body = chunk.plan[chunk.plan["target"] > 0]
+    assert body[["target", "param"]].tolist() == [(5, 1), (6, 4), (7, 6), (12, 1), (13, 4), (14, 6)]
+    assert chunk.frames == 19 and chunk.owner[12:].tolist() == [1, 1, 1, 2, 2, 2]
+
+
+def test_restagger_spreads_each_setpoint_and_keeps_the_original(tmp_path):
+    states = np.zeros((3, 12), dtype=np.int64)
+    states[1, [0, 3]] = [10, 20]
+    states[2, [0, 3]] = [30, 40]
+    rows = [(0, p + 1, 0) for p in range(12)] + [(5, 1, 10), (5, 4, 20), (10, 1, 30), (10, 4, 40)]
+    chunk = L.Chunk(0, states, np.array(rows, dtype=L.PLAN), np.r_[[0] * 12, 1, 1, 2, 2], 20, 0, 5)
+    plan = L.write_plan(tmp_path / "sweep-p.json", [chunk], program="p", source="c.mkv")
+    assert cli.main(["probe", "sweep", "restagger", str(plan)]) == 0
+    (got,), said = L.read_plan(plan)
+    assert got.plan[got.plan["target"] > 0][["target", "param"]].tolist() == [
+        (5, 1),
+        (6, 4),
+        (10, 1),
+        (11, 4),
+    ]
+    assert said["program"] == "p" and (tmp_path / "sweep-p.json.unstaggered").is_file()
+    assert got.plan[got.plan["target"] == 0].size == 12, "the start state stays at frame 0"

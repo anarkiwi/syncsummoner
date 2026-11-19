@@ -272,6 +272,20 @@ def _smoke_cmd(args: argparse.Namespace) -> int:
     return code or (0 if landed.ok and shift.exact else 3)
 
 
+def _restagger_cmd(args: argparse.Namespace) -> int:
+    """Rewrite plans so each setpoint's writes go one a frame, the original kept beside each."""
+    from syncsummoner.probe.locked import read_plan, restaggered, write_plan
+
+    for path in map(Path, args.plans):
+        chunks, said = read_plan(path)
+        kept = path.with_name(path.name + ".unstaggered")
+        if not kept.exists():
+            path.replace(kept)
+        write_plan(path, [restaggered(c) for c in chunks], **said)
+        LOG.info("%s: %d takes restaggered, the original kept as %s", path, len(chunks), kept.name)
+    return 0
+
+
 def held_record(hold: str | Path, program: str) -> dict:
     """A ``probe hold`` record, refused when it measured another program."""
     held = json.loads(Path(hold).read_text(encoding="utf-8"))
@@ -464,6 +478,9 @@ def add_parsers(probe_sub: Any) -> None:
     regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")
     regions.set_defaults(func=_sweep_regions_cmd)
     smoke = _add_smoke(sweep_sub)
+    restagger = sweep_sub.add_parser("restagger", help="spread each setpoint's writes one a frame in plans")
+    restagger.add_argument("plans", nargs="+")
+    restagger.set_defaults(func=_restagger_cmd)
     run = sweep_sub.add_parser(
         "capture", help="capture a plan's takes back to back on the rig, its program loaded once"
     )
