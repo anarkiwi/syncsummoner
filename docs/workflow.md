@@ -235,6 +235,13 @@ hold, with no dry control, a load as long as the device stall guard lets a wait 
 the longest load timed on the rig), so no load the rig lets through outgrows the clip. `probe sweep capture` runs
 under the same guard.
 
+A setpoint's writes go one a frame (`locked.staggered`): the device takes each write only once the one
+before is acknowledged, so a frame lets through only as many as its tick interval holds, and one a
+frame always fits; a setting is measured only once its last write has landed and settled.
+`probe sweep restagger` rewrites existing plans the same way, keeping each original beside it.
+`probe sweep smoke` captures a few seconds toggling one parameter and lands every write from the
+take's wire record alone: the rig check to run before any full take.
+
 `probe hold` measures how long each program's picture keeps moving after a step
 lands (`compose.response`). Every frame of a locked take is scored as the
 evidence scores it; each value-changing step's early lags are compared, step by

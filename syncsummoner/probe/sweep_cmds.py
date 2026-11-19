@@ -272,6 +272,20 @@ def _smoke_cmd(args: argparse.Namespace) -> int:
     return code or (0 if landed.ok and shift.exact else 3)
 
 
+def _restagger_cmd(args: argparse.Namespace) -> int:
+    """Rewrite plans so each setpoint's writes go one a frame, the original kept beside each."""
+    from syncsummoner.probe.locked import read_plan, restaggered, write_plan
+
+    for path in map(Path, args.plans):
+        chunks, said = read_plan(path)
+        kept = path.with_name(path.name + ".unstaggered")
+        if not kept.exists():
+            path.replace(kept)
+        write_plan(path, [restaggered(c) for c in chunks], **said)
+        LOG.info("%s: %d takes restaggered, the original kept as %s", path, len(chunks), kept.name)
+    return 0
+
+
 def held_record(hold: str | Path, program: str) -> dict:
     """A ``probe hold`` record, refused when it measured another program."""
     held = json.loads(Path(hold).read_text(encoding="utf-8"))
@@ -410,6 +424,9 @@ def _add_smoke(sweep_sub: Any) -> Any:
     smoke.add_argument("--out", required=True, help="where the plan and take go")
     smoke.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     smoke.set_defaults(func=_smoke_cmd)
+    restagger = sweep_sub.add_parser("restagger", help="spread each setpoint's writes one a frame in plans")
+    restagger.add_argument("plans", nargs="+")
+    restagger.set_defaults(func=_restagger_cmd)
     return smoke
 
 

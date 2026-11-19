@@ -145,11 +145,32 @@ def carried(states: np.ndarray, toggles: Sequence[int]) -> np.ndarray:
     return out[np.r_[True, np.any(np.diff(out, axis=0) != 0, axis=1)]]
 
 
-def plan_sweep(states: np.ndarray, *, settle: int, hold: int, frames: int) -> list[Chunk]:
-    """Cut a sweep into takes of at most ``frames`` clip frames, each setpoint one ``hold`` after the last.
+def staggered(at: int, state: np.ndarray, before: np.ndarray) -> list[tuple[int, int, int]]:
+    """A setpoint's writes from frame ``at``, one changed slot a frame, so each lands on its own frame.
 
-    A setpoint's changed slots all target one frame; when they land is what the take realizes, and
-    :func:`settled_rows` keeps only the frames after it. A take opens on its setpoint as the start state.
+    The device takes writes one at a time, each acknowledged before the next, so a frame holds only
+    as many as its tick interval lets through; one a frame always fits.
+    """
+    moved = np.flatnonzero(np.asarray(state) != np.asarray(before)) + 1
+    return [(int(at) + i, int(s), int(state[s - 1])) for i, s in enumerate(moved)]
+
+
+def restaggered(chunk: Chunk) -> Chunk:
+    """``chunk`` with each setpoint's writes after frame 0 spread one a frame from where they start."""
+    plan = np.array(chunk.plan, copy=True)
+    body = np.flatnonzero(plan["target"] > 0)
+    for owner in np.unique(chunk.owner[body]):
+        mine = body[chunk.owner[body] == owner]
+        plan["target"][mine] = plan["target"][mine].min() + np.arange(mine.size)
+    return replace(chunk, plan=plan)
+
+
+def plan_sweep(states: np.ndarray, *, settle: int, hold: int, frames: int) -> list[Chunk]:
+    """Cut a sweep into takes of at most ``frames`` clip frames, each setpoint held ``hold`` after its writes.
+
+    A setpoint's changed slots are written one a frame (:func:`staggered`); when they land is what the
+    take realizes, and :func:`settled_rows` keeps only the frames after the last. A take opens on its
+    setpoint as the start state.
     """
     states = np.asarray(states, dtype=np.int64)
     if hold > frames:
@@ -157,11 +178,14 @@ def plan_sweep(states: np.ndarray, *, settle: int, hold: int, frames: int) -> li
     out, k = [], 0
     while k < len(states):
         rows = [(0, p + 1, int(v)) for p, v in enumerate(states[k])]
-        owner, j = [0] * PARAM_COUNT, k + 1
-        while j < len(states) and (j - k + 1) * hold <= frames:
-            slots = np.flatnonzero(states[j] != states[j - 1]) + 1
-            rows += [((j - k) * hold, int(s), int(states[j][s - 1])) for s in slots]
-            owner += [j - k] * slots.size
+        owner, j, at = [0] * PARAM_COUNT, k + 1, hold
+        while j < len(states):
+            mine = staggered(at, states[j], states[j - 1])
+            if at + len(mine) + hold > frames + 1:
+                break
+            rows += mine
+            owner += [j - k] * len(mine)
+            at += max(len(mine) - 1, 0) + hold
             j += 1
         out.append(
             Chunk(
@@ -169,7 +193,7 @@ def plan_sweep(states: np.ndarray, *, settle: int, hold: int, frames: int) -> li
                 states=states[k:j],
                 plan=np.array(rows, dtype=PLAN),
                 owner=np.asarray(owner, dtype=np.int64),
-                frames=(j - k) * hold,
+                frames=at,
                 settle=int(settle),
                 hold=int(hold),
             )

@@ -65,9 +65,9 @@ def test_motion_that_lingers_needs_a_longer_hold_and_short_footage_none():
     ]
 
 
-def test_the_guard_covers_the_landing_window_and_the_settle():
-    assert R.guard_frames(1) == 3
-    assert R.guard_frames(4) == 6
+def test_the_guard_covers_every_slot_written_a_frame_apart_and_the_settle():
+    assert R.guard_frames(1) == 1 + R.PARAM_COUNT + 1
+    assert R.guard_frames(4) - R.guard_frames(1) == 3
 
 
 def test_settings_fill_the_clip_take_by_take_within_one_sessions_budget():
