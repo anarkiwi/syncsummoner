@@ -214,7 +214,7 @@ def loaded_wire(*, program="Teletext", state="running", said_t1=-1e3, last=(5, 6
     payload = json.dumps({"state": state, "program": program}) if fpga is None else fpga
     loaded = json.dumps({"fpga": payload, "t1_ns": cutoff + said_t1})
     plan = np.array([(-2, 1, 5), (0, 2, 6), (3, 3, 1)], dtype=LT.PLAN)
-    shown = np.array([(-1, cutoff - 3e7), (0, cutoff), (1, cutoff + 3e7)], dtype=SS.PLAYED)
+    shown = np.array([(-1, cutoff - 3e7, 0), (0, cutoff, 0), (1, cutoff + 3e7, 0)], dtype=SS.PLAYED)
     return {
         "loaded": np.array(loaded),
         "start": np.zeros(3, np.int64),
@@ -418,7 +418,7 @@ class SimShown:
         """Requests answered by now."""
         out = np.zeros(len(self.asks), dtype=SS.ASKED)
         for k, (t0, frame) in enumerate(self.asks):
-            out[k] = (t0, t0 + HEARD_NS, frame)
+            out[k] = (t0, t0 + HEARD_NS, frame, 0)
         return out[out["t1_ns"] <= self.sim.now]
 
     def wait(self, frame, stop=None):  # pylint: disable=unused-argument

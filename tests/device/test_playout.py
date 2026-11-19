@@ -259,7 +259,7 @@ def test_shown_logs_each_distinct_frame_when_first_heard_and_waits_for_one(feed)
         os.write(w, record(index))
     waiter.join()
     assert got == [103] and shown.wait(1) == 102 and shown.wait(0) == 100 and shown.latest() == 3
-    assert shown.log().tolist() == [(0, 100), (1, 102), (3, 103)] and shown.log().dtype == po.SHOWN
+    assert shown.log().tolist() == [(0, 100, 0), (1, 102, 0), (3, 103, 0)] and shown.log().dtype == po.SHOWN
 
 
 def test_shown_stops_waiting_when_asked_or_when_the_stream_ends(feed):
@@ -310,14 +310,16 @@ def test_a_reply_pairs_with_the_request_before_it_and_never_counts_as_a_flip():
         pi.write(record(0) + record(1))
         assert shown.wait(1) is not None
         shown.ask()
-        pi.write(po.RECORD.pack(1, 1, 1, 0, po.REPLY) + record(2))
+        pi.write(po.RECORD.pack(1, 1, 1, 0, po.REPLY) + po.RECORD.pack(30, 12, 2, 0, po.SEGMENT))
         assert shown.wait(2) is not None
         pi.close()
         shown.close()
     assert asks.getvalue() == b"?"
     assert shown.log()["frame"].tolist() == [0, 1, 2]
+    assert shown.log()["base"].tolist() == [0, 0, -18], "each record keeps its segment's base"
     asked = shown.asked()
     assert asked.size == 1 and asked["t0_ns"][0] < asked["t1_ns"][0] and asked["frame"][0] == 1
+    assert asked["base"][0] == 0
 
 
 def test_a_player_heard_flipping_returns_before_its_status_says_so():

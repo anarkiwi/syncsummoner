@@ -223,3 +223,28 @@ def test_a_tick_just_after_its_flip_is_told_from_one_just_before_the_next():
     shown = np.zeros(flips.size, dtype=SHOWN)
     shown["frame"], shown["t_ns"] = flips, flip_phase + flips * PERIOD + 1_500_000
     assert ev.phase_offset(asked, shown, ticks) == ev.Offset(7, 7)
+
+
+def test_only_the_segment_on_screen_at_the_last_tick_ties_device_frames_to_clip_frames():
+    """Each link-up starts the player on a vblank grid of its own phase; the others are left out."""
+    segments = [(0, 30, 25_000_000, 100), (60, 150, 5_000_000, 80), (170, 200, 20_000_000, 50)]
+    shown = np.concatenate(
+        [
+            shown_at(phase + np.arange(a, b) * PERIOD + 1_000_000, np.arange(a, b))
+            for a, b, phase, _ in segments
+        ]
+    )
+    shown["base"] = np.concatenate([np.full(b - a, base) for a, b, _, base in segments])
+    ticks, _ = device(150 * PERIOD / 1e9, phase=5_800_000 - 3 * PERIOD)
+    ticks = ticks[ticks["t0_ns"] > 62 * PERIOD]
+    asks = np.arange(0.1e9, 6.6e9, 0.0137e9).astype(np.int64)
+    which = np.searchsorted([a * PERIOD for a, *_ in segments], asks, side="right") - 1
+    phases, bases = np.array([s[2] for s in segments]), np.array([s[3] for s in segments])
+    asked = asked_at(asks, pi_frame(asks + 1_000_000, phases[which]))
+    asked["base"] = bases[which]
+    assert ev.offset(
+        np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked, shown, ticks, PERIOD
+    ) == ev.Offset(3, 3)
+    asked["base"] = shown["base"] = 0
+    with pytest.raises(ev.EvidenceError):
+        ev.offset(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), asked, shown, ticks, PERIOD)
