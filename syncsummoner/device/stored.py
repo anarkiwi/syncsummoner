@@ -123,38 +123,79 @@ class Stored:
             proc.wait()
 
 
-def _feed(fifo: Path, stored: Stored, start: int, ffmpeg: str, failed: list) -> None:
-    """Write every capture from ``start`` into ``fifo`` as IVF, stopping quietly when the reader goes."""
-    try:
-        with open(fifo, "wb", buffering=0) as out, closing(stored.frames(start, ffmpeg=ffmpeg)) as frames:
-            out.write(stored.layout.ivf_header())
-            for pts, data in frames:
-                out.write(ivf_frame(data, pts))
-                out.write(data)
-    except BrokenPipeError:
-        pass
-    except BaseException as err:  # pylint: disable=broad-exception-caught
-        failed.append(err)
+class _Feed:
+    """A thread writing ``stored``'s captures from ``start`` into ``fifo`` as IVF, and how to end it.
+
+    The writer opens the FIFO blocking, so it never finishes before a reader has opened it. Leaving
+    holds a read end of its own, which lets an open still pending return, waits under the lock until
+    the writer has opened or given up, and drains until the writer, seeing it is left, closes.
+    """
+
+    def __init__(self, fifo: Path, stored: Stored, start: int, ffmpeg: str):
+        self.fifo, self.stored, self.start, self.ffmpeg = fifo, stored, start, ffmpeg
+        self.state, self.left, self.failed = "idle", False, None
+        self.cond = threading.Condition()
+        self.thread = threading.Thread(target=self._write, daemon=True)
+
+    def _now(self, state: str) -> None:
+        with self.cond:
+            self.state = state
+            self.cond.notify_all()
+
+    def _write(self) -> None:
+        with self.cond:
+            if self.left:
+                self.state = "done"
+                self.cond.notify_all()
+                return
+            self.state = "opening"
+        try:
+            with open(self.fifo, "wb", buffering=0) as out:
+                self._now("open")
+                with closing(self.stored.frames(self.start, ffmpeg=self.ffmpeg)) as frames:
+                    out.write(self.stored.layout.ivf_header())
+                    for pts, data in frames:
+                        if self.left:
+                            break
+                        out.write(ivf_frame(data, pts))
+                        out.write(data)
+        except BrokenPipeError:
+            pass
+        except BaseException as err:  # pylint: disable=broad-exception-caught
+            self.failed = err
+        finally:
+            self._now("done")
+
+    def leave(self) -> None:
+        """End the writer whatever it is doing, and raise its failure."""
+        with self.cond:
+            self.left = True
+        held = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            with self.cond:
+                self.cond.wait_for(lambda: self.state in ("open", "done"))
+                writing = self.state == "open"
+            if writing:
+                os.set_blocking(held, True)
+                while os.read(held, 1 << 16):
+                    pass
+        finally:
+            os.close(held)
+        self.thread.join()
+        if self.failed is not None:
+            raise self.failed
 
 
 @contextmanager
 def _fed(stored: Stored, start: int, ffmpeg: str, fifo: Path) -> Iterator[Path]:
-    """``fifo`` carrying ``stored``'s captures from ``start`` on while the block runs.
-
-    A FIFO its reader never opened is opened here, so the writer always ends; its failure is raised.
-    """
+    """``fifo`` carrying ``stored``'s captures from ``start`` on while the block runs (:class:`_Feed`)."""
     os.mkfifo(fifo)
-    failed: list[BaseException] = []
-    writer = threading.Thread(target=_feed, args=(fifo, stored, start, ffmpeg, failed), daemon=True)
-    writer.start()
+    feed = _Feed(fifo, stored, start, ffmpeg)
+    feed.thread.start()
     try:
         yield fifo
     finally:
-        if writer.is_alive():
-            os.close(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK))
-        writer.join()
-    if failed:
-        raise failed[0]
+        feed.leave()
 
 
 def _lines(listing: Path) -> list[list[str]]:

@@ -1,8 +1,9 @@
 """Deduplicated takes read back capture for capture, as takes storing every capture read."""
 
-# pylint: disable=missing-function-docstring
+# pylint: disable=missing-function-docstring,protected-access
 
 import shutil
+import threading
 
 import numpy as np
 import pytest
@@ -56,6 +57,31 @@ def test_a_reader_stopping_early_or_never_reading_ends_the_feed(pair):
         assert len(takes.framemd5(source, out=("-frames:v", "2"))) <= 3
     with st.captures(new):
         pass
+
+
+def test_a_feed_ends_however_late_its_writer_starts(pair, monkeypatch):
+    """The block may end before the writer thread runs at all."""
+    new, _, _ = pair
+    write, late = st._Feed._write, threading.Event()
+
+    def deferred(self):
+        late.wait()
+        write(self)
+
+    monkeypatch.setattr(st._Feed, "_write", deferred)
+    finished = threading.Event()
+
+    def leave():
+        with st.captures(new):
+            pass
+        finished.set()
+
+    leaving = threading.Thread(target=leave, daemon=True)
+    leaving.start()
+    assert not finished.wait(0.2), "leaving waits for the writer"
+    late.set()
+    leaving.join(30)
+    assert finished.is_set()
 
 
 def test_a_corrupted_stored_frame_is_refused(pair):
