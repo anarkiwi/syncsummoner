@@ -15,36 +15,47 @@ sidecars.
 
 ## Where a write lands
 
-The device latches MIDI CCs once per output frame: the picture changes on a frame
-start, never part way down it (docs/hardware.md). So a write lands on the first frame
-that starts at least a fixed latency after the device took it. Frame starts are the
-take's frame line on the capture clock (`evidence.frame_times`,
-[hardware.md](hardware.md#the-cards-clock)), so they carry no capture phase. The latency
-is measured from the picture in every dry take's lead-in, and is the only thing the
-landing frame rests on; the serial readback's timing is not used.
+Nothing is timed by synchronized or fitted clocks. Every host-side event (CC send, serial
+request and reply, MIDI receipt, capture buffer, Pi report received) is stamped on the host's
+one `CLOCK_MONOTONIC`; the Pi's and the device's own clocks are never compared with it. They
+contribute only counters, ordered against host events by causality:
 
-Each calibration write taken at `t` and first shown in frame `F` puts the latency in
-`(T(F-1) - t, T(F) - t]`, `T` being the frame's start on the line; the bounds of all
-writes intersect in one band (`evidence.latency`). Writes that disagree by half a
-frame or more stop the take. Every frame's start less the band gives the instants a
-write must precede to land on it (`evidence.grid`). Where the take's captures admit
-lines other than the one fitted, frame starts lie within `line_lo..line_hi` of it, so
-the device's own latency lies in `Latency.bounds`, the band widened by them; each record
-says its basis (`"basis": "start"`). A dry take whose start setting looks like its dry picture shows no
-calibration write; it lands by the band the take directory's dry takes measured, as a take
-with no dry control does, and keeps no latency of its own.
+| Channel | Hook | What it proves |
+| --- | --- | --- |
+| Pi player | each flip's clip frame, streamed live and stamped on receipt (`playout.Shown`) | a frame reported by `t` was on screen by `t` |
+| Pi player | request and reply: the last flip done when the request arrived | the next flip came after the request left |
+| Videomancer serial | `transport status` `field_count`, polled between readbacks (`wire.Poller`) | replies keep command order, so each readback and each send lies between two counts |
+| Videomancer MIDI | `midi monitor` receipts (`wire.echoed`) | the device took the write by its echo |
+| Capture card | buffer timestamps | a capture done before a send cannot show it |
 
-A landing is a window, not a frame (`evidence.window`). The device took a write somewhere
-in its echo bracket and applies it on the first tick after; a tick lies in its band
-widened by how far the take's captures admit frame starts either side of its line
-(`locktake.line_spread`). The window runs from the first frame any such tick can land it
-on (`first`) to the last (`last`); `landed` is the point estimate inside it. Nothing
-depends on the window being one frame: a write is late only if its window starts after
-its target, early only if it ends before, and windows wider than a frame are counted
-(`ambiguous`) without failing the take. A setting is measured only once its writes'
-windows have closed and the program has settled, so a frame either way costs guard
-frames, not attribution. A program the CC acts on a frame or two later than the write
-lands gains nothing from a narrower window.
+`field_count` is the transport's counter: it advances once per frame only while the transport
+plays, so a session puts the transport in play and leaves it as it found it, and a take whose count
+never advanced is refused (`evidence.StoppedError`). Each tick read also records the transport's beat
+phase, tempo and play state. The device latches CCs on its frame tick, the frame `field_count` counts: its readback never
+changes between two polls that read the same count (docs/hardware.md). For each write:
+
+- **Floor** `F`: the clip frame the host last heard the Pi show before sending it. No output
+  of an earlier clip frame can show it. A write sent before any frame was heard has no floor
+  and faults its take.
+- **Latch** `L`: the device frame it takes effect on. A count `c` read before the send means
+  `L >= c + 1`; a count `c'` asked for after its echo means `L <= c' + 1`; the readback change,
+  between the counts read either side of it, pins `L` itself.
+- **Offset** `O`: device frame `n` processes clip frame `n - O`, one integer per session as the
+  device genlocks to the Pi: it ticks for clip frame `g` after the Pi flips `g` and before it
+  flips `g + 1`. A Pi reply of `f` to a request sent after a count `c` was read gives `O >= c - f`;
+  a count `c'` asked for after the host heard `f` shown gives `O <= c' - f + 1`; a write with
+  floor `F` and latest latch `L` gives `O <= L - F` (`evidence.offset`). Those leave a
+  frame when the tick comes as close to a flip as the host's brackets are wide, as it does on this
+  device; `evidence.phase_offset` moves every tick bracket to one tick and every flip bracket to one
+  frame by whole periods, the period itself bracketed by the first and last ticks, and the tick's
+  following its own flip by under half a frame (docs/hardware.md) picks the frame. Bounds that cross fault
+  the session; bounds a frame apart widen every write's window by that frame.
+- **Response**: the clip frames after `L - O` until the picture shows the write, from that
+  write's own captures. It is the program's processing of that CC; it is never pooled across
+  writes, parameters or programs.
+
+Each of these faults its take: a picture change attributed to a write before its floor; a floor
+after its target frame (sent late); an echo before its send; a gap in the Pi's flip reports.
 
 ## Frame-locked sends
 
@@ -52,10 +63,10 @@ Takes are recorded in sessions (`locktake.locked_session`, `compose.session`): a
 loaded once and all its takes, a sweep's chunks or a render's pass, play back to back. The Pi
 plays the end of the clip's strip-coded lead-in, each take's clip frames from frame 0 in turn and
 a lead-out as one stream (`--spans`, `session.Layout.spans`), so the card never relocks and one
-frame line spans the session. The recorder rolls from one take's file to the next on the capture
-clock, both files keeping the captures every admitted line puts within a frame of the boundary
-(`v4l2rec`'s `roll T0 T1 PATH`); takes stay separate files with their own sidecars. A failed take
-is recaptured alone, as a session of one, which loads again.
+frame line spans the session. The recorder rolls from one take's file to the next once the Pi is
+heard showing the frame two before the boundary, both files keeping the captures from then to two
+frames past it (`v4l2rec`'s `roll T0 T1 PATH`); takes stay separate files with their own sidecars. A
+failed take is recaptured alone, as a session of one, which loads again.
 
 1. A program with a bypass setting (`locktake.dry_state`) is loaded before playout and held
    dry by it. This is the control setting that the program's HDL shows leaves every other control
@@ -63,45 +74,37 @@ is recaptured alone, as a session of one, which loads again.
    Mix at the end of its range that returns the input exactly (`ProgramModel.bypass`,
    [program-model.md](program-model.md)), found from the declaration before anything loads. No slot
    or label is assumed to do the same thing across programs. No Passthru plays at all.
-2. Once the start state has settled and `lock.ANCHOR_FRAMES` frames have started unprocessed, the
-   dry control is toggled at random intervals and each toggle's first frame in the lead-in's
-   picture measures the latency band.
-3. While the recording runs, its stored captures are read (`lock.read_live`) and attributed
-   (`lock.live_attribution`), giving the frame line from the lead-in's strips; a lead-in whose
-   strips name no two frames is an `AnchorError`, never relaxed.
-4. Each planned write for session frame `j` is sent half a frame before the instant it must
-   precede (`evidence.send_time`): the live clock can err either way and a send can
-   wake late. The take runs with a short interpreter switch interval so the sending
-   thread wakes promptly; each send records when it was due, and the report gives the
-   worst wake-up. The frame line is carried on over every take's captures as the session runs
-   (`locktake.Clock.extend`): each capture starting a frame, its bytes differing from the capture
-   before's, is named by the line so far and narrows it, as the offline fit does.
-5. Two seconds before clip frame 0 the dry control is set to its take value; the
-   last readback before frame 0's latch must equal frame 0's planned parameters,
-   and `fpga status` must name the program (`locktake.loaded_before`). A later take's frame 0
-   lands on its tick, so its last readback must equal the state the take before left.
-6. On the frame after the last take's last the dry control is set dry again, held as long as the
+2. Once the start state has settled, the device-to-clip offset is bound from the frame ticks, the
+   Pi's replies and its reports so far (`evidence.offset`); one bound only after the first write was
+   due is a `LeadInTimeError`.
+3. Each planned write for session frame `j` is sent once the device has ticked for frame
+   `j - 1` (`Poller.wait_count`), its floor the frame the Pi was last heard showing. The take runs
+   with a short interpreter switch interval so the sending thread wakes promptly; each send records
+   when it was due, and the report gives the worst wake-up.
+4. Two seconds before clip frame 0 the dry control is set to its take value; the last readback
+   before frame 0 was heard shown must equal frame 0's planned parameters, and `fpga status` must
+   name the program (`locktake.loaded_before`). A later take's last readback before its frame 0
+   must equal the state the take before left.
+5. On the frame after the last take's last the dry control is set dry again, held as long as the
    lead-in's wet stretch and `ANCHOR_FRAMES` more, whose strips pin the line's far end.
+
+The frame line is fitted after the session from every take's strips (`lock.attribute_take`); a
+session whose strips name no two frames is an `AnchorError`, never relaxed.
 
 A program with no bypass setting has Passthru only at the session's ends: the lead-in plays
 under Passthru, the program is loaded once `ANCHOR_FRAMES` frames have started, the outage
-bridged by the Pi's flip log, and Passthru is loaded again after the last take. Its latency band
-is where every dry take's `Latency.bounds` meet (`ccpicture.json`, start-basis records only; a
-judged dry take records its own); `render --cut-programs` renders such programs after a dry one.
-However wide that band, it only widens such a take's landing windows; bands that do not meet at
-all contradict each other and stop the take.
+bridged by the Pi's flip log, and Passthru is loaded again after the last take. Its writes land by
+its own session's events, as a dry program's do; no other take is consulted.
 
 The lead-in holds exactly what it must (`session.lead_in_frames`): with a bypass, the start
-state's settle, the anchor and the toggles at their longest; without one, the anchor, the longest
-load timed on the rig (`device.loadtimes`) and the settle. The clock is then measured
-from what was recorded, which the host decodes faster than real time, so it takes at most as long
-again; a bypass's wet stretch follows. The lead-out (`session.lead_out_frames`) holds the dry state
-as long as the lead-in held the wet one, or Passthru's load and its first landed frame, then the
-anchor. A clock measured after the first write was due is a `LeadInTimeError`, a load past the
-lead-in fails `loaded_before`, and a clip whose lead-in or lead-out is shorter than the session's
-is refused before anything plays. Device waits fail as stalled once they see nothing for longer
-than the longest load timed (`render.open_rig`), unless `--stall` says otherwise; with no load on
-record and no `--stall`, a rig is not opened at all.
+state's settle and the offset's bounding (`LeadIn.bound_s`), then the wet stretch; without one,
+the anchor, the longest load timed on the rig (`device.loadtimes`), the settle and the bounding.
+Nothing is decoded before the first write. The lead-out (`session.lead_out_frames`) holds the dry
+state as long as the lead-in held the wet one, or Passthru's load and the frame it latches on, then
+the anchor. A load past the lead-in fails `loaded_before`, and a clip whose lead-in or lead-out is
+shorter than the session's is refused before anything plays. Device waits fail as stalled once
+they see nothing for longer than the longest load timed (`render.open_rig`), unless `--stall` says
+otherwise; with no load on record and no `--stall`, a rig is not opened at all.
 
 Every load a session times goes into one record per rig, `loads.jsonl` beside the program cache
 (`SYNCSUMMONER_LOADS` overrides it), keyed by program and firmware and appended under an exclusive
@@ -140,10 +143,9 @@ frame without a device.
 **Realized, not planned.** A message's echo comes with the first poll or command
 reply the device writes after taking it. So it was taken after the request of the
 reply before that one left, and after its write began, and no later than its own
-reply came back (`wire.echoed`); a write is taken once its last message is. Its
-landing is the first tick after that bracket, and `landed` is the frame it is in effect
-from; `clear_ns` is how far the nearer end of the bracket clears a tick, negative when a
-tick's bracket overlaps it, so the write may be in effect a tick either side. A take
+reply came back (`wire.echoed`); a write is taken once its last message is. Its device
+frame is its latch window (`evidence.latches`), and its clip frames that window less the
+session's offset, never before its floor: `first` to `last`, `landed` the first. A take
 without receipts falls back to the send interval. `evidence.realized` is the state every
 clip frame actually held, from those landings and the wire values.
 
@@ -156,21 +158,13 @@ copies aside (`evidence.landed`):
 | never echoed | sent, but some message of it, and of its copy, never came back |
 | duplicated | sent with nothing planned for it |
 | out of order | sent before a write planned ahead of it |
-| late, early | in effect from a frame other than its target, measured from its echo |
-| on a tick | its landing tick could not be told from the next: a tick inside its bracket, or read back a tick from where its echo puts it |
+| late | cannot have landed by its target, or its floor is past it |
+| early | must have landed before its target |
+| over more than one frame | its window spans frames, counted without failing the take |
+| sent before any frame was seen | no floor; fails the take |
 
-The least slack, echo to the target's tick, is reported too. The CC-to-picture latency
-of a dry take is calibrated on the same brackets, so the tick grid and the landings are
-in one time base. A take without a dry control uses a latency on file; one measured
-before echoes were used was timed from the send's return, earlier than the device took
-it, which leans its landings late.
-
-Re-judged this way, the 11 frame-locked takes with receipts (rc4/takes and full/takes)
-have no write unambiguously late or early, and no readback disagreement. 94 writes are
-on a tick and count late: their echo bracket overlaps the tick they targeted, almost all
-because the echo came with a poll reply stalled 25 to 37 ms, the others because the send
-itself woke late. The Bit Rotator rc.4 take's 31 writes lost in the 124-message burst were
-never echoed, and its readback agrees they never took effect.
+Takes recorded before the frame ticks, floors and Pi reports were kept cannot be landed this way
+and are refused by `take_evidence`; they are recorded again.
 
 The cyclic garbage collector is off while a take plays. A full collection over the
 poller's growing records holds the interpreter lock for longer than the half frame a send

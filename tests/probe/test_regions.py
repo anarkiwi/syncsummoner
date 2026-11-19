@@ -65,9 +65,9 @@ def test_motion_that_lingers_needs_a_longer_hold_and_short_footage_none():
     ]
 
 
-def test_the_guard_covers_the_latency_band_an_echo_and_the_settle():
-    assert R.guard_frames(1, 0.0, 33e6) == 3
-    assert R.guard_frames(2, 40e6, 33e6) == 6
+def test_the_guard_covers_the_landing_window_and_the_settle():
+    assert R.guard_frames(1) == 3
+    assert R.guard_frames(4) == 6
 
 
 def test_settings_fill_the_clip_take_by_take_within_one_sessions_budget():
@@ -130,7 +130,6 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     cover.write_text(
         json.dumps({"states": states.tolist(), "chosen": [0, 1], "stepped": {"0": [1, 2], "1": [2]}})
     )
-    LT.write_latency(tmp_path, LT.ev.Latency(lo=30e6, hi=40e6, samples=3, period=1e9 / 30), "dry")
     lead = 1200
     luma = np.zeros((lead + 3000 + lead, 4, 4), dtype=np.float32)
     rng = np.random.default_rng(7)
@@ -158,12 +157,12 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     chunks, said = L.read_plan(tmp_path / "sweep-p.json")
     regions = said["regions"]
     assert regions["dims"] == {"0": [1, 2], "1": [2]}
-    assert regions["joint"] == 6 and regions["guard_frames"] == 1 + 1 + 2
+    assert regions["joint"] == 6 and regions["guard_frames"] == R.guard_frames(1)
     assert (
         sum(len(c.states) for c in chunks) == regions["settings"] == sum(regions["per_regime"].values()) + 6
     )
     assert all(c.frames <= 3000 for c in chunks) and regions["rig_s"] <= 900
-    ends = session_frames(LT.LeadIn(), 30.0, dry=True, directory=tmp_path)
+    ends = session_frames(LT.LeadIn(), 30.0, dry=True)
     session_s = sum(ends) / 30.0 + RenderConfig.for_format("1080p30").tail_s
     assert regions["rig_s"] == pytest.approx(sum(c.frames for c in chunks) / 30.0 + session_s)
     assert "settings" in capsys.readouterr().out
@@ -174,7 +173,7 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     chunks, said = L.read_plan(tmp_path / "sweep-p.json")
     regions = said["regions"]
     assert said["response"] == {"program": "p", "settle": 0, "measured": False}
-    assert regions["guard_frames"] == 1 + 2 and regions["budget_s"] is None
+    assert regions["guard_frames"] == R.guard_frames(0) and regions["budget_s"] is None
     assert regions["per_regime"] == {"0": 4, "1": 2} and regions["settings"] == 4 + 2 + 6
     assert sum(len(c.states) for c in chunks) == 12
 

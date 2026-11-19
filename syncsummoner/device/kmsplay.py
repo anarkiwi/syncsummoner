@@ -15,6 +15,7 @@ import os
 import queue
 import select
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -27,6 +28,8 @@ from typing import Any, Callable, Iterable, Iterator
 RECORD = struct.Struct("<qqqqq")
 #: Flag on the first flip of a segment, after the start or after the link came back up.
 SEGMENT = 1
+#: Flag on a copy of the last flip done, sent in reply to a request on the ``--ask`` pipe.
+REPLY = 2
 #: ``DRM_MODE_FLAG_INTERLACE``: such a mode has no single frame per vblank.
 INTERLACE = 0x10
 #: The framebuffer layout bgr565le words land in, as fbdev and the device chain expect.
@@ -412,6 +415,114 @@ def read_exactly(stream: Any, size: int) -> bytes | None:
     return bytes(buf)
 
 
+def fifo(path: str) -> None:
+    """A named pipe at ``path``: the one there, else a new one in place of whatever is."""
+    try:
+        if stat.S_ISFIFO(os.stat(path).st_mode):
+            return
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(path)
+
+
+class LiveFeed:
+    """A named pipe offered every flip record as its flip completes, never blocking or raising.
+
+    The FIFO at ``path`` is kept if one is there, so a reader that opened it before the player started
+    gets every record. A record is dropped while no reader has the pipe open or while the pipe is full;
+    once a reader leaves, the next record waits for another.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fd: int | None = None
+        self._lock = threading.Lock()
+        fifo(path)
+
+    def write(self, record: bytes) -> None:
+        """Offer one record, smaller than ``PIPE_BUF`` so it lands whole or not at all."""
+        with self._lock:
+            try:
+                if self._fd is None:
+                    self._fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+                os.write(self._fd, record)
+            except BlockingIOError:
+                pass
+            except OSError:
+                self._release()
+
+    def _release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def close(self) -> None:
+        """Let go of the reader, if one is held."""
+        with self._lock:
+            self._release()
+
+
+def answer(
+    asks: Any,
+    last: Callable[[], bytes | None],
+    live: LiveFeed,
+    *,
+    period_ns: Fraction,
+    hold: int,
+    clock: Callable[[], int] = time.monotonic_ns,
+) -> None:
+    """For each byte read from ``asks``, offer ``live`` the frame on screen then, flagged :data:`REPLY`.
+
+    The last flip recorded is carried on by the vblanks its event time puts before now, on this host's
+    own clock, so a flip completed but not yet recorded still counts. A reply is made only after its
+    request was read, so the flip after the frame it reports came after the request was sent. Returns
+    when ``asks`` ends.
+    """
+    while asks.read(1):
+        record = last()
+        if record is not None:
+            v, seq, frame, t_ns, flags = RECORD.unpack(record)
+            passed = int((clock() - t_ns) // period_ns)
+            now = v + max(passed, 0)
+            frame += now // hold - v // hold
+            live.write(RECORD.pack(now, seq + max(passed, 0), frame, t_ns, flags | REPLY))
+
+
+def serve_asks(
+    path: str, last: Callable[[], bytes | None], live: LiveFeed, *, period_ns: Fraction, hold: int
+) -> threading.Thread:
+    """Answer requests on the named pipe at ``path`` from a thread of its own, for askers in turn."""
+    fifo(path)
+
+    def serve() -> None:
+        while True:
+            with open(path, "rb", buffering=0) as asks:
+                answer(asks, last, live, period_ns=period_ns, hold=hold)
+
+    thread = threading.Thread(target=serve, name="asks", daemon=True)
+    thread.start()
+    return thread
+
+
+def recorder(
+    log: Any, live: LiveFeed | None, ask: str | None, *, period_ns: Fraction = Fraction(1), hold: int = 1
+) -> Callable[..., None]:
+    """Each flip's record written to ``log`` and offered ``live``, the last kept to answer ``ask`` with."""
+    last: list[bytes] = []
+    if live is not None and ask:
+        serve_asks(ask, lambda: last[-1] if last else None, live, period_ns=period_ns, hold=hold)
+
+    def record(*fields: int) -> None:
+        data = RECORD.pack(*fields)
+        log.write(data)
+        last[:] = [data]
+        if live is not None:
+            live.write(data)
+
+    return record
+
+
 def decode_argv(
     path: str,
     width: int,
@@ -590,6 +701,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--connector", default="HDMI-A-1")
     parser.add_argument("--preroll-s", type=float, default=2.0)
     parser.add_argument("--flips", required=True, help="binary log of every flip")
+    parser.add_argument("--live", help="named pipe offered every flip record as it completes")
+    parser.add_argument("--ask", help="named pipe whose every byte is answered on --live with the last flip")
     parser.add_argument("--status", required=True, help="JSON status file")
     parser.add_argument("--fb", default="/dev/fb0", help="fbdev left holding the last frame")
     return parser.parse_args(argv)
@@ -608,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         signal.signal(sig, lambda *_, key=name: signals.__setitem__(key, True))
     status: dict = {"state": "starting", "pid": os.getpid()}
     write_status(args.status, status)
-    player = display = None
+    player = display = live = None
     try:
         if args.clip and clip_rate(args.clip) != args.fps:
             raise PlayoutFault(f"{args.clip} runs at {clip_rate(args.clip)} fps, not {args.fps}")
@@ -627,13 +740,16 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
             frames = dir_frames(args.frames, loop=args.loop)
         preroll = Prerolled(frames, max(2, round(float(args.preroll_s * args.fps))))
         preroll.wait_full(timeout_s=60.0)
+        live = LiveFeed(args.live) if args.live else None
         with open(args.flips, "wb", buffering=0) as log:
+            record = recorder(log, live, args.ask, period_ns=display.period_ns, hold=display.hold)
+
             player = Player(
                 display,
                 preroll,
                 hold=display.hold,
                 period_ns=display.period_ns,
-                record=lambda *fields: log.write(RECORD.pack(*fields)),
+                record=record,
                 signals=signals,
             )
             status.update(
@@ -659,6 +775,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - needs a DR
         status.update(state="failed", error=said)
         return 2
     finally:
+        if live is not None:
+            live.close()
         if player is not None:
             status.update(
                 flips=player.flips,

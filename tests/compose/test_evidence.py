@@ -1,4 +1,4 @@
-"""Frame-indexed evidence: ticks, landings, readbacks, receipts and the picture test."""
+"""Frame-indexed evidence: landings, readbacks, receipts and the picture test."""
 
 # pylint: disable=missing-function-docstring
 
@@ -16,7 +16,6 @@ from syncsummoner.device.wire import MESSAGE, READ, RECEIPT, SEND
 
 PERIOD = 33_333_333.0
 TRUE_TICK = 5_000_000.0
-TICKS = ev.Ticks(lo=TRUE_TICK - 400_000.0, hi=TRUE_TICK + 600_000.0, period=PERIOD, count=10)
 DELTA = 1.25 * PERIOD
 LEAD = 4
 FRAMES = 40
@@ -31,13 +30,14 @@ def true_tick(n):
 
 
 def sends_at(rows, t1=None):
-    """SEND records for ``(target, param, value)`` rows, woken just after :func:`ev.send_time` says."""
+    """SEND records for ``(target, param, value)`` rows, sent once the device ticked for the frame before."""
     rows = np.array(rows, dtype=PLAN)
-    due = ev.send_time(rows["target"], TICKS, TIMES, DELTA)
+    due = true_tick(rows["target"] - 1)
     t1 = due + WAKE + WRITE if t1 is None else np.asarray(t1, np.float64)
     out = np.zeros(len(rows), dtype=SEND)
     out["t0_ns"], out["t1_ns"], out["due_ns"] = t1 - WRITE, t1, due
     out["param"], out["value"], out["target"] = rows["param"], rows["value"], rows["target"]
+    out["floor"] = rows["target"] - 1
     return out
 
 
@@ -63,194 +63,37 @@ def test_frame_times_are_the_attributions_line_from_clip_frame_0():
     assert times.frame_of(times.at(7) + 0.4 * PERIOD) == 7 and times.frame_of(times.at(7) - 0.4 * PERIOD) == 7
 
 
-def test_a_latency_bounds_the_devices_own_by_the_lines_its_captures_admit():
-    lat = ev.Latency(lo=DELTA - 1e5, hi=DELTA + 2e5, samples=3, period=PERIOD, line_lo=-4e5, line_hi=3e5)
-    assert lat.bounds == (DELTA - 5e5, DELTA + 5e5)
-    said = lat.as_dict()
-    assert (said["line_lo"], said["line_hi"], said["basis"]) == (-4e5, 3e5, ev.BASIS)
-    assert ev.Latency(lo=1.0, hi=2.0, samples=0, period=PERIOD).bounds == (1.0, 2.0)
-
-
-def test_after_finds_the_first_tick_and_its_clearance():
-    ticks = ev.Ticks(lo=0.0, hi=1e6, period=33e6, count=1)
-    n, clear = ticks.after(np.array([5e6, 0.5e6, 33.5e6, -1e6]))
-    assert n.tolist() == [1, 0, 1, 0]
-    assert clear.tolist() == [28e6, -0.5e6, -0.5e6, 1e6]
-    assert ticks.at(2) == pytest.approx(0.5e6 + 66e6) and ticks.width == 1e6
-
-
-def test_send_time_is_midway_between_ticks_so_errors_either_way_still_land():
-    frames = np.arange(-LEAD, FRAMES + 10)
-    due = ev.send_time(frames, TICKS, TIMES, DELTA)
-    true_n = np.ceil((due - TRUE_TICK) / PERIOD)
-    assert np.all(true_tick(true_n - 1) < due) and np.all(due < true_tick(true_n))
-    assert np.allclose(due - TICKS.at(true_n - 1), PERIOD / 2)
-    for off in np.linspace(-(PERIOD - TICKS.width) / 2 + 1.0, (PERIOD - TICKS.width) / 2 - 1.0, 7):
-        n, clear = TICKS.after(due + off)
-        assert ev.frame_of_tick(n, TICKS, TIMES, DELTA).tolist() == frames.tolist()
-        assert np.allclose(clear, (PERIOD - TICKS.width) / 2 - off) and np.all(clear > 0)
-    n, _ = TICKS.after(due + PERIOD)
-    assert np.all(ev.frame_of_tick(n, TICKS, TIMES, DELTA) == frames + 1)
-
-
-def toggle_take(switch, *, flicker=None, count=60):
-    k = np.arange(count)
-    t = 1000.0 + k * 500.0
-    values = np.array([300, 1023] * (len(switch) // 2))
-    level = np.full(count, 255, dtype=np.uint8)
-    for s, v in zip(switch, values):
-        level[s:] = 0 if v == 300 else 255
-    if flicker is not None:
-        level[flicker] = 255 - level[flicker]
-    images = np.broadcast_to(level[:, None, None, None], (count, 1, 2, 2)).copy()
-    toggles = np.zeros(len(switch), dtype=SEND)
-    toggles["t1_ns"] = t[np.asarray(switch) - 3] + 100
-    toggles["t0_ns"] = toggles["t1_ns"] - 50
-    toggles["value"], toggles["target"] = values, ev.CALIBRATION
-    return images, t, k % 2 == 0, k // 2, toggles
-
-
-def test_toggle_landings_find_the_frame_each_write_first_shows_in():
-    images, t, starts, shown, toggles = toggle_take([6, 20, 34, 48])
-    assert ev.toggle_landings(images, t, starts, shown, toggles).tolist() == [3, 10, 17, 24]
-    assert ev.toggle_landings(images, t, starts, shown, toggles, until=t[52]).tolist() == [3, 10, 17, 24]
-
-
-def test_toggle_landings_reject_switches_off_a_frame_start_or_that_flicker():
-    images, t, starts, shown, toggles = toggle_take([6, 21, 34, 48], flicker=40)
-    assert ev.toggle_landings(images, t, starts, shown, toggles).tolist() == [
-        3,
-        ev.CALIBRATION,
-        ev.CALIBRATION,
-        24,
-    ]
-
-
-def test_toggle_landings_need_two_states_each_with_a_picture():
-    images, t, starts, shown, toggles = toggle_take([6, 20])
-    one = toggles.copy()
-    one["value"] = 300
-    assert ev.toggle_landings(images, t, starts, shown, one).tolist() == [ev.CALIBRATION] * 2
-    late = toggles.copy()
-    late["t1_ns"][1] = t[-1] + 10
-    late["t0_ns"][1] = t[-1] + 5
-    assert ev.toggle_landings(images, t, starts, shown, late).tolist() == [ev.CALIBRATION] * 2
-
-
-def shown_with(latency, sent):
-    """The frame each write sent at ``sent`` first shows in, for a true send-to-capture ``latency``."""
-    return np.ceil((np.asarray(sent) + latency - TIMES.origin) / PERIOD).astype(np.int64)
-
-
-def test_latency_brackets_the_true_send_to_capture_delay_from_where_each_write_showed():
-    rng = np.random.default_rng(5)
-    sent = TIMES.origin + rng.uniform(0, 30 * PERIOD, 24)
-    true = 1.37 * PERIOD
-    shown = shown_with(true, sent)
-    measured = ev.latency(sent, shown, TIMES)
-    lo = (TIMES.at(shown - 1) - sent).max()
-    hi = (TIMES.at(shown) - sent).min()
-    assert (measured.lo, measured.hi) == (pytest.approx(lo), pytest.approx(hi))
-    assert measured.lo < true <= measured.hi and measured.hi - measured.lo < PERIOD / 4
-    assert measured.samples == 24 and measured.delta == pytest.approx(0.5 * (lo + hi))
-    assert measured.spread == pytest.approx(0.5 * (hi - lo)) and measured.frames == pytest.approx(
-        1.37, abs=0.13
-    )
-    said = measured.as_dict()
-    assert said["lo"] == measured.lo and said["delta"] == measured.delta and said["frames"] == measured.frames
-    off = np.r_[sent[:1], sent]
-    assert ev.latency(off, np.r_[ev.CALIBRATION, shown], TIMES).samples == 24
-
-
-def test_latency_writes_that_disagree_a_little_give_the_band_they_disagree_over():
-    sent = TIMES.origin + np.array([0.5, 0.4]) * PERIOD
-    measured = ev.latency(sent, np.array([2, 3]), TIMES)
-    assert (measured.lo, measured.hi) == (pytest.approx(1.5 * PERIOD), pytest.approx(1.6 * PERIOD))
-    assert measured.samples == 2
-
-
-def test_latency_rejects_writes_half_a_frame_apart_and_none_shown():
-    sent = TIMES.origin + np.array([0.95, 0.4]) * PERIOD
-    with pytest.raises(ev.EvidenceError, match="half a frame"):
-        ev.latency(sent, np.array([2, 3]), TIMES)
-    with pytest.raises(ev.EvidenceError, match="no calibration"):
-        ev.latency(sent, np.full(2, ev.CALIBRATION), TIMES)
-    with pytest.raises(ev.EvidenceError, match="no calibration"):
-        ev.latency(sent, np.full(2, -LEAD - 1), TIMES)
-
-
-def test_the_grid_puts_each_frames_tick_its_latency_band_before_its_capture():
-    lat = ev.Latency(lo=DELTA - 600_000.0, hi=DELTA + 400_000.0, samples=7, period=PERIOD)
-    ticks = ev.grid(TIMES, lat)
-    assert (ticks.lo, ticks.hi, ticks.period, ticks.count) == (TICKS.lo, TICKS.hi, PERIOD, 7)
-    rng = np.random.default_rng(8)
-    true = DELTA + rng.uniform(-600_000.0, 400_000.0)
-    sent = TIMES.origin + rng.uniform(0, 30 * PERIOD, 200)
-    n, clear = ticks.after(sent)
-    sure = clear >= 0
-    assert sure.mean() > 0.9
-    got = ev.frame_of_tick(n, ticks, TIMES, lat.delta)
-    assert got[sure].tolist() == shown_with(true, sent)[sure].tolist()
-
-
 def test_writes_sent_on_schedule_land_on_their_targets():
     plan = np.array([(2, 1, 10), (2, 2, 20), (5, 1, 30), (9, 3, 40)], dtype=PLAN)
     sends = np.r_[sends_at([(0, 1, 1)]), sends_at(plan.tolist())]
     sends["target"][0] = ev.START
-    got = ev.landed(plan, sends, TICKS, TIMES, DELTA)
+    latch = np.c_[sends["target"], sends["target"]]
+    got = ev.landed(plan, sends, latch=latch, shift=ev.Offset(0, 0))
     assert got.ok and got.rows["landed"].tolist() == [2, 2, 5, 9]
     assert got.rows["sent"].tolist() == [0, 1, 2, 3] and "4 writes scheduled: 0 missing" in got.summary()
     assert got.wake_ms == pytest.approx(WAKE / 1e6) and "0.10 ms after due" in got.summary()
     sends["t0_ns"][3] += 2_500_000
-    assert ev.landed(plan, sends, TICKS, TIMES, DELTA).wake_ms == pytest.approx(2.6)
-    bare = np.dtype([(name, SEND[name]) for name in SEND.names if name != "due_ns"])
-    undue = np.zeros(len(sends), dtype=bare)
-    for name in bare.names:
-        undue[name] = sends[name]
-    assert np.isnan(ev.landed(plan, undue, TICKS, TIMES, DELTA).wake_ms)
-
-
-def test_a_window_widened_by_the_lines_spread_holds_every_landing_it_admits():
-    """A write echoed clear of its tick lands on one frame; the line's spread opens the window either side."""
-    plan = np.array([(4, 1, 10)], dtype=PLAN)
-    sends = sends_at(plan.tolist())
-    tight = ev.landed(plan, sends, TICKS, TIMES, DELTA)
-    assert tight.rows[["first", "last"]].tolist() == [(4, 4)] and tight.ambiguous == 0
-    wide = ev.landed(plan, sends, TICKS, TIMES, DELTA, spread=(-0.6 * PERIOD, 0.6 * PERIOD))
-    assert wide.rows[["first", "last"]].tolist() == [(3, 5)] and wide.ambiguous == 1 and wide.ok
-    late = ev.landed(plan, sends_at(plan.tolist(), sends["t1_ns"] + 2 * PERIOD), TICKS, TIMES, DELTA)
-    assert late.late == 1 and not late.ok
+    assert ev.landed(plan, sends, latch=latch, shift=ev.Offset(0, 0)).wake_ms == pytest.approx(2.6)
+    assert np.isnan(ev.landed(plan[:0], sends[:0]).wake_ms)
 
 
 def test_late_early_missing_duplicated_and_out_of_order_writes_are_counted():
     plan = np.array([(2, 1, 10), (2, 2, 20), (5, 1, 30), (9, 3, 40), (12, 4, 50)], dtype=PLAN)
-    on_time = ev.send_time(plan["target"], TICKS, TIMES, DELTA) + WAKE + WRITE
-    t1 = on_time + np.array([0, 0, PERIOD, -PERIOD, 0])
-    sends = sends_at(plan.tolist(), t1)
-    sends = np.r_[sends[[1, 0, 2, 3]], sends[[3]]]
-    got = ev.landed(plan, sends, TICKS, TIMES, DELTA)
+    sends = sends_at(plan.tolist())
+    latch = np.c_[plan["target"], plan["target"]] + np.array([0, 0, 1, -1, 0])[:, None]
+    sends["floor"][3] -= 1
+    order = [1, 0, 2, 3, 3]
+    got = ev.landed(plan, sends[order], latch=latch[order], shift=ev.Offset(0, 0))
     assert (got.missing, got.duplicated, got.out_of_order, got.late, got.early) == (1, 1, 1, 1, 1)
     assert got.ambiguous == 0 and not got.ok
     assert got.rows["landed"].tolist() == [2, 2, 6, 8, ev.CALIBRATION]
-
-
-def test_a_write_on_a_tick_or_read_back_off_its_predicted_tick_is_ambiguous():
-    plan = np.array([(2, 1, 10), (5, 2, 20)], dtype=PLAN)
-    sends = sends_at(
-        plan.tolist(), [TICKS.at(2 + 0) + 0.0, ev.send_time(np.array([5]), TICKS, TIMES, DELTA)[0]]
-    )
-    seen = np.array([-1, 6])
-    got = ev.landed(plan, sends, TICKS, TIMES, DELTA, seen)
-    assert got.ambiguous == 2 and got.ok
-    assert got.rows["landed"][1] == 6
-    assert got.rows[["first", "last"]].tolist() == [(2, 3), (5, 6)]
 
 
 def test_readbacks_agree_with_the_writes_landed_before_them():
     sends = sends_at([(2, 1, 100), (5, 1, 200), (5, 2, 50), (8, 1, 200)])
     initial = np.arange(12) * 10
     reads = device_reads(sends, initial, start=TIMES.at(0), stop=TIMES.at(12))
-    got = ev.applied(reads, sends, initial, TICKS, TIMES, DELTA)
+    got = ev.applied(reads, sends, initial, TIMES)
     assert got.ok and got.reads == len(reads) and got.checked == 12 * len(reads)
     assert (got.confirmed, got.unconfirmed) == (3, 1)
     assert "0 disagree" in got.summary()
@@ -260,39 +103,27 @@ def test_a_readback_disagreeing_is_attributed_to_its_slot_and_frame():
     sends = sends_at([(2, 1, 100), (5, 2, 50)])
     initial = np.zeros(12, dtype=np.int64)
     reads = device_reads(sends, initial, start=TIMES.at(0), stop=TIMES.at(10))
-    k = int(np.searchsorted(reads["t0_ns"], TIMES.at(7) - DELTA + 3e6))
+    k = int(np.searchsorted(reads["t0_ns"], TIMES.at(7) + 3e6))
     reads["o"][k, 1] = 49
-    got = ev.applied(reads, sends, initial, TICKS, TIMES, DELTA)
+    got = ev.applied(reads, sends, initial, TIMES)
     assert got.disagree.tolist() == [(k, 2, 7, 50, 49)]
 
 
 def test_a_read_within_a_frame_of_a_landing_may_show_either_side_of_it():
     sends = sends_at([(3, 1, 100)])
-    tick = TICKS.at(TICKS.after(sends["t1_ns"])[0][0])
+    tick = float(sends["t1_ns"][0])
     reads = np.zeros(4, dtype=READ)
     reads["t0_ns"] = [tick - PERIOD - 3e6, tick - 1e6, tick + PERIOD - 1e6, tick + PERIOD + 2e6]
     reads["t1_ns"] = reads["t0_ns"] + 1e6
     reads["o"][[2, 3], 0] = 100
     for value in (0, 100):
         reads["o"][1:3, 0] = value
-        got = ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA)
+        got = ev.applied(reads, sends, np.zeros(12), TIMES)
         assert got.ok and got.ambiguous == 2
     reads["o"][1, 0] = 7
     reads["o"][0, 0], reads["o"][3, 0] = 100, 0
-    bad = ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).disagree
+    bad = ev.applied(reads, sends, np.zeros(12), TIMES).disagree
     assert bad[["read", "want", "got"]].tolist() == [(0, 0, 100), (1, 0, 7), (3, 100, 0)]
-
-
-def test_applied_lands_a_write_on_its_given_tick():
-    sends = sends_at([(3, 1, 100)])
-    n = int(TICKS.after(sends["t1_ns"])[0][0])
-    reads = np.zeros(2, dtype=READ)
-    reads["t0_ns"] = [TICKS.at(n) - 2 * PERIOD, TICKS.at(n + 1) + 5e6]
-    reads["t1_ns"] = reads["t0_ns"] + 1e6
-    reads["o"][1, 0] = 100
-    assert ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).ok
-    late = ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA, np.array([n + 3]))
-    assert late.disagree[["read", "want", "got"]].tolist() == [(1, 0, 100)]
 
 
 def echo_record(t0s, polls, heard):
@@ -329,49 +160,30 @@ def test_a_resent_writes_echo_aligns_to_its_first_copy():
     assert errors[0].tolist() == [1_000_000, 12_000_000]
 
 
-def test_latency_from_brackets_uses_their_far_ends():
-    t = true_tick(np.arange(3)) - 5e6
-    bracket = np.c_[t, t + 2e6]
-    shown = TIMES.frame_of(true_tick(np.arange(3)) + DELTA)
-    point = ev.latency(t, shown, TIMES)
-    wide = ev.latency(bracket, shown, TIMES)
-    assert wide.lo == pytest.approx(point.lo - 2e6) and wide.hi == pytest.approx(point.hi)
-    assert ev.latency(np.c_[t, np.r_[np.nan, t[1:]]], shown, TIMES).samples == 2
-
-
-def test_a_write_lands_where_its_echo_says_late_unechoed_or_on_a_tick():
-    """Echoed before its tick: on target; after it: late; across it: on a tick; never: unechoed."""
-    plan = np.array([(5, 1, 10), (6, 1, 20), (7, 1, 30), (8, 1, 40)], dtype=PLAN)
+def test_an_unechoed_write_counts_and_a_resent_copy_is_no_duplicate():
+    plan = np.array([(5, 1, 10), (6, 1, 20)], dtype=PLAN)
     sends = sends_at(plan.tolist())
-    tick = true_tick(plan["target"])
-    echo = np.c_[sends["t0_ns"], [tick[0] - 3e6, tick[1] + 3e6, tick[2] + 3e6, np.nan]]
-    echo[1, 0] = tick[1] + 1e6
-    echo[3, 0] = np.nan
-    got = ev.landed(plan, sends, TICKS, TIMES, DELTA, echo=echo)
-    rows = got.rows
-    assert rows["landed"].tolist()[:3] == [5, 7, 8] and rows["landed"][3] == ev.CALIBRATION
-    assert min(rows["clear_ns"][:2]) > 0 > rows["clear_ns"][2]
-    assert rows["echo_ns"].tolist() == [int(v) for v in echo[:3, 1]] + [-1]
-    assert rows[["first", "last"]].tolist()[:3] == [(5, 5), (7, 7), (7, 8)]
-    assert (got.late, got.early, got.ambiguous, got.unechoed, got.missing) == (1, 0, 1, 1, 0)
-    assert got.slack_ms == pytest.approx((TICKS.lo + 6 * PERIOD - tick[1] - 3e6) / 1e6)
+    echo = np.c_[sends["t0_ns"], [sends["t1_ns"][0] + 3e6, np.nan]]
+    latch = np.array([[5, 5], [6, ev.UNBOUNDED]])
+    got = ev.landed(plan, sends, echo=echo, latch=latch, shift=ev.Offset(0, 0))
+    assert got.rows["echo_ns"].tolist() == [int(echo[0, 1]), -1]
+    assert got.rows["last"][1] == ev.UNBOUNDED and (got.late, got.early, got.unechoed) == (0, 0, 1)
     assert not got.ok and "1 never echoed" in got.summary()
     copy = np.r_[sends, sends[[0]]]
     copy[-1]["t0_ns"] += 1
-    again = ev.landed(plan[:1], copy[[0, 4]], TICKS, TIMES, DELTA, resent=np.array([1]))
+    again = ev.landed(plan[:1], copy[[0, 2]], resent=np.array([1]))
     assert again.duplicated == 0 and again.rows["sent"].tolist() == [0]
 
 
 def test_readbacks_hold_only_what_was_echoed():
     sends = sends_at([(5, 1, 100)])
-    n = int(TICKS.after(sends["t1_ns"])[0][0])
     reads = np.zeros(1, dtype=READ)
-    reads["t0_ns"] = TICKS.at(n + 1) + 5e6
+    reads["t0_ns"] = sends["t1_ns"][0] + PERIOD + 5e6
     reads["t1_ns"] = reads["t0_ns"] + 1e6
     lost = np.full((1, 2), np.nan)
-    assert ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA, echo=lost).ok
-    assert not ev.applied(reads, sends, np.zeros(12), TICKS, TIMES, DELTA).ok
-    copy = ev.applied(reads, np.r_[sends, sends], np.zeros(12), TICKS, TIMES, DELTA, resent=np.array([1]))
+    assert ev.applied(reads, sends, np.zeros(12), TIMES, echo=lost).ok
+    assert not ev.applied(reads, sends, np.zeros(12), TIMES).ok
+    copy = ev.applied(reads, np.r_[sends, sends], np.zeros(12), TIMES, resent=np.array([1]))
     assert not copy.ok and copy.confirmed == 0
 
 
@@ -540,7 +352,11 @@ def test_a_parameter_whose_steps_jump_the_picture_is_moved_and_one_without_is_no
     one, two = moved[0], moved[1]
     assert (one.param, one.name, two.name) == (1, "Gain", "P2")
     assert one.moved and one.lag == 0 and one.steps == 15 and one.least_p < 0.05
-    assert not two.moved and two.critical == pytest.approx(ev.critical(4)) and one.flat == 0.0
+    assert (
+        not two.moved
+        and two.critical == pytest.approx(ev.critical(2 * (len(ev.LAGS) + 1)))
+        and one.flat == 0.0
+    )
 
 
 def test_a_jump_one_frame_late_is_moved_at_lag_one():
@@ -661,7 +477,7 @@ def test_steps_are_tested_by_pool_and_proven_no_ops_beside_a_step_are_not_its_pa
     )
     assert by[2, ev.DEAD_POOL].steps == 12 and not by[2, ev.DEAD_POOL].moved
     assert by[3, ev.DEAD_POOL].moved
-    assert by[1, ev.LIVE_POOL].critical == pytest.approx(ev.critical(3 * len(ev.LAGS)))
+    assert by[1, ev.LIVE_POOL].critical == pytest.approx(ev.critical(3 * (len(ev.LAGS) + 1)))
     proof = evidence_of(
         moved, {1: {ev.LIVE: 12}, 2: {ev.NOOP: 16}, 3: {ev.DEAD: 8}, 4: {ev.DEAD: 2}, 5: {ev.LIVE: 1}}
     )
@@ -684,22 +500,20 @@ def test_steps_that_change_no_value_are_not_tested():
 
 def evidence_of(moved, predicted):
     plan = np.array([(2, 1, 10)], dtype=PLAN)
-    landed = ev.landed(plan, sends_at(plan.tolist()), TICKS, TIMES, DELTA)
+    landed = ev.landed(plan, sends_at(plan.tolist()), latch=np.array([[2, 2]]), shift=ev.Offset(0, 0))
     applied = ev.Applied(1, 12, 0, np.zeros(0, dtype=ev.DISAGREE), 1, 0)
-    return ev.Evidence("Edge", {}, {}, landed, applied, None, moved, {"ok": True}, predicted)
+    return ev.Evidence("Edge", landed, applied, None, moved, {"ok": True}, predicted)
 
 
 def evidence(loaded_ok=True, received=None):
     plan = np.array([(2, 1, 10), (4, 2, 20)], dtype=PLAN)
     sends = sends_at(plan.tolist())
-    landed = ev.landed(plan, sends, TICKS, TIMES, DELTA)
+    landed = ev.landed(plan, sends, latch=np.c_[plan["target"], plan["target"]], shift=ev.Offset(0, 0))
     disagree = np.array([(0, 2, 4, 20, 0)], dtype=ev.DISAGREE)
     applied = ev.Applied(reads=1, checked=12, ambiguous=0, disagree=disagree, confirmed=1, unconfirmed=0)
     moved = [verdict(z=5.0, partners=(2,)), verdict(param=2, name="Mix")]
     return ev.Evidence(
         program="Edge",
-        latency={"frames": 1.2, "spread": 1e6, "samples": 8},
-        ticks={"width_ms": 1.0, "count": 9},
         landed=landed,
         applied=applied,
         received=received,

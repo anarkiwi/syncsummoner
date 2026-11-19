@@ -1,8 +1,8 @@
 """A session: one program loaded once and its takes played back to back while the card holds lock.
 
 The Pi plays the lead-in, each take's clip frames and a lead-out as one stream (:meth:`Layout.spans`) and
-the recorder rolls between take files on the capture clock, so every take shares one frame line, anchored
-by the lead-in's and lead-out's unprocessed strips. See docs/evidence.md.
+the recorder rolls between take files as the Pi reports each take's first frame near, so every take shares
+one frame line, anchored by the lead-in's and lead-out's unprocessed strips. See docs/evidence.md.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import gc
 import json
 import math
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -23,7 +24,6 @@ import numpy as np
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose.lock import (
     ANCHOR_FRAMES,
-    live_attribution,
     read_live,
     save_lock,
     session_log,
@@ -32,36 +32,31 @@ from syncsummoner.compose.lock import (
 from syncsummoner.compose.lock import changes
 from syncsummoner.compose.locktake import (
     PLAN,
-    Clock,
     LeadIn,
     LeadInTimeError,
     Record,
     RebootError,
     boot_count,
-    calibrate,
     declared_bypass,
     dry_state,
     initial_state,
-    measure_latency,
     plan_rows,
-    read_latency,
     schedule,
     state_at,
     wet_at,
-    write_latency,
 )
 from syncsummoner.compose.timecode import ClipLayout, LayoutError
 from syncsummoner.device import loadtimes
 from syncsummoner.device import wire as W
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, snap_toggles
+from syncsummoner.device.playout import ASKED
+from syncsummoner.device.playout import SHOWN as PLAYED
 from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
 from syncsummoner.probe.decoded import CALIBRATION_SIZE
 from syncsummoner.progress import LOG, meter
 
 #: The program whose picture is its input, carrying the strips for a program with no dry control.
 PASSTHRU = "Passthru"
-#: Longest a session sleeps between carrying its frame line on over the captures since.
-WAKE_S = 1.0
 #: Interpreter thread switch interval during a session, well inside the tick a late wake-up must make.
 SWITCH_S = 0.0005
 
@@ -133,25 +128,24 @@ def frames_of(seconds: float, fps: float) -> int:
 
 
 def lead_in_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None) -> int:
-    """The frames a lead-in must hold: what comes before the clock, the clock, then any wet stretch.
+    """The frames a lead-in must hold: the strips' anchor, the start state settling, then any wet stretch.
 
-    Dry: settle, :data:`~.lock.ANCHOR_FRAMES` and the toggles at their longest. Otherwise: the anchor under
-    Passthru, the longest load timed and settle. The host decodes faster than real time, so the clock takes
-    at most as long again.
+    Dry: settle, the start state's writes and the offset's bounds (``bound_s``), then the wet stretch,
+    the frames before it the strips' anchor. Otherwise: the anchor under Passthru, the longest load
+    timed, then the same (docs/evidence.md).
     """
     if dry:
-        before = frames_of(lead_in.settle_s + 2 * lead_in.toggles * lead_in.toggle_s[1], fps) + ANCHOR_FRAMES
-        return 2 * before + frames_of(lead_in.wet_s, fps)
+        return frames_of(lead_in.settle_s + lead_in.bound_s, fps) + frames_of(lead_in.wet_s, fps)
     if load_s is None:
         raise NoLoadTimeError("a program with no dry control loads inside the lead-in, and no load is timed")
-    return 2 * (ANCHOR_FRAMES + frames_of(load_s + lead_in.settle_s, fps))
+    return ANCHOR_FRAMES + frames_of(load_s + lead_in.settle_s + lead_in.bound_s, fps)
 
 
-def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None, latency_s: float) -> int:
+def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | None) -> int:
     """The frames a lead-out must hold after the last clip frame, ending in :data:`~.lock.ANCHOR_FRAMES`.
 
     Dry: held dry as long as the lead-in held the take value before clip frame 0. Otherwise: the longest
-    load timed, then the frame ``latency_s`` lands Passthru's first picture on.
+    load timed, then the frame the device latches Passthru's first picture on.
     """
     if dry:
         return frames_of(lead_in.wet_s, fps) + ANCHOR_FRAMES
@@ -159,7 +153,7 @@ def lead_out_frames(lead_in: LeadIn, fps: float, *, dry: bool, load_s: float | N
         raise NoLoadTimeError(
             "a program with no dry control reloads Passthru in its lead-out, and no load is timed"
         )
-    return frames_of(load_s + latency_s, fps) + 1 + ANCHOR_FRAMES
+    return frames_of(load_s, fps) + 1 + ANCHOR_FRAMES
 
 
 def session_frames(
@@ -167,19 +161,13 @@ def session_frames(
     fps: float,
     *,
     dry: bool,
-    directory: str | Path,
-    band: ev.Latency | None = None,
     load_s: float | None = None,
 ) -> tuple[int, int]:
-    """A session's lead-in and lead-out frames, for a load of ``load_s`` (else the rig's longest timed) and,
-    without a dry control, its band."""
+    """A session's lead-in and lead-out frames, for a load of ``load_s``, else the rig's longest timed."""
     loads = loadtimes.longest() if load_s is None else load_s
-    if not dry:
-        band = read_latency(directory) if band is None else band
-    after = 0.0 if band is None else (band.hi + band.period) / 1e9
     return (
         lead_in_frames(lead_in, fps, dry=dry, load_s=loads),
-        lead_out_frames(lead_in, fps, dry=dry, load_s=loads, latency_s=after),
+        lead_out_frames(lead_in, fps, dry=dry, load_s=loads),
     )
 
 
@@ -248,10 +236,8 @@ def locked_session(
     """
     shell, midi = rig.transport.device.shell, rig.transport.device.midi
     fps = float(config.fps)
-    directory = Path(takes[0].out).parent
     booted = boot_count(shell)
     dry = dry_state(program, bypass)
-    band = None if dry is not None else read_latency(directory)
     park = np.asarray(rig.session.park_values, dtype=np.int64)
     played: list[dict] = []
 
@@ -266,9 +252,7 @@ def locked_session(
 
     held: dict[str, Any] = {
         "recording": False,
-        "delta": float("nan"),
         "loaded": None,
-        "codes": [],
         "dry": dry,
     }
     held["info"] = None
@@ -280,8 +264,9 @@ def locked_session(
         program,
         takes,
         clip,
-        session_frames(lead_in, fps, dry=dry is not None, directory=directory, band=band),
+        session_frames(lead_in, fps, dry=dry is not None),
     )
+    held["lead"] = layout.lead
     plan = np.concatenate([np.zeros(0, PLAN)] + [_shifted(t.plan, o) for t, o in zip(takes, layout.offsets)])
 
     def prepare(info: Any) -> None:
@@ -305,38 +290,39 @@ def locked_session(
     try:
         with (
             recorder.recording(takes[0].out) as proc,
-            rig.playout.playing(fps=fps, spans=layout.spans()) as player,
+            rig.playout.following() as shown,
             _monitored(shell, poller, sender),
         ):
             held["recording"] = True
-            _play(
-                rig,
-                Live(recorder, proc, takes, layout),
-                sender=sender,
-                poller=poller,
-                shell=shell,
-                player=player,
-                held=held,
-                program=program,
-                config=config,
-                dry=dry,
-                park=park,
-                lead_in=lead_in,
-                load=timed,
-                prepare=prepare,
-            )
-            hold = int(player.status().get("hold", 1))
+            if dry is not None:
+                _arm(shell, poller, sender, held, park, shown)
+            with rig.playout.playing(
+                fps=fps, spans=layout.spans(), heard=lambda: shown.latest() != W.NO_FLOOR
+            ) as player:
+                _play(
+                    rig,
+                    Live(recorder, proc, takes, layout),
+                    sender=sender,
+                    poller=poller,
+                    shown=shown,
+                    shell=shell,
+                    held=held,
+                    program=program,
+                    config=config,
+                    dry=dry,
+                    park=park,
+                    lead_in=lead_in,
+                    load=timed,
+                    prepare=prepare,
+                )
+                hold = int(player.status().get("hold", 1))
         wire = _session_wire(held, sender, poller, played, dry)
         _save_locks(takes, layout, session, rig.playout.flips(), hold, wire, held, config)
     finally:
         wire = _session_wire(held, sender, poller, played, dry)
         for index, take in enumerate(takes):
             _save_take_wire(take, index, layout, wire, held, program=program, park=park, session=session)
-        rebooted = boot_count(shell)
-        if rebooted != booted:
-            raise RebootError(
-                f"{program}: the device's boot count went from {booted} to {rebooted} during the session"
-            )
+        _leave(shell, held, booted, program)
     return [_take_record(index, layout, wire, held, park) for index in range(len(takes))]
 
 
@@ -403,14 +389,25 @@ def _shifted(plan: np.ndarray, offset: int) -> np.ndarray:
     return moved
 
 
+def _session_frame(frame: int, lead: int) -> int:
+    """A player stream frame as a session clip frame; :data:`~.wire.NO_FLOOR` stays as it is."""
+    return frame if frame == W.NO_FLOOR else frame - lead
+
+
 def _session_wire(held: dict, sender: Sender, poller: Poller, played: list[dict], dry: Any) -> dict:
-    """The session's wire record so far, in session clip frames."""
+    """The session's wire record so far, in session clip frames: the Pi's reports and replies among it."""
+    shown = held.get("shown")
+    reports = np.zeros(0, PLAYED) if shown is None else shown.log()
+    replies = np.zeros(0, ASKED) if shown is None else shown.asked()
+    reports["frame"] -= held.get("lead", 0)
+    replies["frame"] -= held.get("lead", 0)
     return {
         "sends": sender.array(),
         "resent": sender.resent(),
-        "latency": np.array(json.dumps(held.get("latency", {}))),
         "dry": np.array(json.dumps(dry)),
         "loads": np.array(json.dumps(played)),
+        "shown": reports,
+        "asked": replies,
         **poller.arrays(),
     }
 
@@ -435,7 +432,15 @@ def _take_sends(wire: dict, layout: Layout, index: int) -> np.ndarray:
     sends = np.array(wire["sends"], copy=True)
     framed = sends["target"] > ev.START
     sends["target"][framed] -= int(layout.offsets[index])
+    sends["floor"] = [_session_frame(int(f), int(layout.offsets[index])) for f in sends["floor"]]
     return sends
+
+
+def _take_frames(records: np.ndarray, layout: Layout, index: int) -> np.ndarray:
+    """The Pi's reports or replies, their frames in the take's own clip frames."""
+    out = np.array(records, copy=True)
+    out["frame"] -= int(layout.offsets[index])
+    return out
 
 
 def _save_take_wire(
@@ -459,7 +464,6 @@ def _save_take_wire(
         start=start,
         sends=_take_sends(wire, layout, index),
         own=_owned(wire["sends"], layout, index),
-        delta=np.float64(held["delta"]),
         cc_map=np.asarray(held.get("cc_map", []), dtype=np.int64),
         loaded=np.array(
             json.dumps(
@@ -473,7 +477,9 @@ def _save_take_wire(
             json.dumps({} if info is None else {int(spec.index): spec.name for spec in info.params})
         ),
         session=np.array(json.dumps({**session, "index": index})),
-        **{k: v for k, v in wire.items() if k != "sends"},
+        **{k: v for k, v in wire.items() if k not in ("sends", "shown", "asked")},
+        shown=_take_frames(wire["shown"], layout, index),
+        asked=_take_frames(wire["asked"], layout, index),
     )
 
 
@@ -486,8 +492,7 @@ def _take_record(index: int, layout: Layout, wire: dict, held: dict, park: np.nd
         plan=_take_rows(held, layout, index)[0],
         initial=np.asarray(park, dtype=np.int64),
         sends=_take_sends(wire, layout, index)[own],
-        arrays={k: v for k, v in wire.items() if k not in ("sends", "resent", "latency", "dry", "loads")},
-        delta=held["delta"],
+        arrays={k: v for k, v in wire.items() if k not in ("sends", "resent", "dry", "loads")},
         dry=held["dry"],
         loaded={} if held["loaded"] is None else {"fpga": held["loaded"].payload},
         cc_map=np.asarray(held.get("cc_map", []), dtype=np.int64),
@@ -510,18 +515,16 @@ def _save_locks(
 
     log = session_log([_read_sidecar(t.out) for t in takes])
     codes = np.full(log.size, -1, dtype=np.int64)
-    live = np.asarray(held["codes"], dtype=np.int64)
-    codes[: min(live.size, log.size)] = live[: log.size]
-    if len(takes) > 1:
-        last, _ = read_live(
-            takes[-1].out,
+    for take in takes[:: max(len(takes) - 1, 1)]:
+        read, _ = read_live(
+            take.out,
             strip_px=config.strip_px,
             bits=config.bits,
             size=CALIBRATION_SIZE,
             ffmpeg=getattr(config, "ffmpeg", "ffmpeg"),
         )
-        seq = _read_sidecar(takes[-1].out)["sequence"][: last.size]
-        codes[np.searchsorted(log["sequence"], seq)] = last[: seq.size]
+        seq = _read_sidecar(take.out)["sequence"][: read.size]
+        codes[np.searchsorted(log["sequence"], seq)] = read[: seq.size]
     span = _written_span({**wire, "cc_map": np.asarray(held.get("cc_map", []))}, layout.count)
     for index, take in enumerate(takes):
         said = {**session, "index": index, "source_lead": layout.source_lead}
@@ -571,8 +574,8 @@ def _run(
     *,
     sender: Sender,
     poller: Poller,
+    shown: Any,
     shell: Any,
-    player: Any,
     held: dict,
     program: str,
     config: Any,
@@ -583,103 +586,126 @@ def _run(
     prepare: Callable[[Any], None],
     began: int,
 ) -> None:
-    """The session's body: anchor, start state, calibration, the live clock, every take's plan, the lead-out.
+    """The session's body: anchor, start state, the device-to-clip offset, every take's plan, the lead-out.
 
     Without a dry control the program is loaded once the lead-in's anchor has shown under Passthru, before
     the poller starts and the monitor is on, and Passthru again once the last take has played, the sender,
-    poller and monitor stopped first, so each load is the shell's only client. Every write is acknowledged
-    before the next goes.
+    poller and monitor stopped first, so each load is the shell's only client. The Pi is asked for its
+    last flip after every frame tick read, and each write goes once the device has ticked for the clip
+    frame before its target, the offset the lead-in's events bound (docs/evidence.md); every write is
+    acknowledged before the next goes.
     """
     layout, period = live.layout, 1e9 / float(config.fps)
-    held["cc_map"] = rig.transport.device.midi.cc_map
+    held["cc_map"], held["shown"] = rig.transport.device.midi.cc_map, shown
+    sender.floor = lambda: _session_frame(shown.latest(), layout.lead)
     if dry is None:
         _await_starts(live, began, ANCHOR_FRAMES, period)
         prepare(load(program))
+        _arm(shell, poller, sender, held, park, shown)
+    shift = _offset(poller, held, sender, dry, layout.lead, period)
+    held["shift"] = shift
+    LOG.info("%s: device frames lead clip frames by %d..%d", program, shift.lo, shift.hi)
+    rows = held["rows"]
+    first = int(rows["target"][0]) if rows.size else 0
+    settle = 0 if dry is not None else frames_of(lead_in.settle_s, float(config.fps))
+    now = json.loads(poller.ask("transport", "status", timeout_s=5.0).payload or "{}").get("field_count")
+    if now is None or int(now) >= first + shift.lo - 1 - settle:
+        raise LeadInTimeError(
+            f"{program}: the start state was written and the device-to-clip offset known after the device "
+            f"ticked for clip frame {first - 1 - settle}, leaving it less than its {settle}-frame settle "
+            "before the first write: past the lead-in this session derived"
+        )
+    sender.due = lambda target, stop: poller.wait_count(target + shift.lo - 1, stop)
+    sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
+    sender.start()
+    poller.wait_count(shift.lo - 2, threading.Event())
+    held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
+    last = layout.lead + layout.count + (0 if dry is None else layout.tail - 1)
+    with meter((last - layout.lead) / float(config.fps), desc="session") as progress:
+        for k in range(1, len(live.takes)):
+            _roll(live, shown, k, period)
+            progress.to((layout.offsets[k]) / float(config.fps))
+        shown.wait(last)
+        progress.to((last - layout.lead) / float(config.fps))
+    time.sleep(config.tail_s)
+    sender.drain(timeout_s=1.0)
+    if dry is None:
+        _reload_quiet(sender, poller, shell, load)
+        shown.wait(layout.lead + layout.count + layout.tail - 1)
+        time.sleep(config.tail_s)
+
+
+def _leave(shell: Any, held: dict, booted: int, program: str) -> None:
+    """Leave the transport as the session found it; a rise in the boot count is a :class:`RebootError`."""
+    if held.get("transport") not in (None, "playing"):
+        shell.command("transport", "stop")
+    rebooted = boot_count(shell)
+    if rebooted != booted:
+        raise RebootError(
+            f"{program}: the device's boot count went from {booted} to {rebooted} during the session"
+        )
+
+
+def _arm(shell: Any, poller: Poller, sender: Sender, held: dict, park: np.ndarray, shown: Any) -> None:
+    """Play the transport, turn the monitor on, start polling, and write the start state.
+
+    Each frame tick read asks the Pi for its last flip once one has been heard. With a bypass this is
+    done before playout, so the start state settles before the lead-in begins.
+    """
+    held["transport"] = _transport_playing(shell)
     shell.command("midi", "monitor", "on")
     del shell.log_lines[:]
+    poller.on_tick = lambda: shown.ask() if shown.latest() != W.NO_FLOOR else None
     poller.start()
     start = held["start"]
     for slot in np.flatnonzero(start != park) + 1:
         sender.send(int(slot), int(start[slot - 1]), ev.START)
-    time.sleep(lead_in.settle_s)
-    if dry is not None:
-        _await_starts(live, time.monotonic_ns(), ANCHOR_FRAMES, period)
-        calibrate(sender, dry, held["initial"], lead_in)
-    hold = int(player.status().get("hold", 1))
-    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    codes, images = read_live(
-        live.first, strip_px=config.strip_px, bits=config.bits, size=CALIBRATION_SIZE, ffmpeg=ffmpeg
-    )
-    held["codes"] = codes
-    found, frames = live_attribution(
-        live.first, rig.playout.flips(), codes, config=config, hold=hold, lead=layout.lead, count=layout.count
-    )
-    lat = _live_latency(rig, live, sender, poller, (images, frames, found), dry=dry, program=program)
-    held["delta"], held["latency"] = lat.delta, lat.as_dict()
-    clock = Clock.of(found, lat)
-    rows = held["rows"]
-    first_due = clock.when(int(rows["target"][0])) if rows.size else clock.when(0)
-    if time.monotonic_ns() >= first_due:
-        raise LeadInTimeError(
-            f"{program}: the clock was measured {(time.monotonic_ns() - first_due) / 1e9:.2f}s after the "
-            "first write was due, past the lead-in this session derived"
-        )
-    clock.extend(live.log())
-    sender.when = clock.when
-    sender.plan([(int(r["target"]), int(r["param"]), int(r["value"])) for r in rows])
-    sender.start()
-    _sleep_until(clock.when(-1) - int(clock.ticks.period))
-    held["loaded"] = poller.ask("fpga", "status", timeout_s=5.0)
-    end = int(clock.times.at(layout.count + (0 if dry is None else layout.tail))) + int(config.tail_s * 1e9)
-    rolls = list(range(1, len(live.takes)))
-    with meter((end - began) / 1e9, desc="session") as progress:
-        while (now := time.monotonic_ns()) < end:
-            rolls = _roll_due(live, clock, rolls, now, period)
-            time.sleep(min(WAKE_S, (end - now) / 1e9))
-            clock.extend(live.log())
-            progress.to((time.monotonic_ns() - began) / 1e9)
-    sender.drain(timeout_s=1.0)
-    if dry is None:
-        _reload_quiet(sender, poller, shell, load)
-        _sleep_until(int(clock.times.at(layout.count + layout.tail)) + int(config.tail_s * 1e9))
 
 
-def _live_latency(
-    rig: Any, live: Live, sender: Sender, poller: Poller, seen: tuple, *, dry: Any, program: str
-) -> ev.Latency:
-    """The CC-to-picture latency the lead-in's calibration measured, else the band on file."""
-    images, frames, found = seen
-    directory = live.first.parent
-    if dry is None:
-        return read_latency(directory)
-    sends, wire = sender.array(), poller.arrays()
-    toggled = sends["target"] == ev.CALIBRATION
-    echo = W.echoed(sends, wire["receipts"], wire["reads"], rig.transport.device.midi.cc_map)
-    try:
-        lat = measure_latency(
-            images, frames, found, sends[toggled], ev.frame_times(found), taken=echo[toggled]
-        )
-    except ev.EvidenceError as err:
-        LOG.warning("%s: %s; landing by the band dry takes measured", program, err)
-        return read_latency(directory)
-    write_latency(directory, lat, program)
-    LOG.info("%s: CC-to-picture %.3f frames over %d writes", program, lat.frames, lat.samples)
-    return lat
+def _transport_playing(shell: Any) -> str:
+    """Put the device's transport in play, so its ``field_count`` counts frames; returns its state before."""
+    was = str(json.loads(shell.command("transport", "status").payload).get("state"))
+    if was != "playing":
+        shell.command("transport", "play")
+    return was
 
 
-def _roll_due(live: Live, clock: Clock, rolls: list[int], now: int, period: float) -> list[int]:
-    """Roll the recording on to each take whose first frame is near: sent at least a wake before the
-    captures it shares with the take before, those every line the clock admits puts within a frame of it.
+def _offset(poller: Poller, held: dict, sender: Sender, dry: Any, frames: int, period_ns: float) -> ev.Offset:
+    """The device-to-clip offset the session's events bound so far, waiting a frame tick while too few do.
+
+    Waiting past ``frames`` ticks, the lead-in's length, is a :class:`LeadInTimeError`.
     """
-    left = []
-    for k in rolls:
-        lo, hi = clock.line.polygon.at(np.array([live.layout.lead + int(live.layout.offsets[k])]))
-        opens, closes = int(lo[0] - period), int(hi[0] + period)
-        if now + 2 * WAKE_S * 1e9 < opens:
-            left.append(k)
-            continue
-        live.recorder.roll(live.proc, live.takes[k].out, opens, closes)
-    return left
+    began = None
+    while True:
+        wire = _session_wire(held, sender, poller, [], dry)
+        try:
+            return ev.offset(
+                np.zeros((0, 2), np.int64),
+                np.zeros(0, np.int64),
+                wire["asked"],
+                wire["shown"],
+                wire["ticks"],
+                period_ns,
+            )
+        except ev.UnboundError as err:
+            count = int(wire["ticks"]["field"][-1]) if wire["ticks"].size else 0
+            began = count if began is None else began
+            if count - began > frames:
+                raise LeadInTimeError(f"{err}, after the lead-in's {frames} frames") from err
+            if poller.wait_count(count + 1, threading.Event()) is None:
+                raise
+
+
+def _roll(live: Live, shown: Any, k: int, period: float) -> None:
+    """Roll the recording on to take ``k`` once the Pi is heard showing the frame two before its first.
+
+    Both files keep the captures from that report to two frames past the boundary, so the boundary's
+    captures are in each whichever card delay holds.
+    """
+    boundary = live.layout.lead + int(live.layout.offsets[k])
+    heard = shown.wait(boundary - 2)
+    if heard is not None:
+        live.recorder.roll(live.proc, live.takes[k].out, int(heard), int(heard + 4 * period))
 
 
 def _reload_quiet(sender: Sender, poller: Poller, shell: Any, reload: Callable[[str], Any]) -> None:
@@ -708,9 +734,3 @@ def _read_sidecar(take: str | Path) -> np.ndarray:
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
     return read_log(take)
-
-
-def _sleep_until(t_ns: int) -> None:
-    """Sleep to ``t_ns`` on the host clock."""
-    while (left := t_ns - time.monotonic_ns()) > 0:
-        time.sleep(min(left / 1e9, 0.5))

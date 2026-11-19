@@ -18,7 +18,6 @@ from tests.compose.test_locktake import (  # pylint: disable=unused-import
     config_for,
     fixture_simulate,
     info_with,
-    lat_for,
     rigged,
     session_for,
 )
@@ -64,15 +63,18 @@ def test_a_lead_in_holds_its_contents_and_a_load_only_without_a_dry_control():
     """A dry lead-in holds no load; one without grows with the longest load timed and needs one timed."""
     dry = SS.lead_in_frames(LEAD_IN, FPS, dry=True, load_s=None)
     assert dry == SS.lead_in_frames(LEAD_IN, FPS, dry=True, load_s=30.0)
-    assert dry >= 2 * (L.ANCHOR_FRAMES + SS.frames_of(2 * LEAD_IN.toggles * LEAD_IN.toggle_s[1], FPS))
+    before = SS.frames_of(LEAD_IN.settle_s + LEAD_IN.bound_s, FPS)
+    assert dry == before + SS.frames_of(LEAD_IN.wet_s, FPS) and before >= L.ANCHOR_FRAMES
     with pytest.raises(SS.NoLoadTimeError):
         SS.lead_in_frames(LEAD_IN, FPS, dry=False, load_s=loadtimes.longest())
     short, long_ = (SS.lead_in_frames(LEAD_IN, FPS, dry=False, load_s=s) for s in (1.0, 4.0))
-    assert long_ - short == 2 * SS.frames_of(3.0, FPS)
-    out = SS.lead_out_frames(LEAD_IN, FPS, dry=False, load_s=1.0, latency_s=0.1)
-    assert out == SS.frames_of(1.1, FPS) + 1 + L.ANCHOR_FRAMES
+    assert long_ - short == SS.frames_of(3.0, FPS), "one load, decoded by no one before the first write"
     assert (
-        SS.lead_out_frames(LEAD_IN, FPS, dry=True, load_s=None, latency_s=0.0)
+        SS.lead_out_frames(LEAD_IN, FPS, dry=False, load_s=1.0)
+        == SS.frames_of(1.0, FPS) + 1 + L.ANCHOR_FRAMES
+    )
+    assert (
+        SS.lead_out_frames(LEAD_IN, FPS, dry=True, load_s=None)
         == SS.frames_of(LEAD_IN.wet_s, FPS) + L.ANCHOR_FRAMES
     )
 
@@ -83,15 +85,12 @@ def test_a_session_keeps_its_loads_where_a_session_in_another_directory_sizes_by
     """Loads timed in one takes directory size the next session's lead-in in any other."""
     for name in "ab":
         (tmp_path / name).mkdir()
-    LT.write_latency(tmp_path / "a", lat_for(width=0.0, samples=1), "Other")
     run_session(monkeypatch, simulate, tmp_path / "a", dry=None, counts=[30])
     held = loadtimes.read()
     assert {e["program"] for e in held} == {"Passthru", "Teletext"} and not list(
         (tmp_path / "a").glob("loads*")
     )
-    fresh = tmp_path / "b"
-    LT.write_latency(fresh, lat_for(width=0.0, samples=1), "Other")
-    assert SS.session_frames(LEAD_IN, FPS, dry=False, directory=fresh)[0] == SS.lead_in_frames(
+    assert SS.session_frames(LEAD_IN, FPS, dry=False)[0] == SS.lead_in_frames(
         LEAD_IN, FPS, dry=False, load_s=max(e["load_s"] for e in held)
     )
 
@@ -173,11 +172,13 @@ def test_a_session_loads_once_and_attributes_every_take_on_its_one_frame_line(
         assert (lock["session_codes"] >= 0).sum() > 0 and lock["session_log"].size == sim.size
         assert proof.ok, (k, proof.lines())
         assert proof.landed.ok and proof.applied.ok and proof.received.ok and proof.loaded["ok"]
-        calibrated = record.sends["target"] == LT.ev.CALIBRATION
-        assert calibrated.any() == (k == 0)
+        assert not (record.sends["target"] == LT.ev.CALIBRATION).any()
     assert len({json.loads(str(np.load(L.lock_path(t.out))["session"]))["id"] for t in takes}) == 1
-    first, later = (json.loads(str(np.load(f"{t.out}.wire.npz")["latency"])) for t in takes[:2])
-    assert first == later
+    first, later = (np.load(f"{t.out}.wire.npz") for t in takes[:2])
+    assert np.array_equal(first["ticks"], later["ticks"])
+    assert (
+        later["asked"]["frame"] == first["asked"]["frame"] - 30
+    ).all(), "each take counts from its frame 0"
     assert records[1].plan["target"].min() == 0 and records[-1].plan["target"].max() == 30
 
 
@@ -194,7 +195,6 @@ def test_a_program_with_no_dry_control_has_passthru_only_at_the_sessions_ends(
     monkeypatch, simulate, tmp_path
 ):
     """Passthru carries the lead-in and the lead-out, the program loaded once between them for every take."""
-    LT.write_latency(tmp_path, lat_for(width=0.0, samples=1), "Other")
     sim, rig, takes, _, found, proofs, loads = run_session(monkeypatch, simulate, tmp_path, dry=None)
     assert [name for name, _ in loads] == ["Passthru", "Teletext", "Passthru"]
     timed = json.loads(str(np.load(f"{takes[0].out}.wire.npz")["loads"]))
@@ -210,29 +210,32 @@ def test_a_program_with_no_dry_control_has_passthru_only_at_the_sessions_ends(
     assert shell.said[lead_out - 1] == ("midi", "monitor", "off")
 
 
-def test_a_lead_in_whose_strips_name_too_few_frames_fails_the_session(simulate, tmp_path):
-    """Two legible lead-in frames name one start: nothing fixes the line, said clearly, nothing relaxed."""
+def test_a_lead_in_whose_strips_name_too_few_frames_fails_the_session(monkeypatch, simulate, tmp_path):
+    """Two legible frames name one start: nothing fixes the line, said once the take is attributed."""
     sim, clip = session_for(simulate, tmp_path, dry=True, counts=[30])
-    sim.codes[: 2 * sim.lead] = -1
+    sim.codes[:] = -1
     sim.codes[2 * (sim.lead - 3) : 2 * (sim.lead - 1)] = (np.repeat(np.arange(-3, -1), 2)) & 0xFFFF
     rig, recorder, load, _ = rigged(sim, info_with(1))
-    with pytest.raises(L.AnchorError, match=f"{L.ANCHOR_FRAMES} consecutive legible strip-coded frames"):
-        SS.locked_take(
-            rig,
-            recorder,
-            tmp_path / "t.mkv",
-            program="Teletext",
-            seconds=1.0,
-            config=config_for(),
-            plan=PLAN_ROWS,
-            working=lambda info: {1: 0},
-            load=load,
-            clip=clip,
-            lead_in=LEAD_IN,
-            bypass=lambda name: info_with(1).dry,
-        )
+    SS.locked_take(
+        rig,
+        recorder,
+        tmp_path / "t.mkv",
+        program="Teletext",
+        seconds=1.0,
+        config=config_for(),
+        plan=PLAN_ROWS,
+        working=lambda info: {1: 0},
+        load=load,
+        clip=clip,
+        lead_in=LEAD_IN,
+        bypass=lambda name: info_with(1).dry,
+    )
     assert rig.transport.device.shell.said[-1] == ("midi", "monitor", "off")
-    assert (tmp_path / "t.mkv.wire.npz").is_file() and not L.lock_path(tmp_path / "t.mkv").exists()
+    monkeypatch.setattr(v4l2rec, "read_log", lambda take: sim.frames[sim.captures(take)])
+    with pytest.raises(L.AnchorError, match=f"{L.ANCHOR_FRAMES} consecutive legible strip-coded frames"):
+        L.attribute_take(
+            tmp_path / "t.mkv", config=config_for(), codes=sim.codes[sim.captures(tmp_path / "t.mkv")]
+        )
 
 
 def test_a_take_judged_against_another_sessions_log_is_refused(monkeypatch, simulate, tmp_path):

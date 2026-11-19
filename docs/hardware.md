@@ -123,6 +123,19 @@ lead-in, and a bypass or crossfader toggled at random phases on eight programs:
 | Serial `modulation status` round trip | about 1.4 to 2.2 ms, 279-byte reply |
 | Send to the start of the frame a write lands on | 1.0 to 1.5 frames, from 16 calibration writes; the frame start is the take's frame line, known to the width of the lines its captures admit ([the card's clock](#the-cards-clock)) |
 
+On firmware 1.0.2-rc.4, `transport status` reports `field_count`, which steps once per
+output frame (30.02 per second on the host clock at 1080p30). Polled alternately with
+`modulation status` (round trip about 1.9 ms each), over 66 MIDI writes to Sidewinder's P1 the
+readback changed 66 times, never between two polls reading the same count, and each write's
+latch frame was pinned to one count: the count after the last one read before the send for 55
+writes, the one after that for 11 (`captures/diag/latchtick.py`). Its tick follows the Pi's flip of the frame it outputs by
+under half a frame: over 446 frames of a session, the tick phase and the flip phase, each intersected
+from its brackets on the shared vblank, put the tick 0 to 4 ms after a flip, and boneoh/RGB Bit
+Rotator's bypass switched the picture on the clip frame the latch less that offset gives, at both
+switches of two sessions (`captures/validate-causal-20261118`). The count advances only while the
+transport plays: stopped, it holds its value, and the beat phase steps by a fixed amount per frame
+at the set tempo while it plays.
+
 Render therefore sends each write half a frame before the instant it must precede
 to land on its target frame, and proves where it landed ([evidence.md](evidence.md)). The early bias
 of design 4.4 picks the target: the first frame starting at or after the write's

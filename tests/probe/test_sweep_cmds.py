@@ -93,7 +93,7 @@ def test_sweep_collect_and_commit_build_the_archive(tmp_path, monkeypatch, capsy
         body = chunk.plan[chunk.plan["target"] > 0]
         for name in ("target", "param", "value"):
             rows[name] = body[name]
-        rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = body["value"], 0, body["target"], 1.0
+        rows["wire"], rows["sent"], rows["landed"] = body["value"], 0, body["target"]
         rows["first"], rows["last"] = body["target"], body["target"]
         n = chunk.frames
         L.save_rows(
@@ -143,7 +143,7 @@ def test_collect_judges_and_keeps_rows(tmp_path, monkeypatch):
     rows = np.zeros(body.size, dtype=LANDED)
     for name in ("target", "param", "value"):
         rows[name] = body[name]
-    rows["wire"], rows["sent"], rows["landed"], rows["clear_ns"] = body["value"], 0, body["target"], 1.0
+    rows["wire"], rows["sent"], rows["landed"] = body["value"], 0, body["target"]
     rows["first"], rows["last"] = body["target"], body["target"]
     n = chunk.frames
     proof = SimpleNamespace(
@@ -217,9 +217,7 @@ def test_sweep_plan_takes_a_recorded_cover_and_joint_moves(tmp_path, monkeypatch
     assert set(states[:, 0].tolist()) == {0, 512} and set(states[:, 10].tolist()) == {0, 1023}
 
 
-def test_timecode_sizes_the_clip_by_the_stall_guard(tmp_path, monkeypatch, capsys):
-    lat = LT.ev.Latency(lo=30e6, hi=40e6, samples=3, period=1e9 / 30)
-    LT.write_latency(tmp_path, lat, "dry")
+def test_timecode_sizes_the_clip_by_the_stall_guard(monkeypatch, capsys):
     made = {}
 
     def write(source, out, *, config, lead, tail, **_kw):
@@ -227,15 +225,14 @@ def test_timecode_sizes_the_clip_by_the_stall_guard(tmp_path, monkeypatch, capsy
         return 90
 
     monkeypatch.setattr(timecode, "write_timecoded", write)
-    argv = ["--stall", "40", "probe", "timecode", "f.mkv", "--out", "c.mkv", "--latency", str(tmp_path)]
+    argv = ["--stall", "40", "probe", "timecode", "f.mkv", "--out", "c.mkv"]
     assert cli.main(argv) == 0
-    after = (lat.hi + lat.period) / 1e9
     assert made == {
         "source": "f.mkv",
         "out": "c.mkv",
         "fps": 30.0,
         "lead": SS.lead_in_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0),
-        "tail": SS.lead_out_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0, latency_s=after),
+        "tail": SS.lead_out_frames(LT.LeadIn(), 30.0, dry=False, load_s=40.0),
     }
     assert "for a 40.0 s load" in capsys.readouterr().out
 
@@ -286,3 +283,31 @@ def test_commit_refuses_rows_that_waited_no_measured_settle(tmp_path, monkeypatc
     assert seen[-1] == {"frames": 2, "source": str(hold), "measured": True} and sweep_cmds.settle_measured(
         take
     )
+
+
+def test_smoke_toggles_one_parameter_captures_it_and_lands_it_from_the_wire(tmp_path, monkeypatch, capsys):
+    plan, _ = sweep_dir(tmp_path)
+    captured = {}
+
+    def capture(args):
+        captured["chunks"], captured["said"] = L.read_plan(args.plan)
+        captured["chunk"] = args.chunk
+        return 0
+
+    rows = np.zeros(2, dtype=LANDED)
+    rows["target"], rows["param"], rows["value"], rows["sent"] = [4, 8], 3, [100, 900], [0, 1]
+    rows["first"], rows["last"] = [4, 8], [4, 8]
+    landed = LT.ev.Landed(rows=rows, missing=0, duplicated=0, out_of_order=0, late=0, early=0)
+    monkeypatch.setattr(sweep_cmds, "_sweep_cmd", capture)
+    monkeypatch.setattr(
+        LT, "landing", lambda wire, period: (LT.ev.Offset(50, 50), np.array([[54, 54], [58, 58]]), landed)
+    )
+    monkeypatch.setattr("syncsummoner.device.wire.load_wire", lambda take: {})
+    out = tmp_path / "smoke"
+    argv = ["probe", "sweep", "smoke", str(plan), "--param", "3", "--values", "100", "900", "--states", "4"]
+    assert cli.main(argv + ["--hold", "4", "--out", str(out)]) == 0
+    (chunk,) = captured["chunks"]
+    assert chunk.states[:, 2].tolist() == [100, 900, 100, 900] and captured["chunk"] == 0
+    assert captured["said"]["program"] == "p" and chunk.frames == 16
+    said = capsys.readouterr().out
+    assert "by 50..50" in said and "device [58, 58], clip 8..8" in said

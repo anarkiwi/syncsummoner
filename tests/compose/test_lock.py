@@ -12,7 +12,7 @@ import pytest
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import lock as L
 from syncsummoner.device.v4l2rec import sidecar
-from syncsummoner.device.wire import READ, RECEIPT, SEND
+from syncsummoner.device.wire import TICK, READ, RECEIPT, SEND
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import burn_timecode, read_timecode
 from tests.compose.locked import CARD_NS, CLEAN, PI_T0, STANDARD, VBLANK_NS, WRAP, take
@@ -301,14 +301,16 @@ def test_a_program_processed_the_picture_from_its_first_wet_write_to_its_dry_wri
     sends = np.zeros(4, dtype=SEND)
     sends["target"] = [ev.START, ev.CALIBRATION, 2, played.count]
     sends["t0_ns"], sends["t1_ns"] = [10, 20, 30, 40], [11, 21, 31, 41]
-    latency = json.dumps({"hi": 5.0, "period": 100.0})
-    common = {"sends": sends, "latency": np.array(latency), "cc_map": np.arange(1, 13)}
+    ticks = np.zeros(31, dtype=TICK)
+    ticks["t0_ns"] = np.arange(31) * 10
+    ticks["t1_ns"], ticks["field"] = ticks["t0_ns"] + 5, ticks["t0_ns"] // 20
+    common = {"sends": sends, "ticks": ticks, "cc_map": np.arange(1, 13)}
     common |= {"receipts": np.zeros(0, RECEIPT), "reads": np.zeros(0, READ)}
     wire_for(path, dry=np.array(json.dumps({"1": 1023})), **common)
-    assert L.processed(path, record, played.frames) == (20.0, 41.0 + 105.0)
+    assert L.processed(path, record, played.frames) == (20.0, 85.0), "two ticks past the dry write's end"
     loads = [{"program": "p", "t0_ns": 7, "t1_ns": 8}, {"program": "Passthru", "t0_ns": 50, "t1_ns": 60}]
     wire_for(path, dry=np.array("null"), loads=np.array(json.dumps(loads)), **common)
-    assert L.processed(path, record, played.frames) == (7.0, 165.0)
+    assert L.processed(path, record, played.frames) == (7.0, 105.0), "two ticks past the lead-out's load"
     wire_for(path, dry=np.array("null"), **common)
     assert L.processed(path, record, played.frames)[0] == float(t[seg == 0][-1])
 

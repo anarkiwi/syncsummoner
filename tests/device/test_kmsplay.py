@@ -4,7 +4,9 @@
 
 import io
 import json
+import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -446,6 +448,96 @@ def test_arguments_name_one_source():
     assert args.fps == 30 and args.loop and args.frames is None
     with pytest.raises(SystemExit):
         K.parse_args(["--clip", "c", "--frames", "d", "--fps", "30", "--flips", "f", "--status", "s"])
+    assert args.live is None
+    assert (
+        K.parse_args(["--frames", "d", "--fps", "30", "--flips", "f", "--status", "s", "--live", "p"]).live
+        == "p"
+    )
+
+
+def packed(*indices):
+    return [K.RECORD.pack(f, f, f, f, 0) for f in indices]
+
+
+def drain(fd):
+    """Everything a non-blocking reader can take now."""
+    out = b""
+    while True:
+        try:
+            more = os.read(fd, 1 << 16)
+        except BlockingIOError:
+            return out
+        if not more:
+            return out
+        out += more
+
+
+def reader(path):
+    return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+
+
+def test_the_live_feed_drops_records_until_a_reader_comes_then_delivers_them_whole(tmp_path):
+    path = str(tmp_path / "live")
+    feed = K.LiveFeed(path)
+    for rec in packed(0, 1):
+        feed.write(rec)
+    fd = reader(path)
+    sent = packed(2, 3, 4)
+    for rec in sent:
+        feed.write(rec)
+    assert drain(fd) == b"".join(sent)
+    feed.close()
+    assert drain(fd) == b""
+    os.close(fd)
+
+
+def test_a_full_live_pipe_drops_whole_records_instead_of_blocking(tmp_path):
+    path = str(tmp_path / "live")
+    feed = K.LiveFeed(path)
+    fd = reader(path)
+    sent = packed(*range(4 * (1 << 16) // K.RECORD.size))
+    for rec in sent:
+        feed.write(rec)
+    got = drain(fd)
+    assert 0 < len(got) < len(b"".join(sent)) and len(got) % K.RECORD.size == 0
+    assert got == b"".join(sent)[: len(got)]
+    feed.write(sent[0])
+    assert drain(fd) == sent[0]
+    feed.close()
+    os.close(fd)
+
+
+def test_the_live_feed_waits_for_a_new_reader_once_one_leaves(tmp_path):
+    path = str(tmp_path / "live")
+    feed = K.LiveFeed(path)
+    fd = reader(path)
+    feed.write(packed(0)[0])
+    os.close(fd)
+    feed.write(packed(1)[0])
+    fd = reader(path)
+    feed.write(packed(2)[0])
+    assert drain(fd) == packed(2)[0]
+    feed.close()
+    os.close(fd)
+
+
+def test_a_live_feed_keeps_the_pipe_a_reader_opened_before_it_started(tmp_path):
+    path = str(tmp_path / "live")
+    K.fifo(path)
+    early = reader(path)
+    feed = K.LiveFeed(path)
+    assert os.stat(path).st_ino == os.fstat(early).st_ino
+    feed.write(packed(0)[0])
+    assert drain(early) == packed(0)[0]
+    feed.close()
+    os.close(early)
+
+
+def test_a_file_where_the_pipe_belongs_is_replaced_by_one(tmp_path):
+    path = tmp_path / "live"
+    path.write_text("stale")
+    K.fifo(str(path))
+    assert stat.S_ISFIFO(os.stat(path).st_mode)
 
 
 @pytest.mark.parametrize("refused", [None, PermissionError, OSError])
@@ -535,3 +627,30 @@ def test_a_failing_decoder_faults_with_its_last_line():
     argv = [sys.executable, "-c", "import sys; sys.stderr.write('first\\nlast words\\n\\n'); sys.exit(3)"]
     with pytest.raises(K.PlayoutFault, match="decoding failed: last words$"):
         list(K.clip_frames(argv, 2))
+
+
+def test_each_request_is_answered_with_the_frame_on_screen_flagged_as_a_reply():
+    sent = []
+    live = SimpleNamespace(write=sent.append)
+    last = [None, K.RECORD.pack(4, 4, 4, 1000, K.SEGMENT), K.RECORD.pack(4, 4, 4, 1000, 0)]
+    now = iter([1000 + 99, 1000 + 250])
+    K.answer(
+        io.BytesIO(b"???"),
+        lambda: last.pop(0),
+        live,
+        period_ns=Fraction(100),
+        hold=1,
+        clock=lambda: next(now),
+    )
+    assert len(sent) == 2, "nothing to answer before the first flip"
+    assert K.RECORD.unpack(sent[0]) == (4, 4, 4, 1000, K.SEGMENT | K.REPLY)
+    assert K.RECORD.unpack(sent[1])[:3] == (6, 6, 6), "two vblanks past the flip recorded, unrecorded yet"
+
+
+def test_each_flip_is_logged_offered_live_and_kept_for_replies():
+    log, offered = io.BytesIO(), []
+    record = K.recorder(log, SimpleNamespace(write=offered.append), None)
+    record(1, 2, 3, 4, 0)
+    record(2, 3, 4, 5, 0)
+    assert log.getvalue() == K.RECORD.pack(1, 2, 3, 4, 0) + K.RECORD.pack(2, 3, 4, 5, 0) == b"".join(offered)
+    assert K.recorder(io.BytesIO(), None, None) is not None

@@ -8,7 +8,7 @@ same ssh transport.
 from __future__ import annotations
 
 import subprocess
-from typing import Protocol
+from typing import Callable, Protocol
 
 DEFAULT_HOST = "pi@videopi"
 #: Sized for the slowest thing sent: a whole framebuffer piped over the link.
@@ -61,3 +61,20 @@ def ssh_runner(host: str = DEFAULT_HOST, *, timeout: float = DEFAULT_TIMEOUT) ->
         return done.stdout.decode(errors="replace").strip()
 
     return run
+
+
+def ssh_stream(host: str = DEFAULT_HOST) -> Callable[[str], subprocess.Popen]:
+    """Return a starter of long-running commands over BatchMode ssh, each one's stdin and stdout a pipe.
+
+    Its stderr is discarded, so a diagnosis no one reads can never block the command.
+    """
+
+    def stream(command: str) -> subprocess.Popen:
+        return subprocess.Popen(  # pylint: disable=consider-using-with
+            ["ssh", "-o", "BatchMode=yes", host, command],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+    return stream

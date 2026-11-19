@@ -373,7 +373,6 @@ def render_played(
         scratch,
         program,
         config=config,
-        directory=Path(out).parent,
         seconds=score.duration,
         start=start,
         prepared=prepared,
@@ -471,7 +470,6 @@ def ensure_clip(
     program: str,
     *,
     config: RenderConfig,
-    directory: str | Path,
     seconds: float,
     start: float = 0.0,
     prepared: bool = False,
@@ -483,7 +481,7 @@ def ensure_clip(
     from syncsummoner.compose import locktake, session  # pylint: disable=import-outside-toplevel
 
     dry = locktake.dry_state(program, locktake.declared_bypass) is not None
-    lead, tail = session.session_frames(locktake.LeadIn(), config.fps, dry=dry, directory=directory)
+    lead, tail = session.session_frames(locktake.LeadIn(), config.fps, dry=dry)
     try:
         have = timecode.clip_layout(scratch) if Path(scratch).is_file() else None
     except timecode.LayoutError:
@@ -793,12 +791,8 @@ def _layer(score: Score, evolved: Mapping[str, Layer], program: str) -> Layer:
 def _passes(
     ordered: Sequence[str], fresh: Sequence[str], paths: Mapping[str, str], run: Callable[[str], Any]
 ) -> None:
-    """Render each fresh program's pass in order; one needing a dry take's latency waits for one, once,
-    and one whose capture lost frames is recaptured once.
-    """
-    from syncsummoner.compose.locktake import NoLatencyError  # pylint: disable=import-outside-toplevel
-
-    waiting, deferred, faulted = list(ordered), set(), set()
+    """Render each fresh program's pass in order; one whose capture lost frames is recaptured once."""
+    waiting, faulted = list(ordered), set()
     with meter(len(ordered), desc="passes", unit="program") as progress:
         while waiting:
             program = waiting.pop(0)
@@ -813,15 +807,6 @@ def _passes(
                     LOG.warning("%s; recapturing it", err)
                     faulted.add(program)
                     waiting.insert(0, program)
-                    continue
-                except NoLatencyError:
-                    if program in deferred or not waiting:
-                        raise
-                    LOG.info(
-                        "%s: no dry control; it renders after a dry take has measured the latency", program
-                    )
-                    deferred.add(program)
-                    waiting.append(program)
                     continue
                 if report is not None and not report.usable:
                     raise BlankTakeError(f"{program}: {report}")

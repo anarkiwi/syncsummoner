@@ -153,7 +153,7 @@ def check_frames(fps: float, lead_in_s: float | None = None) -> tuple[int, int]:
     loads, lead_in = loadtimes.longest(), session.LeadIn()
     return (
         session.lead_in_frames(lead_in, fps, dry=False, load_s=loads),
-        session.lead_out_frames(lead_in, fps, dry=False, load_s=loads, latency_s=0.0),
+        session.lead_out_frames(lead_in, fps, dry=False, load_s=loads),
     )
 
 
