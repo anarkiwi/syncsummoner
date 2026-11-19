@@ -6,6 +6,7 @@ import math
 
 import cv2
 import numpy as np
+import pytest
 
 from syncsummoner.compose.stimulus import Coverage, Stimulus, _texture
 
@@ -34,7 +35,7 @@ def test_the_next_frame_is_this_one_moved_by_its_flow():
 
 
 def test_a_pure_drift_flows_the_same_everywhere_against_its_velocity():
-    stim = Stimulus(seed=2, coverage=Coverage(spin=0.0, zoom=0.0), **SMALL)
+    stim = Stimulus(seed=2, coverage=Coverage(spin=0.0, zoom=0.0, swing=(0.0, 0.0)), **SMALL)
     flow, shot = stim.flow(0), stim.shot(0)
     assert np.allclose(flow[..., 0], -shot.velocity[0]) and np.allclose(flow[..., 1], -shot.velocity[1])
 
@@ -68,3 +69,16 @@ def test_shots_span_their_ranges_evenly():
     for u in (speed, level):
         counts = np.bincount(np.minimum((np.asarray(u) * 8).astype(int), 7), minlength=8)
         assert counts.min() >= 6 and counts.max() <= 10
+
+
+def test_a_shots_rates_swing_frame_to_frame_around_their_base():
+    """Each step is the base rate times a log-normal swing of mean one, as smooth as the shot draws."""
+    stim = Stimulus(seed=4, shot_frames=4000, coverage=Coverage(swing=(1.0, 1.0), smooth=(0.5, 0.5)), **SMALL)
+    shot, path = stim.shot(0), stim.path(0)
+    steps = np.diff(path, axis=0)
+    rate = steps[:, 0] / shot.velocity[0]
+    assert np.allclose(steps[:, 1] / shot.velocity[1], rate), "drift keeps its direction"
+    assert abs(rate.mean() - 1.0) < 0.1 and np.log(rate).std() == pytest.approx(1.0, rel=0.1)
+    lag = np.corrcoef(np.log(rate[:-1]), np.log(rate[1:]))[0, 1]
+    assert lag == pytest.approx(0.5, abs=0.1)
+    assert (path[0] == 0).all()

@@ -1,7 +1,7 @@
 """A synthetic moving picture whose motion is known on every frame, made from a seed and nothing stored.
 
-Each shot is a tileable band-limited colour noise texture under a constant drift, spin and zoom, drawn
-as a scrambled Sobol point over :class:`Coverage`; frame ``k`` depends only on seed, raster and ``k``.
+Each shot is a tileable band-limited colour noise texture under drift, spin and zoom whose rates swing
+frame to frame, a scrambled Sobol point over :class:`Coverage`; frame ``k`` depends on seed, raster, ``k``.
 """
 
 from __future__ import annotations
@@ -18,8 +18,9 @@ from syncsummoner.progress import track
 
 #: BT.709 luma weights, for the colour each shot's chroma is built around.
 KR, KB = 0.2126, 0.0722
-#: Sobol dimensions a shot draws: speed, direction, spin, zoom, wavelength, contrast, level, hue, saturation.
-DIMS = 9
+#: Sobol dimensions a shot draws: speed, direction, spin, zoom, wavelength, contrast, level, hue, saturation,
+#: and how far and how smoothly its rates swing.
+DIMS = 11
 #: Points in one cached block of a seed's Sobol sequence.
 BLOCK = 1024
 
@@ -29,7 +30,8 @@ class Coverage:
     """The ranges shots are drawn over, each ``(low, high)``, scales log-uniform.
 
     ``speed`` is drift in pixels a frame, ``spin`` radians and ``zoom`` log scale a frame either way,
-    ``wavelength`` the texture's in pixels; the rest are fractions of full scale.
+    ``wavelength`` the texture's in pixels, ``swing`` the log-rate deviation and ``smooth`` its frame-to-frame
+    correlation; the rest are fractions of full scale.
     """
 
     speed: tuple[float, float] = (0.25, 48.0)
@@ -39,11 +41,13 @@ class Coverage:
     contrast: tuple[float, float] = (0.1, 0.5)
     level: tuple[float, float] = (0.2, 0.8)
     saturation: tuple[float, float] = (0.0, 0.3)
+    swing: tuple[float, float] = (0.0, 1.5)
+    smooth: tuple[float, float] = (0.0, 0.95)
 
 
 @dataclass(frozen=True)
 class Shot:
-    """One shot's texture and motion, constant over its frames."""
+    """One shot's texture, and its motion: base rates each swung by a seeded log-normal AR(1) a frame."""
 
     velocity: tuple[float, float]
     spin: float
@@ -53,6 +57,8 @@ class Shot:
     level: float
     hue: float
     saturation: float
+    swing: float
+    smooth: float
     seed: int
 
 
@@ -92,6 +98,8 @@ class Stimulus:
             level=_span(cov.level, u[6]),
             hue=float(u[7]),
             saturation=_span(cov.saturation, u[8]),
+            swing=_span(cov.swing, u[9]),
+            smooth=_span(cov.smooth, u[10]),
             seed=int(np.random.SeedSequence([self.seed, k % (1 << 32)]).generate_state(1)[0]),
         )
 
@@ -99,16 +107,18 @@ class Stimulus:
         """The shot frame ``index`` is in, and how far into it."""
         return index // self.shot_frames, index % self.shot_frames
 
+    def path(self, k: int) -> np.ndarray:
+        """Shot ``k``'s motion before each frame: ``(shot_frames, 4)`` of x, y, angle and log zoom."""
+        return _path(self.shot(k), self.shot_frames)
+
     def transform(self, index: int) -> np.ndarray:
         """The 2x3 affine taking frame ``index``'s pixel ``(x, y, 1)`` to its point on the shot's texture."""
         k, i = self.placed(index)
-        shot = self.shot(k)
-        scale = math.exp(-shot.zoom * i)
-        c, s = math.cos(shot.spin * i) * scale, math.sin(shot.spin * i) * scale
+        x, y, angle, zoom = self.path(k)[i]
+        scale = math.exp(-zoom)
+        c, s = math.cos(angle) * scale, math.sin(angle) * scale
         cx, cy = self.width / 2, self.height / 2
-        tx = cx + shot.velocity[0] * i - (c * cx - s * cy)
-        ty = cy + shot.velocity[1] * i - (s * cx + c * cy)
-        return np.array([[c, -s, tx], [s, c, ty]])
+        return np.array([[c, -s, cx + x - (c * cx - s * cy)], [s, c, cy + y - (s * cx + c * cy)]])
 
     def flow(self, index: int) -> np.ndarray:
         """Each pixel's displacement from frame ``index`` to the next, ``(height, width, 2)``, NaN at a cut.
@@ -141,6 +151,23 @@ class Stimulus:
         """Frames ``start`` to ``start + count - 1`` in turn."""
         for index in track(range(start, start + count), desc="stimulus", total=count, unit="frame"):
             yield self.frame(index)
+
+
+@lru_cache(maxsize=64)
+def _path(shot: Shot, frames: int) -> np.ndarray:
+    """Accumulated drift, spin and zoom before each frame, each rate its base times ``exp(swing * a_t)``.
+
+    ``a_t`` is a unit-variance AR(1) with lag-one correlation ``smooth``, one per rate, from the shot's seed.
+    """
+    rng = np.random.default_rng(shot.seed)
+    shocks = rng.standard_normal((frames, 3))
+    a = np.empty_like(shocks)
+    a[0] = shocks[0]
+    for t in range(1, frames):
+        a[t] = shot.smooth * a[t - 1] + math.sqrt(1.0 - shot.smooth**2) * shocks[t]
+    rate = np.exp(shot.swing * a - 0.5 * shot.swing**2)
+    steps = np.c_[rate[:, :1] * np.asarray(shot.velocity), rate[:, 1] * shot.spin, rate[:, 2] * shot.zoom]
+    return np.vstack([np.zeros(4), np.cumsum(steps, axis=0)[:-1]])
 
 
 def _sobol(seed: int, k: int) -> np.ndarray:
