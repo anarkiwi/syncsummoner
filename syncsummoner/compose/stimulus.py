@@ -108,7 +108,7 @@ class Stimulus:
         return index // self.shot_frames, index % self.shot_frames
 
     def path(self, k: int) -> np.ndarray:
-        """Shot ``k``'s motion accumulated before each frame: ``(shot_frames, 4)`` of x, y, angle, log zoom."""
+        """Shot ``k``'s motion before each frame: ``(shot_frames, 4)`` of x, y, angle and log zoom."""
         return _path(self.shot(k), self.shot_frames)
 
     def transform(self, index: int) -> np.ndarray:
