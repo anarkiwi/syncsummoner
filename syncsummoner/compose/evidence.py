@@ -185,6 +185,28 @@ class StoppedError(EvidenceError):
     """The device's ``field_count`` did not advance: its transport was stopped, so it counted no frames."""
 
 
+def one_segment(asked: np.ndarray, shown: np.ndarray, ticks: np.ndarray) -> tuple[np.ndarray, ...]:
+    """The replies, reports and ticks of the player segment on screen at the last tick.
+
+    Each time the link comes up the player starts a segment on a vblank grid of a new phase, and the
+    device relocks to it, so ticks and flips compare only within one. After an earlier segment, ticks
+    count from the first report of this one heard; records without a base are one segment.
+    """
+    if "base" not in (shown.dtype.names or ()) or not shown.size or not ticks.size:
+        return asked, shown, ticks
+    at = int(np.searchsorted(shown["t_ns"], ticks["t1_ns"][-1])) - 1
+    if at < 0:
+        return asked[:0], shown[:0], ticks
+    base = shown["base"][at]
+    first = int(np.flatnonzero(np.r_[True, shown["base"][:at] != base])[-1])
+    last = at + int(np.argmax(np.r_[shown["base"][at:] != base, True]))
+    return (
+        asked[asked["base"] == base],
+        shown[first:last],
+        ticks[ticks["t0_ns"] >= shown["t_ns"][first]] if first else ticks,
+    )
+
+
 def offset(
     latch: np.ndarray,
     floors: np.ndarray,
@@ -201,13 +223,15 @@ def offset(
     latest latch ``L`` means ``O <= L - F``. Bounds that cross mean the device is not locked to the
     player, or an event is misordered, which is an error. A reply counts only once the host has heard
     the frame after it shown, so the Pi was still flipping; one past the clip's end does not. Reads
-    two ``period_ns`` frames apart reading one count mean the transport is stopped.
+    two ``period_ns`` frames apart reading one count mean the transport is stopped. Replies and reports
+    count only from the player segment on screen at the last tick (:func:`one_segment`).
     """
     if ticks.size and ticks["field"][-1] == ticks["field"][0] and np.ptp(ticks["t0_ns"]) > 2 * period_ns:
         raise StoppedError(
             f"field_count stayed at {int(ticks['field'][0])} over {ticks.size} reads: the device's transport "
             "is stopped, so its frame ticks cannot be counted"
         )
+    asked, shown, ticks = one_segment(asked, shown, ticks)
     c = count_before(ticks, asked["t0_ns"])
     flipped = asked["frame"] < (shown["frame"].max() if shown.size else np.iinfo(np.int64).min)
     told = (c >= 0) & flipped

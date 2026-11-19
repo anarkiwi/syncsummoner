@@ -48,8 +48,12 @@ changes between two polls that read the same count (docs/hardware.md). For each 
   frame when the tick comes as close to a flip as the host's brackets are wide, as it does on this
   device; `evidence.phase_offset` moves every tick bracket to one tick and every flip bracket to one
   frame by whole periods, the period itself bracketed by the first and last ticks, and the tick's
-  following its own flip by under half a frame (docs/hardware.md) picks the frame. Bounds that cross fault
-  the session; bounds a frame apart widen every write's window by that frame.
+  following its own flip by under half a frame (docs/hardware.md) picks the frame. Every link-up
+  (a load in a session without a dry control, the Passthru reload before the lead-out) starts the
+  player on a vblank grid of a new phase, and the offset can step by a frame across it, so only
+  the segment on screen at the last tick counts: its records share a base, display vblank less clip
+  vblank (`evidence.one_segment`). Bounds that cross fault the session; bounds a frame apart widen
+  every write's window by that frame.
 - **Response**: the clip frames after `L - O` until the picture shows the write, from that
   write's own captures. It is the program's processing of that CC; it is never pooled across
   writes, parameters or programs.

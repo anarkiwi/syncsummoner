@@ -51,9 +51,9 @@ RTPRIO_LIMIT = 20
 #: Status states the player settles in once started.
 SETTLED = ("playing", "failed", "stopped")
 #: One distinct frame followed live: the player's stream frame and when the host first heard of it.
-SHOWN = np.dtype([("frame", "<i8"), ("t_ns", "<i8")])
+SHOWN = np.dtype([("frame", "<i8"), ("t_ns", "<i8"), ("base", "<i8")])
 #: One request to the player: when the host sent it, when the reply came, and the last flip done between.
-ASKED = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("frame", "<i8")])
+ASKED = np.dtype([("t0_ns", "<i8"), ("t1_ns", "<i8"), ("frame", "<i8"), ("base", "<i8")])
 #: The frame :meth:`Shown.latest` reports before any flip has been heard of.
 NONE = int(np.iinfo(np.int64).min)
 
@@ -122,8 +122,10 @@ class Shown:
     A record counts only once it has been read whole, and is stamped with ``clock`` then, so every frame
     reported was on screen no later than the moment it is reported. :meth:`ask` writes one byte to
     ``asks``, which the player answers with the last flip done once it has read it, so the flip after
-    that one came after the request left. ``procs`` are the processes feeding ``stream`` and reading
-    ``asks``, terminated on :meth:`close`; with none, ``stream`` must end for it to return.
+    that one came after the request left. Each record keeps its segment's base, its display vblank less
+    its clip vblank, which the player sets afresh each time the link comes up. ``procs`` are the
+    processes feeding ``stream`` and reading ``asks``, terminated on :meth:`close`; with none,
+    ``stream`` must end for it to return.
     """
 
     def __init__(
@@ -137,8 +139,9 @@ class Shown:
         self._stream, self._asks, self._procs, self._clock = stream, asks, tuple(procs), clock
         self._frames: list[int] = []
         self._times: list[int] = []
+        self._bases: list[int] = []
         self._sent: list[int] = []
-        self._replies: list[tuple[int, int]] = []
+        self._replies: list[tuple[int, int, int]] = []
         self._ended = False
         self._cond = threading.Condition()
         self._watched: set[threading.Event] = set()
@@ -150,13 +153,14 @@ class Shown:
         try:
             while (record := read_exactly(self._stream, RECORD.size)) is not None:
                 t_ns, fields = self._clock(), RECORD.unpack(record)
-                frame = fields[2]
+                frame, base = fields[2], fields[1] - fields[0]
                 with self._cond:
                     if fields[4] & REPLY:
-                        self._replies.append((t_ns, frame))
+                        self._replies.append((t_ns, frame, base))
                     elif not self._frames or frame > self._frames[-1]:
                         self._frames.append(frame)
                         self._times.append(t_ns)
+                        self._bases.append(base)
                         self._cond.notify_all()
         except (OSError, ValueError):
             pass
@@ -216,15 +220,14 @@ class Shown:
             n = min(len(self._sent), len(self._replies))
             out = np.empty(n, dtype=ASKED)
             out["t0_ns"] = self._sent[:n]
-            out["t1_ns"] = [t for t, _ in self._replies[:n]]
-            out["frame"] = [f for _, f in self._replies[:n]]
+            out["t1_ns"], out["frame"], out["base"] = np.array(self._replies[:n], np.int64).reshape(n, 3).T
         return out
 
     def log(self) -> np.ndarray:
         """Every distinct frame heard of so far, as :data:`SHOWN` records."""
         with self._cond:
             out = np.empty(len(self._frames), dtype=SHOWN)
-            out["frame"], out["t_ns"] = self._frames, self._times
+            out["frame"], out["t_ns"], out["base"] = self._frames, self._times, self._bases
         return out
 
     def close(self) -> None:
