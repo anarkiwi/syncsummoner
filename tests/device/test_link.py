@@ -70,10 +70,12 @@ def shell_runner(tmp_path):
     ).stdout
 
 
+# The handler writes the fd itself: a signal landing while ``print('ready')`` still holds stdout's buffer
+# would make a ``print`` in the handler re-enter it.
 SIGNALLED = (
-    "import signal, sys, time\n"
+    "import os, signal, sys, time\n"
     "for s in (signal.SIGUSR1, signal.SIGUSR2):\n"
-    "    signal.signal(s, lambda n, _: print(signal.Signals(n).name, flush=True))\n"
+    "    signal.signal(s, lambda n, _: os.write(1, (signal.Signals(n).name + '\\n').encode()))\n"
     "print('ready', flush=True)\n"
     "time.sleep(30)\n"
 )
