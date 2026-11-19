@@ -27,18 +27,25 @@ def _hold_cmd(args: argparse.Namespace) -> int:
 
 
 def _timecode_cmd(args: argparse.Namespace) -> int:
-    """Timecode footage for sweep sessions, its lead-in and lead-out each holding the longest load a device
-    wait allows (the stall guard), so no load the rig lets through outgrows the clip."""
+    """Timecode footage, or a synthetic stimulus, for sweep sessions, its lead-in and lead-out each holding
+    the longest load a device wait allows (the stall guard), so no load the rig lets through outgrows it."""
     from syncsummoner.compose.locktake import LeadIn
     from syncsummoner.compose.render import RenderConfig
     from syncsummoner.compose.session import session_frames
+    from syncsummoner.compose.stimulus import Stimulus
     from syncsummoner.compose.timecode import write_timecoded
     from syncsummoner.device.loadtimes import stall_guard
 
+    if (args.source is None) == (args.synthetic is None):
+        raise SystemExit("give footage or --synthetic SEED, not both")
     config = RenderConfig.for_format(args.format, strip_px=args.strip_px)
     load_s = stall_guard(args.stall)
     lead, tail = session_frames(LeadIn(), config.fps, dry=False, load_s=load_s)
-    frames = write_timecoded(args.source, args.out, config=config, lead=lead, tail=tail)
+    source = args.source
+    if args.synthetic is not None:
+        source = Stimulus(seed=args.synthetic, width=config.width, height=config.height)
+        Path(f"{args.out}.stimulus.json").write_text(json.dumps(source.key(), indent=1), encoding="utf-8")
+    frames = write_timecoded(source, args.out, config=config, lead=lead, tail=tail, seconds=args.seconds)
     print(f"{args.out}: {frames} frames, {lead} lead-in and {tail} lead-out frames, for a {load_s} s load")
     return 0
 
@@ -379,7 +386,11 @@ def _add_timecode(probe_sub: Any) -> Any:
     stamp = probe_sub.add_parser(
         "timecode", help="timecode footage for sweep sessions, sized by the stall guard"
     )
-    stamp.add_argument("source", help="the footage")
+    stamp.add_argument("source", nargs="?", help="the footage")
+    stamp.add_argument(
+        "--synthetic", type=int, metavar="SEED", help="a synthetic moving stimulus from this seed"
+    )
+    stamp.add_argument("--seconds", type=float, help="the clip's length; a stimulus needs one")
     stamp.add_argument("--out", required=True, help="the timecoded clip to write")
     stamp.set_defaults(func=_timecode_cmd)
     return stamp

@@ -20,6 +20,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from syncsummoner.compose.stimulus import Stimulus
 from syncsummoner.probe.patterns import timecode_row
 from syncsummoner.progress import LOG, track
 
@@ -61,12 +62,16 @@ def clip_layout(path: str | Path, *, ffprobe: str = "ffprobe") -> ClipLayout:
 def timecode_key(
     source: Any, config: Any, *, seconds: float | None, start: float, lead: int, tail: int
 ) -> str:
-    """SHA-256 over the source file's identity and every setting a timecoded clip depends on."""
-    path = Path(source).resolve()
-    stat = path.stat()
+    """SHA-256 over the source's identity, a file's or a :class:`~.stimulus.Stimulus`'s, and every setting."""
+    if isinstance(source, Stimulus):
+        identity: Any = source.key()
+    else:
+        path = Path(source).resolve()
+        stat = path.stat()
+        identity = [str(path), stat.st_size, stat.st_mtime_ns]
     token = {
         "schema": TIMECODE_SCHEMA,
-        "source": [str(path), stat.st_size, stat.st_mtime_ns],
+        "source": identity,
         "raster": [config.width, config.height, config.fps],
         "strip": [config.strip_px, config.bits],
         "span": [seconds, start, lead, tail],
@@ -117,8 +122,8 @@ def write_timecoded(
 ) -> int:
     """Write the source at session geometry, each frame's index burnt in, between a lead-in and a lead-out.
 
-    The lead-in is ``lead`` copies of the first frame numbered ``-lead..-1``, wrapped to the strip's
-    width, and the lead-out ``tail`` copies of the last numbered on from it.
+    The lead-in is numbered ``-lead..-1``, wrapped to the strip's width, and the lead-out on from the clip:
+    a :class:`~.stimulus.Stimulus`'s own frames there, so they move, else copies of a file's first and last.
     Returns the clip frames, neither included.
 
     A clip the playout can identify frame by frame is what lets the source be
@@ -177,7 +182,14 @@ def _encode_timecoded(
     An encoder that dies takes its own diagnosis with it, so that is what is raised
     rather than the broken pipe writing to it produces.
     """
-    total, frames = source_stream(source, config, seconds=seconds, start=start)
+    if isinstance(source, Stimulus):
+        total = int(round((seconds or 0.0) * config.fps))
+        if total <= 0:
+            raise ValueError("a stimulus has no length of its own: give seconds")
+        numbered = zip(range(-lead, total + tail), source.frames(-lead, lead + total + tail))
+    else:
+        total, frames = source_stream(source, config, seconds=seconds, start=start)
+        numbered = _numbered(frames, lead, tail)
     argv = [
         getattr(config, "ffmpeg", "ffmpeg"),
         "-loglevel",
@@ -208,7 +220,6 @@ def _encode_timecoded(
         argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     wrap, strip, sent = (1 << config.bits) - 1, config.height - config.strip_px, 0
-    numbered = _numbered(frames, lead, tail)
     try:
         for index, frame in track(
             numbered, desc="timecoding", total=total and lead + total + tail or None, unit="frame"
@@ -222,7 +233,7 @@ def _encode_timecoded(
                 break
             sent += 1
     finally:
-        numbered.close()
+        getattr(numbered, "close", lambda: None)()
         proc.stdin.close()
         said = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
         proc.stderr.close()
