@@ -123,12 +123,17 @@ def _projected(index: np.ndarray, lo: np.ndarray, hi: np.ndarray, period: tuple[
     """Brackets ``(lo, hi)`` on events ``index`` moved by whole periods to event ``at`` and intersected.
 
     Each move of ``k`` periods is widened by the period's own bracket, so the result holds the true time
-    of event ``at`` whichever period in ``period`` holds.
+    of event ``at`` whichever period in ``period`` holds. Brackets join nearest ``at`` first while they
+    still meet: the clock the device locks to wanders, so one period holds only so far either way.
     """
     k = (at - index).astype(np.float64)
     early = lo + k * np.where(k > 0, period[0], period[1])
     late = hi + k * np.where(k > 0, period[1], period[0])
-    return float(early.max()), float(late.min())
+    order = np.argsort(np.abs(k), kind="stable")
+    early, late = np.maximum.accumulate(early[order]), np.minimum.accumulate(late[order])
+    met = np.flatnonzero(early <= late)
+    last = int(met[-1]) if met.size else len(order) - 1
+    return float(early[last]), float(late[last])
 
 
 def tick_brackets(ticks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -160,9 +165,12 @@ def phase_offset(asked: np.ndarray, shown: np.ndarray, ticks: np.ndarray) -> Off
     t_lo, t_hi = _projected(n, lo, hi, period, n0)
     f0 = int(shown["frame"][shown.size // 2])
     after = asked["frame"] + 1
-    f_lo, _ = _projected(after, asked["t0_ns"].astype(np.float64), np.full(after.size, np.inf), period, f0)
-    _, f_hi = _projected(
-        shown["frame"], np.full(shown.size, -np.inf), shown["t_ns"].astype(np.float64), period, f0
+    f_lo, f_hi = _projected(
+        np.r_[after, shown["frame"]],
+        np.r_[asked["t0_ns"].astype(np.float64), np.full(shown.size, -np.inf)],
+        np.r_[np.full(after.size, np.inf), shown["t_ns"].astype(np.float64)],
+        period,
+        f0,
     )
     if not (t_lo <= t_hi and f_lo <= f_hi):
         raise EvidenceError("the frame ticks or the Pi's flips contradict one period")

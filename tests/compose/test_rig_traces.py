@@ -46,3 +46,12 @@ def test_a_stopped_transport_on_the_rig_is_refused():
     assert np.unique(w["ticks"]["field"]).size == 1
     with pytest.raises(ev.StoppedError, match="transport is stopped"):
         ev.offset(*NONE, w["asked"], w["shown"], w["ticks"], PERIOD)
+
+
+def test_a_six_minute_render_take_pins_its_offset_though_the_device_clock_wanders():
+    """Teletect RamBend in a render on rc.9: no dry control, so three player segments, and 350 s of ticks
+    too long for one period end to end; the brackets that meet nearest the middle pin it."""
+    w = trace("rambend-render")
+    assert np.unique(w["shown"]["base"]).size == 3
+    found = ev.offset(*NONE, w["asked"], w["shown"], w["ticks"], PERIOD)
+    assert found.exact and 302 <= found.lo <= 303
