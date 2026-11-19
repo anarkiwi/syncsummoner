@@ -435,11 +435,19 @@ class ProgramModel:
         """:meth:`reach` at each of ``states``, in one pass where the ternary simulator answers."""
         return self._reach_many(states, timing, list(free))
 
+    def _key(self, **key) -> dict:
+        """``key`` for an analysis cached on disk, marked when the ternary screen alone answers it."""
+        return {**key, **({"coarse": True} if self.prefer == "ternary" else {})}
+
     def resolution(self) -> dict[int, tuple[int, ...]]:
         """Bits of each control the program reads at all, every register free."""
-        free = [d.parameter_id for d in self.params] + [TIMING]
-        reach = self._reach(np.zeros(PARAM_COUNT, dtype=np.int64), None, free)
-        return {d.parameter_id: tuple(reach.get(d.parameter_id, ())) for d in self.params}
+
+        def compute():
+            free = [d.parameter_id for d in self.params] + [TIMING]
+            reach = self._reach(np.zeros(PARAM_COUNT, dtype=np.int64), None, free)
+            return [[d.parameter_id, list(reach.get(d.parameter_id, ()))] for d in self.params]
+
+        return {p: tuple(bits) for p, bits in self._cached("resolution", self._key(), compute)}
 
     def live(self, state: np.ndarray | None = None, timing: int | None = None, *, gates: bool = True) -> dict:
         """Each declared control's live bits with every other control held at ``state``.
@@ -544,6 +552,13 @@ class ProgramModel:
         the first control with settings :meth:`passes` proves, written at the middle of their longest run.
         """
         base = self.initial() if state is None else np.asarray(state, dtype=np.int64)
+        found = self._cached(
+            "bypass", self._key(state=base.tolist(), timing=timing), lambda: self._bypass(base, timing)
+        )
+        return None if found is None else Bypass(found[0], found[1], tuple(found[2]))
+
+    def _bypass(self, base: np.ndarray, timing: int | None) -> list | None:
+        """:meth:`bypass` as ``[parameter_id, value, proven]``, computed."""
         for decl in self.params:
             if kind(decl)[0] is not Kind.BOOLEAN:
                 continue
@@ -554,13 +569,13 @@ class ProgramModel:
                 on, timing
             ):
                 same = register_value(decl, MANUAL) == register_value(decl, VALUE_MAX)
-                return Bypass(decl.parameter_id, VALUE_MAX, tuple(MANUAL[same].tolist()))
+                return [decl.parameter_id, VALUE_MAX, MANUAL[same].tolist()]
         for decl in self.params:
             proven = self.passes(decl.parameter_id, base, timing)
             if proven.size:
                 runs = np.split(proven, np.flatnonzero(np.diff(proven) > 1) + 1)
                 run = max(runs, key=len)
-                return Bypass(decl.parameter_id, int(run[len(run) // 2]), tuple(proven.tolist()))
+                return [decl.parameter_id, int(run[len(run) // 2]), proven.tolist()]
         return None
 
     def passes(

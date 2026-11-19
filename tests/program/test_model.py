@@ -152,6 +152,17 @@ def test_conditions_are_cached_per_free_set(tiny):
     assert tiny.reach(tiny.preset("Gain"), [1], timing=0)[1] == [6, 7, 8, 9]
 
 
+def test_resolution_and_bypass_are_kept_on_disk(tiny, monkeypatch):
+    want, bypass = tiny.resolution(), tiny.bypass()
+    again = ProgramModel(tiny.program, tiny.library, cache=tiny.cache.parent.parent)
+    for slow in ("_reach", "passes", "live"):
+        monkeypatch.setattr(again, slow, lambda *a, **k: pytest.fail("recomputed"))
+    assert again.resolution() == want and again.bypass() == bypass
+    coarse = ProgramModel(tiny.program, tiny.library, cache=tiny.cache.parent.parent, method="ternary")
+    monkeypatch.setattr(coarse, "_reach", lambda *a, **k: {})
+    assert coarse.resolution() == {p: () for p in want}
+
+
 @pytest.mark.parametrize("fixture", ["tiny", "mixer"])
 def test_the_cli_states_the_bypass_setting(fixture, request, monkeypatch, capsys):
     from syncsummoner import cli  # pylint: disable=import-outside-toplevel
