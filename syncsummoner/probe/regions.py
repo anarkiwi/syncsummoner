@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.stats import qmc
 
-from syncsummoner.aesthetics.survival import SIGMA, critical_z, effective_samples
+from syncsummoner.aesthetics.survival import LEADS, SIGMA, critical_z, effective_samples
 from syncsummoner.compose.locktake import PLAN
 from syncsummoner.device.profile import PARAM_COUNT, snap_toggles
 from syncsummoner.probe.locked import Chunk, SweepError, staggered
@@ -143,6 +143,25 @@ def slots(
             return out
         out.append(Slot(take=take, start=at, guard=guard, hold=need))
         at, spent = at + guard + need, spent + (guard + need) / fps
+
+
+def shot_slots(
+    shot: int, frames: int, *, guard: int, limit: int, measured: int = len(LEADS) + 4
+) -> list[Slot]:
+    """``limit`` settings each on whole shots of a synthetic stimulus, a new take each time the clip runs out.
+
+    A setting spans the fewest shots that hold its ``guard`` and then ``measured`` frames, enough TI pairs at
+    every lead for a correlation's effective samples to pass three, so its writes and settle cover the cut
+    and its hold is one shot's uncut motion, white frame to frame: kriging pools the settings, not the holds.
+    """
+    span = shot * math.ceil((guard + measured) / shot)
+    per_take = frames // span
+    if per_take < 1:
+        raise SweepError(f"a setting needs {span} frames, the clip holds {frames}")
+    return [
+        Slot(take=i // per_take, start=(i % per_take) * span, guard=guard, hold=span - guard)
+        for i in range(limit)
+    ]
 
 
 def _filled(x: np.ndarray) -> np.ndarray:

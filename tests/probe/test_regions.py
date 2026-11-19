@@ -3,6 +3,7 @@
 # pylint: disable=missing-function-docstring
 
 import json
+from pathlib import Path
 import math
 from types import SimpleNamespace
 
@@ -176,6 +177,34 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     assert regions["guard_frames"] == R.guard_frames(0) and regions["budget_s"] is None
     assert regions["per_regime"] == {"0": 4, "1": 2} and regions["settings"] == 4 + 2 + 6
     assert sum(len(c.states) for c in chunks) == 12
+    clip = tmp_path / "c.mkv"
+    Path(f"{clip}.stimulus.json").write_text(json.dumps({"stimulus": {"shot_frames": 45}}), encoding="utf-8")
+    synthetic = [str(clip) if a == "c.mkv" else a for a in unheld if a not in ("--budget-s", "900")]
+    assert cli.main(synthetic) == 0
+    chunks, said = L.read_plan(tmp_path / "sweep-p.json")
+    assert said["regions"]["shot_frames"] == 45 and said["regions"]["hold_frames"][
+        "max"
+    ] == 45 - R.guard_frames(0)
+    assert sum(len(c.states) for c in chunks) == 12 and sum(c.frames for c in chunks) == 12 * 45
+
+
+def test_shot_slots_put_each_setting_on_whole_shots_its_guard_covering_the_cut():
+    placed = R.shot_slots(45, 200, guard=13, limit=7)
+    assert [(s.take, s.start, s.guard, s.hold) for s in placed[:5]] == [
+        (0, 0, 13, 32),
+        (0, 45, 13, 32),
+        (0, 90, 13, 32),
+        (0, 135, 13, 32),
+        (1, 0, 13, 32),
+    ]
+    assert len(placed) == 7 and all(s.start % 45 == 0 for s in placed)
+    longer = R.shot_slots(15, 200, guard=13, limit=2)
+    assert [(s.start, s.hold) for s in longer] == [
+        (0, 17),
+        (30, 17),
+    ], "a guard past a shot takes the next too"
+    with pytest.raises(R.SweepError, match="needs 90 frames"):
+        R.shot_slots(45, 60, guard=40, limit=1)
 
 
 def test_second_order_resolves_every_effect_and_pair_at_a_power_of_two():

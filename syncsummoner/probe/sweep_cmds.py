@@ -43,7 +43,8 @@ def _timecode_cmd(args: argparse.Namespace) -> int:
     lead, tail = session_frames(LeadIn(), config.fps, dry=False, load_s=load_s)
     source = args.source
     if args.synthetic is not None:
-        source = Stimulus(seed=args.synthetic, width=config.width, height=config.height)
+        shot = {} if args.shot_frames is None else {"shot_frames": args.shot_frames}
+        source = Stimulus(seed=args.synthetic, width=config.width, height=config.height, **shot)
         Path(f"{args.out}.stimulus.json").write_text(json.dumps(source.key(), indent=1), encoding="utf-8")
     frames = write_timecoded(source, args.out, config=config, lead=lead, tail=tail, seconds=args.seconds)
     print(f"{args.out}: {frames} frames, {lead} lead-in and {tail} lead-out frames, for a {load_s} s load")
@@ -92,6 +93,14 @@ def _sweep_plan_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def stimulus_shot(clip: str) -> int | None:
+    """The shot length of the stimulus ``clip`` was made from (its ``.stimulus.json``), else None."""
+    key = Path(f"{clip}.stimulus.json")
+    return (
+        int(json.loads(key.read_text(encoding="utf-8"))["stimulus"]["shot_frames"]) if key.is_file() else None
+    )
+
+
 def clip_ti(luma: Any, lead: int, tail: int) -> Any:
     """TI of each clip frame against the frame played before it, the lead-in's last for the first."""
     from syncsummoner.aesthetics.survival import information
@@ -132,6 +141,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         guard_frames,
         region_dims,
         second_order,
+        shot_slots,
         slots,
         without_bypass,
     )
@@ -162,10 +172,14 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     extra = np.zeros((0, PARAM_COUNT), dtype=np.int64)
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
-    if args.budget_s is None:
+    shot = stimulus_shot(args.source)
+    if shot is not None or args.budget_s is None:
         counts = [min(second_order(len(d)), distinct(d, kept)) for d in dims]
-        placed = slots(
-            ti, edges, guard=guard, overhead_s=overhead_s, fps=config.fps, limit=sum(counts) + len(extra)
+        limit = sum(counts) + len(extra)
+        placed = (
+            shot_slots(shot, layout.frames, guard=guard, limit=limit)
+            if shot is not None
+            else slots(ti, edges, guard=guard, overhead_s=overhead_s, fps=config.fps, limit=limit)
         )
     else:
         placed = slots(ti, edges, guard=guard, budget_s=args.budget_s, overhead_s=overhead_s, fps=config.fps)
@@ -190,6 +204,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         "guard_frames": guard,
         "hold_frames": {"min": int(hold.min()), "median": float(np.median(hold)), "max": int(hold.max())},
         "budget_s": args.budget_s,
+        "shot_frames": shot,
         "rig_s": float(sum(c.frames for c in chunks) / config.fps + overhead_s),
         "seed": args.seed,
     }
@@ -405,6 +420,9 @@ def _add_timecode(probe_sub: Any) -> Any:
         "--synthetic", type=int, metavar="SEED", help="a synthetic moving stimulus from this seed"
     )
     stamp.add_argument("--seconds", type=float, help="the clip's length; a stimulus needs one")
+    stamp.add_argument(
+        "--shot-frames", type=int, help="a stimulus's shot length; each sweep setting spans whole shots"
+    )
     stamp.add_argument("--out", required=True, help="the timecoded clip to write")
     stamp.set_defaults(func=_timecode_cmd)
     return stamp

@@ -239,6 +239,10 @@ A setpoint's writes go one a frame (`locked.staggered`): the device takes each w
 before is acknowledged, so a frame lets through only as many as its tick interval holds, and one a
 frame always fits; a setting is measured only once its last write has landed and settled.
 `probe sweep restagger` rewrites existing plans the same way, keeping each original beside it.
+Against a synthetic clip (`probe timecode --synthetic SEED --shot-frames N`, its `.stimulus.json` beside
+it), `probe sweep regions` puts each setting on whole shots instead (`regions.shot_slots`): its writes and
+settle cover the cut, its hold is one shot's uncut motion, and kriging pools the settings rather than each
+being held to its own power, so a program's sweep is one take of minutes.
 `probe sweep smoke` captures a few seconds toggling one parameter and lands every write from the
 take's wire record alone: the rig check to run before any full take.
 
