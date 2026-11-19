@@ -540,7 +540,7 @@ def _bridge(
     near = [shift for shift, miss in misses.items() if miss == 0.0]
     if not near:
         best = min(misses.values(), default=np.inf)
-        near = [shift for shift, miss in misses.items() if miss == best and miss < line.period / 2]
+        near = [shift for shift, miss in misses.items() if miss == best < line.period / 2]
     if len(near) != 1:
         raise LockError(f"the Pi's flip log numbers a run with no strip {len(near)} ways across its outage")
     shift = near[0]
