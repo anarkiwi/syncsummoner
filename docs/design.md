@@ -122,7 +122,7 @@ you. Minimum set:
 | `noise_1f` | behaviour on natural-statistics input |
 | `flat_grey`, `black` | noise floor; self-oscillation in feedback programs |
 | `motion_ball` | trajectory with a hard impact point — temporal response |
-| `stimulus` | the archive's moving picture, made from a seed (`compose.stimulus`): shots of band-limited colour noise under known drift, spin and zoom whose rates swing frame to frame (so the follow test has input motion to correlate against), their texture scale, contrast, level and colour spanning set ranges, so what a program keeps of its input is measured against motion known on every frame, lead-in and lead-out included (§9) |
+| `stimulus` | the archive's moving picture, made from a seed (`compose.stimulus`): shots of band-limited colour noise under known drift, spin and zoom, each frame's motion scaled to a TI drawn afresh for it (so the picture's TI is white and every frame is an independent sample for the follow test), their texture scale, contrast, level and colour spanning set ranges, so what a program keeps of its input is measured against motion known on every frame, lead-in and lead-out included (§9) |
 
 ### 3.2 Frame identification
 
