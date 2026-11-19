@@ -37,7 +37,10 @@ def test_the_next_frame_is_this_one_moved_by_its_flow():
 def test_a_pure_drift_flows_the_same_everywhere_against_its_velocity():
     stim = Stimulus(seed=2, coverage=Coverage(spin=0.0, zoom=0.0, swing=(0.0, 0.0)), **SMALL)
     flow, shot = stim.flow(0), stim.shot(0)
-    assert np.allclose(flow[..., 0], -shot.velocity[0]) and np.allclose(flow[..., 1], -shot.velocity[1])
+    assert np.allclose(flow, flow[0, 0]), "the same everywhere"
+    assert np.allclose(
+        flow[0, 0] / np.hypot(*flow[0, 0]), -np.array(shot.velocity) / np.hypot(*shot.velocity)
+    )
 
 
 def test_the_flow_across_a_cut_is_unknown_and_the_shot_changes_there():
@@ -71,14 +74,19 @@ def test_shots_span_their_ranges_evenly():
         assert counts.min() >= 6 and counts.max() <= 10
 
 
-def test_a_shots_rates_swing_frame_to_frame_around_their_base():
-    """Each step is the base rate times a log-normal swing of mean one, as smooth as the shot draws."""
-    stim = Stimulus(seed=4, shot_frames=4000, coverage=Coverage(swing=(1.0, 1.0), smooth=(0.5, 0.5)), **SMALL)
-    shot, path = stim.shot(0), stim.path(0)
-    steps = np.diff(path, axis=0)
-    rate = steps[:, 0] / shot.velocity[0]
-    assert np.allclose(steps[:, 1] / shot.velocity[1], rate), "drift keeps its direction"
-    assert abs(rate.mean() - 1.0) < 0.1 and np.log(rate).std() == pytest.approx(1.0, rel=0.1)
-    lag = np.corrcoef(np.log(rate[:-1]), np.log(rate[1:]))[0, 1]
-    assert lag == pytest.approx(0.5, abs=0.1)
-    assert (path[0] == 0).all()
+def test_each_frames_ti_is_drawn_afresh_about_the_coverages_level():
+    """The analytic TI each step is scaled to is the TI the rendered frames show, white frame to frame."""
+    cov = Coverage(swing=(0.8, 0.8))
+    stim = Stimulus(seed=4, shot_frames=400, coverage=cov, **SMALL)
+    luma = [
+        f.astype(np.float32) @ np.array([0.2126, 0.7152, 0.0722], np.float32) for f in stim.frames(0, 400)
+    ]
+    ti = np.array([(b - a).std() for a, b in zip(luma, luma[1:])])
+    steps = np.diff(stim.path(0), axis=0)
+    shot = stim.shot(0)
+    cross = steps[:, 0] * shot.velocity[1] - steps[:, 1] * shot.velocity[0]
+    assert np.allclose(cross, 0.0), "drift keeps its direction"
+    assert np.median(ti) == pytest.approx(cov.ti() * math.exp(-0.5 * 0.8**2), rel=0.35)
+    assert np.log(ti).std() == pytest.approx(0.8, rel=0.25)
+    assert abs(np.corrcoef(ti[:-1], ti[1:])[0, 1]) < 0.2, "each frame an independent sample"
+    assert (stim.path(0)[0] == 0).all()

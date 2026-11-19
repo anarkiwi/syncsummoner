@@ -1,7 +1,9 @@
 """A synthetic moving picture whose motion is known on every frame, made from a seed and nothing stored.
 
-Each shot is a tileable band-limited colour noise texture under drift, spin and zoom whose rates swing
-frame to frame, a scrambled Sobol point over :class:`Coverage`; frame ``k`` depends on seed, raster, ``k``.
+Each shot is a tileable band-limited colour noise texture under drift, spin and zoom, a scrambled Sobol
+point over :class:`Coverage`. Each frame's motion is scaled to a TI drawn afresh for it, so the picture's
+TI is white about one level and every frame is an independent sample for the follow test; frame ``k``
+depends on seed, raster and ``k``.
 """
 
 from __future__ import annotations
@@ -19,8 +21,8 @@ from syncsummoner.progress import track
 #: BT.709 luma weights, for the colour each shot's chroma is built around.
 KR, KB = 0.2126, 0.0722
 #: Sobol dimensions a shot draws: speed, direction, spin, zoom, wavelength, contrast, level, hue, saturation,
-#: and how far and how smoothly its rates swing.
-DIMS = 11
+#: and how far its TI swings frame to frame.
+DIMS = 10
 #: Points in one cached block of a seed's Sobol sequence.
 BLOCK = 1024
 
@@ -29,9 +31,10 @@ BLOCK = 1024
 class Coverage:
     """The ranges shots are drawn over, each ``(low, high)``, scales log-uniform.
 
-    ``speed`` is drift in pixels a frame, ``spin`` radians and ``zoom`` log scale a frame either way,
-    ``wavelength`` the texture's in pixels, ``swing`` the log-rate deviation and ``smooth`` its frame-to-frame
-    correlation; the rest are fractions of full scale.
+    ``speed`` is drift in pixels a frame, ``spin`` radians and ``zoom`` log scale a frame either way:
+    together a shot's mix of motion, which each frame scales to its TI. That TI is log-normal about the
+    one the median drift gives the median texture (:meth:`ti`), ``swing`` its log deviation.
+    ``wavelength`` is the texture's in pixels; the rest are fractions of full scale.
     """
 
     speed: tuple[float, float] = (0.25, 48.0)
@@ -41,13 +44,17 @@ class Coverage:
     contrast: tuple[float, float] = (0.1, 0.5)
     level: tuple[float, float] = (0.2, 0.8)
     saturation: tuple[float, float] = (0.0, 0.3)
-    swing: tuple[float, float] = (0.0, 1.5)
-    smooth: tuple[float, float] = (0.0, 0.95)
+    swing: tuple[float, float] = (0.25, 1.5)
+
+    def ti(self) -> float:
+        """The TI frames swing about: the median speed's drift over the median wavelength and contrast."""
+        speed, wavelength = math.sqrt(self.speed[0] * self.speed[1]), math.sqrt(math.prod(self.wavelength))
+        return _ti_scale(sum(self.contrast) / 2, gradient_rms(wavelength)) * speed
 
 
 @dataclass(frozen=True)
 class Shot:
-    """One shot's texture, and its motion: base rates each swung by a seeded log-normal AR(1) a frame."""
+    """One shot's texture, and its motion: a mix of rates scaled each frame to a TI drawn about ``ti``."""
 
     velocity: tuple[float, float]
     spin: float
@@ -58,7 +65,7 @@ class Shot:
     hue: float
     saturation: float
     swing: float
-    smooth: float
+    ti: float
     seed: int
 
 
@@ -99,7 +106,7 @@ class Stimulus:
             hue=float(u[7]),
             saturation=_span(cov.saturation, u[8]),
             swing=_span(cov.swing, u[9]),
-            smooth=_span(cov.smooth, u[10]),
+            ti=cov.ti(),
             seed=int(np.random.SeedSequence([self.seed, k % (1 << 32)]).generate_state(1)[0]),
         )
 
@@ -109,7 +116,7 @@ class Stimulus:
 
     def path(self, k: int) -> np.ndarray:
         """Shot ``k``'s motion before each frame: ``(shot_frames, 4)`` of x, y, angle and log zoom."""
-        return _path(self.shot(k), self.shot_frames)
+        return _path(self.shot(k), self.shot_frames, (self.width, self.height), self.texture)
 
     def transform(self, index: int) -> np.ndarray:
         """The 2x3 affine taking frame ``index``'s pixel ``(x, y, 1)`` to its point on the shot's texture."""
@@ -153,21 +160,45 @@ class Stimulus:
             yield self.frame(index)
 
 
-@lru_cache(maxsize=64)
-def _path(shot: Shot, frames: int) -> np.ndarray:
-    """Accumulated drift, spin and zoom before each frame, each rate its base times ``exp(swing * a_t)``.
+def _ti_scale(contrast: float, gradient: float) -> float:
+    """TI, in luma levels, of a texture-space displacement of one pixel over the whole frame.
 
-    ``a_t`` is a unit-variance AR(1) with lag-one correlation ``smooth``, one per rate, from the shot's seed.
+    Luma is ``level + contrast * F / 3`` of full scale, so a displacement ``d`` moves it by
+    ``255 * contrast / 3 * (grad F . d)``, whose spread over an isotropic ``F`` is ``gradient / sqrt(2)``.
+    """
+    return 255.0 * contrast / 3.0 * gradient / math.sqrt(2.0)
+
+
+@lru_cache(maxsize=256)
+def gradient_rms(wavelength: float, size: int = 1024) -> float:
+    """RMS gradient, per pixel, of the unit-variance noise band :func:`_texture` makes at ``wavelength``."""
+    f = np.hypot(*np.meshgrid(np.fft.fftfreq(size), np.fft.fftfreq(size), indexing="ij"))
+    power = np.exp(-0.5 * np.log2(np.maximum(f, 1.0 / size) * wavelength) ** 2) ** 2
+    power[0, 0] = 0.0
+    return float(2 * math.pi * math.sqrt((f**2 * power).sum() / power.sum()))
+
+
+@lru_cache(maxsize=64)
+def _path(shot: Shot, frames: int, raster: tuple[int, int], texture: int) -> np.ndarray:
+    """Accumulated drift, spin and zoom before each frame, each frame's step the shot's mix of rates
+    scaled to a TI of ``shot.ti * exp(swing * z - swing**2 / 2)``, ``z`` standard normal a frame.
+
+    A step moves texture points by the drift, plus the spin and zoom times their distance from the
+    centre in texture pixels, so its RMS over the raster is ``sqrt(|v|^2 + (w^2 + z^2) s^2 r^2)``, ``s`` the
+    scale then and ``r^2`` the raster's mean square radius (:func:`_ti_scale` turns it to TI).
     """
     rng = np.random.default_rng(shot.seed)
-    shocks = rng.standard_normal((frames, 3))
-    a = np.empty_like(shocks)
-    a[0] = shocks[0]
-    for t in range(1, frames):
-        a[t] = shot.smooth * a[t - 1] + math.sqrt(1.0 - shot.smooth**2) * shocks[t]
-    rate = np.exp(shot.swing * a - 0.5 * shot.swing**2)
-    steps = np.c_[rate[:, :1] * np.asarray(shot.velocity), rate[:, 1] * shot.spin, rate[:, 2] * shot.zoom]
-    return np.vstack([np.zeros(4), np.cumsum(steps, axis=0)[:-1]])
+    target = shot.ti * np.exp(shot.swing * rng.standard_normal(frames) - 0.5 * shot.swing**2)
+    per_pixel = _ti_scale(shot.contrast, gradient_rms(shot.wavelength, texture))
+    radius2 = (raster[0] ** 2 + raster[1] ** 2) / 12.0
+    drift2, turn2 = float(np.hypot(*shot.velocity)) ** 2, shot.spin**2 + shot.zoom**2
+    out = np.zeros((frames, 4))
+    for t in range(frames - 1):
+        scale2 = math.exp(-2.0 * out[t, 3])
+        rms = math.sqrt(drift2 + turn2 * scale2 * radius2) * per_pixel
+        k = target[t] / rms if rms > 0 else 0.0
+        out[t + 1] = out[t] + k * np.array([*shot.velocity, shot.spin, shot.zoom])
+    return out
 
 
 def _sobol(seed: int, k: int) -> np.ndarray:
