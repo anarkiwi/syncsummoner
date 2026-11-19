@@ -226,7 +226,19 @@ ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi 
 ss probe sweep collect sweep/sweep-NAME.json --chunk K   # judge it, keep its archive rows
 ss probe sweep collect sweep/sweep-NAME.json --chunk K --hold holds/hold-NAME.json   # waiting the settle a probe hold measured
 ss probe sweep commit sweep/sweep-NAME.json --archive archive/
+ss probe doctor ARCHIVE_DIR [--plans FILE] [--rate-bytes-s X] [--floor-bytes Y] [--json]   # before starting or resuming
 ```
+
+`probe doctor ARCHIVE_DIR` is the check to run before starting or resuming an archive: offline, in
+seconds, it reads the plans `ARCHIVE_DIR/plans.txt` lists (or `--plans`) and what the takes left, and
+exits 0 only if every check passes. It checks the plans parse and all play one existing clip, on that
+clip's shots when it is synthetic (`regions.shot_frames` against its `.stimulus.json`); that each
+`holds/hold-*.json` names the clip it was measured on, and is that clip; that the plans without a
+`logs/done-<slug>` marker fit the free disk above `--floor-bytes` at the write rate the takes so far
+measure (`--rate-bytes-s` before any take); the rig hours left; the faults `logs/faults.tsv` and the
+takes' `.meta.json` attempts filed, by message (a changed CC map among them); each single-segment take's
+capture rate against the Pi's flips, to within one capture period over the take; and that every
+captured take has its `.rows.parquet`, so a collect that failed silently shows.
 
 `probe timecode --synthetic SEED` makes the clip from the synthetic stimulus, every frame moving, its
 spec kept beside it (`clip.mkv.stimulus.json`) so any frame and its flow can be made again; footage
