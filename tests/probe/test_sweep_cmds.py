@@ -335,6 +335,8 @@ def test_timecode_makes_a_synthetic_stimulus_clip_and_keeps_its_spec(tmp_path, m
     assert json.loads((tmp_path / "c.mkv.stimulus.json").read_text())["stimulus"]["seed"] == 7
     with pytest.raises(SystemExit, match="not both"):
         cli.main(["probe", "timecode", "f.mkv", "--synthetic", "7", "--out", str(out)])
+
+
 def test_a_setpoint_moving_several_slots_writes_one_a_frame_and_holds_after_the_last():
     states = np.zeros((3, 12), dtype=np.int64)
     states[1, [0, 3, 5]] = [10, 20, 30]
