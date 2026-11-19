@@ -56,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
-        black pylint pytest pytest-cov pytest-xdist import-linter \
+        black pylint pytest pytest-cov pytest-xdist pytest-timeout import-linter \
     && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
@@ -66,7 +66,7 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
 FROM base AS deps-aesthetics
 COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
-        pytest pytest-cov pytest-xdist \
+        pytest pytest-cov pytest-xdist pytest-timeout \
     && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9"
 
