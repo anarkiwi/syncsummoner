@@ -311,3 +311,24 @@ def test_smoke_toggles_one_parameter_captures_it_and_lands_it_from_the_wire(tmp_
     assert captured["said"]["program"] == "p" and chunk.frames == 16
     said = capsys.readouterr().out
     assert "by 50..50" in said and "device [58, 58], clip 8..8" in said
+
+
+def test_timecode_makes_a_synthetic_stimulus_clip_and_keeps_its_spec(tmp_path, monkeypatch):
+    made = {}
+
+    def write(source, _out, *, lead, tail, seconds=None, **_kw):
+        made.update(source=source, seconds=seconds, lead=lead, tail=tail)
+        return 90
+
+    monkeypatch.setattr(timecode, "write_timecoded", write)
+    out = tmp_path / "c.mkv"
+    assert (
+        cli.main(
+            ["--stall", "40", "probe", "timecode", "--synthetic", "7", "--seconds", "3", "--out", str(out)]
+        )
+        == 0
+    )
+    assert made["source"].seed == 7 and made["seconds"] == 3.0
+    assert json.loads((tmp_path / "c.mkv.stimulus.json").read_text())["stimulus"]["seed"] == 7
+    with pytest.raises(SystemExit, match="not both"):
+        cli.main(["probe", "timecode", "f.mkv", "--synthetic", "7", "--out", str(out)])

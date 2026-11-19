@@ -18,6 +18,7 @@ from syncsummoner.compose import lock as L
 from syncsummoner.compose import render as R
 from syncsummoner.compose import timecode as T
 from syncsummoner.compose.features import read_frames
+from syncsummoner.compose.stimulus import Stimulus
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import read_timecode
 
@@ -293,3 +294,27 @@ def test_the_default_cache_is_named_by_the_environment(monkeypatch, tmp_path):
     monkeypatch.delenv("SYNCSUMMONER_TIMECODE_CACHE")
     monkeypatch.chdir(tmp_path)
     assert T.timecode_cache() == (tmp_path / ".timecode-cache").resolve()
+
+
+def test_a_stimulus_is_stamped_frame_by_frame_and_its_lead_in_and_out_move(encoded, tmp_path):
+    stim = Stimulus(seed=3, width=CONFIG.width, height=CONFIG.height, shot_frames=4, texture=64)
+    clip = R.write_timecoded(
+        stim, tmp_path / "tc.mkv", config=CONFIG, lead=3, tail=2, seconds=0.2, cache=tmp_path
+    )
+    assert clip == 6 and len(encoded) == 3 + 6 + 2
+    codes = [read_timecode(f / 255.0, bits=CONFIG.bits, strip_px=CONFIG.strip_px) for f in encoded]
+    assert codes == [65533, 65534, 65535] + list(range(8))
+    body = [f[: -CONFIG.strip_px] for f in encoded]
+    assert all((body[k] != body[k + 1]).any() for k in range(len(body) - 1)), "every frame moves, leads too"
+    assert (body[0] == stim.frame(-3)[: -CONFIG.strip_px]).all()
+
+
+def test_a_stimulus_needs_a_length_and_keys_by_its_spec(tmp_path):
+    stim = Stimulus(seed=3, width=CONFIG.width, height=CONFIG.height)
+    with pytest.raises(ValueError, match="give seconds"):
+        R.write_timecoded(stim, tmp_path / "tc.mkv", config=CONFIG, lead=0, tail=0, cache=tmp_path)
+    keys = {
+        T.timecode_key(s, CONFIG, seconds=1.0, start=0.0, lead=0, tail=0)
+        for s in (stim, stim, Stimulus(seed=4, width=CONFIG.width, height=CONFIG.height))
+    }
+    assert len(keys) == 2

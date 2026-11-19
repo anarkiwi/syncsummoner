@@ -216,7 +216,7 @@ measure what each keeps of real footage, archive against the timecoded clip a
 render plays, as frame-locked takes ([evidence.md](evidence.md)):
 
 ```sh
-ss --stall 40 probe timecode footage.mkv --out clip.mkv --latency sweep/   # the clip every take plays
+ss --stall 40 probe timecode --synthetic 1 --seconds 351 --out clip.mkv   # the clip every take plays
 ss probe hold takes/take-*.mkv --source clip.mkv --out holds/      # settle and hold per program
 ss probe sweep regions NAME --cover cover-NAME.json --hold holds/hold-NAME.json --source clip.mkv \
   --audio track.m4a --takes sweep/ --budget-s 1500 [--joint 11:6] [--seed N]
@@ -228,7 +228,9 @@ ss probe sweep collect sweep/sweep-NAME.json --chunk K --hold holds/hold-NAME.js
 ss probe sweep commit sweep/sweep-NAME.json --archive archive/
 ```
 
-`probe timecode` writes the clip a sweep's sessions play, its lead-in and lead-out each sized to
+`probe timecode --synthetic SEED` makes the clip from the synthetic stimulus, every frame moving, its
+spec kept beside it (`clip.mkv.stimulus.json`) so any frame and its flow can be made again; footage
+can still be given instead. `probe timecode` writes the clip a sweep's sessions play, its lead-in and lead-out each sized to
 hold, with no dry control, a load as long as the device stall guard lets a wait run (`--stall`, else
 the longest load timed on the rig), so no load the rig lets through outgrows the clip. `probe sweep capture` runs
 under the same guard.

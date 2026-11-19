@@ -122,7 +122,7 @@ you. Minimum set:
 | `noise_1f` | behaviour on natural-statistics input |
 | `flat_grey`, `black` | noise floor; self-oscillation in feedback programs |
 | `motion_ball` | trajectory with a hard impact point — temporal response |
-| `natural_clip` | a timecoded excerpt of real footage, looped by the player for a whole archive run; programs behave differently on camera sources, and only real footage shows what a program keeps of its input (§9) |
+| `stimulus` | the archive's moving picture, made from a seed (`compose.stimulus`): shots of band-limited colour noise under known drift, spin and zoom, their texture scale, contrast, level and colour spanning set ranges, so what a program keeps of its input is measured against motion known on every frame, lead-in and lead-out included (§9) |
 
 ### 3.2 Frame identification
 
