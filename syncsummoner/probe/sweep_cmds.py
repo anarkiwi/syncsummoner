@@ -424,6 +424,9 @@ def _add_smoke(sweep_sub: Any) -> Any:
     smoke.add_argument("--out", required=True, help="where the plan and take go")
     smoke.add_argument("--source-host", help="ssh target driving playout and the HDMI link")
     smoke.set_defaults(func=_smoke_cmd)
+    restagger = sweep_sub.add_parser("restagger", help="spread each setpoint's writes one a frame in plans")
+    restagger.add_argument("plans", nargs="+")
+    restagger.set_defaults(func=_restagger_cmd)
     return smoke
 
 
@@ -478,9 +481,6 @@ def add_parsers(probe_sub: Any) -> None:
     regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")
     regions.set_defaults(func=_sweep_regions_cmd)
     smoke = _add_smoke(sweep_sub)
-    restagger = sweep_sub.add_parser("restagger", help="spread each setpoint's writes one a frame in plans")
-    restagger.add_argument("plans", nargs="+")
-    restagger.set_defaults(func=_restagger_cmd)
     run = sweep_sub.add_parser(
         "capture", help="capture a plan's takes back to back on the rig, its program loaded once"
     )
