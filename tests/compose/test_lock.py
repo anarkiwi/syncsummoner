@@ -107,6 +107,22 @@ def test_a_strip_less_run_after_an_outage_is_numbered_through_the_pis_lag():
     assert played.shows(found.picked) and found.drops == 50
 
 
+@pytest.mark.parametrize("moved_ns", [3_200_000, -8_000_000])
+def test_a_strip_less_run_is_numbered_though_the_relock_moved_its_lag(moved_ns):
+    """A link cycle moves the Pi's lag by a fraction of a frame; whole-frame shifts move it by frames."""
+    played = take(
+        ((0, 299, 0.2), (400, 23999, 0.7, 50)),
+        ppm=-50.0,
+        jitter_ns=500_000,
+        wet=(1200, 11700),
+        kink=(190, moved_ns),
+        **FULL,
+    )
+    found = attribute(played)
+    assert found.runs == 2 and found.shown.tolist() == played.shown().tolist()
+    assert played.shows(found.picked)
+
+
 def test_strips_a_program_delays_off_the_pis_lag_do_not_number_their_run():
     played = take(((0, 299, 0.2), (400, 23999, 0.7, 50)), ppm=-50.0, wet=(300, 11700), **FULL)
     codes = played.codes.copy()
