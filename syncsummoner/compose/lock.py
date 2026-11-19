@@ -515,24 +515,35 @@ def _lag(line: frameline.Line, shown_at: np.ndarray, rate: float) -> tuple[float
 def _bridge(
     line: frameline.Line, lag: tuple[float, float], rate: float, shown_at: np.ndarray
 ) -> frameline.Line:
-    """A run with no strip, counted from 0, renumbered by the one shift whose Pi lag meets ``lag``."""
+    """A run with no strip, counted from 0, renumbered by the one shift whose Pi lag meets ``lag``.
+
+    A link cycle restarts the Pi on a vblank grid of a new phase and the device relocks to it, so the lag
+    can move by under half a frame across the outage while shifts move it by whole frames: where no
+    shift meets ``lag``, the one nearest it, within half a frame, is the run's.
+    """
     lo, hi = lag
     ok = line.frame >= 0
     span = np.arange(line.frame[ok].min(), line.frame[ok].max() + 1)
     least, most = line.polygon.at(span)
     up = np.flatnonzero(np.isfinite(shown_at))
     centre = int(up[np.argmin(np.abs(rate * shown_at[up] + 0.5 * (lo + hi) - 0.5 * (least[0] + most[0])))])
-    shifts = []
+    misses = {}
     for shift in range(centre - int(span[0]) - 1, centre - int(span[0]) + 2):
         n = span + shift
         inside = (n >= 0) & (n < shown_at.size)
         inside[inside] = np.isfinite(shown_at[n[inside]])
         p = rate * shown_at[n[inside]]
-        if inside.any() and np.max(least[inside] - p) <= hi and np.min(most[inside] - p) > lo:
-            shifts.append(shift)
-    if len(shifts) != 1:
-        raise LockError(f"the Pi's flip log numbers a run with no strip {len(shifts)} ways across its outage")
-    shift = shifts[0]
+        if inside.any():
+            misses[shift] = max(
+                float(np.max(least[inside] - p)) - hi, lo - float(np.min(most[inside] - p)), 0.0
+            )
+    near = [shift for shift, miss in misses.items() if miss == 0.0]
+    if not near:
+        best = min(misses.values(), default=np.inf)
+        near = [shift for shift, miss in misses.items() if miss == best < line.period / 2]
+    if len(near) != 1:
+        raise LockError(f"the Pi's flip log numbers a run with no strip {len(near)} ways across its outage")
+    shift = near[0]
     return frameline.Line(
         origin=line.origin - shift * line.period,
         period=line.period,
