@@ -24,6 +24,7 @@ import numpy as np
 from syncsummoner.device.profile import PARAM_COUNT
 from syncsummoner.device.stored import captures
 from syncsummoner.device.v4l2rec import sidecar
+from syncsummoner.probe.chroma import SWAP
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import ProgramKey, atomic_write, slug, temp_sibling
 
@@ -49,9 +50,10 @@ __all__ = [
     "stimulus_of",
 ]
 
-#: 4 names its stimulus (3 played the codeframe loop); 3 put the chroma pair back, 1 and 2 swapped it.
-ARCHIVE_SCHEMA_VERSION = 4
-READABLE_SCHEMAS = frozenset({3, ARCHIVE_SCHEMA_VERSION})
+#: 5 played its stimulus with red and blue in RG16's order, 4 and before exchanged them; 4 names its
+#: stimulus (3 played the codeframe loop).
+ARCHIVE_SCHEMA_VERSION = 5
+READABLE_SCHEMAS = frozenset({3, 4, ARCHIVE_SCHEMA_VERSION})
 #: Metadata key naming what was played while an archive was recorded.
 STIMULUS = "stimulus"
 CODEFRAMES = {"kind": "codeframes"}
@@ -66,12 +68,14 @@ LISTING_HEADER = "ffconcat version 1.0"
 DARK_SUFFIX = ".dark.json"
 #: Setpoint of a frame captured between setpoints, kept for continuity but not measured.
 GAP = -1
-#: What the card is asked for; the recorder swaps the chroma pair back before encoding.
+#: What the card is asked for.
 CAPTURE_PIX_FMT = "yuyv422"
 #: The card's own compressed stream, as a locked take records it.
 MJPEG_PIX_FMT = "mjpeg"
 #: Card formats an archive may hold.
 CAPTURE_PIX_FMTS = frozenset({CAPTURE_PIX_FMT, MJPEG_PIX_FMT})
+#: Metadata key saying the archive's chroma pair came back exchanged and is read put back.
+EXCHANGED = "chroma_exchanged"
 #: Metadata key holding the device's own ``program info`` reply for the archived program.
 PROGRAM_INFO = "program_info"
 #: Planar 4:2:2 is the same samples deinterleaved into the canonical plane order.
@@ -164,6 +168,18 @@ def listing(parts: Sequence[str], durations: Sequence[str]) -> str:
     """An ffconcat listing of ``parts`` by relative name, each with its duration so the whole is seekable."""
     body = "".join(f"file '{name}'\nduration {span}\n" for name, span in zip(parts, durations))
     return f"{LISTING_HEADER}\n{body}"
+
+
+def one_order(program: str, exchanged: Sequence[bool] | None) -> bool | None:
+    """Whether every recording of ``program`` came back with its chroma pair exchanged; None when unsaid.
+
+    Parts read as one stream share one order, so recordings that disagree are refused.
+    """
+    if exchanged is None:
+        return None
+    if len(set(exchanged)) > 1:
+        raise ArchiveError(f"{program!r}: its takes' chroma pairs disagree; capture them in one session")
+    return bool(exchanged and exchanged[0])
 
 
 @dataclass(frozen=True)
@@ -282,9 +298,9 @@ class FrameReader:
             ]
         )
         self._hwaccel = DECODERS[decode]
-        self._download = (
+        self._prefix = (
             f"hwdownload,format={self.meta.get('stored_pix_fmt', STORED_PIX_FMT)}," if self._hwaccel else ""
-        )
+        ) + (f"{SWAP}," if self.meta.get(EXCHANGED) else "")
 
     @property
     def count(self) -> int:
@@ -313,8 +329,8 @@ class FrameReader:
         if source is None:
             source = ["-ss", f"{max(0.0, start - 0.5) / self.fps:.6f}", "-i", str(self.video)]
         argv = [*self._head(), *source, "-frames:v", str(int(count))]
-        if self._download or (width and width < self.width):
-            argv += ["-vf", self._download + self._scale(width)]
+        if self._prefix or (width and width < self.width):
+            argv += ["-vf", self._prefix + self._scale(width)]
         return argv + [*_RAW_OUT, "pipe:1"]
 
     def _head(self) -> list[str]:
@@ -353,7 +369,7 @@ class FrameReader:
         body = (f"crop=iw:ih-{crop}:0:0," if crop else "") + self._scale(width)
         heads = "".join(f"[o{i}]" for i in range(len(sides) + 1))
         graph = (
-            f"[0:v]{self._download}" + (f"split={len(sides) + 1}{heads};[o0]" if sides else "") + f"{body}[s]"
+            f"[0:v]{self._prefix}" + (f"split={len(sides) + 1}{heads};[o0]" if sides else "") + f"{body}[s]"
         )
         graph += "".join(f";[o{i + 1}]{chain}[x{i}]" for i, (chain, _) in enumerate(sides))
         # pylint: disable-next=contextmanager-generator-missing-cleanup
@@ -597,6 +613,7 @@ class FrameArchive:
         stimulus: Mapping[str, Any] | None = None,
         schedule: Sequence[Mapping[str, Any]] | None = None,
         pix_fmt: str = CAPTURE_PIX_FMT,
+        exchanged: Sequence[bool] | None = None,
     ) -> dict[str, Any]:
         """Publish a recording as this program's archive: video, sidecar, then marker.
 
@@ -608,11 +625,13 @@ class FrameArchive:
         ``program_info`` is the device's reply for the program, kept so a refit
         knows each parameter's name and native range, and ``stimulus`` names what was
         played; ``schedule`` lists each setpoint with the full state it was stepped from, and
-        ``pix_fmt`` names the card format recorded, raw (FFV1) or the card's MJPEG.
+        ``pix_fmt`` names the card format recorded, raw (FFV1) or the card's MJPEG; ``exchanged`` says
+        per recording whether its chroma pair came back exchanged, which every part must agree on.
         A committed archive supersedes any earlier dark verdict for the program.
         """
         if not rows:
             raise ArchiveError(f"no frames archived for {program!r}")
+        swap = one_order(program, exchanged)
         if len(rows) != len({row.frame for row in rows}):
             raise ArchiveError(f"{program!r} has repeated frame indices in its sidecar")
         for row in rows:
@@ -667,6 +686,8 @@ class FrameArchive:
             meta["schedule"] = [dict(entry) for entry in schedule]
         if sources is not None:
             meta["parts"] = [p.name for p in parts]
+        if swap is not None:
+            meta[EXCHANGED] = swap
         self._write_meta(meta_path, meta)
         for path in stale - set(self.files(program, meta)):
             path.unlink(missing_ok=True)

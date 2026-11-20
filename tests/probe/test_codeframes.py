@@ -28,7 +28,7 @@ def loop_fixture():
 def chain(frame, seed=5, noise=0.004):
     """Model the playout chain: limited range, 565 quantisation, capture noise."""
     words = np.frombuffer(playout.to_fb565(frame), "<u2").reshape(frame.shape[:2])
-    levels = np.stack([words & 31, (words >> 5) & 63, (words >> 11) & 31], -1) / playout.LEVELS
+    levels = np.stack([(words >> 11) & 31, (words >> 5) & 63, words & 31], -1) / playout.LEVELS
     noisy = levels + np.random.default_rng(seed).normal(0.0, noise, levels.shape)
     return np.clip(noisy, 0.0, 1.0).astype(np.float32)
 

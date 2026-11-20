@@ -11,6 +11,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from syncsummoner.compose.chroma import swapped
 from syncsummoner.device.stored import Stored, captures
 from syncsummoner.progress import stage
 
@@ -88,6 +89,8 @@ def master_command(
     stays where the device put it, with nothing resampled.
     """
     video_chain, audio_chain = fade_filters(duration, fade_in=fade_in, fade_out=fade_out)
+    for swap in swapped(take):
+        video_chain = f"{swap},{video_chain}" if video_chain else swap
     if strip_px > 0:
         blank = f"crop=iw:ih-{strip_px}:0:0,pad=iw:ih+{strip_px}:0:0:black"
         video_chain = f"{blank},{video_chain}" if video_chain else blank

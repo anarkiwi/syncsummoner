@@ -19,6 +19,7 @@ from syncsummoner.device.profile import PARAM_COUNT, snap_toggles
 from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameRow
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import atomic_write
+from syncsummoner.progress import LOG
 from syncsummoner.program.gates import tour
 
 __all__ = [
@@ -390,6 +391,8 @@ def commit_sweep(
             FrameRow.from_row({**r, "frame": int(r["frame"]) + offset})
             for r in load_measurements(rows_path(take))
         ]
+    from syncsummoner.compose.chroma import exchanged  # pylint: disable=import-outside-toplevel
+
     states = np.concatenate([c.states for c in chunks])
     return archive.commit(
         program,
@@ -406,6 +409,7 @@ def commit_sweep(
             for k in range(len(states))
         ],
         pix_fmt=MJPEG_PIX_FMT,
+        exchanged=[exchanged(take) for take in takes],
     )
 
 
@@ -492,8 +496,26 @@ def capture(
         mine["frames_lost_by_driver"] = lost
         if lost:
             mine.setdefault("fault", f"TakeFaultError: the capture driver lost {lost} frames")
+        if "fault" not in mine:
+            mine.update(chroma_record(out, clip, config))
         said.append(mine)
     return said
+
+
+def chroma_record(take: str | Path, clip: str | Path, config: Any) -> dict:
+    """A captured take's dry lead-in channel order, kept beside it, for its attempt record.
+
+    A program whose output drops active video packs its chroma afresh on every load, so a session can come
+    back exchanged; it is read back put right (:func:`~syncsummoner.compose.chroma.swapped`), not recaptured.
+    """
+    from syncsummoner.compose import chroma  # pylint: disable=import-outside-toplevel
+
+    said = chroma.judge(take, clip, config)
+    if "error" in said:
+        LOG.warning("%s: no channel order from the lead-in: %s", take, said["error"])
+    elif said["judged"] and not said["ok"]:
+        LOG.warning("%s: the dry lead-in came back %s; it is read with %s", take, said["order"], chroma.SWAP)
+    return {"chroma": said}
 
 
 def collect(

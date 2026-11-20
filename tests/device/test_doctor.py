@@ -18,6 +18,7 @@ from syncsummoner.device.doctor import Doctor, Format
 from syncsummoner.device.host import HostCommandError
 from syncsummoner.device.recorder import MJPEG, RecorderError
 from syncsummoner.device.transport import ProgramInfo, Transport
+from syncsummoner.probe.chroma import TO_YUV, order_of
 from syncsummoner.probe.patterns import generate
 from syncsummoner.program.vmprog import ControlMode
 from tests.declared import config, decl, toggle
@@ -357,6 +358,12 @@ def swap_rb(frame):
     return np.ascontiguousarray(frame[:, :, ::-1])
 
 
+def exchange_uv(frame):
+    """The frame with its chroma pair exchanged, as a YVYU read of YUYV bytes gives it."""
+    yuv = frame @ TO_YUV.T
+    return np.clip(yuv[:, :, [0, 2, 1]] @ np.linalg.inv(TO_YUV).T, 0.0, 1.0).astype(np.float32)
+
+
 @pytest.fixture
 def captured(monkeypatch):
     """Serve the pushed frame back through ``shape`` in place of decoding a take."""
@@ -377,6 +384,7 @@ def test_loop_passes_on_a_clean_chain(rig, captured):
     found = by_check(doc.run(loop=True))
     assert found["loop.signal"].ok and found["loop.index"].ok and found["loop.bars"].ok
     assert found["loop.bars"].detail == "bars read white yellow cyan green magenta red blue"
+    assert found["loop.chroma"].ok and found["loop.chroma"].detail.startswith("chroma field reads as played")
     assert doc.dev.shell.loads == ["Passthru"]
     assert doc.player.fps == FMT.fps and not doc.player.playing
     assert doc._link.calls[:2] == ["down", "up"]  # pylint: disable=protected-access
@@ -389,6 +397,26 @@ def test_loop_catches_a_red_blue_swap_at_any_gain(rig, captured):
     assert found["loop.index"].ok
     assert not found["loop.bars"].ok
     assert found["loop.bars"].detail == "bars read white cyan yellow green magenta blue red"
+    assert not found["loop.chroma"].ok and "reads red and blue exchanged" in found["loop.chroma"].detail
+    assert "RG16" in found["loop.chroma"].fix
+
+
+def test_loop_tells_an_exchanged_chroma_pair_from_a_red_blue_swap(rig, captured):
+    """Both read the bars alike, so only the chroma field names which one the chain did."""
+    doc = rig()
+    captured(doc, exchange_uv)
+    found = by_check(doc.loop(Transport(doc.dev, DECLARED)))
+    assert found["loop.index"].ok and not found["loop.bars"].ok
+    assert not found["loop.chroma"].ok and "reads chroma exchanged" in found["loop.chroma"].detail
+    assert "YVYU" in found["loop.chroma"].fix
+
+
+def test_the_chroma_field_sits_below_the_bars_and_reads_as_played():
+    still = dr.with_field(generate("smpte_bars", width=320, height=180, rng=None))
+    bars = generate("smpte_bars", width=320, height=180, rng=None)
+    assert np.array_equal(dr.bar_channels(still), dr.bar_channels(bars))
+    assert order_of(dr.field_yuv(still), dr.field_yuv(still)).order == "as played"
+    assert dr.field_yuv(still).shape == (1, 3, dr.FIELD_SIZE[1], dr.FIELD_SIZE[0])
 
 
 def test_loop_reports_a_stale_frame(rig, captured):
@@ -450,13 +478,13 @@ def test_bar_channels_is_gain_and_pedestal_free():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
-def test_last_frame_puts_the_cards_chroma_exchange_back(tmp_path):
+def test_last_frame_reads_the_take_as_recorded(tmp_path):
     width, height = 320, 180
     bars = generate("smpte_bars", width=width, height=height, rng=None)
     take = tmp_path / "take.mkv"
     raw = (bars * 255).astype(np.uint8).tobytes()
     argv = ["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"]
-    argv += ["-s", f"{width}x{height}", "-r", "30", "-i", "-", "-vf", "swapuv", "-c:v", "mjpeg"]
+    argv += ["-s", f"{width}x{height}", "-r", "30", "-i", "-", "-c:v", "mjpeg"]
     subprocess.run(argv + ["-q:v", "2", str(take)], input=raw * 30, check=True)
     frame = dr.last_frame(take, width, height)
     assert dr.bar_names(dr.bar_channels(frame)) == dr.bar_names(dr.bar_channels(bars))

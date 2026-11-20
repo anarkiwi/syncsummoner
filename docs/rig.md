@@ -104,6 +104,7 @@ the fix:
 | `midi.latency` | pyvmancer's single CC write to serial readback median is within two output frames plus the readback round trip |
 | `midi.backlog` | paced ramps at each `--latency-rates` leave a sentinel no more than a frame behind a single write; the fix names the fastest clean rate |
 | `loop.signal`, `loop.index`, `loop.bars` | a still shown by `LoopPlayer.show`: the HDMI transmitter drives `--format` and the capture is not a uniform field; the strip decodes to the pushed index; SMPTE bars read in order, so a red/blue swap fails |
+| `loop.chroma` | the chroma field below the bars reads as played, not red and blue exchanged (the Pi's 565 packing) or chroma exchanged (a YVYU decode or `swapuv`) |
 
 `--latency` writes CC offsets to the measured parameters, then restores them
 (`midi.restored` fails if they did not read back). By default it measures the

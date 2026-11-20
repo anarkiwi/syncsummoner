@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
+import cv2
 import numpy as np
 from pyvmancer.const import ROUTE_HDMI_IN
 from pyvmancer.const import ParamKind as Control
@@ -22,6 +23,7 @@ from pyvmancer.diagnose import Finding, diagnose, diagnose_latency
 from pyvmancer.errors import PortBusyError, VmancerError
 from pyvmancer.latency import DEFAULT_RATES, measure_latency
 
+from syncsummoner.probe.chroma import AS_PLAYED, TO_YUV, order_of, to_yuv
 from syncsummoner.probe.patterns import generate, read_state_index, state_index_capacity, with_state_index
 from syncsummoner.progress import LOG, stage
 
@@ -55,6 +57,10 @@ BAR_NAMES = {
     (0, 0, 0): "black",
 }
 SMPTE_BARS = 7
+#: Rows of the loop still below the bars that carry :func:`chroma_field`, as fractions of its height.
+FIELD_ROWS = (0.55, 0.95)
+#: Size the field is compared at, area-averaged so the 565 dither and 4:2:2 sampling average out.
+FIELD_SIZE = (96, 24)
 KMS_CRTC = re.compile(r"Crtc \d+ \(\d+\) (\d+)x(\d+)@([\d.]+)")
 V4L2_FORMAT = re.compile(r"(?:Compressed|Raw)\s*:\s*(\S+)\s*:.* : ([\dx ]+)$")
 
@@ -120,16 +126,39 @@ def bar_names(channels: np.ndarray) -> list[str]:
     return [BAR_NAMES[tuple(int(v) for v in carried)] for carried in channels]
 
 
-def last_frame(path: str | Path, width: int, height: int, *, ffmpeg: str = "ffmpeg") -> np.ndarray | None:
-    """A frame from the end of an MJPEG take, as RGB float32 in ``[0, 1]``.
+def chroma_field(width: int, height: int) -> np.ndarray:
+    """RGB in ``[0, 1]`` whose U follows x, V and luma follow y: each channel order reads differently.
 
-    The card's chroma pair arrives exchanged in MJPEG too, so it is put back here
-    as the archive recorder does, before any colour is read.
+    Exchanging the chroma pair turns U's gradient vertical; exchanging red and blue adds U to luma.
     """
+    x = np.linspace(-1.0, 1.0, width)[None, :].repeat(height, 0)
+    y = np.linspace(-1.0, 1.0, height)[:, None].repeat(width, 1)
+    yuv = np.stack([0.45 + 0.1 * y, 0.25 * x, 0.25 * y], -1)
+    return np.clip(yuv @ np.linalg.inv(TO_YUV).T, 0.0, 1.0).astype(np.float32)
+
+
+def with_field(frame: np.ndarray) -> np.ndarray:
+    """``frame`` with :func:`chroma_field` across :data:`FIELD_ROWS`."""
+    out = np.array(frame, dtype=np.float32, copy=True)
+    top, bottom = (int(f * out.shape[0]) for f in FIELD_ROWS)
+    out[top:bottom] = chroma_field(out.shape[1], bottom - top)
+    return out
+
+
+def field_yuv(frame: np.ndarray) -> np.ndarray:
+    """The :func:`chroma_field` rows of an RGB frame, area-scaled to :data:`FIELD_SIZE`, as planar YUV."""
+    top, bottom = (int(f * frame.shape[0]) for f in FIELD_ROWS)
+    band = np.ascontiguousarray(frame[top:bottom], np.float32)
+    small = cv2.resize(band, FIELD_SIZE, interpolation=cv2.INTER_AREA)  # pylint: disable=no-member
+    return to_yuv(small)[None]
+
+
+def last_frame(path: str | Path, width: int, height: int, *, ffmpeg: str = "ffmpeg") -> np.ndarray | None:
+    """A frame from the end of an MJPEG take, as RGB float32 in ``[0, 1]``."""
     from .stored import captures  # pylint: disable=import-outside-toplevel
 
     with captures(path, from_end_s=0.5, ffmpeg=ffmpeg) as source:
-        argv = [ffmpeg, "-loglevel", "error", *source, "-vf", "swapuv"]
+        argv = [ffmpeg, "-loglevel", "error", *source]
         argv += ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
         data = subprocess.run(argv, check=False, capture_output=True).stdout
     size = width * height * 3
@@ -419,7 +448,7 @@ class Doctor:
 
         fmt = self.fmt
         index = int(self._rng.integers(state_index_capacity()))
-        bars = generate("smpte_bars", width=fmt.width, height=fmt.height, rng=self._rng)
+        bars = with_field(generate("smpte_bars", width=fmt.width, height=fmt.height, rng=self._rng))
         with stage("loop", program=PASSTHRU, index=index) as result:
             Session(transport, sleep=self._sleep, clock=self._clock).load_program(PASSTHRU, link=self._link)
             self._playout.show(with_state_index(bars, index), fps=fmt.fps)
@@ -446,6 +475,7 @@ class Doctor:
         if hint:
             return found
         read, want = bar_names(bar_channels(frame)), bar_names(bar_channels(bars))
+        order = order_of(field_yuv(frame), field_yuv(bars))
         return found + [
             _check(
                 "loop.index",
@@ -459,7 +489,14 @@ class Doctor:
                 read == want,
                 f"bars read {' '.join(read)}",
                 "colour order is wrong along the chain (a red/blue swap reads cyan for yellow); "
-                "check the framebuffer's 565 order, and that the card's chroma exchange is put back",
+                "run the loop.chroma check's fix",
+            ),
+            _check(
+                "loop.chroma",
+                order.order == AS_PLAYED and order.judged,
+                f"chroma field reads {order.order}; Y, U, V correlation {order.scores}",
+                "red and blue exchanged: the Pi packs other than RG16's red-high word; chroma exchanged: "
+                "something decodes the card's YUYV as YVYU or filters swapuv",
             ),
         ]
 

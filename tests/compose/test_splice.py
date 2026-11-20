@@ -80,3 +80,18 @@ def test_a_take_that_ends_before_its_cut_fails_the_splice_and_names_it(tmp_path)
             tmp_path / "no/o.mp4",
             config=config,
         )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_a_take_whose_chroma_came_back_exchanged_is_spliced_put_right(tmp_path):
+    red = np.tile(np.array([200, 30, 30], np.uint8), (12, 48, 64, 1)).tobytes()
+    argv = ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "64x48"]
+    argv += ["-r", "60", "-i", "pipe:0", "-c:v", "mjpeg", "-q:v", "2", str(tmp_path / "x.mkv")]
+    subprocess.run(argv, input=red, check=True)
+    (tmp_path / "x.mkv.chroma.json").write_text('{"ok": false, "judged": true}', encoding="utf-8")
+    config = R.RenderConfig(width=64, height=48, fps=30.0)
+    out = tmp_path / "out.mp4"
+    R.splice([R.Cut(0.0, 0.1, "X")], {"X": tmp_path / "x.mkv"}, {"X": np.arange(3) * 2}, out, config=config)
+    argv = ["ffmpeg", "-loglevel", "error", "-i", str(out), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    rgb = np.frombuffer(subprocess.run(argv, check=True, capture_output=True).stdout, np.uint8).reshape(-1, 3)
+    assert rgb[:, 2].mean() > rgb[:, 0].mean() + 50

@@ -1,8 +1,8 @@
 """Long-lived V4L2 capture session.
 
 Locking is slow next to any per-sample dwell (docs/hardware.md), so the stream
-is opened once for a whole sweep and never per sample. The card advertises YUYV
-and delivers YVYU, so every frame is decoded with the chroma pair exchanged.
+is opened once for a whole sweep and never per sample. The card delivers YUYV, the
+one format it enumerates, and every frame is decoded as that.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ STRUCTURE_SAMPLES = 50_000
 #: one DC level per block, which JPEG and resampling reproduce exactly, so its
 #: spatial range is zero up to the rounding of a single step.
 QUANTUM = 1.0 / 255.0
-#: The one format V4L2 enumerates, and what it must be asked for; the bytes are YVYU.
+#: The one format V4L2 enumerates, and what it must be asked for.
 NATIVE_FOURCC = "YUYV"
 
 
@@ -31,13 +31,9 @@ class CaptureError(RuntimeError):
     """The capture device could not be opened or configured."""
 
 
-def yvyu_to_bgr(frame: np.ndarray) -> np.ndarray:
-    """Packed native ``(H, W, 2)`` to uint8 BGR, reading the chroma pair as YVYU.
-
-    The chroma pair arrives exchanged whatever format the card is asked for: its
-    own ``Colorbars`` decodes to SMPTE order only once the pair is put back.
-    """
-    return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YVYU)
+def yuyv_to_bgr(frame: np.ndarray) -> np.ndarray:
+    """Packed native ``(H, W, 2)`` YUYV to uint8 BGR."""
+    return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
 
 
 def structured(frame: np.ndarray) -> bool:
@@ -115,7 +111,7 @@ class Capture:
         for the same native buffer.
         """
         frame = self._grab()
-        return None if frame is None else yvyu_to_bgr(frame)
+        return None if frame is None else yuyv_to_bgr(frame)
 
     def read(self) -> np.ndarray | None:
         """One frame as RGB float32 in ``[0, 1]``, or None when the grab failed."""

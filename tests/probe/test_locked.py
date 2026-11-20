@@ -317,3 +317,16 @@ def test_pooled_numbering_follows_the_clip_only_when_its_series_counts_the_lead_
     clock = [{"run": 2, "candidates": [7, 8]}]
     L.number_runs(list(rows), clock, seg, luma, series)
     assert clock[0]["selection"]["shift"] != 0
+
+
+def test_a_takes_channel_order_is_kept_in_its_attempt_record_and_never_faults_it(monkeypatch, caplog):
+    from syncsummoner.compose import chroma as cc  # pylint: disable=import-outside-toplevel
+
+    said = {"order": "chroma exchanged", "ok": False, "judged": True}
+    monkeypatch.setattr(cc, "judge", lambda take, clip, config: dict(said))
+    assert L.chroma_record("take.mkv", "clip.mkv", None) == {"chroma": said}
+    assert "read with swapuv" in caplog.text
+    said.clear()
+    said["error"] = "ValueError: no strip"
+    assert L.chroma_record("take.mkv", "clip.mkv", None) == {"chroma": said}
+    assert "no channel order from the lead-in" in caplog.text
