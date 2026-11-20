@@ -250,7 +250,6 @@ def gate(path: str | Path, *, strip_px: int = 0, ffmpeg: str = "ffmpeg") -> aest
     full, space = decoded.calibration_colour(path, spec, ffmpeg=ffmpeg)
     rate, duration = _rate(path, ffmpeg)
     width, height = spec.calibration
-    size = 3 * width * height
     with captures(path, ffmpeg=ffmpeg) as source:
         argv = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", *source, "-map", "0:v:0"]
         argv += ["-vf", spec.colour(), "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
@@ -259,17 +258,9 @@ def gate(path: str | Path, *, strip_px: int = 0, ffmpeg: str = "ffmpeg") -> aest
         )
         try:
             with meter(duration, desc=f"screening {Path(path).name}") as progress:
-
-                def chunks():
-                    count = 0
-                    while block := proc.stdout.read(size * decoded.CHUNK):
-                        frames = np.frombuffer(block, np.uint8, len(block) // size * size)
-                        frames = frames.reshape(-1, 3, height, width)
-                        count += frames.shape[0]
-                        progress.to(count / rate)
-                        yield to_rgb(frames, full=full, space=space)
-
-                risk = aesthetics.series_risk(*aesthetics.flash_series(chunks()), fps=rate)
+                pictures = _pictures(proc.stdout, (3, height, width), lambda n: progress.to(n / rate))
+                found = (to_rgb(frames, full=full, space=space) for frames in pictures)
+                risk = aesthetics.series_risk(*aesthetics.flash_series(found), fps=rate)
             said = proc.stderr.read()
         except BaseException:
             proc.kill()
@@ -283,6 +274,17 @@ def gate(path: str | Path, *, strip_px: int = 0, ffmpeg: str = "ffmpeg") -> aest
     return risk
 
 
+def _pictures(stream, shape: tuple[int, int, int], done: Callable[[int], None]):
+    """8-bit pictures of ``shape`` read from ``stream`` a :data:`~syncsummoner.probe.decoded.CHUNK` at a
+    time, ``done`` told how many so far."""
+    size, count = int(np.prod(shape)), 0
+    while block := stream.read(size * decoded.CHUNK):
+        frames = np.frombuffer(block, np.uint8, len(block) // size * size).reshape(-1, *shape)
+        count += frames.shape[0]
+        done(count)
+        yield frames
+
+
 def _rate(path: str | Path, ffmpeg: str) -> tuple[float, float]:
     """A picture's frame rate and duration, from its container."""
     argv = [decoded.ffprobe_for(ffmpeg), "-v", "error", "-select_streams", "v:0"]
@@ -290,6 +292,31 @@ def _rate(path: str | Path, ffmpeg: str) -> tuple[float, float]:
     said = subprocess.run(argv, check=True, capture_output=True, text=True).stdout.split()
     num, _, den = said[0].partition("/")
     return float(num) / float(den or 1), float(said[1])
+
+
+def _screen_cmd(args) -> int:
+    """Screen finished pictures for harmful flashing, as a render's last gate does; 1 if any fails."""
+    failed = 0
+    for path in args.videos:
+        try:
+            risk = gate(path, strip_px=args.strip_px, ffmpeg=args.ffmpeg)
+        except UnsafeOutputError as err:
+            LOG.error("%s", err)
+            failed = 1
+            continue
+        LOG.info("%s: safe, peak %.1f flashes/s, %.1f red", path, risk.flashes_per_s, risk.red_flashes_per_s)
+    return failed
+
+
+def add_parser(sub) -> None:
+    """The ``screen`` command."""
+    screen_p = sub.add_parser(
+        "screen", help="screen finished pictures for harmful flashing, as a render does"
+    )
+    screen_p.add_argument("videos", nargs="+")
+    screen_p.add_argument("--strip-px", type=int, default=0, help="rows off the bottom left out, a strip")
+    screen_p.add_argument("--ffmpeg", default="ffmpeg")
+    screen_p.set_defaults(func=_screen_cmd)
 
 
 def bar_edges(

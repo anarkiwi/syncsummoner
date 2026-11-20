@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from syncsummoner.compose import takecheck
 from syncsummoner.probe import archive_doctor, dedupe, effects, modlayer, sweep_cmds
 from syncsummoner.progress import LOG, configure
 
@@ -587,7 +588,6 @@ def _judge_cmd(args: argparse.Namespace) -> int:
 def _check_cmd(args: argparse.Namespace) -> int:
     """Judge takes, or a master, against the clip they were fed; cover the cut plan and splice it."""
     from syncsummoner.compose import render as render_mod
-    from syncsummoner.compose import takecheck
     from syncsummoner.compose.score import Score
     from syncsummoner.probe.footage import ClockModel
     from syncsummoner.probe.store import slug
@@ -635,22 +635,6 @@ def _check_cmd(args: argparse.Namespace) -> int:
         )
         print(args.splice)
     return 1 if report.failed else 0
-
-
-def _screen_cmd(args: argparse.Namespace) -> int:
-    """Screen finished pictures for harmful flashing, as a render's last gate does."""
-    from syncsummoner.compose import takecheck
-
-    failed = 0
-    for path in args.videos:
-        try:
-            risk = takecheck.gate(path, strip_px=args.strip_px, ffmpeg=args.ffmpeg)
-        except takecheck.UnsafeOutputError as err:
-            LOG.error("%s", err)
-            failed = 1
-            continue
-        LOG.info("%s: safe, peak %.1f flashes/s, %.1f red", path, risk.flashes_per_s, risk.red_flashes_per_s)
-    return failed
 
 
 def _program_cmd(args: argparse.Namespace) -> int:
@@ -996,11 +980,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     check.add_argument("--ffmpeg", default="ffmpeg")
     check.set_defaults(func=_check_cmd)
 
-    screen = sub.add_parser("screen", help="screen finished pictures for harmful flashing, as a render does")
-    screen.add_argument("videos", nargs="+")
-    screen.add_argument("--strip-px", type=int, default=0, help="rows off the bottom left out, a strip")
-    screen.add_argument("--ffmpeg", default="ffmpeg")
-    screen.set_defaults(func=_screen_cmd)
+    takecheck.add_parser(sub)
 
     return parser
 
