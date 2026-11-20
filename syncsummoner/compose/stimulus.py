@@ -9,7 +9,7 @@ depends on seed, raster and ``k``.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from typing import Iterator
 
@@ -45,6 +45,21 @@ class Coverage:
     level: tuple[float, float] = (0.2, 0.8)
     saturation: tuple[float, float] = (0.0, 0.3)
     swing: tuple[float, float] = (0.25, 1.5)
+
+    def one_texture(self) -> Coverage:
+        """These ranges with the texture's held at their middles: every shot alike but for its motion.
+
+        A survival ratio depends on the picture as well as the setting, so a sweep whose settings each see
+        their own texture measures texture as scatter; motion still varies frame to frame.
+        """
+        middle = math.sqrt(self.wavelength[0] * self.wavelength[1])
+        return replace(
+            self,
+            wavelength=(middle, middle),
+            contrast=(sum(self.contrast) / 2,) * 2,
+            level=(sum(self.level) / 2,) * 2,
+            saturation=(sum(self.saturation) / 2,) * 2,
+        )
 
     def ti(self) -> float:
         """The TI frames swing about: the median speed's drift over the median wavelength and contrast."""

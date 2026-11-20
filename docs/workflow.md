@@ -254,7 +254,9 @@ frame always fits; a setting is measured only once its last write has landed and
 Against a synthetic clip (`probe timecode --synthetic SEED --shot-frames N`, its `.stimulus.json` beside
 it), `probe sweep regions` puts each setting on whole shots instead (`regions.shot_slots`): its writes and
 settle cover the cut, its hold is one shot's uncut motion, and kriging pools the settings rather than each
-being held to its own power, so a program's sweep is one take of minutes.
+being held to its own power, so a program's sweep is one take of minutes. Make the clip with `--one-texture`: a survival
+ratio depends on the picture as well as the setting, so settings that each see their own texture
+measure texture as scatter; with one texture, only the motion is drawn per shot.
 `probe sweep smoke` captures a few seconds toggling one parameter and lands every write from the
 take's wire record alone: the rig check to run before any full take.
 
