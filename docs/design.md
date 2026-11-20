@@ -464,10 +464,11 @@ split at every cut, so each cut is judged on the frames it shows alone:
 | --- | --- |
 | `flat` | at most half the frames span more than one 8-bit code, or SI under the live floor |
 | `frozen` | TI under the live floor, or `recorder.held` cannot tell the bar from one picture under capture noise and its motion does not follow the source (a held picture's TI is capture noise, independent of the source's) |
-| `unfollowed` | more than three frames moved, the source TI varies beyond quantisation, and the follow test fails |
-
-A dead run inside a cut is replaced by the take of another program alive across
-the whole run that follows best (highest mean z); a lone dead bar inside a
+A bar is dead only when blank (`flat`) or static (`frozen`), as §11 judges a
+setting; motion that does not follow the source's is alive. A dead run inside a
+cut is replaced by the take of another program alive across the whole run that
+follows best (highest mean z), a run reaching the cut's edge taking that edge
+itself so no sliver of the cut is left beside it; a lone dead bar inside a
 `destroy` section stays. A run nothing covers raises `DeadTakeError` naming the
 program and time range. On a fitted trace, where a strip reads, its clock stands unless the motion clock makes the
 output's moving frames follow the source better by more than the critical z
