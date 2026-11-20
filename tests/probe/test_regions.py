@@ -97,6 +97,26 @@ def test_regimes_get_power_of_two_shares_by_their_dimensions():
     assert R.allot(3, [1, 12]) == [0, 2] and R.allot(0, [2]) == [0] and R.allot(5, [0]) == [0]
 
 
+def test_a_fill_gives_exactly_its_total_in_powers_of_two_where_they_reach_it():
+    assert R.fill(64, [3, 5, 5], [1024] * 3) == [16, 32, 16]
+    assert R.fill(64, [12], [4096]) == [64]
+    got = R.fill(64, [1, 1, 11], [2, 2, 4096])
+    assert got == [2, 2, 60] and sum(got) == 64
+    assert R.fill(64, [0, 2], [1, 16]) == [1, 16]
+    assert R.fill(5, [1, 2], [64, 64]) == [2, 3]
+    with pytest.raises(R.SweepError):
+        R.fill(1, [1, 1], [2, 2])
+
+
+def test_a_design_of_no_power_of_two_is_the_prefix_of_the_next():
+    base = np.zeros(12, dtype=np.int64)
+    values = {1: np.arange(0, 1024, 64), 2: np.array([0, 1023])}
+    whole = R.design(base, [1, 2], values, 64, seed=3)
+    part = R.design(base, [1, 2], values, 48, seed=3)
+    assert (part == whole[:48]).all()
+    assert np.unique(part[:32, 1], return_counts=True)[1].tolist() == [16, 16]
+
+
 def test_a_design_spreads_jointly_over_read_settings_only():
     base = np.full(12, 7, dtype=np.int64)
     values = {1: np.array([0, 341, 682, 1023]), 2: np.arange(0, 1024, 8), 7: np.array([0, 1023])}
@@ -122,7 +142,8 @@ def test_each_take_writes_its_first_setting_whole_and_then_only_what_moves():
         R.chunks_of(states[:3], placed, settle=1, toggles=[8])
 
 
-def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monkeypatch, capsys):
+def _regions_argv(tmp_path, monkeypatch):
+    """A two-regime program's `sweep regions` arguments, its clip, cover and model stubbed."""
     hold = tmp_path / "hold.json"
     hold.write_text(json.dumps({"program": "p", "settle": 1, "hold": 3}))
     cover = tmp_path / "cover.json"
@@ -154,6 +175,11 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
     )
     argv = ["probe", "sweep", "regions", "p", "--cover", str(cover), "--hold", str(hold), "--source", "c.mkv"]
     argv += ["--audio", "a.wav", "--takes", str(tmp_path), "--budget-s", "900", "--joint", "11:6"]
+    return argv
+
+
+def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monkeypatch, capsys):
+    argv = _regions_argv(tmp_path, monkeypatch)
     assert cli.main(argv) == 0
     chunks, said = L.read_plan(tmp_path / "sweep-p.json")
     regions = said["regions"]
@@ -186,6 +212,18 @@ def test_regions_plans_a_sweep_the_capture_and_collect_steps_read(tmp_path, monk
         "max"
     ] == 45 - R.guard_frames(0)
     assert sum(len(c.states) for c in chunks) == 12 and sum(c.frames for c in chunks) == 12 * 45
+
+
+def test_regions_plans_exactly_the_settings_asked_joint_moves_among_them(tmp_path, monkeypatch):
+    clip = tmp_path / "c.mkv"
+    Path(f"{clip}.stimulus.json").write_text(json.dumps({"stimulus": {"shot_frames": 45}}), encoding="utf-8")
+    argv = [str(clip) if a == "c.mkv" else a for a in _regions_argv(tmp_path, monkeypatch)]
+    assert cli.main([a for a in argv if a not in ("--budget-s", "900")] + ["--settings", "9"]) == 0
+    chunks, said = L.read_plan(tmp_path / "sweep-p.json")
+    assert said["regions"]["per_regime"] == {"0": 2, "1": 1} and said["regions"]["settings"] == 9
+    assert said["regions"]["joint"] == 6 and sum(len(c.states) for c in chunks) == 9
+    with pytest.raises(SystemExit):
+        cli.main(argv + ["--settings", "9"])
 
 
 def test_shot_slots_put_each_setting_on_whole_shots_its_guard_covering_the_cut():
