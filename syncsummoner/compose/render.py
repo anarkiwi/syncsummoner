@@ -221,6 +221,9 @@ def play_take(
         rig.session.load_program(PASSTHRU, link=rig.link)
         require_route(rig.transport, program=PASSTHRU, route=config.route)
         await_transmitting(rig.transport, program=PASSTHRU, timing=config.timing)
+    if program is not None:
+        with stage("author", program=program):
+            rig.transport.prepare(program)
     with stage("take", program=program or PASSTHRU, seconds=f"{lead_s + seconds:.1f}") as said:
         with recorder.recording(out):
             with rig.playout.playing(fps=config.fps) as player:

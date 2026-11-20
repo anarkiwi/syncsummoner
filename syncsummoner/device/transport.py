@@ -276,6 +276,18 @@ class Transport:
             self._loaded = self._shell.status().get("program")
         return self._loaded
 
+    def prepare(self, name: str) -> None:
+        """Make ``name``'s author the active one now, so loading ``name`` later needs no index rebuild.
+
+        The firmware rebuilds an author's index when a load switches author, and a load of a name whose
+        author is not active searches every author's folder instead; either can outlast a lead-in.
+        """
+        author, slash, plain = name.partition("/")
+        if not slash:
+            author, plain = DEFAULT_AUTHOR, name
+        if (slash or self._has_authors()) and self._needs_enumerate(author, plain):
+            self._shell.enumerate_author(author, self._shell.watch(f"enumerating {author}"))
+
     def load_program(self, name: str, hold: Callable[[], ContextManager[Any]] | None = None) -> None:
         """Load ``Name`` or ``author/Name``, returning once the device runs it with its CC map assigned.
 

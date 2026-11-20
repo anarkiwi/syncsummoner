@@ -114,6 +114,20 @@ def test_qualified_names_load_once_and_reload_when_the_author_changes(device):
     ]
 
 
+def test_preparing_switches_author_ahead_so_the_load_rebuilds_nothing(device):
+    port = tr.Transport(device, DECLARED)
+    port.prepare("czartroniks/Teletext")
+    assert [c[:2] for c in device.shell.calls if c[0] in ("enumerate", "load")] == [
+        ("enumerate", "czartroniks")
+    ]
+    device.shell.calls.clear()
+    port.load_program("czartroniks/Teletext")
+    assert [c[:2] for c in device.shell.calls if c[0] in ("enumerate", "load")] == [("load", "Teletext")]
+    device.shell.calls.clear()
+    port.prepare("czartroniks/Teletext")
+    assert not [c for c in device.shell.calls if c[0] == "enumerate"], "an active author is left alone"
+
+
 def test_programs_are_passed_through_qualified(device):
     device.programs = lambda: ["Teletext", "czartroniks/Teletext", "boneoh/RGB Bit Crush"]
     assert tr.Transport(device, DECLARED).programs() == [
