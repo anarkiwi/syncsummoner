@@ -281,14 +281,52 @@ def collected(takes: Iterable[Path]) -> Finding:
     )
 
 
+def effect_summaries(profiles: Path) -> dict[str, dict[str, dict]]:
+    """Each profiled program's ``probe effects`` summary by clip colour, empty where none was measured."""
+    from syncsummoner.probe.fit import load_profile  # pylint: disable=import-outside-toplevel
+
+    found = {}
+    for path in sorted(Path(profiles).glob("*.yaml")):
+        profile = load_profile(path)
+        found[profile.program] = {kind: entry["summary"] for kind, entry in profile.effects.items()}
+    return found
+
+
+def _range(span: Sequence[float] | None) -> str:
+    return "none" if not span else f"{span[0]:.3f}-{span[1]:.3f}"
+
+
+def effects_measured(summaries: dict[str, dict[str, dict]]) -> Finding:
+    """Every profile carries its settings' effects; each program's safe intensity range and flag counts."""
+    missing = [name for name, kinds in summaries.items() if not kinds]
+    lines = [
+        f"{name} {kind}: {s['safe']}/{s['settings']} safe, intensity {_range(s['safe_intensity'])}, "
+        f"blank {s['blank']} static {s['static']} flashing {s['flashing']} red {s['red_flashing']}"
+        for name, kinds in sorted(summaries.items())
+        for kind, s in sorted(kinds.items())
+    ]
+    return finding(
+        "effects.measured",
+        bool(summaries) and not missing,
+        f"{len(summaries) - len(missing)} of {len(summaries)} profiles carry effects"
+        + (f"; not: {', '.join(missing[:NAMED])}" if missing else "")
+        + "".join(f"; {line}" for line in lines),
+        "run `probe effects --archive ARCHIVE/archive --profiles PROFILES` on them",
+    )
+
+
 def diagnose(
     archive: str | Path,
     plans_file: str | Path | None = None,
     *,
     rate: float | None = None,
     floor: float = 0.0,
+    profiles: str | Path | None = None,
 ) -> list[Finding]:
-    """Every check over the archive at ``archive``, its plans listed in ``plans_file``."""
+    """Every check over the archive at ``archive``, its plans listed in ``plans_file``.
+
+    Profiles in ``profiles``, default ``ARCHIVE/profiles-each``, are checked for their effects when there.
+    """
     archive = Path(archive)
     listing = Path(plans_file) if plans_file else archive / "plans.txt"
     paths = listing.read_text(encoding="utf-8").split() if listing.is_file() else []
@@ -296,6 +334,7 @@ def diagnose(
     if not listing.is_file():
         errors[str(listing)] = "no plan listing"
     clip = clip_of(plans)
+    shelf = Path(profiles) if profiles else archive / "profiles-each"
     left = remaining(archive, plans)
     takes, rig_s = takes_of(archive), rig_seconds(left)
     messages = logged_faults(archive / "logs" / "faults.tsv") + [
@@ -311,15 +350,20 @@ def diagnose(
         take_faults(messages),
         rate_lock(takes_rate_lock(takes)),
         collected(takes),
-    ]
+    ] + ([effects_measured(effect_summaries(shelf))] if shelf.is_dir() else [])
 
 
 def _doctor_cmd(args: argparse.Namespace) -> int:
-    findings = diagnose(args.archive, args.plans, rate=args.rate_bytes_s, floor=args.floor_bytes)
+    findings = diagnose(
+        args.archive, args.plans, rate=args.rate_bytes_s, floor=args.floor_bytes, profiles=args.profiles
+    )
     if not args.json:
         for found in findings:
             (LOG.info if found.ok else LOG.error)("%s", format_finding(found))
     summary = report(findings)
+    shelf = Path(args.profiles) if args.profiles else Path(args.archive) / "profiles-each"
+    if shelf.is_dir():
+        summary["effects"] = effect_summaries(shelf)
     print(json.dumps(summary, indent=2))
     return 0 if summary["ok"] else 1
 
@@ -337,5 +381,8 @@ def add_parser(probe_sub) -> None:
         "--rate-bytes-s", type=float, help="take bytes written a rig second, when no take measures it"
     )
     doctor.add_argument("--floor-bytes", type=float, default=0.0, help="free bytes the disk must keep")
+    doctor.add_argument(
+        "--profiles", help="the profiles whose effects to report; default ARCHIVE/profiles-each"
+    )
     doctor.add_argument("--json", action="store_true", help="print only the JSON report")
     doctor.set_defaults(func=_doctor_cmd)

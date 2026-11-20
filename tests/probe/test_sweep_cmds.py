@@ -337,6 +337,10 @@ def test_timecode_makes_a_synthetic_stimulus_clip_and_keeps_its_spec(tmp_path, m
     argv = ["--stall", "40", "probe", "timecode", "--synthetic", "7", "--seconds", "3", "--out", str(out)]
     assert cli.main([*argv, "--shot-frames", "45", "--one-texture"]) == 0
     assert made["source"].shot_frames == 45 and made["source"].coverage == Coverage().one_texture()
+    assert cli.main([*argv, "--colour", "bw"]) == 0
+    assert made["source"].coverage == Coverage().monochrome()
+    assert cli.main([*argv, "--colour", "full"]) == 0
+    assert made["source"].coverage == Coverage().full_colour()
     with pytest.raises(SystemExit, match="not both"):
         cli.main(["probe", "timecode", "f.mkv", "--synthetic", "7", "--out", str(out)])
 

@@ -34,7 +34,8 @@ class Coverage:
     ``speed`` is drift in pixels a frame, ``spin`` radians and ``zoom`` log scale a frame either way:
     together a shot's mix of motion, which each frame scales to its TI. That TI is log-normal about the
     one the median drift gives the median texture (:meth:`ti`), ``swing`` its log deviation.
-    ``wavelength`` is the texture's in pixels; the rest are fractions of full scale.
+    ``wavelength`` is the texture's in pixels; the rest are fractions of full scale. ``tint`` weights a
+    shot's hue against its chroma noise: at zero every frame spans every hue and the shot's hue is moot.
     """
 
     speed: tuple[float, float] = (0.25, 48.0)
@@ -45,6 +46,7 @@ class Coverage:
     level: tuple[float, float] = (0.2, 0.8)
     saturation: tuple[float, float] = (0.0, 0.3)
     swing: tuple[float, float] = (0.25, 1.5)
+    tint: float = 1.0
 
     def one_texture(self) -> Coverage:
         """These ranges with the texture's held at their middles: every shot alike but for its motion.
@@ -60,6 +62,19 @@ class Coverage:
             level=(sum(self.level) / 2,) * 2,
             saturation=(sum(self.saturation) / 2,) * 2,
         )
+
+    def monochrome(self) -> Coverage:
+        """:meth:`one_texture` with no chroma: the same luma, black and white."""
+        return replace(self.one_texture(), saturation=(0.0, 0.0))
+
+    def full_colour(self) -> Coverage:
+        """:meth:`one_texture` with untinted chroma noise as wide as the gamut holds at the mean level.
+
+        With no tint every frame spans every hue, so no setting sees a hue another does not; the saturation
+        puts three standard deviations of chroma, the luma's own span, on the BT.709 gamut's nearest edge.
+        """
+        held = self.one_texture()
+        return replace(held, saturation=(gamut_saturation(held.level[0]),) * 2, tint=0.0)
 
     def ti(self) -> float:
         """The TI frames swing about: the median speed's drift over the median wavelength and contrast."""
@@ -82,6 +97,7 @@ class Shot:
     swing: float
     ti: float
     seed: int
+    tint: float = 1.0
 
 
 def _log_span(lo_hi: tuple[float, float], x: float) -> float:
@@ -123,6 +139,7 @@ class Stimulus:
             swing=_span(cov.swing, u[9]),
             ti=cov.ti(),
             seed=int(np.random.SeedSequence([self.seed, k % (1 << 32)]).generate_state(1)[0]),
+            tint=cov.tint,
         )
 
     def placed(self, index: int) -> tuple[int, int]:
@@ -173,6 +190,17 @@ class Stimulus:
         """Frames ``start`` to ``start + count - 1`` in turn."""
         for index in track(range(start, start + count), desc="stimulus", total=count, unit="frame"):
             yield self.frame(index)
+
+
+def gamut_saturation(level: float) -> float:
+    """The saturation whose untinted chroma's three-sigma circle just meets the BT.709 gamut at ``level``.
+
+    Chroma is ``saturation * noise / 6`` an axis (:func:`_colour`), so three sigmas reach half the
+    saturation; R, B and G move along ``2 (1 - KR)``, ``2 (1 - KB)`` and the pair G takes from both.
+    """
+    kg = 1 - KR - KB
+    gains = (2 * (1 - KR), 2 * (1 - KB), math.hypot(2 * KR * (1 - KR) / kg, 2 * KB * (1 - KB) / kg))
+    return 2 * min(level, 1 - level) / max(gains)
 
 
 def _ti_scale(contrast: float, gradient: float) -> float:
@@ -246,8 +274,8 @@ def _colour(fields: np.ndarray, shot: Shot) -> np.ndarray:
     """Noise fields as RGB: luma around the shot's level, chroma around its hue, clipped to full scale."""
     y = shot.level + shot.contrast * fields[..., 0] / 3
     hue = 2 * math.pi * shot.hue
-    cb = shot.saturation * (math.cos(hue) + fields[..., 1] / 3) / 2
-    cr = shot.saturation * (math.sin(hue) + fields[..., 2] / 3) / 2
+    cb = shot.saturation * (shot.tint * math.cos(hue) + fields[..., 1] / 3) / 2
+    cr = shot.saturation * (shot.tint * math.sin(hue) + fields[..., 2] / 3) / 2
     r = y + 2 * (1 - KR) * cr
     b = y + 2 * (1 - KB) * cb
     g = (y - KR * r - KB * b) / (1 - KR - KB)

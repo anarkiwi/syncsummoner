@@ -115,3 +115,32 @@ def test_mitigation_leaves_safe_clips_untouched():
 def test_downsample_preserves_area_fraction():
     big = alternating(90, hz=7.5, area=1.0, shape=(480, 640))
     assert not safety.flash_risk(big, fps=FPS, max_side=64).safe
+
+
+def test_a_fast_red_flash_fails_the_red_test():
+    frames = solid(0.0, 60)
+    frames[::4, :, :, 0] = 1.0
+    frames[1::4, :, :, 0] = 1.0
+    risk = safety.flash_risk(frames, fps=FPS)
+    assert not risk.red_safe and not risk.safe and risk.red_area_frac == pytest.approx(1.0)
+
+
+def test_a_gradual_swing_accumulates_into_one_transition():
+    ramp = np.r_[np.linspace(0.0, 0.3, 4), np.linspace(0.3, 0.0, 4)[1:]]
+    events, _ = safety.transitions(ramp[:, None, None], delta=0.1, fps=FPS)
+    assert events.sum() == 2
+
+
+def test_a_change_over_too_little_of_the_screen_is_no_transition():
+    frames = solid(0.0, 8)
+    frames[1::2, :4] = 1.0
+    events, area = safety.transitions(safety.relative_luminance(frames), delta=0.1, fps=FPS)
+    assert not events.any() and area.max() < 0.25
+
+
+def test_a_moving_texture_is_not_a_flash():
+    rng = np.random.default_rng(1)
+    field = rng.random((SHAPE[0], SHAPE[1] + 90))
+    frames = np.stack([field[:, t : t + SHAPE[1]] for t in range(90)])
+    risk = safety.flash_risk(np.repeat(frames[..., None], 3, axis=-1).astype(np.float32), fps=FPS)
+    assert risk.safe and risk.area_frac > 0.25

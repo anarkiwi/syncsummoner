@@ -244,6 +244,8 @@ class ProgramProfile:
     #: registers with the source.
     registered: float = 0.0
     binary_hash: str = ""
+    #: Each measured setting's intensity and safety, by the clip's colour (``probe effects``).
+    effects: dict[str, Any] = field(default_factory=dict)
 
     def by_axis(self, axis: Axis) -> list[ParamSpec]:
         """Parameters assigned to a canonical axis, so gestures stay program-agnostic."""
@@ -276,6 +278,7 @@ class ProgramProfile:
             pointwise=float(data.get("pointwise", 0.0)),
             registered=float(data.get("registered", 0.0)),
             binary_hash=str(data.get("binary_hash", "")),
+            effects=dict(data.get("effects") or {}),
         )
 
 

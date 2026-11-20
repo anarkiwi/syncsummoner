@@ -536,8 +536,10 @@ def fit_profile(
     )
 
 
-def save_profile(profile, path):
-    """Write a profile as versioned YAML."""
+def save_profile(profile, path, *, carry_effects=False):
+    """Write a profile as versioned YAML, with ``carry_effects`` keeping the effects of the one it replaces."""
+    if carry_effects and not profile.effects and Path(path).is_file():
+        profile.effects = load_profile(path).effects
     payload = {"schema_version": PROFILE_SCHEMA_VERSION, "profile": profile.to_dict()}
     Path(path).write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 

@@ -58,7 +58,7 @@ COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         black pylint pytest pytest-cov pytest-xdist pytest-timeout import-linter \
     && /venv/bin/pip install --no-cache-dir \
-        "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
+        "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" "scikit-image>=0.22" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
         "pyvmancer[serial]>=0.6.5" "python-sat>=1.8.dev16" "scikit-learn>=1.3" /wheels/dd-*.whl
 
@@ -68,7 +68,7 @@ COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         pytest pytest-cov pytest-xdist pytest-timeout \
     && /venv/bin/pip install --no-cache-dir \
-        "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9"
+        "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" "scikit-image>=0.22"
 
 # The image the rig is driven from: ffmpeg for capture and mastering, ssh for the Pi.
 FROM hdl AS runtime
@@ -76,7 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg openssh-
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
-        "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \
+        "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" "scikit-image>=0.22" \
         "pyyaml>=6.0" "pyarrow>=15.0" "librosa>=0.10" "soundfile>=0.12" "tqdm>=4.66" "threadpoolctl>=3.1" "linuxpy>=0.25" \
         "pyvmancer[all]>=0.6.5" "python-sat>=1.8.dev16" "scikit-learn>=1.3" /wheels/dd-*.whl
 COPY . .

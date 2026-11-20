@@ -6,6 +6,7 @@ keeps no global RNG state. Boundary types are pinned in ``docs/contracts.md``.
 """
 
 from syncsummoner.aesthetics.channels import ChannelEnergy, gabor_energy, gabor_bank
+from syncsummoner.aesthetics.departure import DELTA_E_SPAN, Effect, delta_e, effect, ssim
 from syncsummoner.aesthetics.flicker import (
     TemporalSplit,
     flicker_ratio,
@@ -26,6 +27,7 @@ from syncsummoner.aesthetics.safety import (
     flash_risk,
     mitigate_flashes,
     relative_luminance,
+    transitions,
 )
 from syncsummoner.aesthetics.score import (
     ClipDescriptor,
@@ -60,6 +62,12 @@ from syncsummoner.aesthetics.sync import SyncResult, av_correlation
 __version__ = "0.2.0"
 
 __all__ = [
+    "DELTA_E_SPAN",
+    "Effect",
+    "delta_e",
+    "effect",
+    "ssim",
+    "transitions",
     "ChannelEnergy",
     "ClipDescriptor",
     "DynamicsResult",
