@@ -78,7 +78,7 @@ def test_a_sound_archive_passes_every_check(archive):
         "takes.chroma",
     ]
     assert all(f.ok and not f.fix for f in found.values()), found
-    assert found["takes.chroma"].detail == "0 of 1 takes judged"
+    assert found["takes.chroma"].detail == "0 of 1 takes judged, 0 exchanged (0 dry, read put right)"
     assert found["rig.time"].detail == "0.6 rig h left over 2 of 2 plans"
     assert found["takes.rate_lock"].detail == (
         "1 takes measured, 0 multi-segment skipped; ppm +0.0 to +0.0, the tightest bound 1669.4"
@@ -265,20 +265,19 @@ def test_effects_are_reported_per_program_and_a_profile_without_them_fails(archi
     )
 
 
-def test_a_recorded_channel_order_is_read_and_an_exchanged_one_fails(archive):
-    exchanged = {
-        "program": "P",
-        "chroma": {"order": "chroma exchanged", "ok": False, "judged": True, "frames": 30},
-    }
-    unsure = {
-        "program": "P",
-        "chroma": {"order": "chroma exchanged", "ok": False, "judged": False, "frames": 6},
-    }
-    write_take(archive / "takes" / "take-B-00.mkv", attempt=exchanged)
-    write_take(archive / "takes" / "take-C-00.mkv", attempt=unsure)
+def test_only_passthru_coming_back_exchanged_fails_and_a_kept_verdict_is_read_first(archive):
+    dry = {"order": "chroma exchanged", "ok": False, "judged": True, "dry": True}
+    chain = {"order": "chroma exchanged", "ok": False, "judged": True, "dry": False}
+    unsure = {"order": "chroma exchanged", "ok": False, "judged": False, "dry": False}
+    write_take(archive / "takes" / "take-B-00.mkv", attempt={"program": "P", "chroma": dry})
+    write_take(archive / "takes" / "take-C-00.mkv", attempt={"program": "P", "chroma": unsure})
     found = ad.chroma(ad.takes_chroma(ad.takes_of(archive), None))
-    assert not found.ok and "1 of 3 takes judged; 1 chroma exchanged" in found.detail
-    assert "exchanged: take-B-00.mkv (chroma exchanged)" in found.detail and "device doctor" in found.fix
+    assert found.ok and found.detail == "1 of 3 takes judged, 1 exchanged (1 dry, read put right)"
+    kept = archive / "takes" / "take-A-00.mkv.chroma.json"
+    kept.write_text(json.dumps(chain), encoding="utf-8")
+    found = ad.chroma(ad.takes_chroma(ad.takes_of(archive), None))
+    assert not found.ok and "on Passthru: take-A-00.mkv (chroma exchanged)" in found.detail
+    assert "device doctor --loop" in found.fix
 
 
 def test_a_take_with_no_record_is_measured_on_the_clip(archive, monkeypatch):
@@ -296,8 +295,9 @@ def test_a_take_with_no_record_is_measured_on_the_clip(archive, monkeypatch):
     monkeypatch.setattr(cc, "lead_in_order", measure)
     take = archive / "takes" / "take-A-00.mkv"
     clip = str(archive / "clip" / "synthetic.mkv")
+    monkeypatch.setattr("syncsummoner.device.wire.load_wire", lambda path: {"dry": np.array("null")})
     found = ad.take_chroma(take, clip, 120)
-    assert found["order"] == "as played" and found["frames"] == 30
+    assert found["order"] == "as played" and found["frames"] == 30 and found["dry"] is False
     assert asked == {"take": take.name, "clip": clip, "fps": 30, "width": 1920, "lead": 120, "bits": 16}
     assert ad.take_chroma(take, clip, None) is None
 

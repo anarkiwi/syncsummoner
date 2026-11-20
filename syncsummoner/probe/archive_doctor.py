@@ -325,14 +325,18 @@ def last_attempt(take: Path) -> dict:
 
 
 def take_chroma(take: Path, clip: str | None, lead: int | None) -> dict | None:
-    """A captured take's dry lead-in channel order: as its last attempt recorded it, else measured.
+    """A captured take's dry lead-in channel order: as kept beside it or in its last attempt, else measured.
 
     ``lead`` is the clip's lead-in length, None when it could not be read; an unreadable take says why.
     """
     from syncsummoner.compose import chroma as lead_in  # pylint: disable=import-outside-toplevel
+    from syncsummoner.device.wire import load_wire  # pylint: disable=import-outside-toplevel
     from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
 
-    recorded = last_attempt(take).get("chroma")
+    kept = lead_in.record_path(take)
+    recorded = (
+        json.loads(kept.read_text(encoding="utf-8")) if kept.is_file() else last_attempt(take).get("chroma")
+    )
     if recorded is not None or not captured(take) or clip is None or lead is None:
         return recorded
     layout = read_sidecar(take)[1] if sidecar(take).is_file() else None
@@ -341,9 +345,10 @@ def take_chroma(take: Path, clip: str | None, lead: int | None) -> dict | None:
         found = lead_in.lead_in_order(
             take, clip, spec=decoded.Spec(), fps=ARCHIVE_FPS, width=width, lead=lead
         )
+        dry = json.loads(str(load_wire(take)["dry"])) is not None
     except lead_in.UNREADABLE as err:
         return {"error": f"{type(err).__name__}: {err}"}
-    return found.as_dict()
+    return {**found.as_dict(), "dry": dry}
 
 
 def takes_chroma(takes: Iterable[Path], clip: str | None) -> dict[str, dict | None]:
@@ -359,19 +364,20 @@ def takes_chroma(takes: Iterable[Path], clip: str | None) -> dict[str, dict | No
 
 
 def chroma(orders: dict[str, dict | None]) -> Finding:
-    """Every judged take's dry lead-in came back with its chroma pair as the clip played it."""
+    """Every take judged on a Passthru anchor came back as played; a dry take that came back exchanged is
+    its program's packing for that session, read back put right, and is counted."""
     judged = {t: o for t, o in orders.items() if o and "ok" in o and o.get("judged", True)}
-    bad = [f"{Path(t).name} ({o['order']})" for t, o in judged.items() if not o["ok"]]
-    counts = Counter(o["order"] for o in judged.values())
-    detail = f"{len(judged)} of {len(orders)} takes judged" + "".join(f"; {n} {o}" for o, n in counts.items())
-    if bad:
-        detail += f"; exchanged: {named(bad)}"
+    exchanged = {t: o for t, o in judged.items() if not o["ok"]}
+    chain = [f"{Path(t).name} ({o['order']})" for t, o in exchanged.items() if not o.get("dry", True)]
+    detail = f"{len(judged)} of {len(orders)} takes judged, {len(exchanged)} exchanged"
+    detail += f" ({len(exchanged) - len(chain)} dry, read put right)"
+    if chain:
+        detail += f"; on Passthru: {named(chain)}"
     return finding(
         "takes.chroma",
-        not bad,
+        not chain,
         detail,
-        "recapture them, each in a session of its own; "
-        "if every take reads exchanged, run `device doctor --loop`",
+        "Passthru came back exchanged, so the chain is wrong: run `device doctor --loop`, then recapture them",
     )
 
 

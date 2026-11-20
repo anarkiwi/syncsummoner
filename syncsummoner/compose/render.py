@@ -30,7 +30,8 @@ from syncsummoner.device.recorder import (
     require_signal,
     rig_state,
 )
-from syncsummoner.compose import timecode
+from syncsummoner.compose import chroma, timecode
+from syncsummoner.compose.chroma import swapped
 from syncsummoner.compose.cut import Cut, cut_plan
 from syncsummoner.compose.master import DEFAULT_CRF, X264
 from syncsummoner.compose.planner import plan_automation
@@ -310,6 +311,7 @@ def _attempt(
 
     try:
         judged = judge_take(out, clip=clip, config=config, program=program)
+        chroma.judge(out, clip, config, lead=layout.lead)
     except LockError as err:
         from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
@@ -585,6 +587,7 @@ class _Take:
         self.source = ExitStack()
         source = self.source.enter_context(captures(self.path, ffmpeg=ffmpeg))
         argv = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", *source, "-map", "0:v:0"]
+        argv += [*(["-vf", ",".join(swapped(self.path))] if swapped(self.path) else [])]
         argv += ["-fps_mode", "passthrough", "-s", f"{config.width}x{config.height}"]
         argv += ["-pix_fmt", SPLICE_PIX_FMT, "-f", "rawvideo", "pipe:1"]
         self.proc = subprocess.Popen(  # pylint: disable=consider-using-with

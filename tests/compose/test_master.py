@@ -156,3 +156,12 @@ def test_a_mastered_frame_has_no_strip_and_keeps_its_picture(tmp_path):
     ).stdout
     luma = np.frombuffer(got, np.uint8).reshape(height, width)
     assert luma[-strip:].max() <= 16 and np.ptp(luma[:-strip]) <= 2
+
+
+def test_a_take_whose_chroma_came_back_exchanged_is_mastered_put_right(tmp_path):
+    take = tmp_path / "take.mkv"
+    (tmp_path / "take.mkv.chroma.json").write_text('{"ok": false, "judged": true}', encoding="utf-8")
+    argv = M.master_command(take, None, "out.mp4", duration=10.0)
+    assert argv[argv.index("-vf") + 1].startswith("swapuv,")
+    plain = M.master_command(tmp_path / "other.mkv", None, "out.mp4", duration=10.0, fade_in=0, fade_out=0)
+    assert "-vf" not in plain

@@ -239,10 +239,10 @@ measure (`--rate-bytes-s` before any take); the rig hours left; the faults `logs
 takes' `.meta.json` attempts filed, by message (a changed CC map among them); each single-segment take's
 capture rate against the Pi's flips, to within one capture period over the take; and that every
 captured take has its `.rows.parquet`, so a collect that failed silently shows; and that every captured
-take's dry lead-in came back with its chroma pair as the clip played it (`takes.chroma`), read from the
-order its capture recorded or, for a take captured before that, measured on its first seconds and the clip's
-lead-in. A capture faults a take whose lead-in came back exchanged, so it is captured again
-([hardware.md](hardware.md#a-program-that-drops-active-video-pairs-its-chroma-per-load)).
+take's lead-in came back with its chroma pair as the clip played it under Passthru (`takes.chroma`), read
+from the order its capture kept or, for a take captured before that, measured on its first seconds and the
+clip's lead-in. A dry lead-in that came back exchanged is counted, not failed: that take is read put right
+([hardware.md](hardware.md#a-programs-422-packing-can-come-back-exchanged)).
 
 `probe timecode --synthetic SEED` makes the clip from the synthetic stimulus, every frame moving, its
 spec kept beside it (`clip.mkv.stimulus.json`) so any frame and its flow can be made again; footage

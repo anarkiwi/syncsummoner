@@ -14,7 +14,10 @@ import numpy as np
 
 from syncsummoner.device.recorder import SIGMA
 
-__all__ = ["AS_PLAYED", "ORDERS", "TO_YUV", "ChromaOrder", "order_of", "to_yuv", "variants"]
+__all__ = ["AS_PLAYED", "ORDERS", "SWAP", "TO_YUV", "ChromaOrder", "order_of", "to_yuv", "variants"]
+
+#: The ffmpeg filter that puts an exchanged chroma pair back.
+SWAP = "swapuv"
 
 ORDERS = ("as played", "chroma exchanged", "red and blue exchanged", "both exchanged")
 AS_PLAYED = ORDERS[0]
@@ -36,12 +39,12 @@ class ChromaOrder:
     @property
     def ok(self) -> bool:
         """Whether the chroma pair follows the picture as played rather than exchanged."""
-        return self.margin > 0
+        return bool(self.margin > 0)
 
     @property
     def judged(self) -> bool:
         """Whether the margin clears :data:`~syncsummoner.device.recorder.SIGMA` either way."""
-        return abs(self.margin) >= SIGMA
+        return bool(abs(self.margin) >= SIGMA)
 
     def as_dict(self) -> dict[str, Any]:
         """The verdict as stored in a take's attempt record."""
@@ -49,7 +52,7 @@ class ChromaOrder:
             "order": self.order,
             "ok": self.ok,
             "judged": self.judged,
-            "margin": round(self.margin, 2),
+            "margin": round(float(self.margin), 2),
             "frames": self.frames,
             "scores": self.scores,
         }

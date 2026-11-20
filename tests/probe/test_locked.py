@@ -319,51 +319,14 @@ def test_pooled_numbering_follows_the_clip_only_when_its_series_counts_the_lead_
     assert clock[0]["selection"]["shift"] != 0
 
 
-def test_a_take_whose_dry_lead_in_came_back_exchanged_is_a_fault(monkeypatch):
+def test_a_takes_channel_order_is_kept_in_its_attempt_record_and_never_faults_it(monkeypatch, caplog):
     from syncsummoner.compose import chroma as cc  # pylint: disable=import-outside-toplevel
-    from syncsummoner.compose import timecode  # pylint: disable=import-outside-toplevel
-    from syncsummoner.probe.chroma import ORDERS, ChromaOrder  # pylint: disable=import-outside-toplevel
 
-    config = SimpleNamespace(fps=30.0, width=1920, strip_px=8, bits=16, ffmpeg="/opt/ffmpeg")
-    asked = {}
-    said = {"order": ORDERS[0], "margin": 9.0}
-
-    def measure(take, clip, *, spec, fps, width, lead, ffmpeg):
-        asked.update(take=take, clip=clip, fps=fps, width=width, lead=lead, ffmpeg=ffmpeg, bits=spec.bits)
-        scores = {ORDERS[0]: [1.0, 1.0, 1.0], ORDERS[1]: [1.0, 0.0, 0.0]}
-        if said["order"] != ORDERS[0]:
-            scores = {ORDERS[0]: [1.0, 0.0, 0.0], ORDERS[1]: [1.0, 1.0, 1.0]}
-        return ChromaOrder(said["order"], scores, 30, said["margin"])
-
-    monkeypatch.setattr(cc, "lead_in_order", measure)
-    monkeypatch.setattr(
-        timecode, "clip_layout", lambda clip, ffprobe: SimpleNamespace(lead=105, ffprobe=ffprobe)
-    )
-    good = L.chroma_record("take.mkv", "clip.mkv", config)
-    assert good["chroma"]["order"] == ORDERS[0] and good["chroma"]["ok"] and "fault" not in good
-    assert asked == {
-        "take": "take.mkv",
-        "clip": "clip.mkv",
-        "fps": 30.0,
-        "width": 1920,
-        "lead": 105,
-        "ffmpeg": "/opt/ffmpeg",
-        "bits": 16,
-    }
-    said.update(order=ORDERS[1], margin=-9.0)
-    bad = L.chroma_record("take.mkv", "clip.mkv", config)
-    assert (
-        bad["fault"] == "ChromaOrderError: the dry lead-in came back chroma exchanged"
-        and not bad["chroma"]["ok"]
-    )
-
-    said["margin"] = -1.0
-    assert "fault" not in L.chroma_record("take.mkv", "clip.mkv", config)
-
-    def unreadable(*_args, **_kwargs):
-        raise RuntimeError("decoding failed")
-
-    monkeypatch.setattr(cc, "lead_in_order", unreadable)
-    assert L.chroma_record("take.mkv", "clip.mkv", config) == {
-        "chroma": {"error": "RuntimeError: decoding failed"}
-    }
+    said = {"order": "chroma exchanged", "ok": False, "judged": True}
+    monkeypatch.setattr(cc, "judge", lambda take, clip, config: dict(said))
+    assert L.chroma_record("take.mkv", "clip.mkv", None) == {"chroma": said}
+    assert "read with swapuv" in caplog.text
+    said.clear()
+    said["error"] = "ValueError: no strip"
+    assert L.chroma_record("take.mkv", "clip.mkv", None) == {"chroma": said}
+    assert "no channel order from the lead-in" in caplog.text

@@ -3,11 +3,13 @@
 # pylint: disable=missing-function-docstring
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from syncsummoner.compose import chroma as C
+from syncsummoner.compose import timecode
 from syncsummoner.compose.locktake import LeadIn
 from syncsummoner.device.playout import SHOWN
 from syncsummoner.probe.chroma import AS_PLAYED, ORDERS, variants
@@ -111,3 +113,27 @@ def test_a_lead_in_that_never_showed_its_dry_frames_is_an_error(take):
     said["shown"] = said["shown"][:5]
     with pytest.raises(ValueError, match="none of its dry frames"):
         judge(path, source, lead)
+
+
+CONFIG = SimpleNamespace(fps=FPS, width=1920, strip_px=8, bits=16, ffmpeg="ffmpeg")
+
+
+def test_a_judged_verdict_is_kept_beside_the_take_and_read_back(take, monkeypatch):
+    state, path, source, lead, _ = take
+    monkeypatch.setattr(timecode, "clip_layout", lambda clip, ffprobe: SimpleNamespace(lead=lead))
+    said = C.judge(path, source, CONFIG)
+    assert said["ok"] and said["judged"] and said["dry"]
+    assert json.loads(C.record_path(path).read_text(encoding="utf-8")) == said
+    assert not C.exchanged(path) and C.swapped(path) == []
+    state["order"] = 1
+    assert not C.judge(path, source, CONFIG, lead=lead)["ok"]
+    assert C.exchanged(path) and C.swapped(path) == ["swapuv"]
+
+
+def test_an_unreadable_take_keeps_why_and_reads_as_recorded(take, tmp_path):
+    state, path, source, lead, _ = take
+    state["lost"] = set(range(-lead, 0))
+    said = C.judge(path, source, CONFIG, lead=lead)
+    assert said == {"error": f"ValueError: {path}: no capture of its dry lead-in carries a legible strip"}
+    assert not C.exchanged(path)
+    assert not C.exchanged(tmp_path / "never-judged.mkv")

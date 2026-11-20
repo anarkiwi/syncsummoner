@@ -525,6 +525,26 @@ def test_a_real_recording_reads_back_frame_for_frame_in_colour(tmp_path):
     assert [f.shape for f in reader.stream(width=32)] == [reader.shape(32)] * 4
 
 
+def test_an_archive_whose_chroma_came_back_exchanged_is_read_put_right(tmp_path):
+    """Every part's pair is put back on read; parts that disagree are not one archive."""
+    made = [block_frame(shift) for shift in range(2)]
+    source = tmp_path / "source.rgb"
+    source.write_bytes(b"".join(f.tobytes() for f in made))
+    archive = archive_at(tmp_path)
+    scratch = archive.scratch("bitcrush")
+    encode_ffv1(source, scratch, height=32, width=64)
+    meta = archive.commit("bitcrush", KEY, scratch, rows(2), width=64, height=32, fps=FPS, exchanged=[True])
+    assert meta["chroma_exchanged"] is True
+    reader = archive.reader("bitcrush", KEY)
+    assert "swapuv" in " ".join(reader.command(start=0))
+    straight = reader.frame(0).astype(int)
+    for i, colour in enumerate(BLOCKS):
+        if colour[0] != colour[2]:
+            assert np.abs(straight[16, i * 16 + 8] - colour).max() > 40
+    with pytest.raises(ArchiveError, match="disagree"):
+        archive.commit("other", KEY, scratch, rows(2), width=64, height=32, fps=FPS, exchanged=[True, False])
+
+
 def irregular_recording(tmp_path, count=6, **kwargs):
     """A committed FFV1 recording whose capture times jump, as a real card's do."""
     made = [block_frame(shift) for shift in range(count)]

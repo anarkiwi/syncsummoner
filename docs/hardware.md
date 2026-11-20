@@ -54,21 +54,24 @@ computes on V as U.
 
 Never let the card convert (`CAP_PROP_CONVERT_RGB=1`): it clips.
 
-### A program that drops active video pairs its chroma per load
+### A program's 4:2:2 packing can come back exchanged
 
 The yuv444 core packs a program's output to 4:2:2 by toggling Cb and Cr on every pixel
 while the program's `avid` is high, restarting on Cb as it falls. boneoh/YUV Bit Rotator
 drives `avid` from a valid flag that never falls (`s_rotated_pre_valid <= '1'`), so the
 toggle runs free from the moment the program loaded, and a 2200-clock line keeps its phase:
-each load comes back as played or chroma exchanged for the whole session. Measured under
-its Bypass, after a load each with the link dropped: 4 of 8 loads exchanged, in no pattern,
-while Passthru between them never was.
+each load comes back as played or chroma exchanged for the whole session. Under its Bypass,
+one load each with the link dropped: 6 of 8 loads exchanged, in no pattern, while Passthru
+between them never was. YUV Amplifier under its Bypass came back exchanged on every one of
+its 3 loads, as in all 4 of its sessions on 2026-11-19 and 20: a constant exchange.
 
-A locked take therefore judges its dry lead-in against the clip once captured
-(`compose.chroma.lead_in_order`) and faults with `ChromaOrderError` when the pair came back
-exchanged, so the session is captured again; `probe doctor` reports every take's order as
-`takes.chroma`. A program with no dry control is judged on its Passthru anchor, which
-checks the chain but not the program.
+Either way the exchange is the packing, the same over the whole picture, wet or dry. So a
+captured take judges its dry lead-in against the clip (`compose.chroma.judge`, kept as
+`<take>.chroma.json`), and a take whose pair came back exchanged is read through `swapuv`:
+by its archive (`chroma_exchanged`), the splice and the master. `probe doctor` reports
+every take's order as `takes.chroma`, failing only when Passthru came back exchanged. A
+program with no dry control is judged on its Passthru anchor, which checks the chain but
+not the program.
 
 ## Parameters are additive
 

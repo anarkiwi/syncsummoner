@@ -391,6 +391,8 @@ def commit_sweep(
             FrameRow.from_row({**r, "frame": int(r["frame"]) + offset})
             for r in load_measurements(rows_path(take))
         ]
+    from syncsummoner.compose.chroma import exchanged  # pylint: disable=import-outside-toplevel
+
     states = np.concatenate([c.states for c in chunks])
     return archive.commit(
         program,
@@ -407,6 +409,7 @@ def commit_sweep(
             for k in range(len(states))
         ],
         pix_fmt=MJPEG_PIX_FMT,
+        exchanged=[exchanged(take) for take in takes],
     )
 
 
@@ -500,33 +503,19 @@ def capture(
 
 
 def chroma_record(take: str | Path, clip: str | Path, config: Any) -> dict:
-    """A captured take's dry lead-in channel order, and a fault when its chroma pair came back exchanged.
+    """A captured take's dry lead-in channel order, kept beside it, for its attempt record.
 
-    The fault sends the take back for another session: a program that drops its output's active-video flag
-    pairs its chroma afresh on every load, so the pair can come back exchanged for a whole session.
+    A program whose output drops active video packs its chroma afresh on every load, so a session can come
+    back exchanged; it is read back put right (:func:`~syncsummoner.compose.chroma.swapped`), not recaptured.
     """
-    from syncsummoner.compose import chroma as lead_in  # pylint: disable=import-outside-toplevel
-    from syncsummoner.compose.timecode import clip_layout  # pylint: disable=import-outside-toplevel
-    from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import chroma  # pylint: disable=import-outside-toplevel
 
-    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
-    try:
-        found = lead_in.lead_in_order(
-            take,
-            clip,
-            spec=decoded.Spec.of(config),
-            fps=config.fps,
-            width=config.width,
-            lead=clip_layout(clip, ffprobe=decoded.ffprobe_for(ffmpeg)).lead,
-            ffmpeg=ffmpeg,
-        )
-    except lead_in.UNREADABLE as err:
-        LOG.warning("%s: no channel order from the lead-in: %s", take, err)
-        return {"chroma": {"error": f"{type(err).__name__}: {err}"}}
-    said: dict = {"chroma": found.as_dict()}
-    if found.judged and not found.ok:
-        said["fault"] = f"ChromaOrderError: the dry lead-in came back {found.order}"
-    return said
+    said = chroma.judge(take, clip, config)
+    if "error" in said:
+        LOG.warning("%s: no channel order from the lead-in: %s", take, said["error"])
+    elif said["judged"] and not said["ok"]:
+        LOG.warning("%s: the dry lead-in came back %s; it is read with %s", take, said["order"], chroma.SWAP)
+    return {"chroma": said}
 
 
 def collect(
