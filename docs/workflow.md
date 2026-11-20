@@ -257,8 +257,8 @@ frame always fits; a setting is measured only once its last write has landed and
 `probe sweep restagger` rewrites existing plans the same way, keeping each original beside it.
 Against a synthetic clip (`probe timecode --synthetic SEED --shot-frames N`, its `.stimulus.json` beside
 it), `probe sweep regions` puts each setting on whole shots instead (`regions.shot_slots`): its writes and
-settle cover the cut, its hold is one shot's uncut motion, and kriging pools the settings rather than each
-being held to its own power, so a program's sweep is one take of minutes. Make the clip with `--one-texture`: a survival
+settle cover the cut, its hold is one shot's uncut motion, and `probe effects` measures each setting on
+that hold ([design.md](design.md#11-effect-intensity-and-safety)), so a program's sweep is one take of minutes. Make the clip with `--one-texture`: a survival
 ratio depends on the picture as well as the setting, so settings that each see their own texture
 measure texture as scatter; with one texture, only the motion is drawn per shot.
 `probe sweep smoke` captures a few seconds toggling one parameter and lands every write from the
@@ -497,53 +497,25 @@ analysis problem, not a rig problem.
 
 ```sh
 ss compose source.mkv --audio track.flac --profiles profiles/ --format 1080p30 \
-     --style glitchy --seed 7 --passes 8 --density 0.5 -o score.yaml
+     --follow 0.5 --intensity 0,1 [--change-bars 8] [--quicken 0] [--passes 8] -o score.yaml
 ```
 
-Every program with a usable profile is first ranked by one generation of gestures
-over every section, anchored to the track's beats, downbeats and section edges and
-scored against the measured response of that program. `--passes 8` keeps the eight
-strongest, one capture pass each, and cuts them over the sections in rank order;
-that cut plan is stored in the score (`cuts:`), and the render splices by it. Each
-cut is then evolved on its own program, judged on its own frames from the state the
-program's earlier cuts leave, so every gesture and write a layer makes lands while
-its take is on screen. A cut whose bars are predicted dead beyond the destruction
-budget is planned on every other kept program too and goes to the one alive there
-(`  67.11-  68.27s: czartroniks/Quilt predicted dead over 1 bars, planned on
-teletect/Teletect RamBend`). `--density` is gestures per bar on screen: each cut
-is filled to `density x its bars` gestures, each of which must add a write that is
-sent. Every candidate is judged through the program model's gate at the state the
-plan holds, as the render sends it, so a gesture on a parameter dead there is sent
-with the move that makes it live or is not chosen. Each gesture is aimed at a
-parameter drawn from every one it can drive that was measured to move something,
-whatever its axis. `--style` biases which gestures are drawn on; `--seed` makes the
-whole search reproducible.
-
-With profiles refit from footage, the planner predicts, bar by bar, whether each
-program keeps the clip's picture and motion, using the clip's own SI and TI, so
-pass the clip being rendered. A bar predicted dead outside a `destroy` section,
-or past the first bar of a dead run inside one, ranks a candidate below any that
-has fewer, whatever its score. A program whose layer still breaks that budget
-logs `N bars predicted dead outside the destruction budget`; one without survival
-logs `no survival measured, so its picture is unverified; refit from footage`.
-Survival is kriged jointly from the measurement records (`.parquet`) beside the
-profiles, so keep them together; settings shown in dead bars that no record
-decides are logged (`<program>: N settings shown dead that no record decides;
-archive them`) and listed in the score's `meta.unmeasured`, by program.
-Sections are split at the track's phrase length, which the score records as
-`phrase_bars`.
-
-`--budget` is the total number of candidates evaluated, spread over every program
-with a profile, so the generations each program gets is
-`budget / (6 * programs)`. Against twenty profiles the default 48 buys a single
-generation — raise it to `20 * 6 * 10` for ten.
+The composer plays only settings `probe effects` measured safe, whole and as measured
+([design.md §12](design.md#12-effect-mapping)), so run it on every profile first. The source picks
+the clip whose settings are used, black and white or colour, by its chroma (`--kind` forces one).
+Each bar's drive blends the source's motion (`--follow 1`) with the track's onsets
+(`--follow 0`) by rank, and `--intensity LOW,HIGH` maps it onto quantiles of the safe measured
+intensities: `0,1` reaches from the subtlest to the most exaggerated, `0,0.4` stays subtle,
+`0.6,1` stays heavy. Effects change on downbeats, every `--change-bars` bars (default: the
+track's phrase), sooner where the drive is high with `--quicken` above 0, later below it. Each
+run of bars goes to the program whose settings meet its targets best, never the same one twice
+running; `--passes` caps the programs, one capture each. The cut plan is stored in the score
+(`cuts:`) and the render splices by it; each bar's drive, target and chosen intensity are in its
+`meta`.
 
 ```
-09:18:22 composing 60.0s over 20 programs: 1 generation of 6 candidates, 2 sections at 117.5 bpm
-09:18:23 kept Passthru: score -0.483, 15 gestures
-09:18:23 kept Delirium: score -0.531, 15 gestures
-09:18:23 kept Loadstar: score -0.555, 15 gestures
-09:18:23 kept Bitcullis: score -0.560, 15 gestures
+10:14:05 composing for the colour clip: source chroma 0.0086, clips colour 0.0250
+10:14:05 16 cuts over 124 bars on boneoh/YUV Bit Rotator, czartroniks/Fray, teletect/Teletect RamBend, YUV Amplifier, Pinwheel, czartroniks/Porthole
 score.yaml
 ```
 
@@ -630,8 +602,8 @@ the program model from the state it was taken in, so a parameter is tested only 
 the steps that can change the picture, and one moved by steps the model proves
 inert is flagged as a contradiction ([evidence.md](evidence.md#link-3-applied-vs-acted-upon)).
 
-Iterate here, not on the full render. A different `--seed`, `--style` or
-`--density` at step 2 is seconds of CPU; a full render is most of an hour.
+Iterate here, not on the full render. A different `--follow`, `--intensity` or
+`--change-bars` at step 2 is seconds of CPU; a full render is most of an hour.
 
 ## 4. Render
 

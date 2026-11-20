@@ -54,6 +54,19 @@ def luma_709(frames: np.ndarray) -> np.ndarray:
     return frames @ LUMA_709
 
 
+def chroma_rms(frame: np.ndarray) -> float:
+    """RMS chroma per axis of an RGB frame in ``[0, 1]``: Rec.709 ``Cb``, ``Cr`` of full-range RGB.
+
+    ``Cb = (B - Y) / (2 (1 - KB))``, ``Cr = (R - Y) / (2 (1 - KR))``, so a neutral frame is 0 and the
+    figure is the per-axis standard deviation of an untinted picture.
+    """
+    rgb = as_frame(frame)
+    y = rgb @ LUMA_709
+    cb = (rgb[..., 2] - y) / (2.0 * (1.0 - LUMA_709[2]))
+    cr = (rgb[..., 0] - y) / (2.0 * (1.0 - LUMA_709[0]))
+    return float(np.sqrt(0.5 * np.mean(cb * cb + cr * cr)))
+
+
 def downscale(frame: np.ndarray, *, max_width: int | None = None, max_side: int | None = None):
     """Area-average a frame down to a width or longest-side cap, never enlarging.
 

@@ -260,10 +260,12 @@ Each primitive carries a musical anchor and consumes a specific profile field.
 | `lock_snap` | section boundary | tongue centers |
 | `punch` | onset | boolean parameters, pulsed and released |
 | `hysteresis_loop` | 2-bar | path-dependent parameters |
+| `setting` | bar | `effects`: one measured setting, every parameter |
 
 A gesture picks only parameters of the declared kinds it drives: `punch` the
-booleans, every other gesture the continuous and quantized ones; an `unused` slot
-is never written.
+booleans, every other drawn gesture the continuous and quantized ones; an `unused`
+slot is never written. `setting` is the composer's (§12): it writes a measured
+setting's slots one a frame, as archived, and is neither held to its cut nor gated.
 
 ### 4.4 Timing rules
 
@@ -278,43 +280,9 @@ From the perceptual constraints:
 
 ### 4.5 Planner
 
-Sample candidate scores, render a fast proxy (30-second excerpt, downscaled),
-score it, keep and mutate the best. A simple evolutionary loop is sufficient and
-debuggable.
-
-Objective terms:
-
-- reward correlation between visual IC and audio onset strength / IC
-- penalize channel-energy concentration (mud — energy piled into one Gabor cell)
-- keep spectral slope in the natural band by default, with deliberate excursions
-  permitted on hits
-- penalize illegal levels and clipping, unless the section is marked `destroy`
-- reward motif return at section boundaries — visual rhyme, states revisited with
-  variation
-- penalize low variance across any bar (anti-boredom floor); with measured
-  survival, penalize the least share of the source's motion kept in any bar
-- ranked constraint: bars predicted dead beyond the destruction budget (§9.4),
-  compared before the weighted total
-- hard constraint: reachability, given measured settle times; the locked take's
-  link is paced by its echoes, not by a planned rate
-
-Sections are split at the phrase grid before gestures are drawn (§9.5).
-
-The cut plan is composed, not left to the render. Programs are ranked by one
-generation over every section, the kept ones cut over the sections in rank order,
-and the plan stored in the score; the render splices by it (`compose.cut.cut_plan`
-is the one function both call). A take is shown only in its cuts, so each cut is
-evolved on its own program and judged on its own frames, from the state the
-program's earlier cuts leave (thinning continues across the cut boundary as it
-does over the whole layer), and a layer sends no write outside its cuts. A cut
-predicted dead beyond the destruction budget is planned on every other kept
-program and goes to the best ranked, so the render's cover (§9.6) is a check and a
-last resort. Density is gestures per bar on screen, and every candidate is judged through the
-program model's gate at the state the plan holds, so a gesture adding no sent
-write is not chosen. A gesture is aimed at
-a parameter drawn from every one it can drive that was measured to move
-something: left to its axis it would drive only that axis's most sensitive
-parameter, and none assigned no axis.
+The planner maps measured effects onto the music and the source (§12). The cut plan
+is composed, not left to the render: the score stores it (`cuts:`) and the render
+splices by it (`compose.cut.cut_plan` is the one function both call).
 
 ---
 
@@ -356,8 +324,9 @@ syncsummoner profile show | diff | atlas --program bitcrush_displace
 
 syncsummoner analyze clip.mp4 --audio track.wav -o features.json
 
-syncsummoner compose --profiles profiles/ --features features.json \
-                     --style glitchy --seed 7 -o score.yaml
+syncsummoner compose clip.mp4 --audio track.wav --profiles profiles/ \
+                     [--follow 0.5] [--intensity 0,1] [--change-bars N] [--quicken 0] \
+                     [--passes N] [--kind auto|bw|colour] --format 1080p30 -o score.yaml
 
 syncsummoner audition score.yaml --seconds 30
 syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
@@ -459,56 +428,13 @@ framebuffer could scan out the strip one frame ahead of the picture above it.
 
 A refit of a footage archive scores each setpoint group on the clip frames its
 captures show, adding `si_ratio`, `ti_ratio` and `motion_follow` to its record,
-and the fit keeps them among each parameter's measured curves. The loop
-behaviour fits read the codeframe loop and are not run on footage archives.
-Codeframe archives (schema 3) are still read and refit as before.
-
-Each measured curve is a first-order marginal, `E[metric | parameter value]`,
-estimated by Nadaraya–Watson regression with a Gaussian kernel. The archive
-moves every parameter at once, so the records at one value of one parameter are
-few and carry every other parameter's effect as noise; the kernel pools nearby
-values. The bandwidth minimises leave-one-out squared error over a dyadic grid
-from the least value gap to the span, with zero (the per-value mean) as a
-candidate, so a cliff is smoothed only when the data cannot resolve it. The
-planner predicts a vector's other metrics as the sum of each parameter's
-departure from its own median (first-order HDMR), which is what first-order
-marginals are for.
-
-Survival is not predicted that way: a sum of one-parameter averages cannot carry
-one parameter gating another (Pinwheel's Posterize near zero flattens the
-picture whatever its gains add, while its marginal, averaged over every other
-parameter, stays flat). `compose.kriged` instead fits each survival response
-jointly over every parameter the archive varied, from the records in the
-`.parquet` beside each profile: a Gaussian process with an ARD squared-exponential
-kernel plus white noise, its hyperparameters by marginal likelihood
-(scikit-learn), in log space for the ratios and Fisher z for the follow. A
-program with no records falls back to the first-order sum. The planner opens
-every cut on the state the program loaded in, from its model, plus every write
-sent since.
-
-### 9.4 Survival constraint and destruction budget
-
-`predict_survival` judges each bar of a predicted trajectory against the same
-bar of the source footage, whose SI and TI come from `VideoFeatures`. A bar is
-dead when the predicted SI or TI falls below its live floor, or when, where the
-source's TI varies beyond quantisation as the take check asks, the predicted
-follow would not reach the critical z over the bar's effective samples
-(`live_bounds`). A kriged response is judged by simple kriging with the bound
-itself as the prior mean: the bar lives only where the records pull the
-prediction above the bound, so a setting no record informs reverts to the bound
-and is not alive. A dead bar whose verdict lies within the one-sided critical z
-of its posterior spread is undecided by the records; its settings are logged
-and kept in the score's `unmeasured`, by program, as what an archive would have
-to measure.
-
-Destruction is budgeted one bar at a time: inside a `destroy` section the first
-bar of a dead run is allowed and every further one counts; outside, every dead
-bar counts. `Objective.violation` is that count and `Objective.rank` sorts by
-`(violation, -total)`, so selection is constraint domination: no weighting of
-the other terms trades a dead picture for anything. With survival measured,
-boredom is the largest shortfall of predicted `ti_ratio` below 1 in any bar; a
-profile with no survival falls back to the variance floor, ranks unconstrained,
-and is logged as unverified.
+and the fit keeps them among each parameter's measured curves, first-order
+marginals `E[metric | parameter value]` by Nadaraya–Watson regression with a
+leave-one-out bandwidth. The composer no longer predicts survival from them: a
+sum of one-parameter averages cannot carry one parameter gating another, and the
+archive measures each setting's intensity and safety outright (§11), so the
+composer plays measured settings only (§12). Survival is judged on the takes
+themselves (§9.6).
 
 ### 9.5 Phrase-length sections
 
@@ -516,8 +442,9 @@ and is logged as unverified.
 which more than half the inner section boundaries (each snapped to its nearest
 downbeat) lie; one bar always qualifies. Sections are split on that grid,
 keeping label and destroy mark, so gestures and cuts change at phrase length
-rather than only at the segmentation's boundaries. The score records `bar` and
-`phrase_bars` in its metadata.
+rather than only at the segmentation's boundaries. The phrase is the composer's
+default spacing of effect changes (§12); the score records `bar` and `phrase_bars`
+in its metadata.
 
 ### 9.6 Take check before mastering
 
@@ -666,6 +593,37 @@ varied, each over its span, and calls a setting safe only when every measured se
 nearest-neighbour spacing, the design's own resolution, is safe. At archive density an unmeasured
 setting's intensity is barely informed by its neighbours across a dozen parameters, so the composer
 chooses among measured settings and uses `lookup` only for a setting a score already holds.
+
+---
+
+## 12. Effect mapping
+
+The composer needs only what §11 measures: how far each setting takes a picture and whether it stays
+watchable. At render time it reads the beat, whether the source is black and white or colour, and the
+source's own activity, and maps a configurable curve from those onto the measured settings
+(`compose.planner`).
+
+```sh
+syncsummoner compose source.mkv --audio track.flac --profiles profiles/ --format 1080p30 \
+    --follow 0.5 --intensity 0,1 [--change-bars 8] [--quicken 0] [--passes N] [--kind auto] -o score.yaml
+```
+
+| Step | What | Why |
+| --- | --- | --- |
+| clip | the measured clip whose RMS chroma per axis is nearer the source's; a clip's is `saturation / 6` (`stimulus.chroma_sigma`), the colour clip's set by the gamut (§11.1) | the only threshold is the midpoint between the two stimuli the settings were measured on; it assumes untinted clips, which `--colour bw` and `--colour full` are |
+| source chroma | per frame, `sqrt(mean(Cb^2 + Cr^2) / 2)` of Rec.709 full-range `Cb`, `Cr` (`aesthetics.chroma_rms`), RMS over the clip | the same quantity the clip's saturation sets |
+| bars | downbeat to downbeat, a pickup joined to the first bar | settings change on the bar, effects on downbeats |
+| drive | per bar, the rank of `follow * rank(source TI) + (1 - follow) * rank(onset strength)`, each a bar mean | ranks are scale-free, so P.910 TI and onset strength mix without a conversion; the most and least driven bars always reach the bounds |
+| target | `low + (high - low) * drive`, a quantile of every program's safe intensities on the clip | quantiles of what was measured, so `0` is the subtlest safe setting and `1` the most exaggerated whatever the archive holds |
+| changes | each bar adds `(1 + quicken (2 drive - 1)) / bars` to a count; an effect starts where the count passes a whole number | `quicken 0` changes every `bars` bars on the phrase grid; positive crowds changes where the drive is high, negative where it is low, keeping their number |
+| program | Viterbi over runs of bars: cost the summed distance from each bar's target to the program's nearest safe setting, no program twice running; `--passes` keeps programs greedily, each lowering the least total most | a change is a change of effect; each program kept is one capture |
+| setting | each bar plays its program's safe setting nearest its target, its changed slots written one a frame so the last lands as the bar starts; a run's first, every slot, from when its program last left the screen | measured settings only, as measured: at archive density a neighbour's measurement does not predict a setting's (§11.3); one slot a frame is how the archive wrote them (`locked.staggered`) and always fits the link; off screen, the first settles by the cut |
+
+Settings change at most once a bar, so a change cannot itself flash at the three a second §11.2
+counts. The score's `meta` records the clip, both chromas, the curve, and each bar's edge, drive, target
+and chosen intensity. Defaults: `follow 0.5` weighs picture and music alike; `intensity 0,1` spans
+every safe setting; `change-bars` the track's phrase (§9.5) and `quicken 0` keep changes on its grid;
+`passes` uses every program with a safe setting; `kind auto` lets the source choose.
 
 ---
 

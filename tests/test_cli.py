@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring,protected-access
 
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -255,8 +256,7 @@ def test_probe_archive_fails_fast_with_no_ffmpeg_and_never_touches_the_rig(monke
     assert cli.main(["probe", "archive", "--out", str(tmp_path)]) == 1
 
 
-def test_compose_passes_density_through(monkeypatch, tmp_path):
-    """`search` always took density; the composer could not say it."""
+def test_compose_passes_the_curve_through(monkeypatch, tmp_path):
     seen = {}
 
     def fake_search(profiles, features, **kwargs):
@@ -277,13 +277,24 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
             "clip.mkv",
             "--profiles",
             str(tmp_path),
-            "--density",
+            "--follow",
             "0.9",
+            "--intensity",
+            "0.2,0.7",
+            "--change-bars",
+            "2",
+            "--quicken",
+            "-0.5",
+            "--passes",
+            "3",
+            "--kind",
+            "bw",
             "-o",
             str(tmp_path / "score.yaml"),
         ]
     )
-    assert seen["density"] == 0.9
+    want = {"follow": 0.9, "low": 0.2, "high": 0.7, "bars": 2.0, "quicken": -0.5, "passes": 3, "kind": "bw"}
+    assert dataclasses.asdict(seen["curve"]) == want
 
 
 @pytest.mark.parametrize(
@@ -304,7 +315,10 @@ def test_compose_passes_density_through(monkeypatch, tmp_path):
         ),
         ("render", ["--audio", "--fade", "--fade-in", "--fade-out", "--no-master", "--take"]),
         ("audition", ["--seconds", "--start", "--audio", "--fade", "--cut-programs"]),
-        ("compose", ["--density", "--style", "--budget", "--passes", "--format"]),
+        (
+            "compose",
+            ["--follow", "--intensity", "--change-bars", "--quicken", "--passes", "--kind", "--format"],
+        ),
         ("probe refit", ["--archive", "--jobs", "--ffmpeg"]),
         ("probe names", ["--archive", "--program"]),
         ("score show", ["--profiles"]),

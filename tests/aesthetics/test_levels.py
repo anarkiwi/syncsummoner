@@ -6,6 +6,7 @@ import pytest
 from syncsummoner.aesthetics.levels import (
     LUMA_709,
     chroma,
+    chroma_rms,
     downscale,
     level_stats,
     luma,
@@ -90,3 +91,15 @@ def test_non_rgb_input_is_rejected(shape):
     """Only (H, W, 3) frames are accepted at the boundary."""
     with pytest.raises(ValueError):
         level_stats(np.zeros(shape, dtype=np.float32))
+
+
+def test_chroma_rms_is_zero_on_grey_and_inverts_a_known_chroma():
+    """A neutral frame has none; a frame built from known Cb, Cr gives back their per-axis RMS."""
+    assert chroma_rms(np.full((4, 4, 3), 0.3, np.float32)) == pytest.approx(0.0, abs=1e-7)
+    kr, kb = float(LUMA_709[0]), float(LUMA_709[2])
+    cb = np.array([[0.05, -0.05], [0.05, -0.05]])
+    cr = np.array([[0.02, 0.02], [-0.02, -0.02]])
+    r, b = 0.5 + 2 * (1 - kr) * cr, 0.5 + 2 * (1 - kb) * cb
+    g = (0.5 - kr * r - kb * b) / (1 - kr - kb)
+    frame = np.stack([r, g, b], axis=-1).astype(np.float32)
+    assert chroma_rms(frame) == pytest.approx(np.sqrt((0.05**2 + 0.02**2) / 2), rel=1e-4)

@@ -19,7 +19,7 @@ from syncsummoner.aesthetics.dynamics import (
     analyze_dynamics,
     winding_number,
 )
-from syncsummoner.aesthetics.levels import LevelStats, level_stats, passthrough_distance
+from syncsummoner.aesthetics.levels import LevelStats, chroma_rms, level_stats, passthrough_distance
 from syncsummoner.aesthetics.motion import MotionStats, motion_stats
 from syncsummoner.aesthetics.safety import (
     FlashRisk,
@@ -99,6 +99,7 @@ __all__ = [
     "information",
     "live_floor",
     "information_content",
+    "chroma_rms",
     "level_stats",
     "mitigate_flashes",
     "motion_stats",
