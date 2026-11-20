@@ -344,10 +344,12 @@ def test_a_passthru_take_loads_nothing_inside_its_lead_in(monkeypatch, tmp_path)
 
 def test_a_lockcheck_take_loads_its_program_inside_the_lead_in(monkeypatch, tmp_path):
     rig = locked_pass(monkeypatch, load_s={"Teletext": 0.1})
+    rig.rig.transport.prepare = lambda name: rig.log.append(("author", name))
     out = tmp_path / "take.mkv"
     loaded = R.play_take(rig.rig, rig, out, program="Teletext", seconds=0.2, config=LOCKED, clip=CLIP)
     assert [step[1] for step in rig.log if step[0] == "load"] == ["Passthru", "Teletext", "Passthru"]
-    assert rig.steps[:5] == ["load", "record", "play", "load", "params"] and loaded == pytest.approx(0.1)
+    assert rig.steps[:6] == ["load", "author", "record", "play", "load", "params"]
+    assert loaded == pytest.approx(0.1), "the author is switched before the lead-in, outside its timing"
     assert rig.clock.now == pytest.approx((8 + 6 + 8) / 30 + LOCKED.tail_s)
     record = np.load(L.lock_path(out))
     assert (int(record["lead"]), int(record["count"]), int(record["tail"])) == (8, 6, 8)
