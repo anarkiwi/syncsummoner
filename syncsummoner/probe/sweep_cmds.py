@@ -141,6 +141,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
         chunks_of,
         design,
         distinct,
+        fill,
         guard_frames,
         region_dims,
         second_order,
@@ -176,20 +177,25 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     for selector, mover in (tuple(int(x) for x in pair.split(":")) for pair in args.joint):
         extra = np.r_[extra, joint(states[chosen[:1]], selector, mover, values)[1:]]
     shot = stimulus_shot(args.source)
-    if shot is not None or args.budget_s is None:
-        counts = [min(second_order(len(d)), distinct(d, kept)) for d in dims]
+    if shot is None and args.budget_s is not None:
+        placed = slots(ti, edges, guard=guard, budget_s=args.budget_s, overhead_s=overhead_s, fps=config.fps)
+        counts = [
+            min(n, distinct(d, kept))
+            for n, d in zip(allot(max(len(placed) - len(extra), 0), [len(d) for d in dims]), dims)
+        ]
+    else:
+        caps = [distinct(d, kept) for d in dims]
+        counts = (
+            [min(second_order(len(d)), c) for d, c in zip(dims, caps)]
+            if args.settings is None
+            else fill(args.settings - len(extra), [len(d) for d in dims], caps)
+        )
         limit = sum(counts) + len(extra)
         placed = (
             shot_slots(shot, layout.frames, guard=guard, limit=limit)
             if shot is not None
             else slots(ti, edges, guard=guard, overhead_s=overhead_s, fps=config.fps, limit=limit)
         )
-    else:
-        placed = slots(ti, edges, guard=guard, budget_s=args.budget_s, overhead_s=overhead_s, fps=config.fps)
-        counts = [
-            min(n, distinct(d, kept))
-            for n, d in zip(allot(max(len(placed) - len(extra), 0), [len(d) for d in dims]), dims)
-        ]
     sampled = [
         design(states[i], d, kept, n, args.seed + k) for k, (i, d, n) in enumerate(zip(chosen, dims, counts))
     ]
@@ -500,11 +506,17 @@ def add_parsers(probe_sub: Any) -> None:
     regions.add_argument("--source", required=True, help="the timecoded clip the takes will play")
     regions.add_argument("--audio", required=True, help="the track the clip is scored to, for its bars")
     regions.add_argument("--takes", required=True, help="the sweep's takes directory")
-    regions.add_argument(
+    size = regions.add_mutually_exclusive_group()
+    size.add_argument(
         "--budget-s",
         type=float,
-        help="rig seconds the program's takes may use; without it each regime gets the settings a "
-        "second-order model of its parameters needs, at most their distinct settings",
+        help="rig seconds the program's takes may use; without it or --settings each regime gets the "
+        "settings a second-order model of its parameters needs, at most their distinct settings",
+    )
+    size.add_argument(
+        "--settings",
+        type=int,
+        help="settings the program's takes hold, joint moves among them, shared by its regimes",
     )
     regions.add_argument("--seed", type=int, default=0, help="seed of the scrambled Sobol design")
     regions.add_argument("--joint", action="append", default=[], metavar="SELECTOR:MOVER", help="as for plan")

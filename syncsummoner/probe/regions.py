@@ -29,6 +29,7 @@ __all__ = [
     "second_order",
     "without_bypass",
     "effect_sizes",
+    "fill",
     "guard_frames",
     "hold_at",
     "holds",
@@ -198,6 +199,29 @@ def allot(total: int, dims: Sequence[int]) -> list[int]:
     return [int(2 ** math.floor(math.log2(s))) if s >= 1 else 0 for s in share]
 
 
+def fill(total: int, dims: Sequence[int], caps: Sequence[int]) -> list[int]:
+    """Exactly ``total`` settings over regimes sampling ``dims`` parameters, each at most its ``caps``.
+
+    Each regime starts at one setting and the regime with the most dimensions per setting doubles while a
+    doubling fits, so each count is a power of two and a balanced Sobol design; what no doubling fits
+    goes to the regimes with the most dimensions, whose designs are then Sobol prefixes, unions of
+    balanced nets. Fewer than ``total`` only if the caps hold fewer.
+    """
+    counts = [min(1, int(c)) for c in caps]
+    left = total - sum(counts)
+    if left < 0:
+        raise SweepError(f"{total} settings for {len(counts)} regimes")
+    while grow := [i for i, n in enumerate(counts) if n <= left and 2 * n <= caps[i] and dims[i]]:
+        i = max(grow, key=lambda j: dims[j] / counts[j])
+        left -= counts[i]
+        counts[i] *= 2
+    for i in sorted(range(len(counts)), key=lambda j: -dims[j]):
+        more = min(left, int(caps[i]) - counts[i]) if dims[i] else 0
+        counts[i] += more
+        left -= more
+    return counts
+
+
 def region_dims(record: Mapping, values: Mapping[int, np.ndarray]) -> list[list[int]]:
     """Per chosen regime of a cover record, the parameters a design samples: those stepped there that
     the program reads at more than one of ``values`` (from :func:`without_bypass`, so never its bypass).
@@ -223,7 +247,8 @@ def without_bypass(values: Mapping[int, np.ndarray], bypass: Any) -> dict[int, n
 def design(
     base: np.ndarray, params: Sequence[int], values: Mapping[int, np.ndarray], count: int, seed: int
 ) -> np.ndarray:
-    """``count`` states sampling ``params`` jointly from ``base`` by a scrambled Sobol design.
+    """``count`` states sampling ``params`` jointly from ``base`` by a scrambled Sobol design, its prefix
+    when ``count`` is no power of two.
 
     Each coordinate picks among ``values[p]``, the settings the program tells apart, by the stratum it
     falls in, so each of a few settings comes up equally often; other parameters keep ``base``.
@@ -232,7 +257,7 @@ def design(
     out = np.repeat(np.asarray(base, dtype=np.int64)[None, :], count, axis=0)
     if not params or not count:
         return out
-    u = qmc.Sobol(d=len(params), scramble=True, seed=seed).random_base2(int(math.log2(count)))
+    u = qmc.Sobol(d=len(params), scramble=True, seed=seed).random_base2(math.ceil(math.log2(count)))[:count]
     for j, p in enumerate(params):
         reps = np.asarray(values[p], dtype=np.int64)
         out[:, p - 1] = reps[np.minimum((u[:, j] * reps.size).astype(np.int64), reps.size - 1)]

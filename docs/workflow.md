@@ -219,7 +219,7 @@ render plays, as frame-locked takes ([evidence.md](evidence.md)):
 ss --stall 40 probe timecode --synthetic 1 --seconds 351 --out clip.mkv   # the clip every take plays
 ss probe hold takes/take-*.mkv --source clip.mkv --out holds/      # settle and hold per program
 ss probe sweep regions NAME --cover cover-NAME.json --hold holds/hold-NAME.json --source clip.mkv \
-  --audio track.m4a --takes sweep/ --budget-s 1500 [--joint 11:6] [--seed N]
+  --audio track.m4a --takes sweep/ [--budget-s 1500 | --settings 64] [--joint 11:6] [--seed N]
 ss probe sweep plan NAME --structural --hold holds/hold-NAME.json --source clip.mkv --takes sweep/
 ss probe sweep capture sweep/sweep-NAME.json --source-host pi@videopi   # rig, every take in one session
 ss probe sweep capture sweep/sweep-NAME.json --chunk K --source-host pi@videopi   # recapture one take alone
@@ -337,6 +337,12 @@ program. Without `--hold`, a program with no takes yet, each setting's guard is 
 alone and the plan records its settle as unmeasured (`"measured": false`); its takes' rows say so in
 their evidence, and `sweep commit` refuses them until `probe hold` has measured the program on those
 same takes and each is collected again with `--hold`.
+
+`--settings N` asks for exactly N settings, joint moves among them (`regions.fill`): each regime
+starts at one and the regime with the most dimensions per setting doubles while a doubling fits and
+stays within its distinct settings, so counts are powers of two where they can sum to N; any rest
+goes to the regimes with the most dimensions as a Sobol prefix, a union of balanced nets. Fewer than
+N only when the regimes' distinct settings hold fewer.
 
 `--cover FILE` plans from a cover `program cover --json` already wrote, each stepped
 parameter's settings taken from the bits the program reads, so no cover is searched.
