@@ -170,6 +170,18 @@ def listing(parts: Sequence[str], durations: Sequence[str]) -> str:
     return f"{LISTING_HEADER}\n{body}"
 
 
+def one_order(program: str, exchanged: Sequence[bool] | None) -> bool | None:
+    """Whether every recording of ``program`` came back with its chroma pair exchanged; None when unsaid.
+
+    Parts read as one stream share one order, so recordings that disagree are refused.
+    """
+    if exchanged is None:
+        return None
+    if len(set(exchanged)) > 1:
+        raise ArchiveError(f"{program!r}: its takes' chroma pairs disagree; capture them in one session")
+    return bool(exchanged and exchanged[0])
+
+
 @dataclass(frozen=True)
 class FrameRow:
     """One archived frame: where it sits in the stream, and what produced it.
@@ -619,8 +631,7 @@ class FrameArchive:
         """
         if not rows:
             raise ArchiveError(f"no frames archived for {program!r}")
-        if exchanged is not None and len(set(exchanged)) > 1:
-            raise ArchiveError(f"{program!r}: its takes' chroma pairs disagree; capture them in one session")
+        swap = one_order(program, exchanged)
         if len(rows) != len({row.frame for row in rows}):
             raise ArchiveError(f"{program!r} has repeated frame indices in its sidecar")
         for row in rows:
@@ -675,8 +686,8 @@ class FrameArchive:
             meta["schedule"] = [dict(entry) for entry in schedule]
         if sources is not None:
             meta["parts"] = [p.name for p in parts]
-        if exchanged is not None:
-            meta[EXCHANGED] = bool(exchanged and exchanged[0])
+        if swap is not None:
+            meta[EXCHANGED] = swap
         self._write_meta(meta_path, meta)
         for path in stale - set(self.files(program, meta)):
             path.unlink(missing_ok=True)

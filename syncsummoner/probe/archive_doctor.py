@@ -377,7 +377,7 @@ def chroma(orders: dict[str, dict | None]) -> Finding:
         "takes.chroma",
         not chain,
         detail,
-        "Passthru came back exchanged, so the chain is wrong: run `device doctor --loop`, then recapture them",
+        "Passthru came back exchanged, so the chain is wrong: run `device doctor --loop`, then recapture",
     )
 
 

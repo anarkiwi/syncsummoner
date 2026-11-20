@@ -87,7 +87,7 @@ def exchanged(take: str | Path) -> bool:
 
 
 def swapped(take: str | Path) -> list[str]:
-    """The filters that read ``take`` in its clip's channel order: :data:`SWAP` when it came back exchanged."""
+    """The filters reading ``take`` in its clip's channel order: :data:`SWAP` when it came back exchanged."""
     return [SWAP] if exchanged(take) else []
 
 
