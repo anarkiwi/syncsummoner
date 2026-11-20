@@ -1,8 +1,9 @@
 """Check captured takes against the source frames they were fed, before anything is mastered.
 
 Every capture is attributed to the clip frame it shows, so each bar of each take is judged
-by how much of that bar's picture and motion it kept: flat, frozen and unfollowed bars are
-dead, and a cut that shows one is covered from a take alive there or the render fails.
+by what it kept of that bar's picture and motion: a flat bar is blank and a frozen bar static,
+either is dead, and a cut that shows one is covered from a take alive there or the render fails.
+Whether the output's motion follows the source's is no part of being alive.
 """
 
 from __future__ import annotations
@@ -60,7 +61,6 @@ class Fault(enum.Enum):
 
     FLAT = "flat"
     FROZEN = "frozen"
-    UNFOLLOWED = "unfollowed"
 
 
 @dataclass(frozen=True)
@@ -202,15 +202,14 @@ class Verdict:
     fault: Fault | None
 
 
-def fault(out: Trace, a: int, b: int, kept: aesthetics.Survival, source_ti: np.ndarray) -> Fault | None:
+def fault(out: Trace, a: int, b: int, kept: aesthetics.Survival) -> Fault | None:
     """Why clip frames ``a:b`` of a trace are dead, or None while they live.
 
     Flat: not mostly frames whose luma spans more than one 8-bit step, or SI under the source's
     :func:`~syncsummoner.aesthetics.live_floor`; frozen: TI under it, or
     :func:`~syncsummoner.device.recorder.held` unable to tell the bar from one picture under
     capture noise while its motion does not follow the source either, since a held picture's TI
-    is that noise and independent of the source's; unfollowed: motion not following a source TI
-    that varies beyond quantisation.
+    is that noise and independent of the source's.
     """
     picked = out.picked[a:b]
     frames = out.frames[picked[picked >= 0]].astype(np.float32)
@@ -223,10 +222,6 @@ def fault(out: Trace, a: int, b: int, kept: aesthetics.Survival, source_ti: np.n
         kept.source_ti, aesthetics.quantisation_ti()
     ):
         return Fault.FROZEN
-    window = source_ti[a:b]
-    varied = bool(np.isfinite(window).any() and np.nanstd(window) > aesthetics.quantisation_ti())
-    if kept.frames > 3 and varied and not kept.following:
-        return Fault.UNFOLLOWED
     return None
 
 
@@ -237,7 +232,7 @@ def judge(
     verdicts = []
     for a, b in zip(edges[:-1], edges[1:]):
         kept = aesthetics.survival_stats(source_si[a:b], source_ti[a:b], out.si[a:b], out.ti[a:b])
-        verdicts.append(Verdict(a / fps, b / fps, kept, fault(out, a, b, kept, source_ti)))
+        verdicts.append(Verdict(a / fps, b / fps, kept, fault(out, a, b, kept)))
     return verdicts
 
 
@@ -300,8 +295,9 @@ def cover(
     """Replace every dead run of every cut with the take alive across it that follows best.
 
     Every take is judged on the same bars, each in the cut its middle falls in, as :func:`bar_edges`
-    splits them at every cut. Destruction is budgeted at one bar at a time, so a lone dead bar
-    inside a destroy-marked section stays; any other dead run is covered.
+    splits them at every cut on the frame grid. A run reaching a cut's edge takes that edge itself, so
+    no sliver of the cut is left between the edge and its bar's frame. Destruction is budgeted at one
+    bar at a time, so a lone dead bar inside a destroy-marked section stays; any other dead run is covered.
     """
     grid = next(iter(verdicts.values()), [])
     middles = np.array([0.5 * (v.start + v.end) for v in grid])
@@ -315,7 +311,8 @@ def cover(
             run = index[a:b]
             if run.size == 1 and destroy(0.5 * (grid[run[0]].start + grid[run[0]].end)):
                 continue
-            start, end = max(cut.start, grid[run[0]].start), min(cut.end, grid[run[-1]].end)
+            start = cut.start if a == 0 else grid[run[0]].start
+            end = cut.end if b == index.size else grid[run[-1]].end
             alive = {
                 name: float(np.mean([found[i].survival.z for i in run]))
                 for name, found in verdicts.items()

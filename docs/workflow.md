@@ -659,7 +659,7 @@ What happens, in order:
    becomes `take-author_Name-<digest>.mkv`, the archive's name for it), and they are spliced
    together on the score's cuts into `final.take.mp4`.
 7. Before the takes are spliced together, each is checked against the timecoded
-   clip it was fed, frame for frame by its attribution, and every bar is judged `flat`, `frozen` or `unfollowed` on what it kept of the
+   clip it was fed, frame for frame by its attribution, and every bar is judged `flat` (blank) or `frozen` (static) on what it kept of the
    same bar of the clip. A dead run inside a cut is covered from another
    program's take alive across it (`Derez:   42.10-  46.20s frozen, covered by
    Lorenz`); a lone dead bar inside a `destroy` section stays. Compose already moved
@@ -797,7 +797,7 @@ doing it twice, which is what the audition is for.
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
 | `SpliceError: <program>: no capture shows clip frames ...` | the take ends early, or a fitted take was never aligned; check its `aligned by` line in the take check |
-| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or not following the clip, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
+| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat or frozen, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
 | `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `probe sweep` and refit |
 | `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
 | `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, the frame line against the jitter, slips, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |

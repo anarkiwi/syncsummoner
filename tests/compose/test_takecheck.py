@@ -71,14 +71,13 @@ def test_a_passthrough_lives_and_a_held_or_blank_take_dies():
     assert {v.fault for v in flat[2:]} == {T.Fault.FLAT}
 
 
-def test_motion_the_source_never_had_is_unfollowed():
+def test_motion_the_source_never_had_is_alive():
     clip = moving(270)
     src_si, src_ti = series(clip)
-    other = moving(270, seed=5)
-    out = T.trace(recording(other), src_si, src_ti, fps=FPS)
+    out = T.trace(recording(moving(270, seed=5)), src_si, src_ti, fps=FPS)
     verdicts = T.judge(out, src_si, src_ti, T.bar_edges(9.0, 3.0, FPS), fps=FPS)
-    faults = [v.fault for v in verdicts]
-    assert set(faults) <= {T.Fault.UNFOLLOWED, None} and 2 * faults.count(T.Fault.UNFOLLOWED) > len(faults)
+    astray = sum(not v.survival.following for v in verdicts)
+    assert 2 * astray > len(verdicts) and all(v.fault is None for v in verdicts)
 
 
 def test_a_take_without_a_strip_is_aligned_by_its_motion():
@@ -107,13 +106,13 @@ def test_a_master_spliced_by_attribution_is_alive_on_the_identity_clock():
     assert all(v.fault is None for v in T.judge(out, src_si, src_ti, T.bar_edges(10.0, 2.5, FPS), fps=FPS))
 
 
-def test_a_master_spliced_from_a_late_take_is_dead_where_it_trails():
+def test_a_master_spliced_from_a_late_take_is_alive_where_it_trails():
     clip = moving(300)
     src_si, src_ti = series(clip)
     late = _spliced(clip, src_si, src_ti, late=17)
     out = T.trace(late, src_si, src_ti, fps=FPS, model=F.ClockModel.identity(FPS))
-    faults = [v.fault for v in T.judge(out, src_si, src_ti, T.bar_edges(10.0, 2.5, FPS), fps=FPS)]
-    assert faults[:2] == [None, None] and all(f is not None for f in faults[2:])
+    verdicts = T.judge(out, src_si, src_ti, T.bar_edges(10.0, 2.5, FPS), fps=FPS)
+    assert not verdicts[-1].survival.following and all(v.fault is None for v in verdicts)
 
 
 def test_a_given_attribution_is_measured_as_it_is():
@@ -174,6 +173,22 @@ def test_a_bar_is_judged_in_the_cut_its_middle_falls_in():
     verdicts = {"a": [verdict(0), verdict(1), sliver], "b": [verdict(0), verdict(1), verdict(2.0)]}
     cuts, spans = T.cover([R.Cut(0.0, 2.04, "a")], verdicts)
     assert cuts == [R.Cut(0.0, 2.04, "a")] and not spans
+
+
+def test_a_cover_reaching_a_cut_edge_off_the_frame_grid_leaves_no_sliver():
+    plan = [R.Cut(0.0, 0.99, "a"), R.Cut(0.99, 2.01, "b"), R.Cut(2.01, 3.0, "a")]
+    edges = T.bar_edges(3.0, 1.0, FPS, cuts=plan)
+    kept = aesthetics.Survival(10, 1.0, 1.0, 1.0, 1.0, 0.9, 0, 5.0)
+
+    def bars(dead):
+        return [T.Verdict(a / FPS, b / FPS, kept, dead(a)) for a, b in zip(edges[:-1], edges[1:])]
+
+    verdicts = {"a": bars(lambda _a: None), "b": bars(lambda _a: T.Fault.FROZEN), "c": bars(lambda _a: None)}
+    cuts, spans = T.cover(plan, verdicts)
+    assert [(s.start, s.end) for s in spans] == [(0.99, 2.01)]
+    assert cuts[1] == R.Cut(0.99, 2.01, "a") and len(cuts) == 3
+    owners = R.frame_owners(cuts, FPS)
+    assert np.array_equal(np.unique(owners), np.arange(len(cuts)))
 
 
 def test_the_report_names_alignments_and_failures():
@@ -240,8 +255,8 @@ def test_a_passthrough_of_a_grainy_still_is_alive_and_a_still_without_its_grain_
     out = T.trace(recording(clip, origin=0.5), src_si, src_ti, fps=FPS)
     kept = aesthetics.survival_stats(src_si, src_ti, out.si, out.ti)
     assert rec.held(out.frames[out.picked].astype(np.float32))[1] and kept.following
-    assert T.fault(out, 0, 90, kept, src_ti) is None
+    assert T.fault(out, 0, 90, kept) is None
     even = np.clip(plate + rng.normal(0.0, 6.0, clip.shape), 0, 255).astype(np.uint8)
     stuck = T.trace(recording(even, origin=0.5), src_si, src_ti, fps=FPS, model=out.model)
     lost = aesthetics.survival_stats(src_si, src_ti, stuck.si, stuck.ti)
-    assert not lost.following and T.fault(stuck, 0, 90, lost, src_ti) is T.Fault.FROZEN
+    assert not lost.following and T.fault(stuck, 0, 90, lost) is T.Fault.FROZEN
