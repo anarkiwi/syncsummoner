@@ -15,6 +15,7 @@ FPS = 30.0
 POLLS_PER_FIELD = 4
 LFO_RATES = np.array([1 / 16, 1 / 8, 1 / 4, 1 / 3, 1 / 2, 2 / 3, 1, 4 / 3, 3 / 2, 2, 3, 4, 6, 8, 12, 16])
 DIV_RATES = 1.0 / np.arange(1, 17)
+TOGGLE_SLOTS = [False] * 6 + [True] * 5 + [False]
 
 
 def true_rate(op, time_):
@@ -43,7 +44,11 @@ def simulate(design, seconds, lag_beats=0.0):
             op, t = int(design.operator[k, i]), int(design.time[k, i])
             mod = (design.space[k, i] - 512) * wave(op, np.mod(true_rate(op, t) * b, 1.0), design.slope[k, i])
             raw = design.manual[k, i] + mod
-            o[:, i] = np.where(ml.TOGGLES[i], np.where(raw >= 512, 1023, 0), np.clip(np.rint(raw), 0, 1023))
+            middle = 0.0 if op == 7 else 0.5
+            above = (design.space[k, i] - 512) * (
+                wave(op, np.mod(true_rate(op, t) * b, 1.0), design.slope[k, i]) - middle
+            )
+            o[:, i] = np.where(TOGGLE_SLOTS[i], np.where(above > 0, 1023, 0), np.clip(np.rint(raw), 0, 1023))
         t_ns = (np.arange(n) * 1e9 / FPS / POLLS_PER_FIELD).astype(np.int64)
         stale = (k, 0, 0, 999, 10 * ml.PHASE_ONE, 12000, True, 0, o[0])
         rows.append(stale)
@@ -59,6 +64,22 @@ def _runs():
     scan = ml.Design.scan(32)
     sobol = ml.Design.sobol(64, seed=3)
     return {"scan": (scan, simulate(scan, 16.0)), "sobol": (sobol, simulate(sobol, 8.0))}
+
+
+def test_toggles_are_the_panel_switches_and_follow_the_modulation_not_the_manual_value(runs):
+    assert ml.TOGGLES.tolist() == TOGGLE_SLOTS
+    rates = ml.Rates.read(*runs["scan"])
+    d, polls = runs["sobol"]
+    model = ml.Model.fit(rates, d, polls)
+    s = ml._samples(rates, d, polls)  # pylint: disable=protected-access
+    t = s["toggle"]
+    w = np.zeros(t.shape)
+    for op in ml.TEMPO_OPERATORS:
+        m = s["op"] == op
+        w[m] = ml._bilinear(model.waves[op], s["x"][m], s["slope"][m])  # pylint: disable=protected-access
+    by_manual = np.where(s["manual"] + s["depth"] * w >= 512, 1023, 0)
+    new, old = (np.mean(p[t] == s["o"][t]) for p in (model.predict(s), by_manual))
+    assert new > 0.9 > old
 
 
 def test_sobol_design_draws_tempo_operators_and_knobs_in_range():

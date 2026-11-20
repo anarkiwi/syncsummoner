@@ -33,8 +33,9 @@ KNOB_MIDDLE = 512
 TEMPO = (40.0, 240.0)
 #: A slot's knobs in ``modulation set`` order.
 KNOBS = ("manual", "time", "space", "slope")
-#: Slots the panel switches drive: their combined value reads on at :data:`KNOB_MIDDLE` and above.
-TOGGLES = np.arange(PARAM_COUNT) // 6 == 1
+#: Slots the panel switches drive, P7-P11: under a source each reads on while its modulation is above the
+#: middle of its operator's wave for positive depth, below it for negative, whatever its manual value.
+TOGGLES = (np.arange(PARAM_COUNT) >= 6) & (np.arange(PARAM_COUNT) <= 10)
 #: Cycles over which a rate estimate is trusted, at least, in the window it was read over.
 CYCLES = 2.0
 #: Beats of clock a setting sends before MIDI Start, so the device's tempo estimate has settled when its
@@ -73,7 +74,7 @@ class Design:
 
     @classmethod
     def sobol(cls, settings: int, seed: int) -> Design:
-        """A scrambled Sobol design of ``settings``, a power of two, every slot drawing its operator and knobs."""
+        """A scrambled Sobol design of ``settings``, a power of two, each slot drawing its own knobs."""
         m = int(settings).bit_length() - 1
         if settings < 1 or 1 << m != settings:
             raise ValueError(f"a Sobol design keeps its balance at a power of two settings, not {settings}")
@@ -263,7 +264,7 @@ def _fields_per_beat(polls: np.ndarray, bpm: float) -> float:
 
 
 def folded(r: float, b: np.ndarray, o: np.ndarray, bins: int = FOLD_BINS) -> float:
-    """Share of ``o``'s variance left within ``bins`` positions over a cycle of ``r``; zero if periodic in it."""
+    """Share of the variance of ``o`` left within ``bins`` positions over a cycle of ``r``."""
     if np.var(o) == 0:
         return 0.0
     cell = np.minimum((np.mod(r * b, 1.0) * bins).astype(np.int64), bins - 1)
@@ -425,8 +426,11 @@ class Model:
         for op in TEMPO_OPERATORS:
             m = (s["op"] == op) & np.isfinite(s["x"])
             w[m] = _bilinear(self.waves[op], s["x"][m], s["slope"][m])
+        middle = np.zeros(w.shape)
+        for op in TEMPO_OPERATORS:
+            middle[s["op"] == op] = 0.5 * (np.nanmin(self.waves[op]) + np.nanmax(self.waves[op]))
         o = np.clip(np.rint(s["manual"] + s["depth"] * w), 0, PARAM_MAX)
-        return np.where(s["toggle"], np.where(s["manual"] + s["depth"] * w >= KNOB_MIDDLE, PARAM_MAX, 0), o)
+        return np.where(s["toggle"], np.where(s["depth"] * (w - middle) > 0, PARAM_MAX, 0), o)
 
 
 @dataclass(frozen=True)
