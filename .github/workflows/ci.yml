@@ -41,6 +41,30 @@ jobs:
           cache-to: type=gha,mode=max,scope=test-${{ matrix.python-version }}
       - run: docker run --rm syncsummoner-test:${{ matrix.python-version }}
 
+  # The Pi's native player: formatted, tested with coverage, and cross-built for the Pi.
+  kmsplay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: kmsplay-test
+          load: true
+          tags: kmsplay-test:ci
+          cache-from: type=gha,scope=kmsplay-test
+          cache-to: type=gha,mode=max,scope=kmsplay-test
+      - run: docker run --rm kmsplay-test:ci
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: kmsplay-build
+          load: false
+          push: false
+          cache-from: type=gha,scope=kmsplay-build
+          cache-to: type=gha,mode=max,scope=kmsplay-build
+
   # The rig runs the image as the invoking user, who owns neither /venv nor the
   # home that gets mounted over; librosa's cached jits still need somewhere to go.
   runtime-nonroot:

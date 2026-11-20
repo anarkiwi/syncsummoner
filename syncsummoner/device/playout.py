@@ -1,10 +1,10 @@
 """Stimulus playout: a vsync-locked DRM/KMS player on the Pi feeding the device's input.
 
-The Pi runs :mod:`syncsummoner.device.kmsplay`, which flips one frame per vblank and fails
-loudly on any missed one. The host uploads the stimulus once, starts and stops the player
-by its pidfile, and reads back its status and its log of every flip. While it plays, the host
-follows every flip live (:class:`Shown`), so it knows a frame that was on screen at any moment.
-"""
+The Pi runs the native player (``native/kmsplay``), pushed as a static aarch64 binary on every start,
+which flips one frame per vblank and fails loudly on any missed one. The host uploads the stimulus once,
+starts and stops the player by its pidfile, and reads back its status and its log of every flip. While it
+plays, the host follows every flip live (:class:`Shown`), so it knows a frame that was on screen at any
+moment."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import bisect
 import json
+import os
 import subprocess
 import threading
 import time
@@ -48,6 +49,9 @@ FLIP = np.dtype([("v", "<i8"), ("seq", "<i8"), ("frame", "<i8"), ("t_ns", "<i8")
 assert FLIP.itemsize == RECORD.size
 #: The pacing thread's ``SCHED_FIFO`` ceiling, raised for the player's own shell only.
 RTPRIO_LIMIT = 20
+#: Names the Pi player binary; the runtime image sets it to the one its ``kmsplay-build`` stage made.
+PLAYER_ENV = "SYNCSUMMONER_KMSPLAY"
+DEFAULT_PLAYER = "/opt/syncsummoner/kmsplay"
 #: Status states the player settles in once started.
 SETTLED = ("playing", "failed", "stopped")
 #: One distinct frame followed live: the player's stream frame and when the host first heard of it.
@@ -69,6 +73,18 @@ def file_digest(path: str | Path, chunk: int = 1 << 22) -> str:
 
 class PlayoutError(RuntimeError):
     """The Pi-side player faulted, or did not reach the state it was driven to."""
+
+
+def player_source() -> bytes:
+    """The Pi-side player binary, from ``$SYNCSUMMONER_KMSPLAY`` or the image's own."""
+    path = Path(os.environ.get(PLAYER_ENV) or DEFAULT_PLAYER)
+    try:
+        return path.read_bytes()
+    except FileNotFoundError as err:
+        raise PlayoutError(
+            f"no Pi player at {path}: build one with `docker build --target kmsplay-build` and name it "
+            f"in ${PLAYER_ENV}"
+        ) from err
 
 
 def to_fb565(frame: np.ndarray, *, limited_range: bool = True) -> bytes:
@@ -97,11 +113,6 @@ def rate(fps: float | str | Fraction) -> Fraction:
     whole = round(fps * 1.001)
     ntsc = Fraction(whole * 1000, 1001)
     return ntsc if 2 * abs(float(ntsc) - fps) < float(whole - ntsc) else Fraction(fps).limit_denominator()
-
-
-def player_source() -> bytes:
-    """The Pi-side player program."""
-    return Path(__file__).with_name("kmsplay.py").read_bytes()
 
 
 def flip_summary(flips: np.ndarray, hold: int) -> dict:
@@ -325,7 +336,7 @@ class KmsPlayer(Playout):
     def command(self, fps: Fraction, spans: Sequence[tuple[int, int]] | None = None) -> str:
         """The player's command line on the Pi, playing only ``spans`` of the source when given."""
         return (
-            f"python3 {self.path('kmsplay.py')} {self.source_args()}{self.span_args(spans)} --fps {fps} "
+            f"{self.path('kmsplay')} {self.source_args()}{self.span_args(spans)} --fps {fps} "
             f"--width {self.width} --height {self.height} --preroll-s {self.preroll_s:g} "
             f"--flips {self.path('flips.bin')} --live {self.path('live.fifo')} --ask {self.path('ask.fifo')} "
             f"--status {self.path('status.json')}" + (" --loop" if self.loop else "")
@@ -390,10 +401,15 @@ class KmsPlayer(Playout):
         if exact <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
         self.stop()
-        self._runner(f"mkdir -p {self.directory} && cat > {self.path('kmsplay.py')}", player_source())
+        binary = self.path("kmsplay")
+        self._runner(
+            f"mkdir -p {self.directory} && cat > {binary}.new && chmod +x {binary}.new && "
+            f"mv -f {binary}.new {binary}",
+            player_source(),
+        )
         self._runner(
             f"rm -f {self.path('status.json')}; setsid sh -c 'echo $$ > {self.pid_path}; "
-            f"sudo -n prlimit --rtprio={RTPRIO_LIMIT} --pid $$; "
+            f"sudo -n prlimit --rtprio={RTPRIO_LIMIT} --memlock=unlimited --pid $$; "
             f"exec {self.command(exact, spans)}' < /dev/null > {self.path('player.log')} 2>&1 &"
         )
         deadline = self._clock() + self.timeout_s
@@ -410,10 +426,13 @@ class KmsPlayer(Playout):
         if state != "playing":
             self.stop()
             raise PlayoutError(f"player exited as it started: {self.log() or 'no diagnostic'}")
-        if not self.status().get("realtime"):
+        settled = self.status()
+        if not settled.get("realtime"):
             LOG.warning(
                 "the Pi player runs without SCHED_FIFO: a stall can make it miss a vblank, which it reports"
             )
+        if not settled.get("locked"):
+            LOG.warning("the Pi player's memory is not locked: a page fault can make it miss a vblank")
         return self.pid()
 
     def stop(self) -> dict:

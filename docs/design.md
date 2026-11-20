@@ -559,7 +559,7 @@ clock (`ClockModel.identity`).
 
 ## 10. Locked frame clock and exact attribution
 
-Every stimulus is played by `syncsummoner.device.kmsplay` on the Pi: atomic KMS
+Every stimulus is played by the native player (`native/kmsplay`) on the Pi: atomic KMS
 page flips, each clip frame held `refresh / fps` vblanks, every flip logged with
 its vblank sequence and time, and any missed vblank a fault
 ([hardware.md](hardware.md#locked-playout)). `ClipPlayer` plays an uploaded clip,
