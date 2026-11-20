@@ -167,6 +167,34 @@ def test_a_clip_is_decoded_once_cropped_and_scaled_then_memory_mapped(tmp_path):
         list(fx.decode(tmp_path / "missing.mkv", width=W, height=H, strip_px=0))
 
 
+@needs_ffmpeg
+def test_an_exchanged_recording_is_decoded_put_right(tmp_path):
+    clip, exchanged = tmp_path / "clip.mkv", tmp_path / "exchanged.mkv"
+    make_clip(clip)
+    argv = ["ffmpeg", "-loglevel", "error", "-i", str(clip), "-vf", "swapuv", "-c:v", "ffv1", str(exchanged)]
+    subprocess.run(argv, check=True)
+    played = np.stack(list(fx.decode(clip, width=W, height=H, strip_px=0)))
+    back = np.stack(list(fx.decode(exchanged, width=W, height=H, strip_px=0)))
+    righted = np.stack(list(fx.decode(exchanged, width=W, height=H, strip_px=0, swap=True)))
+    error = [np.abs(x.astype(int) - played).mean() for x in (back, righted)]
+    assert error[1] < error[0] / 10
+
+
+def test_effects_read_an_archive_whose_chroma_came_back_exchanged_put_right(monkeypatch):
+    clip = picture(2)
+    rows = rows_for([(0, 2)])
+    reader = Reader(rows, len(rows))
+    reader.meta["chroma_exchanged"] = True
+    asked = {}
+
+    def stream(*_a, **kw):
+        asked.update(kw)
+        return iter(clip[[r.shown for r in rows]])
+
+    monkeypatch.setattr(fx, "decode", stream)
+    assert len(fx.program_effects(Archive(reader), "p", clip)) == 1 and asked["swap"] is True
+
+
 def committed(tmp_path, monkeypatch, saturation):
     """An archive directory whose one program measures as canned, and its profile."""
     (tmp_path / "clip.mkv.stimulus.json").write_text(
