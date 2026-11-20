@@ -24,11 +24,21 @@ from pyvmancer.shell import Reply, ShellClient
 from pyvmancer.transports.base import MidiTransport
 from pyvmancer.video import VideoStatus
 
+from syncsummoner.device.playout import PLAYER_ENV
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX
 from syncsummoner.probe.runner import raw_params
 from syncsummoner.program.vmprog import ControlMode
 from tests.declared import Declarations, config, decl, toggle
 from tests.transmitter import LIVE, Live
+
+
+@pytest.fixture(autouse=True)
+def _pi_player(monkeypatch, tmp_path_factory):
+    """A player binary to push, so starting a player never depends on the image's own."""
+    path = tmp_path_factory.mktemp("player") / "kmsplay"
+    path.write_bytes(b"\x7fELF")
+    monkeypatch.setenv(PLAYER_ENV, str(path))
+
 
 COLORBARS_INFO = {
     "name": "Colorbars",
