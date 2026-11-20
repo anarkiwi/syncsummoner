@@ -227,6 +227,35 @@ TEST(Player, TheTraceKeepsAllFlipsWhileFewerThanItsDepth) {
   EXPECT_EQ(player->trace().size(), 5u);
 }
 
+// Records (r), wakes (w) and the pacer blocking on the display or the clock
+// (b), in order, through a link drop and the clip's end.
+TEST(Player, EveryRecordIsPassedOnBeforeThePacerNextBlocks) {
+  FakeDisplay display;
+  Signals signals;
+  std::string seen;
+  size_t records = 0;
+  int sleeps = 0;
+  display.on_block = [&] { seen += 'b'; };
+  display.on_sleep = [&] {
+    ++sleeps;
+    signals.up = sleeps == 3;
+    signals.stop = sleeps > 10;
+  };
+  FnSink sink(
+      [&](const Record &) {
+        seen += 'r';
+        signals.down = ++records == 5;
+      },
+      [&] { seen += 'w'; });
+  auto frames = decoded(12);
+  Player player(display, *frames, display, sink, signals, 1, PERIOD.rate());
+  player.run();
+  EXPECT_TRUE(player.ended);
+  EXPECT_EQ(display.actives, (std::vector<bool>{false, true}));
+  EXPECT_EQ(seen.find("rb"), std::string::npos) << seen;
+  EXPECT_EQ(seen.back(), 'b') << seen;
+}
+
 class SlowClock : public FakeDisplay {
 public:
   int64_t now() override {

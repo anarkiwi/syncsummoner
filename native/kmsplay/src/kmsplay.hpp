@@ -151,7 +151,8 @@ class Sink {
 public:
   virtual ~Sink() = default;
   virtual void record(const Record &rec) = 0;
-  // Called once a commit is made, so a reader may be woken off the deadline.
+  // Called once a commit is made, or before the pacer pauses with no commit to
+  // make, so every record is passed on off the deadline.
   virtual void wake() {}
 };
 

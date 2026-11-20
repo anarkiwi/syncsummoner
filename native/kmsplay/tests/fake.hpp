@@ -60,6 +60,7 @@ public:
 
   int64_t now() override { return static_cast<int64_t>(t.floor()); }
   void sleep_ns(int64_t ns) override {
+    block();
     t = t + Q(ns);
     if (on_sleep) {
       on_sleep();
@@ -75,6 +76,7 @@ public:
     screen = filled.at(buf);
   }
   void set_active(bool on, int buf) override {
+    block();
     actives.push_back(on);
     if (on && !active) {
       grid = t + phase;
@@ -87,6 +89,7 @@ public:
     pending = {buf, v, filled.at(buf)};
   }
   std::optional<Event> wait(double timeout_s) override {
+    block();
     EXPECT_TRUE(active && pending);
     auto [buf, v, data] = *pending;
     pending.reset();
@@ -118,7 +121,14 @@ public:
   int64_t screen = -1;
   int started = -1;
   std::vector<bool> actives;
-  std::function<void()> on_sleep;
+  std::function<void()> on_sleep, on_block;
+
+private:
+  void block() {
+    if (on_block) {
+      on_block();
+    }
+  }
 };
 
 // Frames 0..count-1, each eight bytes holding its own index.
@@ -154,8 +164,16 @@ inline std::unique_ptr<Prerolled> decoded(int64_t count) {
 
 struct FnSink : Sink {
   std::function<void(const Record &)> fn;
-  explicit FnSink(std::function<void(const Record &)> f) : fn(std::move(f)) {}
+  std::function<void()> woken;
+  explicit FnSink(std::function<void(const Record &)> f,
+                  std::function<void()> w = {})
+      : fn(std::move(f)), woken(std::move(w)) {}
   void record(const Record &rec) override { fn(rec); }
+  void wake() override {
+    if (woken) {
+      woken();
+    }
+  }
 };
 
 } // namespace kmsplay::test

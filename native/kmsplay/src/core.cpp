@@ -291,6 +291,7 @@ void Player::commit(int64_t v) {
   }
   if (!ready_) {
     ended = true;
+    sink_.wake();
     return;
   }
   Slot pending = *ready_;
@@ -365,6 +366,7 @@ void Player::run() {
     timeline.check(e.seq, e.t_ns, e.v);
     land(e, e.v, 0);
     if (Signals::pop(signals_.down)) {
+      sink_.wake();
       down();
     } else {
       commit(e.v + 1);
