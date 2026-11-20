@@ -144,3 +144,23 @@ def test_a_moving_texture_is_not_a_flash():
     frames = np.stack([field[:, t : t + SHAPE[1]] for t in range(90)])
     risk = safety.flash_risk(np.repeat(frames[..., None], 3, axis=-1).astype(np.float32), fps=FPS)
     assert risk.safe and risk.area_frac > 0.25
+
+
+def test_a_clip_measured_in_chunks_is_measured_as_one():
+    frames = np.r_[alternating(45, hz=7.5), alternating(45, hz=2.0, lo=0.3)]
+    frames[50:60, :, :, 0] = 1.0
+    whole = safety.flash_series([frames])
+    split = safety.flash_series([frames[:7], frames[7:7], frames[7:50], frames[50:]])
+    for one, other in zip(whole, split):
+        assert np.array_equal(one.mean, other.mean) and np.array_equal(one.changed, other.changed)
+    assert safety.series_risk(*split, fps=FPS) == safety.flash_risk(frames, fps=FPS)
+    assert safety.series_risk(*safety.flash_series([]), fps=FPS).safe
+
+
+def test_the_frames_to_blame_are_the_transitions_in_the_failing_seconds_alone():
+    frames = np.r_[solid(0.5, 30), alternating(30, hz=5.0), solid(0.0, 30), alternating(30, hz=1.0)]
+    risk = safety.flash_risk(frames, fps=FPS)
+    ((start, stop),) = risk.windows
+    assert not risk.safe and start < 30 and stop > 61
+    assert min(risk.flashes) == 30 and max(risk.flashes) == 60, "the last flash ends on the black after it"
+    assert not safety.flash_risk(frames[:30], fps=FPS).flashes

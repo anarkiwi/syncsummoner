@@ -23,10 +23,13 @@ from syncsummoner.aesthetics.levels import LevelStats, chroma_rms, level_stats, 
 from syncsummoner.aesthetics.motion import MotionStats, motion_stats
 from syncsummoner.aesthetics.safety import (
     FlashRisk,
+    FlashSeries,
     dead_output,
     flash_risk,
+    flash_series,
     mitigate_flashes,
     relative_luminance,
+    series_risk,
     transitions,
 )
 from syncsummoner.aesthetics.score import (
@@ -73,6 +76,7 @@ __all__ = [
     "DynamicsResult",
     "QUANTUM",
     "FlashRisk",
+    "FlashSeries",
     "LevelStats",
     "MotionStats",
     "PointwiseFit",
@@ -93,6 +97,8 @@ __all__ = [
     "entropy_rate",
     "flicker_ratio",
     "flash_risk",
+    "flash_series",
+    "series_risk",
     "follow_z",
     "gabor_bank",
     "gabor_energy",

@@ -637,6 +637,22 @@ def _check_cmd(args: argparse.Namespace) -> int:
     return 1 if report.failed else 0
 
 
+def _screen_cmd(args: argparse.Namespace) -> int:
+    """Screen finished pictures for harmful flashing, as a render's last gate does."""
+    from syncsummoner.compose import takecheck
+
+    failed = 0
+    for path in args.videos:
+        try:
+            risk = takecheck.gate(path, strip_px=args.strip_px, ffmpeg=args.ffmpeg)
+        except takecheck.UnsafeOutputError as err:
+            LOG.error("%s", err)
+            failed = 1
+            continue
+        LOG.info("%s: safe, peak %.1f flashes/s, %.1f red", path, risk.flashes_per_s, risk.red_flashes_per_s)
+    return failed
+
+
 def _program_cmd(args: argparse.Namespace) -> int:
     """List programs, or show or step one program's parameter model."""
     from syncsummoner.program import Library, gates, model, parse_state
@@ -979,6 +995,12 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     check.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
     check.add_argument("--ffmpeg", default="ffmpeg")
     check.set_defaults(func=_check_cmd)
+
+    screen = sub.add_parser("screen", help="screen finished pictures for harmful flashing, as a render does")
+    screen.add_argument("videos", nargs="+")
+    screen.add_argument("--strip-px", type=int, default=0, help="rows off the bottom left out, a strip")
+    screen.add_argument("--ffmpeg", default="ffmpeg")
+    screen.set_defaults(func=_screen_cmd)
 
     return parser
 

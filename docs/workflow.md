@@ -660,9 +660,12 @@ What happens, in order:
    together on the score's cuts into `final.take.mp4`.
 7. Before the takes are spliced together, each is checked against the timecoded
    clip it was fed, frame for frame by its attribution, and every bar is judged `flat` (blank) or `frozen` (static) on what it kept of the
-   same bar of the clip. A dead run inside a cut is covered from another
+   same bar of the clip, or `flashing` where the pictures it shows fail the
+   general or red flash test. A dead run inside a cut is covered from another
    program's take alive across it (`Derez:   42.10-  46.20s frozen, covered by
-   Lorenz`); a lone dead bar inside a `destroy` section stays. Compose already moved
+   Lorenz`); a lone blank or static bar inside a `destroy` section stays, a
+   flashing one never does. Each take's line gives its peak rates
+   (`<program>: aligned by given, peak <n> flashes/s, <n> red`). Compose already moved
    every cut predicted dead, so this is the check of that prediction and the last
    resort: a cover plays a take outside its own cuts, where its layer sends nothing. A run no take
    covers stops the render with `DeadTakeError: dead picture no take can cover:`
@@ -676,6 +679,9 @@ What happens, in order:
    (cropped off the bottom edge and padded back, so the frame keeps its size and
    nothing is resampled), trim to the length both inputs cover, mux the track, fade the picture up from black and the audio up from
    silence over `--fade` seconds, and the same back down at the end.
+10. The last gate: the mastered clip is screened whole for flashing. One that
+   fails is kept as `final.unsafe.mp4`, never at `-o`, and the render stops with
+   `UnsafeOutputError` naming the seconds that fail.
 
 The capture card returns frames at its own rate
 ([hardware.md](hardware.md#the-cards-clock)), so a take holds more frames than
@@ -700,6 +706,7 @@ ss check score.yaml --source timecoded.mkv --takes takes/ \
      --cut-programs Derez,Lorenz,Scramble,Sfumato,Kaledos,Folio,Isotherm,Howler \
      --splice final.take.mp4
 ss check score.yaml --source timecoded.mkv --master final.take.mp4
+ss screen final.mp4                                # the last gate alone; exits 1 if it flashes
 ```
 
 `--source` is the render's `--scratch`. Each take is checked on its
@@ -751,8 +758,9 @@ docker run --rm -v "$PWD:/work" --entrypoint /venv/bin/python anarkiwi/syncsummo
   -m syncsummoner.aesthetics score final.mp4   # perceptual metrics, no device needed
 ```
 
-The photosensitive-seizure veto is a hard constraint rather than a score: a take
-with offending windows is temporally low-passed, not discarded.
+The photosensitive-seizure veto is a hard constraint rather than a score: a
+flashing bar is covered from another take, and a finished picture that still
+flashes is refused. `ss screen final.mp4` screens any finished picture.
 
 ## Time it takes
 
@@ -797,7 +805,8 @@ doing it twice, which is what the audition is for.
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
 | `SpliceError: <program>: no capture shows clip frames ...` | the take ends early, or a fitted take was never aligned; check its `aligned by` line in the take check |
-| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat or frozen, and no other take is alive across it: render another program over it, or recompose with profiles refit from footage |
+| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or flashing, and no other take is alive and safe across it: render another program over it, or recompose with profiles refit from footage |
+| `UnsafeOutputError: <out> flashes harmfully: ... at <from>-<to>s; kept as <out>.unsafe.mp4` | the mastered clip fails the flash test though every take passed: a splice joined two takes into a flash. Recut, or compose with other changes at those seconds |
 | `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `probe sweep` and refit |
 | `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
 | `LockError: ...` | the take's captures do not attribute frame for frame; its attribution summary in the message says what failed (frames covered, runs, the frame line against the jitter, slips, strip agreement, driver drops). `ss lockcheck` checks the rig the same way |

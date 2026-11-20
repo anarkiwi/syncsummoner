@@ -14,7 +14,17 @@ import numpy as np
 
 from syncsummoner.device.recorder import SIGMA
 
-__all__ = ["AS_PLAYED", "ORDERS", "SWAP", "TO_YUV", "ChromaOrder", "order_of", "to_yuv", "variants"]
+__all__ = [
+    "AS_PLAYED",
+    "ORDERS",
+    "SWAP",
+    "TO_YUV",
+    "ChromaOrder",
+    "order_of",
+    "to_rgb",
+    "to_yuv",
+    "variants",
+]
 
 #: The ffmpeg filter that puts an exchanged chroma pair back.
 SWAP = "swapuv"
@@ -100,3 +110,25 @@ def order_of(captured: np.ndarray, shown: np.ndarray) -> ChromaOrder:
 def to_yuv(rgb: np.ndarray) -> np.ndarray:
     """RGB in ``[0, 1]``, ``(..., h, w, 3)``, as 8-bit-scaled planar ``(..., 3, h, w)`` YUV."""
     return np.moveaxis(np.asarray(rgb, dtype=np.float64) * 255.0 @ TO_YUV.T + CHROMA_ZERO, -1, -3)
+
+
+#: Luma weights of red and blue by the matrix a stream is tagged with; any other is read as ffmpeg reads it.
+MATRICES = {"bt709": (0.2126, 0.0722)}
+BT601 = (0.299, 0.114)
+
+
+def to_rgb(yuv: np.ndarray, *, full: bool = True, space: str = "unknown") -> np.ndarray:
+    """8-bit planar ``(..., 3, h, w)`` YUV as RGB ``(..., h, w, 3)`` in ``[0, 1]``, as a decoder shows it.
+
+    ``full`` is the planes' range, else studio swing; ``space`` the matrix they are tagged with, ffmpeg's
+    BT.601 when it names none other.
+    """
+    red, blue = MATRICES.get(space, BT601)
+    planes = np.moveaxis(np.asarray(yuv, dtype=np.float32), -3, -1) - np.float32(128.0)
+    scale = np.array([255.0, 255.0, 255.0] if full else [219.0, 224.0, 224.0], dtype=np.float32)
+    planes[..., 0] += np.float32(128.0 if full else 112.0)
+    y, cb, cr = np.moveaxis(planes / scale, -1, 0)
+    r = y + np.float32(2.0 * (1.0 - red)) * cr
+    b = y + np.float32(2.0 * (1.0 - blue)) * cb
+    g = (y - np.float32(red) * r - np.float32(blue) * b) / np.float32(1.0 - red - blue)
+    return np.clip(np.stack([r, g, b], axis=-1), 0.0, 1.0)

@@ -27,7 +27,17 @@ from syncsummoner.device.v4l2rec import read_log, sidecar
 from syncsummoner.probe.patterns import read_codes
 from syncsummoner.progress import LOG, meter
 
-__all__ = ["CALIBRATION_SIZE", "Features", "SCHEMA", "Spec", "cache_path", "decode", "features", "segment"]
+__all__ = [
+    "CALIBRATION_SIZE",
+    "Features",
+    "SCHEMA",
+    "Spec",
+    "cache_path",
+    "calibration_colour",
+    "decode",
+    "features",
+    "segment",
+]
 
 #: Bumped whenever what a decode stores, or how, changes; older caches are then decoded afresh.
 SCHEMA = 1
@@ -39,6 +49,7 @@ CHUNK = 512
 HASH_BLOCK = 1 << 24
 
 _PTS = re.compile(rb"pts_time:\s*(-?[0-9.]+)")
+_COLOUR = re.compile(rb"color_range:(\w+) color_space:(\w+)")
 
 
 @dataclass(frozen=True)
@@ -61,13 +72,18 @@ class Spec:
         Every branch converts its own crop, so no branch's format is negotiated up to the whole frame;
         ``showinfo`` checksums the small branch, the cheapest to time each frame by.
         """
-        (sw, sh), (cw, ch), px = self.survival, self.calibration, self.strip_px
+        (sw, sh), px = self.survival, self.strip_px
         return (
             "[0:v]split=3[a][b][c];"
             f"[a]crop=iw:ih-{px}:0:0,scale={sw}:{sh}:flags=area,format=gray[s];"
-            f"[b]crop=iw:ih-{px}:0:0,scale={cw}:{ch}:flags=area,format=yuv444p,showinfo[e];"
+            f"[b]{self.colour()}[e];"
             f"[c]crop=iw:{px}:0:ih-{px},scale,format=rgb24[t]"
         )
+
+    def colour(self) -> str:
+        """The calibration branch of :meth:`graph`; its ``showinfo`` gives each picture's range and matrix."""
+        (cw, ch), px = self.calibration, self.strip_px
+        return f"crop=iw:ih-{px}:0:0,scale={cw}:{ch}:flags=area,format=yuv444p,showinfo"
 
     def token(self) -> dict:
         """The spec as stored with a cache."""
@@ -326,6 +342,27 @@ def decode(
     if sidecar(path).is_file():
         out["log"] = read_log(path)
     return out
+
+
+def calibration_colour(path: str | Path, spec: Spec = Spec(), *, ffmpeg: str = "ffmpeg") -> tuple[bool, str]:
+    """Whether the calibration YUV :func:`decode` makes of ``path`` is full range, and its matrix tag.
+
+    Read from the first picture through the same branch, as ffmpeg converts it: a YUV stream keeps its own
+    range, and RGB is scaled to studio swing.
+    """
+    with captures(path, ffmpeg=ffmpeg) as source:
+        argv = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", *source]
+        done = subprocess.run(
+            [*argv, "-vf", spec.colour(), "-frames:v", "1", "-f", "null", "-"],
+            check=False,
+            capture_output=True,
+        )
+    found = _COLOUR.search(done.stderr)
+    if done.returncode or found is None:
+        raise RuntimeError(
+            f"cannot read the colour of {path}: {done.stderr.decode('utf-8', 'replace')[-200:]}"
+        )
+    return found.group(1) == b"pc", found.group(2).decode()
 
 
 def _cached(path: str | Path, spec: Spec) -> Features | None:

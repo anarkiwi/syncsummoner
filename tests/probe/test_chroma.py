@@ -5,7 +5,16 @@
 import numpy as np
 import pytest
 
-from syncsummoner.probe.chroma import AS_PLAYED, ORDERS, TO_YUV, ChromaOrder, order_of, to_yuv, variants
+from syncsummoner.probe.chroma import (
+    AS_PLAYED,
+    ORDERS,
+    TO_YUV,
+    ChromaOrder,
+    order_of,
+    to_rgb,
+    to_yuv,
+    variants,
+)
 
 H, W = 18, 32
 
@@ -87,3 +96,14 @@ def test_a_flat_plane_scores_zero_rather_than_nan():
 def test_no_captures_cannot_be_judged():
     with pytest.raises(ValueError, match="no captures"):
         order_of(np.zeros((0, 3, H, W)), np.zeros((0, 3, H, W)))
+
+
+def test_to_rgb_undoes_to_yuv_and_reads_studio_swing():
+    rgb = np.random.default_rng(2).uniform(0.0, 1.0, (3, 4, 6, 3))
+    assert np.allclose(to_rgb(to_yuv(rgb)), rgb, atol=1e-5)
+    studio = np.stack([np.full((4, 6), v) for v in (235.0, 128.0, 128.0)])[None]
+    black = np.stack([np.full((4, 6), v) for v in (16.0, 128.0, 128.0)])[None]
+    assert np.allclose(to_rgb(studio, full=False), 1.0) and np.allclose(to_rgb(black, full=False), 0.0)
+    red = np.array([[[1.0, 0.0, 0.0]]])
+    bt709 = np.array([0.2126, 0.5 / (1 - 0.0722) * -0.2126, 0.5]) * 255.0 + [0.0, 128.0, 128.0]
+    assert np.allclose(to_rgb(bt709[:, None, None], space="bt709"), red, atol=1e-5)

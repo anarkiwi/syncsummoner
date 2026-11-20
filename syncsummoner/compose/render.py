@@ -59,10 +59,6 @@ class LeadInError(RuntimeError):
     """The take's program had not finished loading when the clip's first frame played."""
 
 
-class UnsafeOutputError(RuntimeError):
-    """Output tripped a hard safety veto and mitigation was declined."""
-
-
 class RigFaultError(RuntimeError):
     """A program showed no picture and the Passthru control on the same rig showed none either."""
 
@@ -890,22 +886,3 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
         playout=playout_mod.ClipPlayer(*host, width=config.width, height=config.height),
         link=link_mod.Link(*host),
     )
-
-
-def enforce_safety(frames: np.ndarray, *, fps: float, mitigate: bool = True) -> np.ndarray:
-    """Apply the photosensitive-seizure veto to a finished pass.
-
-    A hard constraint, not a score. Offending windows are temporally low-passed
-    rather than discarded, so a take is repaired instead of lost.
-    """
-    from syncsummoner import aesthetics
-
-    risk = aesthetics.flash_risk(frames, fps=fps)
-    if risk.safe:
-        return frames
-    if not mitigate:
-        raise UnsafeOutputError(
-            f"{risk.flashes_per_s:.1f} flashes/s over {risk.area_frac:.0%} of frame "
-            f"in windows {list(risk.windows)}"
-        )
-    return aesthetics.mitigate_flashes(frames, risk, fps=fps)

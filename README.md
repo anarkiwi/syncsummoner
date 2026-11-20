@@ -54,8 +54,9 @@ syncsummoner score show score.yaml --profiles profiles/   # what each layer driv
 syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4
 syncsummoner render score.yaml --source clip.mp4 --audio track.wav \
                     --fade 1.5 -o final.mp4   # cut by the score's own cut plan
-syncsummoner check score.yaml --source timecoded.mkv --takes takes/ [--splice cut.mp4]   # dead picture per take
+syncsummoner check score.yaml --source timecoded.mkv --takes takes/ [--splice cut.mp4]   # dead or flashing picture per take
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4   # the same, on a splice
+syncsummoner screen final.mp4                              # harmful flashing, the render's last gate
 syncsummoner judge takes/take-*.mkv --source timecoded.mkv [--score score.yaml] [--jobs 2]   # offline: lock, evidence, picture, bars; steps judged by the program model
 ```
 

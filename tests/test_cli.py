@@ -852,3 +852,20 @@ def test_a_score_carrying_its_cuts_is_cut_by_them_with_no_programs_named(monkeyp
     argv = ["render", path, "--source", "clip.mkv", "--no-master", "-o", str(tmp_path / "final.mp4")]
     assert cli.main(argv) == 0
     assert seen["cuts"]["programs"] == [] and "render" not in seen
+
+
+def test_screen_says_each_picture_safe_or_where_it_flashes(monkeypatch, capsys):
+    from syncsummoner.aesthetics import FlashRisk
+    from syncsummoner.compose import takecheck
+
+    def gate(path, **kw):
+        if path == "bad.mp4":
+            raise takecheck.UnsafeOutputError("bad.mp4 flashes harmfully: 5.0 flashes/s")
+        assert kw == {"strip_px": 8, "ffmpeg": "ffmpeg"}
+        return FlashRisk(2.0, 1.0, 0.5, (), True)
+
+    monkeypatch.setattr(takecheck, "gate", gate)
+    assert cli.main(["screen", "good.mp4", "--strip-px", "8"]) == 0
+    assert cli.main(["screen", "good.mp4", "bad.mp4", "--strip-px", "8"]) == 1
+    said = capsys.readouterr().err
+    assert "good.mp4: safe, peak 2.0 flashes/s, 0.5 red" in said and "bad.mp4 flashes harmfully" in said
