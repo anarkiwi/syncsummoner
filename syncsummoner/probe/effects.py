@@ -24,7 +24,8 @@ from threadpoolctl import threadpool_limits
 
 from syncsummoner import aesthetics
 from syncsummoner.device.stored import captures
-from syncsummoner.probe.archive import GAP, FrameArchive, stimulus_of
+from syncsummoner.probe.archive import EXCHANGED, GAP, FrameArchive, stimulus_of
+from syncsummoner.probe.chroma import SWAP
 from syncsummoner.probe.store import slug
 from syncsummoner.progress import LOG, configure, track
 
@@ -64,12 +65,15 @@ def scaled(width: int, height: int, strip_px: int) -> tuple[int, int]:
 
 
 def decode(
-    path: str | Path, *, width: int, height: int, strip_px: int, ffmpeg: str = "ffmpeg"
+    path: str | Path, *, width: int, height: int, strip_px: int, ffmpeg: str = "ffmpeg", swap: bool = False
 ) -> Iterator[np.ndarray]:
-    """Every frame of ``path`` in stream order, strip cropped, area-scaled to :func:`scaled`, as RGB."""
+    """Every frame of ``path`` in stream order, strip cropped, area-scaled to :func:`scaled`, as RGB.
+
+    ``swap`` reads a recording whose chroma pair came back exchanged put right.
+    """
     w, h = scaled(width, height, strip_px)
     size = w * h * 3
-    graph = f"crop=iw:ih-{strip_px}:0:0,scale={w}:{h}:flags=area"
+    graph = (f"{SWAP}," if swap else "") + f"crop=iw:ih-{strip_px}:0:0,scale={w}:{h}:flags=area"
     # pylint: disable-next=contextmanager-generator-missing-cleanup
     with captures(path, ffmpeg=ffmpeg) as source:
         argv = [ffmpeg, "-loglevel", "error", "-nostdin", *source, "-vf", graph]
@@ -155,6 +159,7 @@ def program_effects(
             height=reader.height,
             strip_px=int(stimulus["strip_px"]),
             ffmpeg=ffmpeg,
+            swap=bool(reader.meta.get(EXCHANGED)),
         )
     for index, frame in enumerate(track(stream, desc=program, total=reader.count, unit="frame")):
         if index in wanted:
