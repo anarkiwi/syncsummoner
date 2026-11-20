@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from skimage.color import deltaE_ciede2000, rgb2lab
+from skimage.color import deltaE_ciede2000, rgb2lab  # pylint: disable=no-name-in-module  ; lazily loaded
 
 from syncsummoner.aesthetics.levels import LUMA_709
 from syncsummoner.aesthetics.safety import flash_risk
