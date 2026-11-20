@@ -32,7 +32,7 @@ def _timecode_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose.locktake import LeadIn
     from syncsummoner.compose.render import RenderConfig
     from syncsummoner.compose.session import session_frames
-    from syncsummoner.compose.stimulus import Stimulus
+    from syncsummoner.compose.stimulus import Coverage, Stimulus
     from syncsummoner.compose.timecode import write_timecoded
     from syncsummoner.device.loadtimes import stall_guard
 
@@ -44,7 +44,8 @@ def _timecode_cmd(args: argparse.Namespace) -> int:
     source = args.source
     if args.synthetic is not None:
         shot = {} if args.shot_frames is None else {"shot_frames": args.shot_frames}
-        source = Stimulus(seed=args.synthetic, width=config.width, height=config.height, **shot)
+        texture = {"coverage": Coverage().one_texture()} if args.one_texture else {}
+        source = Stimulus(seed=args.synthetic, width=config.width, height=config.height, **shot, **texture)
         Path(f"{args.out}.stimulus.json").write_text(json.dumps(source.key(), indent=1), encoding="utf-8")
     frames = write_timecoded(source, args.out, config=config, lead=lead, tail=tail, seconds=args.seconds)
     print(f"{args.out}: {frames} frames, {lead} lead-in and {tail} lead-out frames, for a {load_s} s load")
@@ -422,6 +423,9 @@ def _add_timecode(probe_sub: Any) -> Any:
     stamp.add_argument("--seconds", type=float, help="the clip's length; a stimulus needs one")
     stamp.add_argument(
         "--shot-frames", type=int, help="a stimulus's shot length; each sweep setting spans whole shots"
+    )
+    stamp.add_argument(
+        "--one-texture", action="store_true", help="every shot the same texture, only its motion drawn"
     )
     stamp.add_argument("--out", required=True, help="the timecoded clip to write")
     stamp.set_defaults(func=_timecode_cmd)

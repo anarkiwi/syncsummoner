@@ -90,3 +90,11 @@ def test_each_frames_ti_is_drawn_afresh_about_the_coverages_level():
     assert np.log(ti).std() == pytest.approx(0.8, rel=0.25)
     assert abs(np.corrcoef(ti[:-1], ti[1:])[0, 1]) < 0.2, "each frame an independent sample"
     assert (stim.path(0)[0] == 0).all()
+
+
+def test_one_texture_holds_every_shot_alike_but_for_its_motion():
+    stim = Stimulus(seed=3, coverage=Coverage().one_texture(), **SMALL)
+    shots = [stim.shot(k) for k in range(8)]
+    looks = {(s.wavelength, s.contrast, s.level, s.saturation) for s in shots}
+    assert len(looks) == 1 and len({s.velocity for s in shots}) == 8
+    assert Coverage().one_texture().ti() == pytest.approx(Coverage().ti())

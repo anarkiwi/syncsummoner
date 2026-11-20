@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from syncsummoner.compose.stimulus import Coverage
 from syncsummoner import cli
 from syncsummoner.compose import locktake as LT
 from syncsummoner.compose import response as response_mod
@@ -333,6 +334,9 @@ def test_timecode_makes_a_synthetic_stimulus_clip_and_keeps_its_spec(tmp_path, m
     )
     assert made["source"].seed == 7 and made["seconds"] == 3.0
     assert json.loads((tmp_path / "c.mkv.stimulus.json").read_text())["stimulus"]["seed"] == 7
+    argv = ["--stall", "40", "probe", "timecode", "--synthetic", "7", "--seconds", "3", "--out", str(out)]
+    assert cli.main([*argv, "--shot-frames", "45", "--one-texture"]) == 0
+    assert made["source"].shot_frames == 45 and made["source"].coverage == Coverage().one_texture()
     with pytest.raises(SystemExit, match="not both"):
         cli.main(["probe", "timecode", "f.mkv", "--synthetic", "7", "--out", str(out)])
 
