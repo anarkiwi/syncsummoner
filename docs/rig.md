@@ -46,13 +46,16 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Playout
 
-Every stimulus is played on the Pi by `syncsummoner.device.kmsplay`, a vsync-locked
-DRM/KMS player on pykms: ffmpeg decodes the clip to raw frames, and the player
-commits one atomic page flip per vblank, holding each frame `refresh / fps`
+Every stimulus is played on the Pi by the native player (`native/kmsplay`), a
+vsync-locked DRM/KMS player on libdrm: ffmpeg decodes the clip to raw frames, and the
+player commits one atomic page flip per vblank, holding each frame `refresh / fps`
 vblanks, logging every flip (`flips.bin`) and faulting on any missed vblank
-(`status.json`, raised on the host as `PlayoutError`). Its pacing thread runs
-`SCHED_FIFO`, the ceiling raised with `sudo -n prlimit` for the player's shell, so
-the Pi user needs passwordless sudo. The host starts and stops it by pidfile in
+(`status.json`, raised on the host as `PlayoutError`). The image's `kmsplay-build`
+stage cross-builds it as one static aarch64 binary (`$SYNCSUMMONER_KMSPLAY`), which the
+host pushes to `/dev/shm/syncsummoner/kmsplay` on every start; the Pi needs no
+packages for it. Its pacing thread runs `SCHED_FIFO` with its memory locked, the
+ceilings raised with `sudo -n prlimit` for the player's shell, so the Pi user needs
+passwordless sudo. The host starts and stops it by pidfile in
 `/dev/shm`. `ClipPlayer` plays an uploaded clip, once or looped; `LoopPlayer`
 cycles uploaded raw frames through the same player, at 10 fps by default (a
 whole number of vblanks at 30 Hz; a rate that does not divide the refresh is

@@ -13,6 +13,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
+# The Pi's player, cross-built as one static aarch64 binary the host pushes on every start.
+FROM debian:trixie-slim AS kmsplay-build
+RUN dpkg --add-architecture arm64 && apt-get update && apt-get install -y --no-install-recommends \
+        cmake make pkg-config g++-aarch64-linux-gnu libdrm-dev:arm64 nlohmann-json3-dev libcli11-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY native/kmsplay /src/kmsplay
+RUN cmake -S /src/kmsplay -B /build -DCMAKE_TOOLCHAIN_FILE=/src/kmsplay/cmake/aarch64.cmake \
+        -DCMAKE_BUILD_TYPE=Release -DKMSPLAY_STATIC=ON \
+    && cmake --build /build -j "$(nproc)" \
+    && aarch64-linux-gnu-strip -o /kmsplay /build/kmsplay
+
+# The player's own tests, built natively with coverage; formatting is checked first.
+FROM debian:trixie-slim AS kmsplay-test
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake make pkg-config g++ libdrm-dev nlohmann-json3-dev libcli11-dev libgtest-dev libgmock-dev \
+        gcovr clang-format ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+COPY native/kmsplay /src/kmsplay
+RUN clang-format --dry-run -Werror /src/kmsplay/src/* /src/kmsplay/tests/* \
+    && cmake -S /src/kmsplay -B /build -DKMSPLAY_TESTS=ON -DKMSPLAY_COVERAGE=ON \
+    && cmake --build /build -j "$(nproc)"
+WORKDIR /build
+CMD ["sh", "-c", "ctest --output-on-failure -j \"$(nproc)\" && gcovr -r /src/kmsplay --filter /src/kmsplay/src/ --exclude /src/kmsplay/src/main.cpp --exclude-throw-branches --fail-under-line 85 /build"]
+
 # Yosys, GHDL with its Yosys plugin, Project IceStorm and Icarus, as one pinned upstream build.
 FROM debian:trixie-slim AS hdl-tools
 ARG OSS_CAD_SUITE=2026-11-01
@@ -74,6 +98,8 @@ RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
 FROM hdl AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg openssh-client libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=kmsplay-build /kmsplay /opt/syncsummoner/kmsplay
+ENV SYNCSUMMONER_KMSPLAY=/opt/syncsummoner/kmsplay
 COPY pyproject.toml README.md LICENSE ./
 RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir \
         "numpy>=1.24" "scipy>=1.11" "opencv-python-headless>=4.9" \

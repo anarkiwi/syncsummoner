@@ -323,10 +323,10 @@ unmeasurable until that loop exists.
 
 ## Locked playout
 
-The Pi plays every stimulus with `syncsummoner.device.kmsplay`, a DRM/KMS player built on
-pykms. ffmpeg decodes the clip to raw `bgr565le` with no `-re`; the player prerolls two
-seconds of frames in RAM, then commits one atomic page flip per vblank to three RG16 dumb
-buffers. Each clip frame is held for exactly `refresh / fps` vblanks, so the frame clock is
+The Pi plays every stimulus with the native player (`native/kmsplay`), a DRM/KMS player on
+libdrm's atomic API. ffmpeg decodes the clip to raw `bgr565le` with no `-re`; the player
+prerolls two seconds of frames in RAM, then commits one atomic page flip per vblank to three
+RG16 dumb buffers. Each clip frame is held for exactly `refresh / fps` vblanks, so the frame clock is
 the display's pixel clock and flips cannot tear.
 
 | Property | Value |
@@ -336,14 +336,28 @@ the display's pixel clock and flips cannot tear.
 | Format | RG16, the bytes `ffmpeg -pix_fmt bgr565le` writes (red and blue come back exchanged otherwise) |
 | DRM master | free: nothing holds `card1`, fbcon is an in-kernel client; `device doctor` fails `source.drm_free` otherwise |
 | Software decode | 1080p30 H.264 at about 1.85x real time on the Pi 4's CPU; `h264_v4l2m2m` stalled |
-| Scheduling | the pacing thread runs `SCHED_FIFO`, its ceiling raised with `sudo prlimit` for the player's shell only, with the garbage collector frozen |
+| Scheduling | the pacing thread runs `SCHED_FIFO` with all memory locked, its ceilings raised with `sudo prlimit` for the player's shell only |
 
 Every flip-complete event's vblank sequence is checked against the vblank it was committed
 for and logged with its time (`flips.bin`). A late flip, an undecoded frame or a mode that
 does not divide the clip rate ends the player with a fault in `status.json`, which the host
-raises as `PlayoutError`. Without real-time scheduling a garbage-collector pause or the
-decoder's teardown delayed one commit past its vblank at the end of every clip; with it none
-has been missed.
+raises as `PlayoutError`.
+
+The pacing thread shares nothing that blocks with the rest of the player. A normal-priority
+thread reads each decoder's output into a single-producer, single-consumer ring of
+preallocated frames. The next span's decoder is started while the current one plays, and
+each decoder dies with the thread that started it. The pacer hands every flip record to a
+writer thread through a second lock-free ring, which fills `flips.bin` and the live pipe. It
+publishes the last flip under a seqlock for the asks thread. Flips are committed from one
+prebuilt atomic request per buffer, so nothing on the deadline path allocates.
+
+`status.json` reports `worst_commit_us`: the longest time from a flip-complete event to the
+next commit. On a fault it also reports `trace`, the last 64 flips. For each flip the trace
+gives when the pacer woke after the event, when it committed, and when the next frame was in a
+buffer, in µs after the event. DRM stamps an event with the start of scanout after its
+vblank, which comes after the event is delivered, so a pacer quick to wake shows negative
+times. A late commit points at the pacer; a commit in time on a flip that still landed late
+points at the kernel or the link.
 
 When the player exits, fbdev takes the display back, so it leaves its last frame in
 `/dev/fb0` and the picture stands. While it runs, fbdev blanking does nothing, so `Link`

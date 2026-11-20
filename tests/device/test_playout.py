@@ -144,10 +144,17 @@ def test_flip_records_match_the_players_own_layout():
     assert np.frombuffer(po.RECORD.pack(*fields), dtype=po.FLIP)[0].tolist() == fields
 
 
-def test_the_player_program_shipped_is_the_module_run_on_the_pi():
-    source = po.player_source().decode()
-    assert source.startswith('"""Vsync-locked clip player') and "def main(" in source
-    assert "import numpy" not in source and "from syncsummoner" not in source
+def test_the_player_shipped_is_the_binary_named_or_the_images_own(tmp_path, monkeypatch):
+    binary = tmp_path / "kmsplay"
+    binary.write_bytes(b"\x7fELF player")
+    monkeypatch.setenv(po.PLAYER_ENV, str(binary))
+    assert po.player_source() == b"\x7fELF player"
+    monkeypatch.setenv(po.PLAYER_ENV, str(tmp_path / "none"))
+    with pytest.raises(po.PlayoutError, match="no Pi player at .*none.*kmsplay-build"):
+        po.player_source()
+    monkeypatch.delenv(po.PLAYER_ENV)
+    monkeypatch.setattr(po, "DEFAULT_PLAYER", str(binary))
+    assert po.player_source() == b"\x7fELF player"
 
 
 def test_a_player_allows_a_whole_clip_to_go_up(monkeypatch):

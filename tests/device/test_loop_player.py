@@ -24,7 +24,7 @@ from .test_playout import frame
 
 FAKE_PLAYER = """\
 import json, os, signal, struct, sys, time
-args = sys.argv[2:]
+args = sys.argv[1:]
 status, flips = args[args.index("--status") + 1], args[args.index("--flips") + 1]
 mode = open(os.path.join(os.path.dirname(status), "mode")).read().split()
 def put(**state):
@@ -38,7 +38,7 @@ if "fail" in mode:
 with open(flips, "wb") as log:
     log.write(struct.pack("<qqqqq", 0, 1000, 0, 5, 1) + struct.pack("<qqqqq", 1, 1001, 0, 9, 0))
 signal.signal(signal.SIGTERM, lambda *_: (put(state="stopped"), sys.exit(0)))
-put(state="playing", realtime="rt" in mode, pid=os.getpid())
+put(state="playing", realtime="rt" in mode, locked="rt" in mode, pid=os.getpid())
 if "die" in mode:
     os._exit(1)
 while True:
@@ -46,8 +46,17 @@ while True:
 """
 
 
+@pytest.fixture(autouse=True)
+def fake_player(tmp_path_factory, monkeypatch):
+    """The program pushed as the Pi's player: a script that acts out its status and pidfile."""
+    path = tmp_path_factory.mktemp("player") / "kmsplay"
+    path.write_text(f"#!{sys.executable}\n{FAKE_PLAYER}")
+    monkeypatch.setenv(po.PLAYER_ENV, str(path))
+    return path
+
+
 class Pi:
-    """A local shell standing in for the Pi, with ``python3`` and ``sudo`` replaced by stubs.
+    """A local shell standing in for the Pi, with ``sudo`` replaced by a stub.
 
     ``setsid`` waits on the player it starts, so a player that exits is reaped without an init.
     """
@@ -57,7 +66,6 @@ class Pi:
         self.directory = root / "pi"
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        (bin_dir / "python3").write_text(f"#!{sys.executable}\n{FAKE_PLAYER}")
         (bin_dir / "sudo").write_text('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
         (bin_dir / "setsid").write_text('#!/bin/sh\n/usr/bin/setsid "$@" &\nwait\n')
         for stub in bin_dir.iterdir():
@@ -117,7 +125,8 @@ def test_show_holds_one_frame_by_its_own_pid_until_stopped(pi):
     argv = pi.argv()
     assert argv[argv.index("--fps") + 1] == "30000/1001" and "--loop" in argv
     assert argv[argv.index("--frames") + 1] == player.frames_dir
-    assert (pi.directory / "kmsplay.py").read_bytes() == po.player_source()
+    assert (pi.directory / "kmsplay").read_bytes() == po.player_source()
+    assert os.access(pi.directory / "kmsplay", os.X_OK) and not (pi.directory / "kmsplay.new").exists()
     assert player.stop() == {"state": "stopped"}
     assert not alive(pid) and player.pid() is None and not player.is_running()
 
@@ -166,6 +175,7 @@ def test_running_without_realtime_is_warned(pi, caplog, mode, warned):
         player.show(frame((0, 0, 0), 2, 4))
     player.stop()
     assert ("without SCHED_FIFO" in caplog.text) is warned
+    assert ("memory is not locked" in caplog.text) is warned
 
 
 @pytest.mark.parametrize("loop", [False, True])
@@ -202,7 +212,7 @@ class FakePi:
             self.frames = [blob[i : i + size] for i in range(0, len(blob), size)]
         elif "setsid" in command:
             self.pid, self.alive = 4243, True
-            self.state = {"state": self.settles, "realtime": True} if self.settles else {}
+            self.state = {"state": self.settles, "realtime": True, "locked": True} if self.settles else {}
         elif command.startswith("kill -0"):
             return po.RUNNING if self.alive else po.STOPPED
         elif command.startswith("kill "):
