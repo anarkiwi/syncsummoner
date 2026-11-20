@@ -224,6 +224,27 @@ def test_mutation_keeps_every_gesture_inside_its_span(features):
         assert span.start <= inst.arrival - inst.duration <= inst.arrival < span.end
 
 
+def test_a_gesture_arrives_where_its_whole_approach_fits_its_span(features):
+    """An anchor on the span's start would leave no approach: a ramp there is a step, so it is passed over."""
+    profile, audio = make_profile(), features.audio
+    rng = np.random.default_rng(11)
+    weights = P._applicable(profile, P.STYLES["default"], rng)
+    longest = max(P.SPAN_BARS[P.GESTURES[n].anchor] for n in weights) * audio.bar_duration
+    span = Section(0.0, min(2.5 * longest, float(audio.duration)), "")
+    for name in weights:
+        approach = P.SPAN_BARS[P.GESTURES[name].anchor] * audio.bar_duration
+        for _ in range(8):
+            inst = P._sample_instance(name, audio, span, profile, rng)
+            if inst is None:
+                continue
+            times = P._anchor_times(audio, span, P.GESTURES[name].anchor)
+            room = times[(times >= span.start) & (times < span.end)] - span.start
+            if room.size and room.max() >= approach:
+                assert inst.duration == pytest.approx(approach), name
+            elif room.size:
+                assert inst.arrival - span.start == pytest.approx(room.max()), name
+
+
 def test_glitchy_style_marks_destroy_sections(features):
     profiles = {"glitch": make_profile()}
     score = P.search(profiles, features, style="glitchy", rng=np.random.default_rng(9), budget=6, fps=FPS)
