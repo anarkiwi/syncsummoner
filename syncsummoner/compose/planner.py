@@ -443,17 +443,25 @@ def _fit_span(inst: GestureInstance, span: Section) -> GestureInstance:
 def _sample_instance(
     name: str, audio, span: Section, profile: ProgramProfile, rng, banned=frozenset()
 ) -> GestureInstance | None:
-    """One gesture arriving on its anchor inside ``span``, its approach too; None if every aim is banned."""
+    """One gesture arriving on its anchor inside ``span``, its approach too; None if every aim is banned.
+
+    It arrives on an anchor its whole approach fits before inside the span, else on the one with the most
+    room, so an approach is cut short only where no anchor leaves it room, never to a step at the start.
+    """
     aim = _aim(name, profile, rng, banned)
     if aim is None:
         return None
     anchor = GESTURES[name].anchor
+    approach = SPAN_BARS[anchor] * audio.bar_duration
     times = _anchor_times(audio, span, anchor)
     times = times[(times >= span.start) & (times < span.end)]
+    room = times - span.start
+    most = room.max(initial=-np.inf)
+    fits = times[room >= approach] if most >= approach else times[room == most]
     inst = GestureInstance(
         gesture=name,
-        arrival=float(rng.choice(times)) if times.size else span.start,
-        duration=SPAN_BARS[anchor] * audio.bar_duration,
+        arrival=float(rng.choice(fits)) if times.size else span.start,
+        duration=approach,
         axis=aim[0],
         intensity=float(rng.uniform(0.15, 0.95)),
         targets=aim[1],
