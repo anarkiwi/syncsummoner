@@ -32,8 +32,8 @@ from .kmsplay import RECORD, REPLY, SEGMENT, read_exactly
 DEFAULT_FB = "/dev/fb0"
 #: 565 quantisation levels per channel, for an RGB-ordered source frame.
 LEVELS = np.array([31, 63, 31], dtype=np.float32)
-#: Measured word layout is BGR565: blue occupies the high bits, not red.
-SHIFTS = np.array([0, 5, 11], dtype=np.uint16)
+#: DRM's RG16 word: red in the high bits, blue in the low.
+SHIFTS = np.array([11, 5, 0], dtype=np.uint16)
 LIMITED_BLACK, LIMITED_WHITE = 16.0 / 255.0, 235.0 / 255.0
 #: tmpfs, so the Pi's own reads of the stimulus run at memory speed.
 DEFAULT_DIR = "/dev/shm/syncsummoner"
@@ -88,7 +88,7 @@ def player_source() -> bytes:
 
 
 def to_fb565(frame: np.ndarray, *, limited_range: bool = True) -> bytes:
-    """Pack an RGB float32 frame in ``[0, 1]`` into the display's BGR565 words.
+    """Pack an RGB float32 frame in ``[0, 1]`` into the display's RG16 words.
 
     ``limited_range`` maps to studio swing, measured at unity gain end to end; full range
     clips above ~92% against the chain's limited-range expectation.

@@ -127,7 +127,7 @@ def test_frames_the_packets_do_not_account_for_are_said(tmp_path, monkeypatch, c
 
 def test_a_segment_ffmpeg_cannot_decode_is_an_error(tmp_path):
     with pytest.raises(RuntimeError, match="failed with exit"):
-        D._segment(  # pylint: disable=protected-access
+        D.segment(
             tmp_path / "missing.mkv",
             SPEC,
             start_s=None,

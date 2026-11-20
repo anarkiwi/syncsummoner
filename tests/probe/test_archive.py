@@ -158,7 +158,7 @@ def test_metadata_is_self_describing(tmp_path):
     """Metadata names the key, the geometry, the codec and the yield."""
     archive, made, _ = write_archive(tmp_path, 4, gaps=(3,))
     meta = json.loads(archive.paths("bitcrush")[2].read_text(encoding="utf-8"))
-    assert meta["schema_version"] == ARCHIVE_SCHEMA_VERSION == 4
+    assert meta["schema_version"] == ARCHIVE_SCHEMA_VERSION == 5
     assert meta["program"] == "bitcrush"
     assert (meta["key_kind"], meta["key_material"], meta["key_digest"]) == (
         "binary",

@@ -28,20 +28,47 @@ MJPEG and no 1080p, so the recorder cannot open the session format. On USB 3
 of its own for its RGB lighting controller, which is normal; only the video
 function's link speed matters. `syncsummoner device doctor` checks both.
 
-## The chroma pair arrives exchanged
+## Channel order through the chain
 
-`v4l2-ctl --list-formats-ext` reports one format, `YUYV 4:2:2`, but Cb and Cr
-arrive exchanged, swapping red and blue. The device's own `Colorbars` decodes as
-white, cyan, yellow, green, magenta, blue, red, black under the advertised order,
-and as SMPTE order once the pair is put back. MJPEG carries the same exchange.
+The Pi's RG16 framebuffer holds red in a word's high bits, so the player packs it so
+(`ffmpeg -pix_fmt rgb565le`, `playout.to_fb565`). The card's `YUYV` 4:2:2, the one format
+it enumerates, and its MJPEG both arrive in the order advertised, and are decoded as that.
+Measured with Passthru on firmware 1.0.2-rc.9 at 1080p30 on a still whose U follows x and
+V and luma follow y (`captures/diag/chromaphase.py`), its Y, U and V correlated with the
+capture:
 
-- `device/capture.py` decodes with `COLOR_YUV2BGR_YVYU`, never `..._YUYV`.
-- The archive recorder filters `-vf swapuv` before encoding, so what is stored is
-  already right.
-- `-c copy` cannot filter, so an MJPEG take keeps the exchange until re-encoded.
-- Never let the card convert (`CAP_PROP_CONVERT_RGB=1`): it uses the advertised
-  order and clips, so full red returns `B=254.5` and the true `R=208.6` is
-  unrecoverable.
+| Pi packing | Card format | Order read | Y, U, V correlation |
+| --- | --- | --- | --- |
+| blue high (the earlier `bgr565le`) | MJPEG | red and blue exchanged | 0.996, 1.000, 0.998 |
+| red high | MJPEG | as played | 0.971, 0.999, 1.000 |
+| red high | YUYV | as played | 0.962, 0.999, 1.000 |
+
+Red and blue exchanged in RGB reads much as an exchanged chroma pair, and only luma
+tells them apart, so SMPTE bars cannot: a blue-high packing decoded as YVYU or behind
+`swapuv` reads the bars right and the picture wrong. `device doctor --loop` reads a chroma field below the bars (`loop.chroma`).
+
+The device's own `Colorbars`, whose source holds the standard U and V of each bar, comes
+back with its chroma pair exchanged while Passthru comes back as played: consistent with
+the device exchanging the pair on its way out and again on its way in, so that a program
+computes on V as U.
+
+Never let the card convert (`CAP_PROP_CONVERT_RGB=1`): it clips.
+
+### A program that drops active video pairs its chroma per load
+
+The yuv444 core packs a program's output to 4:2:2 by toggling Cb and Cr on every pixel
+while the program's `avid` is high, restarting on Cb as it falls. boneoh/YUV Bit Rotator
+drives `avid` from a valid flag that never falls (`s_rotated_pre_valid <= '1'`), so the
+toggle runs free from the moment the program loaded, and a 2200-clock line keeps its phase:
+each load comes back as played or chroma exchanged for the whole session. Measured under
+its Bypass, after a load each with the link dropped: 4 of 8 loads exchanged, in no pattern,
+while Passthru between them never was.
+
+A locked take therefore judges its dry lead-in against the clip once captured
+(`compose.chroma.lead_in_order`) and faults with `ChromaOrderError` when the pair came back
+exchanged, so the session is captured again; `probe doctor` reports every take's order as
+`takes.chroma`. A program with no dry control is judged on its Passthru anchor, which
+checks the chain but not the program.
 
 ## Parameters are additive
 
@@ -324,7 +351,7 @@ unmeasurable until that loop exists.
 ## Locked playout
 
 The Pi plays every stimulus with the native player (`native/kmsplay`), a DRM/KMS player on
-libdrm's atomic API. ffmpeg decodes the clip to raw `bgr565le` with no `-re`; the player
+libdrm's atomic API. ffmpeg decodes the clip to raw `rgb565le` with no `-re`; the player
 prerolls two seconds of frames in RAM, then commits one atomic page flip per vblank to three
 RG16 dumb buffers. Each clip frame is held for exactly `refresh / fps` vblanks, so the frame clock is
 the display's pixel clock and flips cannot tear.
@@ -333,7 +360,7 @@ the display's pixel clock and flips cannot tear.
 | --- | --- |
 | Device | `/dev/dri/card1`, connector `HDMI-A-1`, primary plane |
 | Mode | the EDID's preferred `1920x1080@30.00`, 74.25 MHz; kept, never re-set, when it divides the clip rate |
-| Format | RG16, the bytes `ffmpeg -pix_fmt bgr565le` writes (red and blue come back exchanged otherwise) |
+| Format | RG16, red in the high bits: the bytes `ffmpeg -pix_fmt rgb565le` writes |
 | DRM master | free: nothing holds `card1`, fbcon is an in-kernel client; `device doctor` fails `source.drm_free` otherwise |
 | Software decode | 1080p30 H.264 at about 1.85x real time on the Pi 4's CPU; `h264_v4l2m2m` stalled |
 | Scheduling | the pacing thread runs `SCHED_FIFO` with all memory locked, its ceilings raised with `sudo prlimit` for the player's shell only |

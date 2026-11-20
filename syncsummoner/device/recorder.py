@@ -57,11 +57,9 @@ __all__ = [
 MJPEG = ("mjpeg", "-c:v", "copy", "-flush_packets", "1", "-cluster_time_limit", "200")
 #: The card's own samples, unencoded, for a scratch pass that is read once.
 RAW_422 = ("yuyv422", "-c:v", "rawvideo")
-#: Lossless intra-only at session rate, with the exchanged chroma pair put back.
+#: Lossless intra-only at session rate.
 FFV1 = (
     "yuyv422",
-    "-vf",
-    "swapuv",
     "-c:v",
     "ffv1",
     "-level",

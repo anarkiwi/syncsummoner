@@ -27,7 +27,7 @@ from syncsummoner.device.v4l2rec import read_log, sidecar
 from syncsummoner.probe.patterns import read_codes
 from syncsummoner.progress import LOG, meter
 
-__all__ = ["CALIBRATION_SIZE", "Features", "SCHEMA", "Spec", "cache_path", "decode", "features"]
+__all__ = ["CALIBRATION_SIZE", "Features", "SCHEMA", "Spec", "cache_path", "decode", "features", "segment"]
 
 #: Bumped whenever what a decode stores, or how, changes; older caches are then decoded afresh.
 SCHEMA = 1
@@ -241,7 +241,7 @@ def _run_segment(
     return said, body, small, codes, proc.returncode
 
 
-def _segment(
+def segment(
     path: str | Path,
     spec: Spec,
     *,
@@ -303,7 +303,7 @@ def decode(
                 progress.to(total[0] * span / pts.size)
 
         def one(index: int) -> dict[str, np.ndarray]:
-            found = _segment(
+            found = segment(
                 path,
                 spec,
                 start_s=edges[index] if index else None,

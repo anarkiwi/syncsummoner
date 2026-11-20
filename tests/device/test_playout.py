@@ -1,4 +1,4 @@
-"""Playout: BGR565 packing, exact rates and flip-log judging, with no Pi and no network."""
+"""Playout: RG16 packing, exact rates and flip-log judging, with no Pi and no network."""
 
 # pylint: disable=missing-function-docstring
 
@@ -39,19 +39,19 @@ def frame(rgb, height=1080, width=1920):
     [
         ((0.0, 0.0, 0.0), 0x0000),
         ((1.0, 1.0, 1.0), 0xFFFF),
-        ((1.0, 0.0, 0.0), 0x001F),
+        ((1.0, 0.0, 0.0), 0xF800),
         ((0.0, 1.0, 0.0), 0x07E0),
-        ((0.0, 0.0, 1.0), 0xF800),
+        ((0.0, 0.0, 1.0), 0x001F),
     ],
 )
-def test_fb565_primaries_use_measured_bgr_word_order(rgb, word):
-    """Blue occupies the high bits; red the low. Measured against the real chain."""
+def test_fb565_primaries_use_the_rg16_word_order(rgb, word):
+    """Red occupies the high bits; blue the low, as DRM's RG16 lays them out."""
     data = to_fb565(frame(rgb, 2, 2), limited_range=False)
     assert np.all(np.frombuffer(data, dtype="<u2") == word)
 
 
 def test_fb565_is_little_endian():
-    data = to_fb565(frame((0.0, 0.0, 1.0), 1, 1), limited_range=False)
+    data = to_fb565(frame((1.0, 0.0, 0.0), 1, 1), limited_range=False)
     assert data == b"\x00\xf8"
 
 
@@ -64,7 +64,7 @@ def test_fb565_quantises_per_channel():
 def test_fb565_clips_out_of_range():
     odd = np.array([[[-1.0, 2.0, 0.5]]], dtype=np.float32)
     word = int(np.frombuffer(to_fb565(odd, limited_range=False), dtype="<u2")[0])
-    assert (word & 0x1F, (word >> 5) & 0x3F) == (0, 63)
+    assert (word >> 11, (word >> 5) & 0x3F) == (0, 63)
 
 
 def test_limited_range_is_the_default_and_maps_to_studio_swing():

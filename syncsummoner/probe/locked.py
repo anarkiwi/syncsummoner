@@ -19,6 +19,7 @@ from syncsummoner.device.profile import PARAM_COUNT, snap_toggles
 from syncsummoner.probe.archive import GAP, MJPEG_PIX_FMT, FrameRow
 from syncsummoner.probe.fit import load_measurements, save_measurements
 from syncsummoner.probe.store import atomic_write
+from syncsummoner.progress import LOG
 from syncsummoner.program.gates import tour
 
 __all__ = [
@@ -492,7 +493,39 @@ def capture(
         mine["frames_lost_by_driver"] = lost
         if lost:
             mine.setdefault("fault", f"TakeFaultError: the capture driver lost {lost} frames")
+        if "fault" not in mine:
+            mine.update(chroma_record(out, clip, config))
         said.append(mine)
+    return said
+
+
+def chroma_record(take: str | Path, clip: str | Path, config: Any) -> dict:
+    """A captured take's dry lead-in channel order, and a fault when its chroma pair came back exchanged.
+
+    The fault sends the take back for another session: a program that drops its output's active-video flag
+    pairs its chroma afresh on every load, so the pair can come back exchanged for a whole session.
+    """
+    from syncsummoner.compose import chroma as lead_in  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose.timecode import clip_layout  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
+
+    ffmpeg = getattr(config, "ffmpeg", "ffmpeg")
+    try:
+        found = lead_in.lead_in_order(
+            take,
+            clip,
+            spec=decoded.Spec.of(config),
+            fps=config.fps,
+            width=config.width,
+            lead=clip_layout(clip, ffprobe=decoded.ffprobe_for(ffmpeg)).lead,
+            ffmpeg=ffmpeg,
+        )
+    except lead_in.UNREADABLE as err:
+        LOG.warning("%s: no channel order from the lead-in: %s", take, err)
+        return {"chroma": {"error": f"{type(err).__name__}: {err}"}}
+    said: dict = {"chroma": found.as_dict()}
+    if found.judged and not found.ok:
+        said["fault"] = f"ChromaOrderError: the dry lead-in came back {found.order}"
     return said
 
 

@@ -1,4 +1,4 @@
-"""Capture: V4L2 configuration, YVYU decoding, bounded liveness waits."""
+"""Capture: V4L2 configuration, YUYV decoding, bounded liveness waits."""
 
 # pylint: disable=missing-function-docstring,no-member  ; cv2 defeats pylint introspection
 
@@ -8,7 +8,7 @@ import pytest
 
 from syncsummoner.device import capture as cap
 from syncsummoner.device.capture import Capture, CaptureError
-from tests import MEASURED_YVYU, native_frame
+from tests import MEASURED_YUYV, native_frame
 
 from .conftest import FakeClock, FakeVideoCapture
 
@@ -16,8 +16,8 @@ SIZE = (48, 64)
 
 
 def packed(frame):
-    """Pack an RGB float frame into the card's native ``(H, W, 2)`` YVYU layout."""
-    return cv2.cvtColor((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2YUV_YVYU)
+    """Pack an RGB float frame into the card's native ``(H, W, 2)`` YUYV layout."""
+    return cv2.cvtColor((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2YUV_YUYV)
 
 
 @pytest.fixture(name="opened")
@@ -67,10 +67,10 @@ def test_read_before_open_raises(opened):
         capture.read()
 
 
-@pytest.mark.parametrize("colour", sorted(MEASURED_YVYU))
+@pytest.mark.parametrize("colour", sorted(MEASURED_YUYV))
 def test_measured_buffers_decode_to_the_colour_that_was_sent(opened, colour):
-    """The regression: these bytes read as YUYV give the complementary hue."""
-    planes, expected = MEASURED_YVYU[colour]
+    """The card's bytes read in the order it enumerates give the colour on screen."""
+    planes, expected = MEASURED_YUYV[colour]
     capture, fake, _ = opened
     fake.frames = [native_frame(planes)]
     frame = capture.open().read()
@@ -78,30 +78,30 @@ def test_measured_buffers_decode_to_the_colour_that_was_sent(opened, colour):
     assert frame[0, 0] * 255.0 == pytest.approx(expected, abs=1.0)
 
 
-def test_the_advertised_byte_order_reads_red_as_blue():
-    """What the card enumerates disagrees with what it sends, so decoding is measured."""
-    planes, expected = MEASURED_YVYU["red"]
+def test_an_exchanged_chroma_pair_reads_red_as_blue():
+    """A YVYU read of the card's bytes is the red/blue confusion this decode must not make."""
+    planes, expected = MEASURED_YUYV["red"]
     frame = native_frame(planes)
-    assert cap.yvyu_to_bgr(frame)[0, 0].tolist() == list(expected)[::-1]
-    assert cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)[0, 0].tolist() == [255, 0, 0]
+    assert cap.yuyv_to_bgr(frame)[0, 0].tolist() == list(expected)[::-1]
+    assert cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YVYU)[0, 0].tolist()[0] > 200
 
 
 def test_read_raw_is_the_decoded_bgr_of_the_native_buffer(opened):
     """Every caller gets the same 4:2:2 upsample of the card's own buffer."""
     capture, fake, _ = opened
-    native = native_frame(MEASURED_YVYU["green"][0])
+    native = native_frame(MEASURED_YUYV["green"][0])
     fake.frames = [native]
     raw = capture.open().read_raw()
     assert raw.dtype == np.uint8 and raw.shape == (4, 4, 3)
-    assert np.array_equal(raw, cap.yvyu_to_bgr(native))
+    assert np.array_equal(raw, cap.yuyv_to_bgr(native))
 
 
 def test_read_is_a_view_of_the_raw_frame(opened):
     """One decode path: the float RGB frame is exactly the raw frame rescaled."""
     capture, fake, _ = opened
-    native = native_frame(MEASURED_YVYU["blue"][0])
+    native = native_frame(MEASURED_YUYV["blue"][0])
     fake.frames = [native]
-    assert capture.open().read() == pytest.approx(cap.yvyu_to_bgr(native)[:, :, ::-1] / 255.0, abs=1e-6)
+    assert capture.open().read() == pytest.approx(cap.yuyv_to_bgr(native)[:, :, ::-1] / 255.0, abs=1e-6)
 
 
 def test_read_returns_none_on_failed_grab(opened):
@@ -123,7 +123,7 @@ def test_read_raw_before_open_raises(opened):
 def test_one_read_costs_one_grab(opened):
     """Metrics and any archive of a frame must come from the same grab, not two."""
     capture, fake, _ = opened
-    fake.frames = [native_frame(MEASURED_YVYU["red"][0])]
+    fake.frames = [native_frame(MEASURED_YUYV["red"][0])]
     assert capture.open().read() is not None and fake.reads == 1
 
 

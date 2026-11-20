@@ -49,9 +49,10 @@ __all__ = [
     "stimulus_of",
 ]
 
-#: 4 names its stimulus (3 played the codeframe loop); 3 put the chroma pair back, 1 and 2 swapped it.
-ARCHIVE_SCHEMA_VERSION = 4
-READABLE_SCHEMAS = frozenset({3, ARCHIVE_SCHEMA_VERSION})
+#: 5 played its stimulus with red and blue in RG16's order, 4 and before exchanged them; 4 names its
+#: stimulus (3 played the codeframe loop).
+ARCHIVE_SCHEMA_VERSION = 5
+READABLE_SCHEMAS = frozenset({3, 4, ARCHIVE_SCHEMA_VERSION})
 #: Metadata key naming what was played while an archive was recorded.
 STIMULUS = "stimulus"
 CODEFRAMES = {"kind": "codeframes"}
@@ -66,7 +67,7 @@ LISTING_HEADER = "ffconcat version 1.0"
 DARK_SUFFIX = ".dark.json"
 #: Setpoint of a frame captured between setpoints, kept for continuity but not measured.
 GAP = -1
-#: What the card is asked for; the recorder swaps the chroma pair back before encoding.
+#: What the card is asked for.
 CAPTURE_PIX_FMT = "yuyv422"
 #: The card's own compressed stream, as a locked take records it.
 MJPEG_PIX_FMT = "mjpeg"

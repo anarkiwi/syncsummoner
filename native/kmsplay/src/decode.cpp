@@ -43,7 +43,7 @@ Argv decode_argv(const std::string &path, int width, int height, bool loop,
   argv.insert(argv.end(), {"-i", path, "-map", "0:v:0", "-vf",
                            trim + "scale=" + std::to_string(width) + ":" +
                                std::to_string(height),
-                           "-fps_mode", "passthrough", "-pix_fmt", "bgr565le",
+                           "-fps_mode", "passthrough", "-pix_fmt", "rgb565le",
                            "-f", "rawvideo", "pipe:1"});
   return argv;
 }

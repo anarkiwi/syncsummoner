@@ -35,7 +35,7 @@ TEST(DecodeArgv, KeepsEveryFrameAtDisplayGeometry) {
   EXPECT_EQ(find(argv, "-r"), std::string::npos);
   EXPECT_EQ(argv.at(find(argv, "-stream_loop") + 1), "-1");
   EXPECT_NE(find(argv, "scale=1280:720"), std::string::npos);
-  EXPECT_NE(find(argv, "bgr565le"), std::string::npos);
+  EXPECT_NE(find(argv, "rgb565le"), std::string::npos);
   EXPECT_EQ(find(decode_argv("c.mkv", 8, 8, false), "-stream_loop"),
             std::string::npos);
 }

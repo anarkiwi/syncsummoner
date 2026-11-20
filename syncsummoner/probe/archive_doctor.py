@@ -17,6 +17,7 @@ from pyvmancer.diagnose import Finding, format_finding, report
 
 from syncsummoner.device.kmsplay import SEGMENT
 from syncsummoner.device.v4l2rec import read_sidecar, sidecar
+from syncsummoner.probe.archive import ARCHIVE_FPS
 from syncsummoner.progress import LOG, track
 
 #: Characters of a fault message kept in a finding's detail.
@@ -25,6 +26,8 @@ MESSAGE = 120
 TOP = 3
 #: Files a finding names before counting the rest.
 NAMED = 8
+#: Capture width a take without a sidecar is read at: the session raster's.
+WIDTH = 1920
 
 
 def finding(check: str, ok: bool, detail: str, fix: str = "") -> Finding:
@@ -315,6 +318,63 @@ def effects_measured(summaries: dict[str, dict[str, dict]]) -> Finding:
     )
 
 
+def last_attempt(take: Path) -> dict:
+    """A take's latest capture attempt record, empty when it has none."""
+    said = attempts(take)
+    return said[max(said, key=lambda name: int(name.rpartition("-")[2]))] if said else {}
+
+
+def take_chroma(take: Path, clip: str | None, lead: int | None) -> dict | None:
+    """A captured take's dry lead-in channel order: as its last attempt recorded it, else measured.
+
+    ``lead`` is the clip's lead-in length, None when it could not be read; an unreadable take says why.
+    """
+    from syncsummoner.compose import chroma as lead_in  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe import decoded  # pylint: disable=import-outside-toplevel
+
+    recorded = last_attempt(take).get("chroma")
+    if recorded is not None or not captured(take) or clip is None or lead is None:
+        return recorded
+    layout = read_sidecar(take)[1] if sidecar(take).is_file() else None
+    width = (layout.width if layout else 0) or WIDTH
+    try:
+        found = lead_in.lead_in_order(
+            take, clip, spec=decoded.Spec(), fps=ARCHIVE_FPS, width=width, lead=lead
+        )
+    except lead_in.UNREADABLE as err:
+        return {"error": f"{type(err).__name__}: {err}"}
+    return found.as_dict()
+
+
+def takes_chroma(takes: Iterable[Path], clip: str | None) -> dict[str, dict | None]:
+    """:func:`take_chroma` of every take, the clip's layout read once."""
+    from syncsummoner.compose.chroma import UNREADABLE  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose.timecode import clip_layout  # pylint: disable=import-outside-toplevel
+
+    try:
+        lead = clip_layout(clip).lead if clip and Path(clip).is_file() else None
+    except UNREADABLE:
+        lead = None
+    return {str(t): take_chroma(t, clip, lead) for t in track(list(takes), desc="chroma", unit="take")}
+
+
+def chroma(orders: dict[str, dict | None]) -> Finding:
+    """Every judged take's dry lead-in came back with its chroma pair as the clip played it."""
+    judged = {t: o for t, o in orders.items() if o and "ok" in o and o.get("judged", True)}
+    bad = [f"{Path(t).name} ({o['order']})" for t, o in judged.items() if not o["ok"]]
+    counts = Counter(o["order"] for o in judged.values())
+    detail = f"{len(judged)} of {len(orders)} takes judged" + "".join(f"; {n} {o}" for o, n in counts.items())
+    if bad:
+        detail += f"; exchanged: {named(bad)}"
+    return finding(
+        "takes.chroma",
+        not bad,
+        detail,
+        "recapture them, each in a session of its own; "
+        "if every take reads exchanged, run `device doctor --loop`",
+    )
+
+
 def diagnose(
     archive: str | Path,
     plans_file: str | Path | None = None,
@@ -350,6 +410,7 @@ def diagnose(
         take_faults(messages),
         rate_lock(takes_rate_lock(takes)),
         collected(takes),
+        chroma(takes_chroma(takes, clip)),
     ] + ([effects_measured(effect_summaries(shelf))] if shelf.is_dir() else [])
 
 

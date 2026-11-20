@@ -75,8 +75,10 @@ def test_a_sound_archive_passes_every_check(archive):
         "takes.faults",
         "takes.rate_lock",
         "takes.collected",
+        "takes.chroma",
     ]
     assert all(f.ok and not f.fix for f in found.values()), found
+    assert found["takes.chroma"].detail == "0 of 1 takes judged"
     assert found["rig.time"].detail == "0.6 rig h left over 2 of 2 plans"
     assert found["takes.rate_lock"].detail == (
         "1 takes measured, 0 multi-segment skipped; ppm +0.0 to +0.0, the tightest bound 1669.4"
@@ -223,7 +225,7 @@ def test_captured_takes_without_rows_are_listed(archive):
 def test_the_cli_exits_by_the_checks_and_prints_the_report(archive, capsys):
     assert cli.main(["probe", "doctor", str(archive), "--json"]) == 0
     said = json.loads(capsys.readouterr().out)
-    assert said["ok"] and len(said["findings"]) == 9
+    assert said["ok"] and len(said["findings"]) == 10
     write_plan(archive / "takes" / "sweep-B.json", archive / "clip" / "synthetic.mkv", shot_frames=30)
     listing = archive / "only.txt"
     listing.write_text(f"{archive / 'takes' / 'sweep-B.json'}\n", encoding="utf-8")
@@ -261,3 +263,54 @@ def test_effects_are_reported_per_program_and_a_profile_without_them_fails(archi
     assert ad.effects_measured({"C": {"bw": {**summary, "safe": 0, "safe_intensity": None}}}).detail.endswith(
         "0/4 safe, intensity none, blank 1 static 1 flashing 0 red 0"
     )
+
+
+def test_a_recorded_channel_order_is_read_and_an_exchanged_one_fails(archive):
+    exchanged = {
+        "program": "P",
+        "chroma": {"order": "chroma exchanged", "ok": False, "judged": True, "frames": 30},
+    }
+    unsure = {
+        "program": "P",
+        "chroma": {"order": "chroma exchanged", "ok": False, "judged": False, "frames": 6},
+    }
+    write_take(archive / "takes" / "take-B-00.mkv", attempt=exchanged)
+    write_take(archive / "takes" / "take-C-00.mkv", attempt=unsure)
+    found = ad.chroma(ad.takes_chroma(ad.takes_of(archive), None))
+    assert not found.ok and "1 of 3 takes judged; 1 chroma exchanged" in found.detail
+    assert "exchanged: take-B-00.mkv (chroma exchanged)" in found.detail and "device doctor" in found.fix
+
+
+def test_a_take_with_no_record_is_measured_on_the_clip(archive, monkeypatch):
+    from syncsummoner.compose import chroma as cc  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe.chroma import ChromaOrder  # pylint: disable=import-outside-toplevel
+
+    asked = {}
+
+    def measure(take, clip, *, spec, fps, width, lead):
+        asked.update(take=take.name, clip=clip, fps=fps, width=width, lead=lead, bits=spec.bits)
+        return ChromaOrder(
+            "as played", {o: [1.0, 1.0, 1.0] for o in ("as played", "chroma exchanged")}, 30, 9.0
+        )
+
+    monkeypatch.setattr(cc, "lead_in_order", measure)
+    take = archive / "takes" / "take-A-00.mkv"
+    clip = str(archive / "clip" / "synthetic.mkv")
+    found = ad.take_chroma(take, clip, 120)
+    assert found["order"] == "as played" and found["frames"] == 30
+    assert asked == {"take": take.name, "clip": clip, "fps": 30, "width": 1920, "lead": 120, "bits": 16}
+    assert ad.take_chroma(take, clip, None) is None
+
+    def unreadable(*_args, **_kwargs):
+        raise ValueError("no strip")
+
+    monkeypatch.setattr(cc, "lead_in_order", unreadable)
+    assert ad.take_chroma(take, clip, 120) == {"error": "ValueError: no strip"}
+
+
+def test_the_latest_attempt_is_the_one_read(archive):
+    take = archive / "takes" / "take-A-00.mkv"
+    meta = {f"attempt-{n}": {"program": "P", "chroma": {"order": str(n), "ok": True}} for n in (2, 10, 9)}
+    (take.parent / f"{take.name}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert ad.last_attempt(take)["chroma"]["order"] == "10"
+    assert ad.last_attempt(archive / "takes" / "missing.mkv") == {}

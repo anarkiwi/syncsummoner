@@ -1,12 +1,12 @@
-"""Fixtures shared across the suite, chiefly the capture card's measured byte order."""
+"""Fixtures shared across the suite, chiefly the capture card's measured bytes."""
 
 import numpy as np
 
-#: Measured (Y, first chroma byte, second chroma byte) and the RGB a YVYU decode recovers.
-MEASURED_YVYU = {
-    "red": ((41, 241, 109), (209, 0, 0)),
-    "green": ((144, 53, 34), (29, 247, 0)),
-    "blue": ((82, 89, 241), (15, 64, 255)),
+#: Measured (Y, U, V) bytes the card sent for each primary on screen, and the RGB a YUYV decode gives.
+MEASURED_YUYV = {
+    "blue": ((41, 241, 109), (0, 0, 255)),
+    "green": ((144, 53, 34), (0, 255, 0)),
+    "red": ((82, 89, 241), (255, 0, 0)),
 }
 
 
