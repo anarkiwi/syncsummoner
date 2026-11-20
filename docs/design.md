@@ -612,6 +612,61 @@ plays a timecoded clip through Passthru, or a program loaded in the lead-in, and
 reports missed vblanks, driver drops, gaps, picture changes off a frame start, strip
 agreement and, under Passthru, tears (`compose.lockcheck`).
 
+## 11. Effect intensity and safety
+
+What the composer needs from an archive is how far each setting takes the picture, from subtle to
+exaggerated, and whether it leaves a picture that can be watched. `probe effects` measures both for every
+archived setting, its captures against the exact clip frames they show (§9.1), and writes them into the
+program's profile under `effects`, keyed `bw` or `colour` by the saturation of the synthetic clip played,
+so one profile carries both clips.
+
+```sh
+syncsummoner probe timecode --synthetic 4 --shot-frames 45 --colour bw   --seconds 351.1667 --out bw.mkv
+syncsummoner probe timecode --synthetic 4 --shot-frames 45 --colour full --seconds 351.1667 --out colour.mkv
+syncsummoner probe effects --archive archive/ --profiles profiles/ --jobs 8 [--sheets sheets/]
+syncsummoner probe doctor ARCHIVE_DIR   # each program's safe intensity range and flag counts
+```
+
+### 11.1 Clips
+
+Both clips are the one-texture stimulus (`Coverage.one_texture`): every shot the same texture statistics,
+only motion drawn. `--colour bw` sets saturation to zero, so the luma is the colour clip's and the pair
+isolates what a program does with chroma. `--colour full` removes each shot's tint and sets the
+saturation so three standard deviations of chroma, the luma's own span, meet the nearest BT.709 gamut
+edge at the mean level (`gamut_saturation`). Untinted chroma noise spans every hue in every frame, so no
+setting sees a hue another does not, and hue is held by construction rather than drawn per shot.
+
+### 11.2 Measures
+
+Captures and clip frames are compared with the strip cropped, area-scaled by Wang et al.'s SSIM rule:
+the short side over 256, rounded (480x268 at 1080p).
+
+| Measure | Definition | Source |
+| --- | --- | --- |
+| `structure` | mean DSSIM, `(1 - SSIM) / 2`, of luma: 0 identical, 0.5 unrelated, 1 inverted | Wang, Bovik, Sheikh and Simoncelli 2004, their window and constants |
+| `colour` | mean CIEDE2000 in CIELAB, D65, from sRGB | CIE 142-2001; scikit-image |
+| `intensity` | larger of `structure` and `colour / 100`, both fractions of the most an output can depart | 100 is CIEDE2000 between black and white |
+| `blank` | output SI below the live floor between the source's SI and quantisation SI | P.910 SI, §9.2 |
+| `static` | output TI below the live floor between the source's TI and quantisation TI | P.910 TI, §9.2 |
+| `flashing` | more than 3 general flashes in any second | ITU-R BT.1702, WCAG 2.3.1, as EA IRIS implements them |
+| `red_flashing` | the same for saturated red | WCAG 2.2 red flash definition |
+
+A flash is a pair of opposing transitions. Each frame's change is the change in the screen's mean
+relative luminance, counted only where at least a quarter of the screen changed; same-signed changes
+within a second accumulate, and a run becomes one transition when it first reaches 0.1 with the darker
+frame below 0.8. The red test runs the same on `320 * (R - G - B)` of linear RGB where red is at least
+0.8 of the sum, with a threshold of 20. A setting is safe when it raises none of the four flags.
+SSIM, not MS-SSIM: a contrast-reversed scale has no real fractional power, and clipping it at zero
+saturates a large share of settings at the top of the scale, where ranking matters.
+
+### 11.3 Between measured settings
+
+`probe.effects.lookup` takes the nearest measured setting's intensity, over the parameters the archive
+varied, each over its span, and calls a setting safe only when every measured setting within the median
+nearest-neighbour spacing, the design's own resolution, is safe. At archive density an unmeasured
+setting's intensity is barely informed by its neighbours across a dozen parameters, so the composer
+chooses among measured settings and uses `lookup` only for a setting a score already holds.
+
 ---
 
 ## Appendix — theoretical grounding

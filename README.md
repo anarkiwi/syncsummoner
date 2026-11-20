@@ -41,6 +41,7 @@ syncsummoner probe hold takes/take-*.mkv --source clip.mkv --out holds/   # each
 syncsummoner probe sweep plan|capture|collect|commit ...   # an archive on real footage as locked takes
 syncsummoner probe names --archive archive/   # add each program's program info to its archive
 syncsummoner probe refit --archive archive/ --out profiles/   # profiles from the archive, no device
+syncsummoner probe effects --archive archive/ --profiles profiles/   # each setting's intensity and safety
 
 syncsummoner profile show | diff | atlas --program bitcrush_displace
 
@@ -78,7 +79,7 @@ through `docker run`.
 ## Docs
 
 - [docs/workflow.md](docs/workflow.md) — worked example: clip and track in, finished render out
-- [docs/design.md](docs/design.md) — the design being realized
+- [docs/design.md](docs/design.md) — the design being realized; §11 effect intensity and safety
 - [docs/program-model.md](docs/program-model.md) — each program's parameters from its `.vmprog`, and which are live from its HDL
 - [docs/hardware.md](docs/hardware.md) — measured rig behaviour and its consequences
 - [docs/evidence.md](docs/evidence.md) — frame-locked parameter writes and the per-take proof they landed

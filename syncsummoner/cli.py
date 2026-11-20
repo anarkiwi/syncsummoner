@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from syncsummoner.probe import archive_doctor, dedupe, modlayer, sweep_cmds
+from syncsummoner.probe import archive_doctor, dedupe, effects, modlayer, sweep_cmds
 from syncsummoner.progress import LOG, configure
 
 
@@ -229,7 +229,7 @@ def _refit_cmd(args: argparse.Namespace) -> int:
         profile = result.profile
         profile.registered, profile.pointwise = result.behaviour
         profile.style = styles[program]
-        save_profile(profile, path)
+        save_profile(profile, path, carry_effects=True)
         save_measurements(result.records, out / f"{slug(program)}.parquet")
         written.append(str(path))
     LOG.info("%d profiles in %s", len(written), out)
@@ -860,6 +860,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     sweep_cmds.add_parsers(probe_sub)
     dedupe.add_parser(probe_sub)
     archive_doctor.add_parser(probe_sub)
+    effects.add_parser(probe_sub)
     modlayer.add_parser(probe_sub)
 
     profile = sub.add_parser("profile", help="inspect fitted profiles")

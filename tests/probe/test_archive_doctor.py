@@ -238,3 +238,26 @@ def test_long_lists_name_the_first_files_and_count_the_rest():
     paths = [f"/a/sweep-{k}.json" for k in range(ad.NAMED + 3)]
     assert ad.named(paths).endswith("sweep-7.json and 3 more") and "/a/" not in ad.named(paths)
     assert ad.named(paths[:2]) == "sweep-0.json, sweep-1.json"
+
+
+def test_effects_are_reported_per_program_and_a_profile_without_them_fails(archive, capsys):
+    from syncsummoner.device.profile import ProgramProfile, Source  # pylint: disable=import-outside-toplevel
+    from syncsummoner.probe.fit import save_profile  # pylint: disable=import-outside-toplevel
+
+    shelf = archive / "profiles-each"
+    shelf.mkdir()
+    summary = {"settings": 4, "safe": 3, "blank": 1, "static": 1, "flashing": 0, "red_flashing": 0}
+    measured = ProgramProfile("A", "fw", "a", Source.HW)
+    measured.effects = {"bw": {"summary": {**summary, "intensity": [0.1, 0.8], "safe_intensity": [0.1, 0.5]}}}
+    save_profile(measured, shelf / "A.yaml")
+    found = by_check(ad.diagnose(archive))["effects.measured"]
+    assert found.ok and "A bw: 3/4 safe, intensity 0.100-0.500, blank 1 static 1" in found.detail
+    save_profile(ProgramProfile("B", "fw", "a", Source.HW), shelf / "B.yaml")
+    found = by_check(ad.diagnose(archive, profiles=shelf))["effects.measured"]
+    assert not found.ok and "1 of 2" in found.detail and "probe effects" in found.fix
+    assert cli.main(["probe", "doctor", str(archive), "--json"]) == 1
+    said = json.loads(capsys.readouterr().out)
+    assert said["effects"] == {"A": {"bw": measured.effects["bw"]["summary"]}, "B": {}}
+    assert ad.effects_measured({"C": {"bw": {**summary, "safe": 0, "safe_intensity": None}}}).detail.endswith(
+        "0/4 safe, intensity none, blank 1 static 1 flashing 0 red 0"
+    )

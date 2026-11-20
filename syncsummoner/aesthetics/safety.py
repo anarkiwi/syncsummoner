@@ -1,8 +1,7 @@
 """Hard safety constraints on rendered output.
 
-These are vetoes, not scores: they override any fitness value. The flash test is
-a relative-luminance proxy for a Harding assessment, which needs absolute
-cd/m^2 and display characterisation this library does not have.
+Vetoes, not scores. The general and red flash tests of ITU-R BT.1702 and WCAG 2.3.1 as EA's IRIS reads
+them, in relative luminance, which stands in for cd/m^2 without a display characterisation.
 """
 
 from __future__ import annotations
@@ -15,6 +14,12 @@ from scipy.ndimage import uniform_filter1d
 from syncsummoner.aesthetics.levels import LUMA_709, downscale
 
 SRGB_KNEE = 0.04045
+#: A general flash's least luminance change, and the brightest its darker state may be (WCAG 2.x).
+LUMINANCE_DELTA, DARK_MAX = 0.1, 0.8
+#: A red flash's least change in ``RED_GAIN * (R - G - B)`` of saturated red, red share ``RED_FRACTION``.
+RED_DELTA, RED_GAIN, RED_FRACTION = 20.0, 320.0, 0.8
+#: More flashes than this in any one second fail, over at least this share of the screen (BT.1702).
+RATE_LIMIT, AREA_LIMIT = 3.0, 0.25
 
 
 @dataclass(frozen=True)
@@ -26,20 +31,33 @@ class FlashRisk:
     red_flashes_per_s: float
     windows: tuple[tuple[int, int], ...]
     safe: bool
+    red_area_frac: float = 0.0
+    general_safe: bool = True
+    red_safe: bool = True
+
+
+def linear_rgb(frames: np.ndarray) -> np.ndarray:
+    """sRGB values in unit range, linearised."""
+    return np.where(frames <= SRGB_KNEE, frames / 12.92, ((frames + 0.055) / 1.055) ** 2.4)
 
 
 def relative_luminance(frames: np.ndarray) -> np.ndarray:
     """WCAG relative luminance of an RGB frame stack, shape ``(T, H, W)``."""
-    lin = np.where(frames <= SRGB_KNEE, frames / 12.92, ((frames + 0.055) / 1.055) ** 2.4)
-    return (lin * LUMA_709).sum(-1).astype(np.float32)
+    return (linear_rgb(frames) * LUMA_709).sum(-1).astype(np.float32)
 
 
-def saturated_red(frames: np.ndarray, *, fraction: float = 0.8) -> np.ndarray:
-    """Mask of pixels whose red component dominates, shape ``(T, H, W)``."""
-    total = frames.sum(-1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = np.where(total > 0, frames[..., 0] / np.maximum(total, 1e-6), 0.0)
-    return (ratio >= fraction) & (frames[..., 0] >= 0.5)
+def saturated_red(frames: np.ndarray, *, fraction: float = RED_FRACTION) -> np.ndarray:
+    """Mask of pixels whose linear red share is at least ``fraction``, shape ``(T, H, W)``."""
+    lin = linear_rgb(frames)
+    total = lin.sum(-1)
+    return (lin[..., 0] >= fraction * total) & (total > 0)
+
+
+def red_quantity(frames: np.ndarray) -> np.ndarray:
+    """WCAG's ``RED_GAIN * max(0, R - G - B)`` of linear RGB where the red is saturated, else zero."""
+    lin = linear_rgb(frames)
+    red = RED_GAIN * np.maximum(lin[..., 0] - lin[..., 1] - lin[..., 2], 0.0)
+    return np.where(saturated_red(frames), red, 0.0).astype(np.float32)
 
 
 def _downsample(frames: np.ndarray, max_side: int) -> np.ndarray:
@@ -50,53 +68,75 @@ def _downsample(frames: np.ndarray, max_side: int) -> np.ndarray:
     return np.stack(small).astype(np.float32)
 
 
-def _windowed_rate(events: np.ndarray, window: int) -> np.ndarray:
-    """Per-pixel event count in a trailing window of ``window`` frames."""
-    if window <= 1 or events.shape[0] <= window:
-        return events.sum(0, keepdims=True)
-    cumulative = np.cumsum(events, axis=0, dtype=np.float32)
-    return cumulative[window:] - cumulative[:-window]
+def transitions(
+    planes: np.ndarray, *, delta: float, fps: float, dark_max: float = np.inf, area: float = AREA_LIMIT
+) -> tuple[np.ndarray, np.ndarray]:
+    """Which frames complete a flash transition, and the share of the screen changing at each.
+
+    A frame's change is the screen mean's, counted where at least ``area`` of the screen changed. Same-signed
+    changes over at most a second accumulate; a run becomes one transition when its total first reaches
+    ``delta`` with the darker of the two frames' means below ``dark_max``.
+    """
+    x = np.asarray(planes, dtype=np.float32).reshape(planes.shape[0], -1)
+    mean = x.mean(axis=1)
+    changed = (np.diff(x, axis=0) != 0).mean(axis=1)
+    step = np.where(changed >= area, np.diff(mean), 0.0)
+    window = max(1, int(round(fps)))
+    events = np.zeros(x.shape[0], dtype=bool)
+    run: list[float] = []
+    for t, d in enumerate(step, 1):
+        before = float(np.sum(run))
+        onward = bool(run) and (d == 0 or np.sign(d) == np.sign(before))
+        run = (run[-(window - 1) :] if window > 1 else []) + [float(d)] if onward else [float(d)]
+        total = float(np.sum(run))
+        counted = onward and abs(before) >= delta
+        events[t] = (not counted) and abs(total) >= delta and min(mean[t - 1], mean[t]) < dark_max
+    return events, np.r_[0.0, changed]
+
+
+def _flashing(
+    events: np.ndarray, area: np.ndarray, window: int, rate_limit: float
+) -> tuple[float, float, np.ndarray]:
+    """Peak flashes a second, peak changing area, and which windows hold more than ``rate_limit`` flashes."""
+    count = np.convolve(events.astype(np.float64), np.ones(min(window, events.size)), mode="valid")
+    pairs = count / 2.0
+    return float(pairs.max(initial=0.0)), float(area.max(initial=0.0)), pairs > rate_limit
 
 
 def flash_risk(
     frames: np.ndarray,
     *,
     fps: float,
-    luminance_delta: float = 0.1,
-    dark_max: float = 0.8,
-    area_threshold: float = 0.25,
-    rate_limit: float = 3.0,
+    luminance_delta: float = LUMINANCE_DELTA,
+    dark_max: float = DARK_MAX,
+    area_threshold: float = AREA_LIMIT,
+    rate_limit: float = RATE_LIMIT,
     max_side: int = 128,
 ) -> FlashRisk:
-    """Screen a clip for photosensitive-seizure risk.
+    """Screen a clip for photosensitive-seizure risk by the general and red flash tests.
 
-    Flags opposing luminance transitions exceeding ``luminance_delta`` where the
-    darker state is below ``dark_max``, occurring faster than ``rate_limit`` per
-    second over more than ``area_threshold`` of the frame.
+    A flash is a pair of opposing transitions (:func:`transitions`); a clip fails where any second holds
+    more than ``rate_limit`` of them.
     """
     if frames.shape[0] < 2:
         return FlashRisk(0.0, 0.0, 0.0, (), True)
     small = _downsample(frames, max_side)
-    lum = relative_luminance(small)
-    delta = np.diff(lum, axis=0)
-    darker = np.minimum(lum[:-1], lum[1:])
-    transition = (np.abs(delta) >= luminance_delta) & (darker < dark_max)
-    red = saturated_red(small)
-    red_transition = transition & (red[:-1] != red[1:])
-
     window = max(1, int(round(fps)))
-    pairs = _windowed_rate(transition.astype(np.float32), window) / 2.0
-    red_pairs = _windowed_rate(red_transition.astype(np.float32), window) / 2.0
-    offending = pairs > rate_limit
-    area = offending.mean(axis=(1, 2))
-    unsafe = area > area_threshold
-
+    general = transitions(
+        relative_luminance(small), delta=luminance_delta, fps=fps, dark_max=dark_max, area=area_threshold
+    )
+    red = transitions(red_quantity(small), delta=RED_DELTA, fps=fps, area=area_threshold)
+    rate, area, unsafe = _flashing(*general, window, rate_limit)
+    red_rate, red_area, red_unsafe = _flashing(*red, window, rate_limit)
     return FlashRisk(
-        flashes_per_s=float(pairs.max(initial=0.0)),
-        area_frac=float(area.max(initial=0.0)),
-        red_flashes_per_s=float(red_pairs.max(initial=0.0)),
-        windows=_runs(unsafe, window),
-        safe=not bool(unsafe.any()),
+        flashes_per_s=rate,
+        area_frac=area,
+        red_flashes_per_s=red_rate,
+        windows=_runs(unsafe | red_unsafe, min(window, frames.shape[0])),
+        safe=not bool(unsafe.any() or red_unsafe.any()),
+        red_area_frac=red_area,
+        general_safe=not bool(unsafe.any()),
+        red_safe=not bool(red_unsafe.any()),
     )
 
 
@@ -117,7 +157,7 @@ def dead_output(frames: np.ndarray, *, fps: float, min_seconds: float = 2.0, tol
     mean = frames.reshape(frames.shape[0], -1).mean(1)
     spread = frames.reshape(frames.shape[0], -1).std(1)
     flat = (spread <= tol) & ((mean <= tol) | (mean >= 1.0 - tol))
-    return bool(_windowed_rate(flat[:, None, None].astype(np.float32), run_len).max(initial=0.0) >= run_len)
+    return bool(np.convolve(flat, np.ones(run_len), mode="valid").max(initial=0.0) >= run_len)
 
 
 def mitigate_flashes(

@@ -44,7 +44,9 @@ def _timecode_cmd(args: argparse.Namespace) -> int:
     source = args.source
     if args.synthetic is not None:
         shot = {} if args.shot_frames is None else {"shot_frames": args.shot_frames}
-        texture = {"coverage": Coverage().one_texture()} if args.one_texture else {}
+        held = {"bw": Coverage().monochrome, "full": Coverage().full_colour}.get(args.colour)
+        held = held or (Coverage().one_texture if args.one_texture else None)
+        texture = {"coverage": held()} if held else {}
         source = Stimulus(seed=args.synthetic, width=config.width, height=config.height, **shot, **texture)
         Path(f"{args.out}.stimulus.json").write_text(json.dumps(source.key(), indent=1), encoding="utf-8")
     frames = write_timecoded(source, args.out, config=config, lead=lead, tail=tail, seconds=args.seconds)
@@ -426,6 +428,11 @@ def _add_timecode(probe_sub: Any) -> Any:
     )
     stamp.add_argument(
         "--one-texture", action="store_true", help="every shot the same texture, only its motion drawn"
+    )
+    stamp.add_argument(
+        "--colour",
+        choices=("bw", "full"),
+        help="one texture in black and white, or in untinted colour as wide as the gamut holds",
     )
     stamp.add_argument("--out", required=True, help="the timecoded clip to write")
     stamp.set_defaults(func=_timecode_cmd)

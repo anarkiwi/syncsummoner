@@ -498,3 +498,16 @@ def test_a_settle_measured_elsewhere_stands_for_every_swept_parameter():
     records += [record({2: v}, {"concentration": v / 2046}, settle=280) for v in GRID]
     assert fit.fit_profile(records).settle_frames == {1: 300, 2: 280}
     assert fit.fit_profile(records, settle=3).settle_frames == {1: 3, 2: 3}
+
+
+def test_a_refit_profile_keeps_the_effects_of_the_one_it_replaces(tmp_path, profile):
+    """A refit carries the effects forward only when asked and only when it has none of its own."""
+    path = tmp_path / "profile.yaml"
+    profile.effects = {"bw": {"summary": {"settings": 1}}}
+    fit.save_profile(profile, path)
+    profile.effects = {}
+    fit.save_profile(profile, path, carry_effects=True)
+    assert fit.load_profile(path).effects == {"bw": {"summary": {"settings": 1}}}
+    profile.effects = {}
+    fit.save_profile(profile, path)
+    assert not fit.load_profile(path).effects

@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import pytest
 
+from syncsummoner.compose import stimulus
 from syncsummoner.compose.stimulus import Coverage, Stimulus, _texture
 
 SMALL = {"width": 160, "height": 96, "texture": 128}
@@ -98,3 +99,31 @@ def test_one_texture_holds_every_shot_alike_but_for_its_motion():
     looks = {(s.wavelength, s.contrast, s.level, s.saturation) for s in shots}
     assert len(looks) == 1 and len({s.velocity for s in shots}) == 8
     assert Coverage().one_texture().ti() == pytest.approx(Coverage().ti())
+
+
+def test_a_monochrome_clip_has_the_colour_clips_luma_and_no_chroma():
+    grey = Stimulus(seed=3, coverage=Coverage().monochrome(), **SMALL).frame(5).astype(np.int16)
+    assert (grey[..., 0] == grey[..., 1]).all() and (grey[..., 1] == grey[..., 2]).all()
+    held = Coverage().one_texture()
+    assert Coverage().monochrome() == Coverage().monochrome().one_texture().monochrome()
+    assert Coverage().monochrome().level == held.level and Coverage().monochrome().contrast == held.contrast
+
+
+def test_full_colour_spans_every_hue_in_every_frame_inside_the_gamut():
+    cover = Coverage().full_colour()
+    assert cover.tint == 0.0 and cover.saturation[0] == pytest.approx(stimulus.gamut_saturation(0.5))
+    frame = Stimulus(seed=3, coverage=cover, **SMALL).frame(5).astype(np.float64) / 255
+    y = frame @ np.array([stimulus.KR, 1 - stimulus.KR - stimulus.KB, stimulus.KB])
+    cb, cr = (frame[..., 2] - y) / (2 * (1 - stimulus.KB)), (frame[..., 0] - y) / (2 * (1 - stimulus.KR))
+    hues = np.angle(cb + 1j * cr)
+    assert np.histogram(hues, bins=8, range=(-math.pi, math.pi))[0].min() > 0.08 * hues.size
+    assert abs(cb.mean()) < 0.02 and abs(cr.mean()) < 0.02
+    assert np.hypot(cb, cr).max() > 0.2
+    clipped = ((frame <= 0) | (frame >= 1)).any(axis=-1).mean()
+    assert clipped < 0.05
+
+
+def test_the_gamut_saturation_meets_the_tightest_primary_and_mirrors_about_mid_grey():
+    sat = stimulus.gamut_saturation(0.5)
+    assert sat / 2 * 2 * (1 - stimulus.KB) == pytest.approx(0.5)
+    assert stimulus.gamut_saturation(0.3) == pytest.approx(stimulus.gamut_saturation(0.7))
