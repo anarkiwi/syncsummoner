@@ -55,6 +55,7 @@ def test_of_takes_groups_takes_by_program(monkeypatch):
     monkeypatch.setattr(response_mod, "judge_offline", lambda take, **_kw: seen)
     out = response_mod.of_takes(["a.mkv", "b.mkv"], clip="c.mkv", config=None)
     assert list(out) == ["p"] and out["p"].takes == ("a.mkv", "b.mkv")
+    assert out["p"].as_dict()["source"] == "c.mkv"
 
 
 def plan_states():

@@ -274,7 +274,8 @@ lag is tested only while the one before departed (a fixed sequence), at the
 evidence's family-wise bound over the parameters and the pooled steps. The
 settle is the last lag departing; the hold is the settle plus the two settled
 frames a frame-to-frame measure needs. It is bounded when the next lag reached
-at least the steps the exact signed-rank test needs to reject at all.
+at least the steps the exact signed-rank test needs to reject at all. The record names the clip its takes play
+(`source`), which `probe doctor` checks against the plans' clip (`holds.clip`).
 
 A footage archive is refitted with its programs' hold records, `ss probe refit
 --archive archive/ --holds holds/ --out profiles/`: each program's settle is its

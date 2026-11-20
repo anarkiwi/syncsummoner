@@ -76,6 +76,7 @@ class Response:
     steps: np.ndarray
     critical: float
     takes: tuple[str, ...] = field(default_factory=tuple)
+    source: str = ""
 
     def moving(self, row: int) -> int:
         """The last lag ``row`` departs at, in a fixed sequence: the landing lags, then each next in turn.
@@ -132,6 +133,7 @@ class Response:
             "z": [[round(float(v), 3) if np.isfinite(v) else None for v in row] for row in self.z],
             "steps": self.steps.tolist(),
             "takes": list(self.takes),
+            **({"source": self.source} if self.source else {}),
         }
 
     def table(self) -> str:
@@ -155,9 +157,9 @@ class Response:
 
 
 def response(
-    program: str, parts: Iterable[tuple[np.ndarray, np.ndarray]], takes: Sequence[str] = ()
+    program: str, parts: Iterable[tuple[np.ndarray, np.ndarray]], takes: Sequence[str] = (), source: str = ""
 ) -> Response:
-    """The settle of ``program`` from its takes' :func:`differences`, tested lag by lag.
+    """The settle of ``program`` from its takes' :func:`differences`, tested lag by lag, on clip ``source``.
 
     Each test is a two-sided signed-rank test over the steps reaching that lag; the bound is the
     evidence's family-wise one over the rows, each row's lags a fixed sequence (:meth:`Response.moving`).
@@ -180,7 +182,7 @@ def response(
             if np.count_nonzero(d):
                 steps[r, k] = d.size
                 z[r, k] = float(norm.isf(wilcoxon(d).pvalue / 2))
-    return Response(program, params, z, steps, matched.critical(len(rows)), tuple(takes))
+    return Response(program, params, z, steps, matched.critical(len(rows)), tuple(takes), str(source))
 
 
 def take_scores(judged: Any, start: Sequence[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -245,7 +247,7 @@ def judge_offline(take: str | Path, *, clip: str | Path, config: Any, workers: i
 def of_takes(
     takes: Sequence[str | Path], *, clip: str | Path, config: Any, workers: int | None = None
 ) -> dict[str, Response]:
-    """Each program's :class:`Response` over every take of it among ``takes``."""
+    """Each program's :class:`Response` over every take of it among ``takes``, on ``clip``."""
     from syncsummoner.progress import track  # pylint: disable=import-outside-toplevel
 
     parts: dict[str, list] = {}
@@ -255,4 +257,4 @@ def of_takes(
         scores, frames, params = take_scores(seen, seen.start)
         parts.setdefault(seen.program, []).append(differences(scores, frames, params))
         names.setdefault(seen.program, []).append(str(take))
-    return {program: response(program, found, names[program]) for program, found in parts.items()}
+    return {program: response(program, found, names[program], str(clip)) for program, found in parts.items()}

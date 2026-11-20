@@ -82,3 +82,6 @@ def test_saved_response_round_trips(tmp_path):
     found = R.response("p", [R.differences(scores, frames, params)], ["t.mkv"])
     found.save(tmp_path / "h.json")
     assert '"hold": 2' in (tmp_path / "h.json").read_text()
+    assert "source" not in found.as_dict()
+    named = R.response("p", [R.differences(scores, frames, params)], ["t.mkv"], "c.mkv")
+    assert named.as_dict()["source"] == "c.mkv"
