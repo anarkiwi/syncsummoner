@@ -862,6 +862,8 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
 
     A recorded pass wants no capture: the recorder opens the card itself. A device wait seeing nothing for
     longer than ``stall_s``, else the longest load on the rig's record, fails; with neither it refuses.
+    Every author's programs are listed first, so a load inside a lead-in or lead-out switches author
+    without the firmware's index rebuild, which can outlast the lead-in.
     """
     from syncsummoner.device.loadtimes import stall_guard  # pylint: disable=import-outside-toplevel
 
@@ -872,6 +874,7 @@ def open_rig(config: RenderConfig, *, capture: bool = True) -> Rig:
     from syncsummoner.device import transport as transport_mod
 
     transport = transport_mod.Transport.open(stall=stall_guard(config.stall_s))
+    LOG.info("listed %d programs before any take", len(transport.programs()))
     host = () if config.source_host is None else (config.source_host,)
     return Rig(
         transport=transport,

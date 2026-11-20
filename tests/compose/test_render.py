@@ -71,10 +71,13 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
 
         return make
 
-    stalls = []
+    stalls, listed = [], []
+    transport = types.SimpleNamespace(
+        programs=lambda: listed.append(True) or ["Passthru", "czartroniks/Fray"]
+    )
     module(
         "syncsummoner.device.transport",
-        Transport=types.SimpleNamespace(open=lambda stall: stalls.append(stall) or "transport"),
+        Transport=types.SimpleNamespace(open=lambda stall: stalls.append(stall) or transport),
     )
     module("syncsummoner.device.session", Session=record("session"))
 
@@ -91,7 +94,8 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
     loadtimes.record("Teletext", 0, 3_000_000_000, firmware="1.0.2")
     loadtimes.record("Passthru", 10, 2_000_000_010, firmware="1.0.2")
     rig = R.open_rig(CONFIG)
-    assert rig.session == (("transport",), {})
+    assert rig.session == ((transport,), {})
+    assert listed == [True], "every author's programs are listed once, before any take loads one"
     assert built["capture"][1]["width"] == 32 and built["playout"][1]["height"] == 24
     assert rig.capture == "open capture", "the rig hands back an opened capture"
     assert rig.link == ((), {}), "a real rig always gets link control, defaulted by the device layer"
@@ -142,7 +146,9 @@ def test_open_rig_hands_back_an_open_capture(monkeypatch):
     monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
     monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
     monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
-    monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(
+        transport_mod.Transport, "open", staticmethod(lambda *a, **k: types.SimpleNamespace(programs=list))
+    )
     rig = R.open_rig(STALLED)
     assert opened == ["open"] and isinstance(rig.capture, FakeCapture)
 
@@ -247,7 +253,9 @@ def test_a_recorded_rig_leaves_the_card_for_the_recorder(monkeypatch):
     monkeypatch.setattr(link_mod, "Link", lambda *a, **k: None)
     monkeypatch.setattr(playout_mod, "ClipPlayer", lambda *a, **k: None)
     monkeypatch.setattr(session_mod, "Session", lambda *a, **k: None)
-    monkeypatch.setattr(transport_mod.Transport, "open", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(
+        transport_mod.Transport, "open", staticmethod(lambda *a, **k: types.SimpleNamespace(programs=list))
+    )
     assert R.open_rig(STALLED, capture=False).capture is None and not opened
     R.open_rig(STALLED, capture=True)
     assert opened == [True], "the old path still gets one when it asks"
