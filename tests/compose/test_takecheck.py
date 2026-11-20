@@ -260,3 +260,98 @@ def test_a_passthrough_of_a_grainy_still_is_alive_and_a_still_without_its_grain_
     stuck = T.trace(recording(even, origin=0.5), src_si, src_ti, fps=FPS, model=out.model)
     lost = aesthetics.survival_stats(src_si, src_ti, stuck.si, stuck.ti)
     assert not lost.following and T.fault(stuck, 0, 90, lost) is T.Fault.FROZEN
+
+
+def drifting(n, seed=4):
+    """A colour texture drifting a pixel a frame, in unit-range RGB at 64x48."""
+    plate = np.stack([texture(np.random.default_rng(seed + c), (48, 64 + n)) for c in range(3)], -1)
+    return np.stack([plate[:, i : i + 64] for i in range(n)]).astype(np.float32)
+
+
+def encode(path, frames):
+    """Frames under their timecode strip, losslessly, as a take that showed each clip frame once."""
+    raw = np.stack([R.burn_timecode(f, i, bits=16, strip_px=8) for i, f in enumerate(frames)])
+    argv = ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "64x48"]
+    argv += ["-r", "30", "-i", "pipe:0", "-c:v", "ffv1", str(path)]
+    subprocess.run(argv, input=(np.clip(raw, 0, 1) * 255).astype(np.uint8).tobytes(), check=True)
+    return path
+
+
+def five_hz(frames, a, b, dark, bright):
+    """Frames ``a:b`` alternated between ``dark`` and ``bright`` of themselves every 3 frames, dark first."""
+    out = frames.copy()
+    up = ((np.arange(b - a) // 3) % 2).astype(bool)
+    out[a:b] = np.where(up[:, None, None, None], bright(frames[a:b]), dark(frames[a:b]))
+    return out
+
+
+@pytest.fixture(name="flashes")
+def fixture_flashes(tmp_path):
+    """A clip, a take flashing at 5 Hz over the whole screen in its second bar, and one as played."""
+    source = drifting(120)
+    return {
+        "clip": encode(tmp_path / "clip.mkv", source),
+        "flash": encode(tmp_path / "flash.mkv", five_hz(source, 30, 60, lambda f: 0.2 * f, lambda f: f)),
+        "plain": encode(tmp_path / "plain.mkv", source),
+        "red": encode(
+            tmp_path / "red.mkv",
+            five_hz(source, 30, 60, lambda f: np.full_like(f, 0.5), lambda f: f * 0 + [1.0, 0.0, 0.0]),
+        ),
+    }
+
+
+SCORE = Score(duration=4.0, fps=FPS, sections=[Section(0.0, 4.0, "A")])
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_a_bar_flashing_at_5hz_over_the_screen_is_covered_from_a_take_that_does_not(flashes):
+    takes = {"a": flashes["flash"], "b": flashes["plain"]}
+    report = T.check_takes(SCORE, [R.Cut(0.0, 4.0, "a")], takes, flashes["clip"], strip_px=8, bar=1.0)
+    assert [s[:5] for s in map(astuple, report.spans)] == [("a", 1.0, 2.0, T.Fault.FLASHING, "b")]
+    assert [(c.start, c.end, c.program) for c in report.cuts] == [
+        (0.0, 1.0, "a"),
+        (1.0, 2.0, "b"),
+        (2.0, 4.0, "a"),
+    ]
+    assert not report.traces["b"].flashing.any() and report.traces["a"].flashing[30:60].any()
+    assert (
+        "a: aligned by strip, picture starts" in report.lines()[0]
+        and "5.0 flashes/s, 0.0 red" in report.lines()[0]
+    )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_a_red_flash_no_take_can_cover_fails_even_inside_a_destroy_section(flashes):
+    """The red test alone catches it: saturated red against a grey of the same luminance."""
+    score = Score(duration=4.0, fps=FPS, sections=[Section(0.0, 4.0, "A", destroy=True)])
+    report = T.check_takes(
+        score, [R.Cut(0.0, 4.0, "r")], {"r": flashes["red"]}, flashes["clip"], strip_px=8, bar=1.0
+    )
+    assert [s[:5] for s in map(astuple, report.failed)] == [("r", 1.0, 2.0, T.Fault.FLASHING, None)]
+    with pytest.raises(T.UnsafeOutputError, match=r"0\.0 flashes/s, 5\.0 red flashes/s, at 0\.\d\d-2\.\d\ds"):
+        T.gate(flashes["red"], strip_px=8)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_the_gate_passes_a_safe_picture_and_names_where_an_unsafe_one_flashes(flashes):
+    assert T.gate(flashes["plain"], strip_px=8).safe
+    with pytest.raises(T.UnsafeOutputError, match="flash.mkv flashes harmfully: 5.0 flashes/s"):
+        T.gate(flashes["flash"], strip_px=8)
+    with pytest.raises(RuntimeError, match="cannot read the colour"):
+        T.gate(flashes["clip"].with_name("missing.mkv"))
+
+
+def test_a_take_with_too_few_captures_is_not_screened():
+    colour = np.zeros((1, 3, 2, 2), np.uint8)
+    marked, risk = T.flashing(colour, np.array([-1, 0, -1]), fps=FPS)
+    assert not marked.any() and risk.safe
+
+
+def test_a_clip_frame_no_capture_shows_holds_the_one_before():
+    """A capture missing as a flash turns holds its predecessor, so the flash is seen a frame late."""
+    colour = np.stack([np.full((2, 2), v) for v in (0, 128, 128)])[None].repeat(60, 0).astype(np.uint8)
+    colour[:, 0] = np.where((np.arange(60) // 3) % 2, 235, 16)[:, None, None]
+    picked = np.r_[-1, -1, np.arange(2, 60)]
+    picked[30] = -1
+    marked, _ = T.flashing(colour, picked, fps=FPS, full=False)
+    assert np.flatnonzero(marked).tolist() == sorted(set(range(3, 60, 3)) - {30} | {31})

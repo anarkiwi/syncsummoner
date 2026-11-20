@@ -302,7 +302,8 @@ Offline, multi-pass, all real-time captures.
 3. Attribute every clip frame to one capture exactly (§10), crop the strip, write
    the pass.
 4. Check every take against the clip it was fed, bar by bar, and cover or fail
-   before mastering (§9.6).
+   before mastering (§9.6); screen the mastered picture for flashing, and fail
+   rather than ship it.
 5. Optionally re-feed pass output through a second program with its own score
    layer, then composite offline. Layering is where depth beyond a single program
    comes from.
@@ -332,6 +333,7 @@ syncsummoner audition score.yaml --seconds 30
 syncsummoner render score.yaml --source clip.mp4 --passes 2 -o out.mov
 syncsummoner check score.yaml --source timecoded.mkv --takes takes/ --cut-programs A,B --splice cut.mp4
 syncsummoner check score.yaml --source timecoded.mkv --master cut.mp4
+syncsummoner screen final.mp4
 syncsummoner lockcheck source.mkv --take lockcheck.mkv [--program NAME]
 ```
 
@@ -463,16 +465,39 @@ split at every cut, so each cut is judged on the frames it shows alone:
 | Fault | Condition |
 | --- | --- |
 | `flat` | at most half the frames span more than one 8-bit code, or SI under the live floor |
+| `flashing` | a transition between two of the bar's frames counts toward a second that fails the general or red flash test (§11.2), on the pictures the take shows, clip frame by clip frame; judged first |
+| `flat` | at most half the frames span more than one 8-bit code, or SI under the live floor |
 | `frozen` | TI under the live floor, or `recorder.held` cannot tell the bar from one picture under capture noise and its motion does not follow the source (a held picture's TI is capture noise, independent of the source's) |
-A bar is dead only when blank (`flat`) or static (`frozen`), as §11 judges a
+
+A bar is dead when blank (`flat`) or static (`frozen`), as §11 judges a
 setting; motion that does not follow the source's is alive. A dead run inside a
 cut is replaced by the take of another program alive across the whole run that
 follows best (highest mean z), a run reaching the cut's edge taking that edge
 itself so no sliver of the cut is left beside it; a lone dead bar inside a
-`destroy` section stays. A run nothing covers raises `DeadTakeError` naming the
-program and time range. On a fitted trace, where a strip reads, its clock stands unless the motion clock makes the
+`destroy` section stays. A `flashing` bar is covered the same way, and never stays.
+A run nothing covers raises `DeadTakeError` naming the program and time range.
+On a fitted trace, where a strip reads, its clock stands unless the motion clock makes the
 output's moving frames follow the source better by more than the critical z
 (chance among the lags searched), which a strip a program scrambled loses.
+
+The flash test reads the calibration-size planar YUV (96x54) the decode already
+keeps, so nothing is decoded again for it. That size is an area scaling of the
+picture, and the test counts only screen means and the share of the screen that
+changed, which an area scaling keeps; it is also under the 128-pixel side
+`flash_risk` scales to itself. The planes are converted to RGB as a decoder
+shows them: in the range and matrix the decode's own `showinfo` reports for
+that branch (ffmpeg keeps a YUV stream's range and scales RGB to studio swing;
+BT.601 unless tagged BT.709), with the chroma pair exchanged back for a take
+that came back exchanged, as the splice reads it. A clip frame no capture shows
+holds the one before. Each take's peak general and red flash rates are logged
+on its alignment line. A transition across a bar's edge belongs to neither bar:
+covering either changes it, so the splice's own joins are left to the last gate.
+
+`master` writes the finished clip beside its output and screens it whole
+(`takecheck.gate`), every frame decoded to the same size and read the same way.
+One that fails is kept as `<output>.unsafe.<ext>` and the render stops with
+`UnsafeOutputError` naming the seconds that fail and the peak rates; nothing is
+left at the output's name. `screen` runs the gate on any finished picture.
 
 A trace's `picked` is the attribution: per clip frame, the capture nearest the
 centre of its display interval, or -1. It is the one interface between alignment
@@ -712,7 +737,8 @@ saturated-red transition case, implemented as a relative-luminance proxy with
 its limits stated. The output of this project is glitch content intended for
 projection at audiences, which makes this the most consequential omission in the
 rename. Mitigate by temporally low-passing the offending window rather than
-discarding the take.
+discarding the take. The render instead covers a flashing bar from another
+take and refuses a finished picture that still flashes (§9.6).
 
 ### 6. No noise floor
 

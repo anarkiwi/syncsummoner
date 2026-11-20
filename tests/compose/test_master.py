@@ -5,17 +5,22 @@
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from syncsummoner.compose import master as M
+from syncsummoner.compose import takecheck as T
+from tests.compose.test_takecheck import drifting, encode, five_hz
 
 
 def _fake_run(stdout=b"", returncode=0, seen=None):
     def run(argv, **kwargs):  # pylint: disable=unused-argument
         if seen is not None:
             seen.append(argv)
+        if not returncode and "-t" in argv:
+            Path(argv[-1]).write_bytes(b"")
         return subprocess.CompletedProcess(argv, returncode, stdout, b"broken")
 
     return run
@@ -82,11 +87,13 @@ def test_master_command_without_audio_is_silent():
     assert "-map" not in argv
 
 
-def test_master_probes_when_no_duration_is_given(monkeypatch):
+def test_master_probes_when_no_duration_is_given(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(M, "probe_duration", lambda path, **kw: 9.0)
     monkeypatch.setattr(subprocess, "run", _fake_run(seen=seen))
-    assert M.master("take.mkv", "track.flac", "out.mp4") == pytest.approx(9.0)
+    monkeypatch.setattr(M, "gate", lambda path, **kw: None)
+    assert M.master("take.mkv", "track.flac", tmp_path / "out.mp4") == pytest.approx(9.0)
+    assert (tmp_path / "out.mp4").is_file() and seen[0][-1] == str(tmp_path / "out.partial.mp4")
     assert seen[0][seen[0].index("-t") + 1] == "9.000"
 
 
@@ -127,10 +134,12 @@ def test_blanking_the_strip_alone_still_filters():
     assert argv[argv.index("-vf") + 1] == "crop=iw:ih-4:0:0,pad=iw:ih+4:0:0:black"
 
 
-def test_master_passes_the_strip_through(monkeypatch):
-    seen = []
+def test_master_passes_the_strip_through(monkeypatch, tmp_path):
+    seen, screened = [], []
     monkeypatch.setattr(subprocess, "run", _fake_run(seen=seen))
-    M.master("take.mkv", None, "out.mp4", seconds=3.0, strip_px=8)
+    monkeypatch.setattr(M, "gate", lambda path, **kw: screened.append(kw))
+    M.master("take.mkv", None, tmp_path / "out.mp4", seconds=3.0, strip_px=8)
+    assert screened[0]["strip_px"] == 8
     assert "crop=iw:ih-8:0:0" in seen[0][seen[0].index("-vf") + 1]
 
 
@@ -165,3 +174,15 @@ def test_a_take_whose_chroma_came_back_exchanged_is_mastered_put_right(tmp_path)
     assert argv[argv.index("-vf") + 1].startswith("swapuv,")
     plain = M.master_command(tmp_path / "other.mkv", None, "out.mp4", duration=10.0, fade_in=0, fade_out=0)
     assert "-vf" not in plain
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_a_master_that_flashes_is_kept_aside_and_never_takes_the_outputs_name(tmp_path):
+    source = drifting(120)
+    take = encode(tmp_path / "take.mkv", five_hz(source, 30, 60, lambda f: 0.2 * f, lambda f: f))
+    out = tmp_path / "final.mp4"
+    with pytest.raises(T.UnsafeOutputError, match=r"flashes harmfully.*kept as .*final\.unsafe\.mp4, not "):
+        M.master(take, None, out, seconds=4.0, fade_in=0.0, fade_out=0.0, strip_px=8)
+    assert not out.exists() and (tmp_path / "final.unsafe.mp4").is_file()
+    assert M.master(encode(tmp_path / "safe.mkv", source), None, out, seconds=4.0, strip_px=8) == 4.0
+    assert out.is_file() and not (tmp_path / "final.partial.mp4").exists()

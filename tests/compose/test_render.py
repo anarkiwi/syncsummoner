@@ -101,18 +101,6 @@ def test_open_rig_builds_from_the_device_layer(monkeypatch):
     assert stalls == [3.0, 3.0, 5.0], "a wait seeing nothing past the longest load timed fails"
 
 
-def test_enforce_safety_passes_safe_output_through():
-    frames = np.full((30, 32, 32, 3), 0.5, np.float32)
-    assert R.enforce_safety(frames, fps=30.0) is frames
-
-
-def test_enforce_safety_raises_when_mitigation_declined():
-    frames = np.zeros((90, 32, 32, 3), np.float32)
-    frames[::2] = 1.0
-    with pytest.raises(R.UnsafeOutputError, match="flashes/s"):
-        R.enforce_safety(frames, fps=30.0, mitigate=False)
-
-
 def test_open_rig_hands_back_an_open_capture(monkeypatch):
     """A pass grabs frame by frame and never enters the capture as a context."""
     opened = []

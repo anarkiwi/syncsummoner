@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from syncsummoner.compose import takecheck
 from syncsummoner.probe import archive_doctor, dedupe, effects, modlayer, sweep_cmds
 from syncsummoner.progress import LOG, configure
 
@@ -587,7 +588,6 @@ def _judge_cmd(args: argparse.Namespace) -> int:
 def _check_cmd(args: argparse.Namespace) -> int:
     """Judge takes, or a master, against the clip they were fed; cover the cut plan and splice it."""
     from syncsummoner.compose import render as render_mod
-    from syncsummoner.compose import takecheck
     from syncsummoner.compose.score import Score
     from syncsummoner.probe.footage import ClockModel
     from syncsummoner.probe.store import slug
@@ -979,6 +979,8 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     check.add_argument("--strip-px", type=int, default=8, help="rows of timecode strip along the bottom")
     check.add_argument("--ffmpeg", default="ffmpeg")
     check.set_defaults(func=_check_cmd)
+
+    takecheck.add_parser(sub)
 
     return parser
 

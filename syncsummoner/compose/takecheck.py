@@ -3,12 +3,17 @@
 Every capture is attributed to the clip frame it shows, so each bar of each take is judged
 by what it kept of that bar's picture and motion: a flat bar is blank and a frozen bar static,
 either is dead, and a cut that shows one is covered from a take alive there or the render fails.
-Whether the output's motion follows the source's is no part of being alive.
+Whether the output's motion follows the source's is no part of being alive. A bar is also unusable
+where the pictures the take would show there fail the general or red flash test
+(:func:`~syncsummoner.aesthetics.series_risk`), read from the decode's calibration-size colour, and is
+covered the same way. The finished picture is screened again as a whole (:func:`gate`), since a splice
+can join two safe takes into a flash.
 """
 
 from __future__ import annotations
 
 import enum
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -17,22 +22,25 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 
 from syncsummoner import aesthetics
+from syncsummoner.compose.chroma import exchanged
 from syncsummoner.compose.cut import Cut
 from syncsummoner.compose.score import Score
 from syncsummoner.device.recorder import held
+from syncsummoner.device.stored import captures
+from syncsummoner.probe import decoded
+from syncsummoner.probe.chroma import to_rgb
 from syncsummoner.probe.decoded import Features
 from syncsummoner.probe.footage import (
     ClockModel,
     Recording,
     attribute,
     clock_model,
-    decode_recording,
     motion_model,
     recording_of,
     source_series,
     unit_frames,
 )
-from syncsummoner.progress import LOG, track
+from syncsummoner.progress import LOG, meter, track
 
 __all__ = [
     "CheckReport",
@@ -40,15 +48,19 @@ __all__ = [
     "DeadTakeError",
     "Fault",
     "Trace",
+    "UnsafeOutputError",
     "Verdict",
     "bar_edges",
     "check_takes",
     "cover",
+    "flashing",
+    "gate",
     "judge",
     "measure",
     "picks",
-    "read_recording",
+    "screen",
     "trace",
+    "unsafe_spans",
 ]
 
 
@@ -56,11 +68,16 @@ class DeadTakeError(RuntimeError):
     """A cut shows a dead span that no other program's take is alive across."""
 
 
+class UnsafeOutputError(RuntimeError):
+    """A finished picture fails the flash test."""
+
+
 class Fault(enum.Enum):
-    """Why a bar of output carries no live picture."""
+    """Why a bar of output cannot be shown: blank, static, or harmful flashing."""
 
     FLAT = "flat"
     FROZEN = "frozen"
+    FLASHING = "flashing"
 
 
 @dataclass(frozen=True)
@@ -68,7 +85,9 @@ class Trace:
     """One recording read against its clip: per clip frame, the capture that shows it and its SI and TI.
 
     ``picked`` indexes ``frames`` and is -1 where no capture of that clip frame was kept;
-    ``si`` and ``ti`` are NaN there.
+    ``si`` and ``ti`` are NaN there. ``flashing`` marks the clip frames completing a flash in a second
+    that fails the flash test, and ``flash`` is that test's whole verdict (:func:`flashing`); both are
+    None where the take's colour was not screened.
     """
 
     picked: np.ndarray
@@ -77,6 +96,8 @@ class Trace:
     ti: np.ndarray
     model: ClockModel | None
     how: str
+    flashing: np.ndarray | None = None
+    flash: aesthetics.FlashRisk | None = None
 
     @property
     def start(self) -> float | None:
@@ -160,21 +181,142 @@ def _explains(out: Trace, source_si: np.ndarray, source_ti: np.ndarray) -> float
     return aesthetics.survival_stats(source_si + blank, source_ti + blank, out.si + blank, out.ti + blank).z
 
 
-def read_recording(
-    path: str | Path,
-    source_si: np.ndarray,
-    source_ti: np.ndarray,
+def screen(
+    colour: np.ndarray,
+    shown: np.ndarray,
     *,
     fps: float,
-    strip_px: int,
-    bits: int = 16,
-    model: ClockModel | None = None,
-    picked: np.ndarray | None = None,
-    ffmpeg: str = "ffmpeg",
-) -> Trace:
-    """Decode a take or a master and trace it against the clip's TI."""
-    recording = decode_recording(path, strip_px=strip_px, bits=bits, ffmpeg=ffmpeg)
-    return trace(recording, source_si, source_ti, fps=fps, bits=bits, model=model, picked=picked)
+    full: bool = True,
+    space: str = "unknown",
+    swap: bool = False,
+) -> aesthetics.FlashRisk:
+    """The flash tests on the pictures ``shown``, indices into planar YUV ``colour``, in the order shown.
+
+    ``full`` and ``space`` are the planes' range and matrix
+    (:func:`~syncsummoner.probe.decoded.calibration_colour`) and ``swap`` exchanges the chroma pair,
+    as a take that came back exchanged is spliced. The calibration size is an area scaling, which keeps
+    every share of the screen the tests count, and is under :func:`~syncsummoner.aesthetics.flash_risk`'s
+    own, so the tests see what they would at full size.
+    """
+    order = np.array([0, 2, 1] if swap else [0, 1, 2])
+    chunks = (
+        to_rgb(colour[shown[i : i + decoded.CHUNK]][:, order], full=full, space=space)
+        for i in range(0, shown.size, decoded.CHUNK)
+    )
+    return aesthetics.series_risk(*aesthetics.flash_series(chunks), fps=fps)
+
+
+def flashing(
+    colour: np.ndarray,
+    picked: np.ndarray,
+    *,
+    fps: float,
+    full: bool = True,
+    space: str = "unknown",
+    swap: bool = False,
+) -> tuple[np.ndarray, aesthetics.FlashRisk]:
+    """The take's :func:`screen` on the clip frames ``picked`` shows, and per clip frame whether the
+    change to it from the frame before completes a transition inside a second that fails, so a bar
+    holding none is not marked for its neighbour's flashes.
+
+    A clip frame no capture shows holds the one before, as a display would; frames before the
+    first capture are not shown at all.
+    """
+    picked = np.asarray(picked, dtype=np.int64)
+    mask = np.zeros(picked.size, dtype=bool)
+    seen = np.flatnonzero(picked >= 0)
+    if seen.size < 2:
+        return mask, aesthetics.FlashRisk(0.0, 0.0, 0.0, (), True)
+    held_at = np.maximum.accumulate(np.where(picked >= 0, np.arange(picked.size), -1))[seen[0] :]
+    risk = screen(colour, picked[held_at], fps=fps, full=full, space=space, swap=swap)
+    mask[seen[0] + np.array(risk.flashes, dtype=np.int64)] = True
+    return mask, risk
+
+
+def unsafe_spans(risk: aesthetics.FlashRisk, fps: float) -> str:
+    """The seconds a :class:`~syncsummoner.aesthetics.FlashRisk` fails over, and its peak rates."""
+    spans = ", ".join(f"{a / fps:.2f}-{b / fps:.2f}s" for a, b in risk.windows)
+    return f"{risk.flashes_per_s:.1f} flashes/s, {risk.red_flashes_per_s:.1f} red flashes/s, at {spans}"
+
+
+def gate(path: str | Path, *, strip_px: int = 0, ffmpeg: str = "ffmpeg") -> aesthetics.FlashRisk:
+    """Screen a finished picture whole, every frame in turn, and raise :class:`UnsafeOutputError` naming
+    the seconds that fail.
+
+    Decoded straight to the calibration-size colour the takes are screened at, ``strip_px`` rows off the
+    bottom, at the stream's own rate.
+    """
+    spec = decoded.Spec(strip_px=strip_px)
+    full, space = decoded.calibration_colour(path, spec, ffmpeg=ffmpeg)
+    rate, duration = _rate(path, ffmpeg)
+    width, height = spec.calibration
+    with captures(path, ffmpeg=ffmpeg) as source:
+        argv = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", *source, "-map", "0:v:0"]
+        argv += ["-vf", spec.colour(), "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]
+        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        try:
+            with meter(duration, desc=f"screening {Path(path).name}") as progress:
+                pictures = _pictures(proc.stdout, (3, height, width), lambda n: progress.to(n / rate))
+                found = (to_rgb(frames, full=full, space=space) for frames in pictures)
+                risk = aesthetics.series_risk(*aesthetics.flash_series(found), fps=rate)
+            said = proc.stderr.read()
+        except BaseException:
+            proc.kill()
+            raise
+        finally:
+            proc.wait()
+    if proc.returncode:
+        raise RuntimeError(f"screening {path} failed: {said.decode('utf-8', 'replace')[-200:]}")
+    if not risk.safe:
+        raise UnsafeOutputError(f"{path} flashes harmfully: {unsafe_spans(risk, rate)}")
+    return risk
+
+
+def _pictures(stream, shape: tuple[int, int, int], done: Callable[[int], None]):
+    """8-bit pictures of ``shape`` read from ``stream`` a :data:`~syncsummoner.probe.decoded.CHUNK` at a
+    time, ``done`` told how many so far."""
+    size, count = int(np.prod(shape)), 0
+    while block := stream.read(size * decoded.CHUNK):
+        frames = np.frombuffer(block, np.uint8, len(block) // size * size).reshape(-1, *shape)
+        count += frames.shape[0]
+        done(count)
+        yield frames
+
+
+def _rate(path: str | Path, ffmpeg: str) -> tuple[float, float]:
+    """A picture's frame rate and duration, from its container."""
+    argv = [decoded.ffprobe_for(ffmpeg), "-v", "error", "-select_streams", "v:0"]
+    argv += ["-show_entries", "stream=avg_frame_rate:format=duration", "-of", "default=nw=1:nk=1", str(path)]
+    said = subprocess.run(argv, check=True, capture_output=True, text=True).stdout.split()
+    num, _, den = said[0].partition("/")
+    return float(num) / float(den or 1), float(said[1])
+
+
+def _screen_cmd(args) -> int:
+    """Screen finished pictures for harmful flashing, as a render's last gate does; 1 if any fails."""
+    failed = 0
+    for path in args.videos:
+        try:
+            risk = gate(path, strip_px=args.strip_px, ffmpeg=args.ffmpeg)
+        except UnsafeOutputError as err:
+            LOG.error("%s", err)
+            failed = 1
+            continue
+        LOG.info("%s: safe, peak %.1f flashes/s, %.1f red", path, risk.flashes_per_s, risk.red_flashes_per_s)
+    return failed
+
+
+def add_parser(sub) -> None:
+    """The ``screen`` command."""
+    screen_p = sub.add_parser(
+        "screen", help="screen finished pictures for harmful flashing, as a render does"
+    )
+    screen_p.add_argument("videos", nargs="+")
+    screen_p.add_argument("--strip-px", type=int, default=0, help="rows off the bottom left out, a strip")
+    screen_p.add_argument("--ffmpeg", default="ffmpeg")
+    screen_p.set_defaults(func=_screen_cmd)
 
 
 def bar_edges(
@@ -203,14 +345,19 @@ class Verdict:
 
 
 def fault(out: Trace, a: int, b: int, kept: aesthetics.Survival) -> Fault | None:
-    """Why clip frames ``a:b`` of a trace are dead, or None while they live.
+    """Why clip frames ``a:b`` of a trace cannot be shown, or None while they can.
 
-    Flat: not mostly frames whose luma spans more than one 8-bit step, or SI under the source's
-    :func:`~syncsummoner.aesthetics.live_floor`; frozen: TI under it, or
+    Flashing: a frame after the first marked in :attr:`Trace.flashing`, so the transition is between two
+    of the bar's own frames; one across a bar's edge belongs to neither, since covering either changes
+    it and :func:`gate` judges what the splice made of it. Judged first, since a flash between plain
+    fields is also flat. Flat: not mostly frames whose luma spans more than one 8-bit step, or SI
+    under the source's :func:`~syncsummoner.aesthetics.live_floor`; frozen: TI under it, or
     :func:`~syncsummoner.device.recorder.held` unable to tell the bar from one picture under
     capture noise while its motion does not follow the source either, since a held picture's TI
     is that noise and independent of the source's.
     """
+    if out.flashing is not None and out.flashing[a + 1 : b].any():
+        return Fault.FLASHING
     picked = out.picked[a:b]
     frames = out.frames[picked[picked >= 0]].astype(np.float32)
     structured = int((np.ptp(frames.reshape(len(frames), -1), axis=1) > 1).sum()) if len(frames) else 0
@@ -268,13 +415,18 @@ class CheckReport:
         return [span for span in self.spans if span.cover is None]
 
     def lines(self) -> list[str]:
-        """One line per take's alignment, then one per dead span."""
+        """One line per take's alignment and peak flash rates, then one per dead span."""
         said = [
             (
                 f"{name}: never aligned"
                 if t.how == "none"
                 else f"{name}: aligned by {t.how}"
                 + (f", picture starts {t.start:.3f}s" if t.start is not None else "")
+            )
+            + (
+                ""
+                if t.flash is None
+                else f", peak {t.flash.flashes_per_s:.1f} flashes/s, {t.flash.red_flashes_per_s:.1f} red"
             )
             for name, t in self.traces.items()
         ]
@@ -297,7 +449,8 @@ def cover(
     Every take is judged on the same bars, each in the cut its middle falls in, as :func:`bar_edges`
     splits them at every cut on the frame grid. A run reaching a cut's edge takes that edge itself, so
     no sliver of the cut is left between the edge and its bar's frame. Destruction is budgeted at one
-    bar at a time, so a lone dead bar inside a destroy-marked section stays; any other dead run is covered.
+    bar at a time, so a lone blank or static bar inside a destroy-marked section stays; any other dead
+    run, and any flashing one, is covered.
     """
     grid = next(iter(verdicts.values()), [])
     middles = np.array([0.5 * (v.start + v.end) for v in grid])
@@ -309,7 +462,8 @@ def cover(
         cursor = cut.start
         for a, b in _runs(dead):
             run = index[a:b]
-            if run.size == 1 and destroy(0.5 * (grid[run[0]].start + grid[run[0]].end)):
+            lone = run.size == 1 and verdicts[cut.program][run[0]].fault is not Fault.FLASHING
+            if lone and destroy(0.5 * (grid[run[0]].start + grid[run[0]].end)):
                 continue
             start = cut.start if a == 0 else grid[run[0]].start
             end = cut.end if b == index.size else grid[run[-1]].end
@@ -362,6 +516,8 @@ def check_takes(
     ``attributions`` gives a recording's per-clip-frame capture indices outright, with the
     meaning of :attr:`Trace.picked`, and ``models`` fixes a recording's clock, as a master's identity
     clock is; any other is fitted. ``features`` and ``source`` are decodes already made of takes and clip.
+    Each take is screened for flashing (:func:`flashing`) on the clip frames its trace shows, in the
+    channel order it is spliced in.
     """
     fps = float(score.fps)
     with_bar = float(bar or score.meta.get("bar") or 4 * 60.0 / score.bpm)
@@ -378,28 +534,24 @@ def check_takes(
     )
     fixed, given, decodes = dict(models or {}), dict(attributions or {}), dict(features or {})
 
+    spec = decoded.Spec(strip_px=strip_px, bits=bits)
+
     def read(name: str) -> tuple[str, Trace]:
-        if name in decodes:
-            return name, trace(
-                recording_of(decodes[name]),
-                source_si,
-                source_ti,
-                fps=fps,
-                bits=bits,
-                model=fixed.get(name),
-                picked=given.get(name),
-            )
-        return name, read_recording(
-            takes[name],
+        found = decodes[name] if name in decodes else decoded.features(takes[name], spec, ffmpeg=ffmpeg)
+        out = trace(
+            recording_of(found),
             source_si,
             source_ti,
             fps=fps,
-            strip_px=strip_px,
             bits=bits,
             model=fixed.get(name),
             picked=given.get(name),
-            ffmpeg=ffmpeg,
         )
+        full, space = decoded.calibration_colour(takes[name], spec, ffmpeg=ffmpeg)
+        mask, risk = flashing(
+            found.small, out.picked, fps=fps, full=full, space=space, swap=exchanged(takes[name])
+        )
+        return name, replace(out, flashing=mask, flash=risk)
 
     with ThreadPoolExecutor(max_workers=max(1, len(takes))) as pool:
         traces = dict(track(pool.map(read, list(takes)), desc="takes", total=len(takes), unit="take"))

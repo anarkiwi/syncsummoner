@@ -1,4 +1,5 @@
-"""Finishing a captured take: trim to the shorter input, blank the strip, mux the audio, fade the edges.
+"""Finishing a captured take: trim to the shorter input, blank the strip, mux the audio, fade the edges,
+and screen the result for harmful flashing before it takes the output's name.
 
 A pass off the capture card is video only and runs edge to edge, because the rig
 has no notion of a beginning or an end. Mastering is one ffmpeg invocation, built
@@ -8,10 +9,12 @@ here so it can be asserted on without one installed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 from syncsummoner.compose.chroma import swapped
+from syncsummoner.compose.takecheck import UnsafeOutputError, gate
 from syncsummoner.device.stored import Stored, captures
 from syncsummoner.progress import stage
 
@@ -130,14 +133,19 @@ def master(
     """Write the finished clip and return its duration.
 
     ``seconds`` overrides the measured length; without it the clip runs as long
-    as both the take and the track do.
+    as both the take and the track do. The clip is written beside ``out`` and
+    screened whole (:func:`~syncsummoner.compose.takecheck.gate`); one that fails
+    is kept as ``<out stem>.unsafe<suffix>`` and :class:`UnsafeOutputError` raised,
+    so nothing unsafe is ever left at ``out``.
     """
+    out = Path(out)
+    partial = out.with_name(f"{out.stem}.partial{out.suffix}")
     duration = seconds if seconds else common_duration(take, audio, ffprobe=ffprobe) - video_start
     with captures(take, ffmpeg=ffmpeg) as source:
         argv = master_command(  # pylint: disable=duplicate-code
             take,
             audio,
-            out,
+            partial,
             duration=duration,
             fade_in=fade_in,
             fade_out=fade_out,
@@ -151,4 +159,12 @@ def master(
             done = subprocess.run(argv, check=False, capture_output=True)
     if done.returncode:
         raise RuntimeError(f"mastering failed: {done.stderr.decode('utf-8', 'replace')[:200]}")
+    try:
+        with stage("screen", out=str(out)):
+            gate(partial, strip_px=strip_px, ffmpeg=ffmpeg)
+    except UnsafeOutputError as err:
+        unsafe = out.with_name(f"{out.stem}.unsafe{out.suffix}")
+        os.replace(partial, unsafe)
+        raise UnsafeOutputError(f"{err}; kept as {unsafe}, not {out}") from err
+    os.replace(partial, out)
     return duration

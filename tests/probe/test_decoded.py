@@ -177,3 +177,16 @@ def test_a_deduplicated_take_decodes_to_the_old_takes_features_capture_for_captu
         assert after.keys() == before.keys()
         for key, value in before.items():
             assert np.array_equal(after[key], value), key
+
+
+@pytest.mark.parametrize(
+    "codec, full, space",
+    [(("-c:v", "ffv1"), False, "unknown"), (("-c:v", "mjpeg", "-pix_fmt", "yuvj420p"), True, "bt470bg")],
+    ids=["rgb", "full-range-yuv"],
+)
+def test_the_calibration_colour_is_read_as_the_decode_converts_it(tmp_path, codec, full, space):
+    """ffmpeg scales RGB to studio swing and keeps a YUV stream's own range."""
+    clip = encode(tmp_path / "clip.mkv", 3, codec=codec)
+    assert D.calibration_colour(clip, SPEC) == (full, space)
+    with pytest.raises(RuntimeError, match="cannot read the colour"):
+        D.calibration_colour(tmp_path / "missing.mkv", SPEC)
