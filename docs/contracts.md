@@ -248,8 +248,9 @@ HarvestReport.summary() -> list[str]   # totals, each failed program with its er
 ```python
 features.analyze(video_path, audio_path, *, rng) -> Features
 vocabulary.GESTURES: dict[str, Gesture]
-planner.search(profiles, features, *, style, rng, budget) -> Score
-planner.STYLE_WEIGHTS: dict[str, ObjectiveWeights]   # naturalness is not a cost for every style
+planner.search(profiles, features, *, curve=Curve(), fps, seed) -> Score   # measured safe settings, one a bar
+planner.Curve(follow, low, high, bars, quicken, passes, kind)   # design.md §12
+planner.plan_automation(score, profiles, *, fps, gates) -> dict[int, Automation]   # what the render plays
 render.device_programs() -> Offered                 # names the attached device offers, .authors enumerated
 render.unknown_programs(programs, available) -> list[str]   # named but not offered; None checks nothing
 # render_cuts lists again once when a name is missing, then raises UnknownProgramError

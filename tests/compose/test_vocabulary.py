@@ -11,6 +11,7 @@ from syncsummoner.compose.vocabulary import (
     GESTURES,
     Anchor,
     Automation,
+    SETTING,
     GestureContext,
     monotonic_segment,
     safe_range,
@@ -37,7 +38,9 @@ TABLE = {
     "lock_snap": (Anchor.SECTION, "tongue_centers"),
     "punch": (Anchor.ONSET, "effect_buttons"),
     "hysteresis_loop": (Anchor.TWO_BAR, "hysteresis"),
+    SETTING: (Anchor.BAR, "effects"),
 }
+DRAWN = sorted(set(TABLE) - {SETTING})
 
 
 def ctx(**kw):
@@ -52,13 +55,20 @@ def test_vocabulary_matches_the_design_table():
         assert (GESTURES[name].anchor, GESTURES[name].profile_field) == (anchor, field)
 
 
-@pytest.mark.parametrize("name", sorted(TABLE))
+@pytest.mark.parametrize("name", DRAWN)
 def test_every_gesture_is_legal_and_lands_on_its_anchor(name):
     auto = GESTURES[name](make_profile(), ctx())
     assert len(auto) > 0
     assert auto.values.min() >= 0 and auto.values.max() <= PARAM_MAX
     assert np.abs(auto.times - 4.0).min() < 1e-9
     assert auto.times.max() <= 4.0 + 2.0 + 1e-9
+
+
+def test_a_setting_writes_each_of_its_parameters_its_value_at_the_arrival():
+    auto = GESTURES[SETTING](make_profile(), ctx(targets=(1, 2, 12), values=(5, 2000, 0)))
+    assert auto.times.tolist() == pytest.approx([4.0, 4.0 + 1 / 30, 4.0 + 2 / 30])
+    assert dict(zip(auto.indices.tolist(), auto.values.tolist())) == {1: 5, 2: PARAM_MAX, 12: 0}
+    assert len(GESTURES[SETTING](make_profile(), ctx())) == 0
 
 
 @pytest.mark.parametrize("name", ["cliff_cross", "detune_drift", "lock_snap", "punch"])
@@ -179,7 +189,7 @@ def cliffed(**kinds):
     return profile
 
 
-@pytest.mark.parametrize("name", sorted(TABLE))
+@pytest.mark.parametrize("name", DRAWN)
 def test_no_gesture_ever_writes_an_undeclared_slot(name):
     profile = cliffed(p2=ParamKind.UNUSED, p7=ParamKind.UNUSED)
     for intensity in np.linspace(0.0, 1.0, 11):
@@ -192,7 +202,7 @@ def test_a_declared_boolean_is_only_ever_pulsed():
     profile = cliffed()
     pulse = GESTURES["punch"](profile, ctx())
     assert pulse.indices.tolist() == [7, 7] and pulse.values.tolist() == [PARAM_MAX, 0]
-    for name in sorted(set(TABLE) - {"punch"}):
+    for name in sorted(set(DRAWN) - {"punch"}):
         assert 7 not in GESTURES[name](profile, ctx(targets=(7,))).indices.tolist(), name
 
 

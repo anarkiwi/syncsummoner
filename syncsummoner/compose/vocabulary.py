@@ -24,6 +24,8 @@ from syncsummoner.device.profile import (
 )
 
 CONTINUOUS_KINDS = (ParamKind.CONTINUOUS, ParamKind.QUANTIZED)
+#: The gesture that writes one measured setting whole, as ``probe effects`` measured it.
+SETTING = "setting"
 
 
 class Anchor(enum.Enum):
@@ -106,6 +108,7 @@ class GestureContext:
     axis: Axis
     rng: np.random.Generator
     targets: tuple[int, ...] = ()
+    values: tuple[int, ...] = ()
 
 
 Renderer = Callable[[ProgramProfile, GestureContext], Automation]
@@ -304,3 +307,15 @@ def _hysteresis_loop(profile: ProgramProfile, ctx: GestureContext) -> Automation
     up = np.linspace(lo, hi, max(2, t.size // 2))
     loop = np.r_[up, up[::-1]]
     return Automation.of(t, spec.index, np.interp(t, np.linspace(t[0], t[-1], loop.size), loop))
+
+
+@_register(SETTING, Anchor.BAR, "effects")
+def _setting(_profile: ProgramProfile, ctx: GestureContext) -> Automation:
+    """``ctx.targets`` set to ``ctx.values`` one a frame from the arrival, as the archive staggered them.
+
+    The control rate is half the frame rate (:func:`~syncsummoner.compose.score.control_rate`).
+    """
+    step = 0.5 / ctx.rate
+    return Automation.concat(
+        Automation.of([ctx.arrival + k * step], i, v) for k, (i, v) in enumerate(zip(ctx.targets, ctx.values))
+    )

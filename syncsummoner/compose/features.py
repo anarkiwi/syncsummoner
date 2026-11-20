@@ -16,6 +16,7 @@ import numpy as np
 from scipy import ndimage, signal
 from scipy.io import wavfile
 
+from syncsummoner.aesthetics.levels import chroma_rms
 from syncsummoner.progress import LOG, stage, track
 
 try:
@@ -81,6 +82,7 @@ class VideoFeatures:
     shot_boundaries: np.ndarray
     motion_energy: np.ndarray
     luma: np.ndarray
+    #: Per-frame RMS chroma per axis (:func:`~syncsummoner.aesthetics.levels.chroma_rms`).
     chroma: np.ndarray
     #: ITU-T P.910 spatial and temporal information per frame, at the size takes are judged at.
     si: np.ndarray | None = None
@@ -451,7 +453,7 @@ def analyze_frames(frames: np.ndarray, *, fps: float, shot_sigma: float = 3.0) -
         fps=fps,
         n_frames=x.shape[0],
         luma=plane.mean(axis=(1, 2)),
-        chroma=x.std(axis=3).mean(axis=(1, 2)),
+        chroma=np.array([chroma_rms(frame) for frame in x], np.float32),
         shot_sigma=shot_sigma,
         si=np.asarray(si, np.float64),
         ti=np.asarray(ti, np.float64),
@@ -500,7 +502,7 @@ def analyze_video(
         count += 1
         plane = frame.mean(axis=2)
         luma.append(plane.mean())
-        chroma.append(frame.std(axis=2).mean())
+        chroma.append(chroma_rms(frame))
         if prev is not None:
             diff.append(np.abs(plane - prev).mean())
         prev = plane

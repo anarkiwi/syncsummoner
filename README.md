@@ -48,7 +48,7 @@ syncsummoner profile show | diff | atlas --program bitcrush_displace
 syncsummoner analyze clip.mp4 --audio track.wav -o features.json
 
 syncsummoner compose clip.mp4 --audio track.wav --profiles profiles/ \
-                     --style glitchy --seed 7 --passes 8 -o score.yaml
+                     --follow 0.5 --intensity 0,1 -o score.yaml   # measured safe settings, bar by bar
 syncsummoner score show score.yaml --profiles profiles/   # what each layer drives, flagged
 
 syncsummoner audition score.yaml --source clip.mp4 --audio track.wav --seconds 30 -o audition.mp4

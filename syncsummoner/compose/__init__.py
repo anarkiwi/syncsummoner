@@ -9,17 +9,7 @@ from syncsummoner.compose.features import (
     analyze_audio,
     analyze_frames,
 )
-from syncsummoner.compose.planner import (
-    Objective,
-    ObjectiveWeights,
-    Trajectory,
-    evaluate,
-    plan_automation,
-    proxy_render,
-    reachable,
-    search,
-    thin,
-)
+from syncsummoner.compose.planner import Curve, plan_automation, reachable, search, thin
 from syncsummoner.compose.master import common_duration, master_command, probe_duration
 from syncsummoner.compose.render import RenderConfig, Rig, render_cuts, render_played
 from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
@@ -31,18 +21,16 @@ __all__ = [
     "Anchor",
     "AudioFeatures",
     "Automation",
+    "Curve",
     "Features",
     "Gesture",
     "GestureContext",
     "GestureInstance",
     "Layer",
-    "Objective",
-    "ObjectiveWeights",
     "RenderConfig",
     "Rig",
     "Score",
     "Section",
-    "Trajectory",
     "VideoFeatures",
     "analyze",
     "analyze_audio",
@@ -51,14 +39,12 @@ __all__ = [
     "render_cuts",
     "render_played",
     "control_rate",
-    "evaluate",
     "features",
     "master",
     "master_command",
     "plan_automation",
     "planner",
     "probe_duration",
-    "proxy_render",
     "reachable",
     "render",
     "score",

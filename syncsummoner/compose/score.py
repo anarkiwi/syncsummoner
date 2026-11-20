@@ -43,9 +43,10 @@ class GestureInstance:
     intensity: float = 0.5
     targets: tuple[int, ...] = ()
     seed: int = 0
+    values: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        """Plain-data form for YAML."""
+        """Plain-data form for YAML; ``values`` only where a gesture writes given values."""
         return {
             "gesture": self.gesture,
             "arrival": float(self.arrival),
@@ -54,6 +55,7 @@ class GestureInstance:
             "intensity": float(self.intensity),
             "targets": list(self.targets),
             "seed": int(self.seed),
+            **({"values": [int(v) for v in self.values]} if self.values else {}),
         }
 
     @classmethod
@@ -67,6 +69,7 @@ class GestureInstance:
             intensity=float(data.get("intensity", 0.5)),
             targets=tuple(int(t) for t in data.get("targets", ())),
             seed=int(data.get("seed", 0)),
+            values=tuple(int(v) for v in data.get("values", ())),
         )
 
 
@@ -243,6 +246,7 @@ class Score:
                 axis=Axis(inst.axis),
                 rng=np.random.default_rng((self.seed, program_key(layer.program), inst.seed, i)),
                 targets=inst.targets,
+                values=inst.values,
             )
             parts.append((inst, gesture(profile, ctx)))
         return parts

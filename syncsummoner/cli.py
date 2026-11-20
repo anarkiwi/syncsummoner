@@ -403,31 +403,26 @@ def _jsonable(obj):
 
 def _compose_cmd(args: argparse.Namespace) -> int:
     from syncsummoner.compose.features import analyze
-    from syncsummoner.compose.planner import search
+    from syncsummoner.compose.planner import Curve, search
 
     from syncsummoner.compose.render import SESSION_FORMATS
 
-    rng = np.random.default_rng(args.seed)
     profiles = _profiles_in(Path(args.profiles))
     if not profiles:
         raise ValueError(f"no profiles in {args.profiles}; run `syncsummoner probe run` first")
+    (low, high), kind = args.intensity, None if args.kind == "auto" else args.kind
+    curve = Curve(args.follow, low, high, args.change_bars, args.quicken, args.passes, kind)
     fps = SESSION_FORMATS[args.format][2] if args.format else 60.0
     LOG.info("%d profiles from %s", len(profiles), args.profiles)
-    features = analyze(args.clip, args.audio, rng=rng)
-    score = search(
-        profiles,
-        features,
-        style=args.style,
-        rng=rng,
-        budget=args.budget,
-        density=args.density,
-        n_passes=args.passes,
-        fps=fps,
-    )
+    features = analyze(args.clip, args.audio, rng=np.random.default_rng(args.seed))
+    score = search(profiles, features, curve=curve, fps=fps, seed=args.seed)
     score.save(Path(args.output))
     LOG.info("%s: %d layers over %.1fs", args.output, len(score.layers), score.duration)
     print(args.output)
     return 0
+
+
+_INTENSITY_HELP = "quantiles of the safe measured intensities the least and most driven bars get"
 
 
 def _numbers(kind: type) -> Any:
@@ -892,17 +887,20 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     analyze.add_argument("-o", "--output")
     analyze.set_defaults(func=_analyze_cmd)
 
-    compose = sub.add_parser("compose", help="search for a score")
-    compose.add_argument("clip")
-    compose.add_argument("--audio")
-    compose.add_argument("--profiles", default="profiles/")
-    compose.add_argument("--style", default="default")
-    compose.add_argument("--seed", type=int, default=0)
-    compose.add_argument("--budget", type=int, default=48)
-    compose.add_argument("--density", type=float, default=0.5, help="gestures per bar on screen")
-    compose.add_argument("--passes", type=int, default=1, help="layers to keep, one capture pass each")
-    compose.add_argument("--format", help="session format the score is written for, e.g. 1080p30")
-    compose.add_argument("-o", "--output", default="score.yaml")
+    compose = sub.add_parser("compose", help="map measured effects onto the music and the source")
+    add = compose.add_argument
+    add("clip")
+    add("--audio")
+    add("--profiles", default="profiles/")
+    add("--seed", type=int, default=0)
+    add("--follow", type=float, default=0.5, help="weight of the source's motion against the music, 0 to 1")
+    add("--intensity", type=_numbers(float), default=(0.0, 1.0), metavar="LOW,HIGH", help=_INTENSITY_HELP)
+    add("--change-bars", type=float, help="mean bars between effect changes (default: a phrase)")
+    add("--quicken", type=float, default=0.0, help="-1 to 1: how far the drive speeds effect changes")
+    add("--passes", type=int, help="most programs to use, one capture each (default: all)")
+    add("--kind", choices=("auto", "bw", "colour"), default="auto", help="clip the effects were measured on")
+    add("--format", help="session format the score is written for, e.g. 1080p30")
+    add("-o", "--output", default="score.yaml")
     compose.set_defaults(func=_compose_cmd)
 
     lock = sub.add_parser("lockcheck", help="play a timecoded clip and check the frame clock is exact")

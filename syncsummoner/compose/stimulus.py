@@ -192,6 +192,11 @@ class Stimulus:
             yield self.frame(index)
 
 
+def chroma_sigma(saturation: float) -> float:
+    """Per-axis chroma standard deviation of an untinted shot at ``saturation`` (:func:`_colour`)."""
+    return saturation / 6.0
+
+
 def gamut_saturation(level: float) -> float:
     """The saturation whose untinted chroma's three-sigma circle just meets the BT.709 gamut at ``level``.
 

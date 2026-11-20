@@ -1,158 +1,336 @@
-"""Evolutionary search from measured profiles plus musical structure to a score.
+"""Measured effects mapped onto the music: each bar a safe measured setting, each cut a program.
 
-Sample candidate layers, render a fast analytic proxy from the profile's measured
-response curves and cliff atlas, score it, keep and mutate the best. Program is
-the outermost loop variable and is never mutated inside the inner loop.
+The source takes the clip it is nearer in chroma (:func:`clip_kind`); each bar's drive blends the source's
+motion and the track's onsets by rank (:func:`drive`) into a quantile of the safe intensities; effects change
+on downbeats (:func:`changes`), each run of bars on the program whose settings meet it best (:func:`assign`).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, NamedTuple, Sequence
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
+from scipy.stats import rankdata
 
-from syncsummoner.device.profile import PARAM_MAX, Axis, ParamKind, ParamSpec, ProgramProfile, Source
+from syncsummoner.device.profile import ProgramProfile
 from syncsummoner.progress import LOG, track
-from syncsummoner.compose import kriged
-from syncsummoner.compose.cut import Cut, cut_plan, spans_of
-from syncsummoner.compose.gating import gate_automation, model_gate
-from syncsummoner.compose.features import Features, Section, information_content, phrases
-from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate, program_key
-from syncsummoner.compose.survived import dead_bars_over_budget, predict_survival
-from syncsummoner.compose.thinning import flush, reachable, settle_of, settled, thin, visible
-from syncsummoner.compose.vocabulary import GESTURES, Anchor, Automation, GestureContext, candidates
+from syncsummoner.compose.cut import Cut, spans_of
+from syncsummoner.compose.features import Features, Section, VideoFeatures
+from syncsummoner.compose.gating import model_gate
+from syncsummoner.compose.score import GestureInstance, Layer, Score, control_rate
+from syncsummoner.compose.stimulus import chroma_sigma
+from syncsummoner.compose.thinning import reachable, thin, visible
+from syncsummoner.compose.vocabulary import SETTING, Automation
 
-EPS = 1e-12
-NATURAL_SLOPE_BAND = (-1.4, -1.0)
-SIM_DISCOUNT = 0.5
-#: Physical span of each metric the objective scores, so movement in one is
-#: comparable to movement in another and to the same metric in another program.
-#: The three fractions are bounded by construction; the slope's span is its
-#: measured range over every archived program.
-METRIC_SPAN = {"spectral_slope": 4.2, "concentration": 1.0, "clip_frac": 1.0, "illegal_frac": 1.0}
-#: Stasis floor for profiles that measured no survival, as a fraction of each metric's span.
-BOREDOM_FLOOR = 0.02
-#: Survival responses a footage archive measures, as each parameter's share of what the source keeps.
-SURVIVAL = ("si_ratio", "ti_ratio", "motion_follow")
-
-SPAN_BARS: dict[Anchor, float] = {
-    Anchor.BAR: 1.0,
-    Anchor.TWO_BAR: 2.0,
-    Anchor.MULTI_BAR: 4.0,
-    Anchor.PHRASE: 4.0,
-    Anchor.DOWNBEAT: 1.0,
-    Anchor.SECTION: 1.0,
-    Anchor.ONSET: 0.25,
-}
-
-STYLES: dict[str, dict[str, float]] = {
-    "default": dict.fromkeys(GESTURES, 1.0),
-    "glitchy": {
-        "hold": 0.5,
-        "ramp": 1.0,
-        "cliff_cross": 4.0,
-        "detune_drift": 2.0,
-        "lock_snap": 1.0,
-        "punch": 3.0,
-        "hysteresis_loop": 2.0,
-    },
-    "smooth": {
-        "hold": 2.0,
-        "ramp": 4.0,
-        "cliff_cross": 0.2,
-        "detune_drift": 2.0,
-        "lock_snap": 1.0,
-        "punch": 0.2,
-        "hysteresis_loop": 0.5,
-    },
-}
-DESTROY_STYLES = frozenset({"glitchy"})
+__all__ = [
+    "Curve",
+    "Palette",
+    "assign",
+    "bar_edges",
+    "changes",
+    "clip_kind",
+    "drive",
+    "palettes",
+    "plan_automation",
+    "ranks",
+    "reachable",
+    "search",
+    "thin",
+    "visible",
+]
 
 
 @dataclass(frozen=True)
-class ObjectiveWeights:
-    """Relative weight of each objective term; every term is reported separately regardless."""
+class Curve:
+    """How the chosen effects follow the source and the music.
 
-    av_corr: float = 1.0
-    mud: float = 0.5
-    slope: float = 0.3
-    levels: float = 0.8
-    motif: float = 0.4
-    boredom: float = 0.6
+    Attributes:
+        follow: weight of the source's motion against the track's onsets in each bar's drive, 0 to 1.
+        low: quantile of the safe measured intensities the least driven bar gets.
+        high: quantile the most driven bar gets; ``(0, 1)`` spans the subtlest to the most exaggerated.
+        bars: mean bars between effect changes; ``None`` for the track's phrase.
+        quicken: -1 to 1, how far the drive speeds changes where it is high; 0 a steady grid.
+        passes: most programs used, one capture each; ``None`` for every program with a safe setting.
+        kind: ``bw`` or ``colour`` to force the clip; ``None`` for the one the source is nearer.
+    """
 
+    follow: float = 0.5
+    low: float = 0.0
+    high: float = 1.0
+    bars: float | None = None
+    quicken: float = 0.0
+    passes: int | None = None
+    kind: str | None = None
 
-DEFAULT_WEIGHTS = ObjectiveWeights()
-#: Per-style weights; ``glitchy`` leaves the natural slope band and legal levels on purpose, so neither costs.
-STYLE_WEIGHTS: dict[str, ObjectiveWeights] = {
-    "glitchy": ObjectiveWeights(slope=0.0, levels=0.0, boredom=1.0),
-}
+    def __post_init__(self) -> None:
+        for name in ("follow", "low", "high"):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must lie in [0, 1], got {getattr(self, name)}")
+        if not -1.0 <= self.quicken <= 1.0:
+            raise ValueError(f"quicken must lie in [-1, 1], got {self.quicken}")
+        if self.bars is not None and self.bars <= 0:
+            raise ValueError(f"bars must be positive, got {self.bars}")
+        if self.passes is not None and self.passes < 1:
+            raise ValueError(f"passes must be at least 1, got {self.passes}")
 
 
 @dataclass(frozen=True, eq=False)
-class Trajectory:
-    """Proxy render: predicted per-frame metrics from the measured profile, no hardware."""
+class Palette:
+    """One program's safe settings on one clip, with each intensity's quantile among every program's."""
 
-    times: np.ndarray
-    state: np.ndarray
-    activity: np.ndarray
-    ic: np.ndarray
-    concentration: np.ndarray
-    slope: np.ndarray
-    clip_frac: np.ndarray
-    illegal_frac: np.ndarray
-    #: Predicted share of the source's SI and TI kept, and how far output motion follows it; None unmeasured.
-    si_ratio: np.ndarray | None = None
-    ti_ratio: np.ndarray | None = None
-    follow: np.ndarray | None = None
-    #: The survival responses kriged from the archive's records, by name, where it has them.
-    joint: Mapping[str, kriged.Kriged] = field(default_factory=dict)
-    #: Raw parameter values held at each frame.
-    settings: np.ndarray | None = None
+    program: str
+    params: np.ndarray
+    setpoints: np.ndarray
+    intensity: np.ndarray
+    quantile: np.ndarray
+
+    def nearest(self, targets: np.ndarray) -> np.ndarray:
+        """Index of the setting whose quantile is nearest each target, the first on a tie."""
+        return np.argmin(np.abs(self.quantile[None, :] - np.asarray(targets)[:, None]), axis=1)
+
+    def cost(self, targets: np.ndarray) -> float:
+        """Total distance, in quantile, from each target to its nearest setting."""
+        return float(np.abs(self.quantile[self.nearest(targets)] - targets).sum())
 
 
-@dataclass(frozen=True)
-class Objective:
-    """Weighted objective value, its decomposition, the reachability verdict and dead bars over budget.
+def ranks(values: Sequence[float] | np.ndarray) -> np.ndarray:
+    """Each value's mid-rank as a fraction of ``[0, 1]``, ties sharing one; a lone value is 0.5."""
+    x = np.asarray(values, dtype=np.float64)
+    if x.size < 2:
+        return np.full(x.size, 0.5)
+    return (rankdata(x) - 1.0) / (x.size - 1.0)
 
-    ``violation`` counts bars predicted dead beyond what destroy-marked sections allow; the search
-    ranks by it before ``total``, so no weighting trades a dead picture for anything else.
+
+def bar_edges(downbeats: np.ndarray, duration: float) -> np.ndarray:
+    """Bar boundaries from zero to ``duration``: every downbeat after the first, so a pickup joins bar one."""
+    inner = np.asarray(downbeats, dtype=np.float64)[1:]
+    inner = inner[(inner > 0.0) & (inner < duration)]
+    return np.unique(np.r_[0.0, inner, duration])
+
+
+def bar_means(series: np.ndarray, times: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Mean of ``series`` sampled at ``times`` over each bar, the nearest sample where a bar holds none."""
+    x = np.nan_to_num(np.asarray(series, dtype=np.float64))
+    at = np.searchsorted(np.asarray(times, dtype=np.float64), edges)
+    sums = np.diff(np.r_[0.0, np.cumsum(x)][at])
+    counts = np.diff(at)
+    near = x[np.clip(at[:-1], 0, x.size - 1)] if x.size else np.zeros(counts.size)
+    return np.where(counts > 0, sums / np.maximum(counts, 1), near)
+
+
+def drive(features: Features, edges: np.ndarray, follow: float) -> np.ndarray:
+    """Each bar's drive in ``[0, 1]``: the rank of the ``follow``-weighted blend of the source motion's rank
+    and the onset strength's, so the most driven bar is 1 whatever the blend.
+
+    The source's motion is its P.910 temporal information; without it the music drives alone.
     """
-
-    total: float
-    feasible: bool
-    terms: dict[str, float] = field(default_factory=dict)
-    violation: float = 0.0
-    #: Settings shown in dead bars whose verdict no record decides: what an archive would have to measure.
-    unmeasured: frozenset[tuple[int, ...]] = frozenset()
-
-    @property
-    def rank(self) -> tuple[float, float]:
-        """Sort key: fewer dead bars first, then the higher total."""
-        return (self.violation, -self.total)
+    audio, video = features.audio, features.video
+    music = ranks(bar_means(audio.onset_strength, audio.times, edges))
+    if video is None or video.ti is None or follow == 0.0:
+        return music
+    motion = ranks(bar_means(video.ti, np.arange(video.ti.size) / video.fps, edges))
+    return ranks(follow * motion + (1.0 - follow) * music)
 
 
-def _corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = a - a.mean()
-    b = b - b.mean()
-    d = float(np.sqrt((a * a).sum() * (b * b).sum()))
-    return float((a * b).sum() / d) if d > EPS else 0.0
+def changes(level: np.ndarray, bars: float, quicken: float) -> np.ndarray:
+    """The bars a new effect starts on, bar 0 always: each bar counts ``(1 + quicken (2 level - 1)) / bars``,
+    and an effect starts where the count passes a whole number, so ``quicken`` 0 changes every ``bars``.
+    """
+    rate = 1.0 + quicken * (2.0 * np.asarray(level, dtype=np.float64) - 1.0)
+    count = np.floor_divide(np.r_[0.0, np.cumsum(rate)][:-1], bars)
+    return np.flatnonzero(np.r_[True, np.diff(count) > 0])
 
 
-def _response(spec: ParamSpec, values: np.ndarray) -> np.ndarray:
-    """The profiled metric response of one parameter, normalized to ``[0, 1]``."""
-    v = np.asarray(spec.values, dtype=np.float64)
-    r = np.asarray(spec.response, dtype=np.float64)
-    if v.size < 2 or r.size != v.size:
-        return values / PARAM_MAX
-    order = np.argsort(v)
-    r = r[order]
-    return np.interp(values, v[order], (r - r.min()) / (np.ptp(r) + EPS))
+def _route(cost: np.ndarray) -> tuple[float, np.ndarray]:
+    """The least total cost through ``cost[run, program]`` with no program twice running, and its path."""
+    runs, programs = cost.shape
+    if programs == 1:
+        return float(cost.sum()), np.zeros(runs, np.int64)
+    barred = np.where(np.eye(programs, dtype=bool), np.inf, 0.0)
+    total, back = cost[0].copy(), []
+    for row in cost[1:]:
+        step = total[:, None] + barred
+        back.append(np.argmin(step, axis=0))
+        total = step.min(axis=0) + row
+    path = [int(np.argmin(total))]
+    for came in reversed(back):
+        path.append(int(came[path[-1]]))
+    return float(total.min()), np.asarray(path[::-1], np.int64)
 
 
-def score_spans(score: Score, program: str) -> list[tuple[float, float]] | None:
-    """The spans a program's take is shown in, or ``None`` when the score carries no cut plan."""
-    return spans_of(score.cuts, program) if score.cuts else None
+def assign(cost: np.ndarray, passes: int | None = None) -> np.ndarray:
+    """A program for each run of bars, from ``cost[run, program]``, never the same one twice running.
+
+    With ``passes``, programs are kept one at a time, each the one that lowers the least total most.
+    """
+    cost = np.asarray(cost, dtype=np.float64)
+    programs = cost.shape[1]
+    if passes is None or passes >= programs:
+        return _route(cost)[1]
+    kept: list[int] = []
+    for _ in range(passes):
+        rest = [p for p in range(programs) if p not in kept]
+        kept.append(min(rest, key=lambda p: _route(cost[:, kept + [p]])[0]))
+    return np.asarray(kept)[_route(cost[:, kept])[1]]
+
+
+def clip_kind(video: VideoFeatures | None, profiles: Mapping[str, ProgramProfile], kind: str | None = None):
+    """The measured clip the source is nearer in RMS chroma, with the source's chroma and each clip's.
+
+    A clip's chroma follows from its saturation (:func:`~syncsummoner.compose.stimulus.chroma_sigma`), the
+    colour clip's set by the gamut, so the midpoint between the clips is the only threshold.
+    """
+    sigma: dict[str, list[float]] = {}
+    for profile in profiles.values():
+        for name, entry in profile.effects.items():
+            sigma.setdefault(name, []).append(chroma_sigma(max(entry["saturation"])))
+    clips = {name: float(np.median(found)) for name, found in sorted(sigma.items())}
+    if not clips:
+        raise ValueError("no profile carries effects; run `probe effects` on its archive")
+    source = None
+    if video is not None and video.chroma is not None and video.chroma.size:
+        source = float(np.sqrt(np.mean(np.square(video.chroma, dtype=np.float64))))
+    if kind is not None:
+        if kind not in clips:
+            raise ValueError(f"no profile measured effects on a {kind} clip; measured: {', '.join(clips)}")
+        return kind, source, clips
+    if source is None:
+        if len(clips) > 1:
+            raise ValueError("without the source's chroma, name the clip to compose for")
+        return next(iter(clips)), source, clips
+    return min(clips, key=lambda name: (abs(clips[name] - source), name)), source, clips
+
+
+def palettes(profiles: Mapping[str, ProgramProfile], kind: str) -> list[Palette]:
+    """Every program's safe settings measured on the ``kind`` clip, quantiles taken over them all."""
+    found = []
+    for name in sorted(profiles):
+        settings = [s for s in profiles[name].effects.get(kind, {}).get("settings", ()) if s["safe"]]
+        if not settings:
+            LOG.info("%s: no safe setting measured on the %s clip", name, kind)
+            continue
+        found.append((name, settings))
+    if not found:
+        raise ValueError(f"no program has a safe setting measured on the {kind} clip")
+    pooled = ranks([s["intensity"] for _, settings in found for s in settings])
+    out, at = [], 0
+    for name, settings in found:
+        out.append(
+            Palette(
+                program=name,
+                params=np.array([s["params"] for s in settings], np.int64),
+                setpoints=np.array([s["setpoint"] for s in settings], np.int64),
+                intensity=np.array([s["intensity"] for s in settings], np.float64),
+                quantile=pooled[at : at + len(settings)],
+            )
+        )
+        at += len(settings)
+    return out
+
+
+def _gestures(
+    palette: Palette,
+    picks: np.ndarray,
+    starts: np.ndarray,
+    opening: float,
+    held: np.ndarray | None,
+    fps: float,
+) -> list[GestureInstance]:
+    """A setting gesture per change of setting over a run's bars, writing the slots that change one a frame.
+
+    Each one's last write lands as its bar starts; the run's first starts at ``opening``. ``held`` is the
+    setting the program last held, ``None`` when unknown.
+    """
+    out = []
+    for k, (pick, start) in enumerate(zip(picks.tolist(), starts.tolist())):
+        values = palette.params[pick]
+        slots = np.arange(values.size) if held is None else np.flatnonzero(values != held)
+        held = values
+        if not slots.size:
+            continue
+        out.append(
+            GestureInstance(
+                gesture=SETTING,
+                arrival=float(opening if k == 0 else start - (slots.size - 1) / fps),
+                duration=0.0,
+                intensity=float(palette.quantile[pick]),
+                targets=tuple(int(s) + 1 for s in slots),
+                seed=int(palette.setpoints[pick]),
+                values=tuple(int(v) for v in values[slots]),
+            )
+        )
+    return out
+
+
+def search(
+    profiles: Mapping[str, ProgramProfile],
+    features: Features,
+    *,
+    curve: Curve | None = None,
+    fps: float = 60.0,
+    seed: int = 0,
+) -> Score:
+    """A score of measured settings, one a bar, its program changing on the curve's downbeats.
+
+    Each run of bars goes to a program by :func:`assign`, costed by each bar's distance to that program's
+    nearest safe setting, which the bar then plays. A run's first setting is written from when its program
+    last left the screen, unseen, so it has settled by the cut.
+    """
+    curve = curve or Curve()
+    audio = features.audio
+    if audio is None:
+        raise ValueError("composing needs the track's beats")
+    duration = features.duration or audio.duration
+    kind, source, clips = clip_kind(features.video, profiles, curve.kind)
+    LOG.info(
+        "composing for the %s clip: source chroma %s, clips %s",
+        kind,
+        "unmeasured" if source is None else f"{source:.4f}",
+        ", ".join(f"{name} {value:.4f}" for name, value in clips.items()),
+    )
+    found = palettes(profiles, kind)
+    edges = bar_edges(audio.downbeats, duration)
+    level = drive(features, edges, curve.follow)
+    target = curve.low + (curve.high - curve.low) * level
+    runs = np.split(
+        np.arange(level.size), changes(level, float(curve.bars or audio.phrase_bars), curve.quicken)[1:]
+    )
+    chosen = assign(np.array([[p.cost(target[run]) for p in found] for run in runs]), curve.passes)
+    layers: dict[str, list[GestureInstance]] = {}
+    cuts, left, held, shown = [], {}, {}, np.zeros(level.size)
+    for run, index in track(list(zip(runs, chosen.tolist())), desc="cuts", unit="cut"):
+        palette = found[index]
+        name, picks = palette.program, palette.nearest(target[run])
+        shown[run] = palette.intensity[picks]
+        written = _gestures(palette, picks, edges[run], left.get(name, 0.0), held.get(name), fps)
+        layers.setdefault(name, []).extend(written)
+        cuts.append(Cut(float(edges[run[0]]), float(edges[run[-1] + 1]), name))
+        left[name], held[name] = cuts[-1].end, palette.params[picks[-1]]
+    names = list(dict.fromkeys(cut.program for cut in cuts))
+    LOG.info("%d cuts over %d bars on %s", len(cuts), level.size, ", ".join(names))
+    return Score(
+        seed=int(seed),
+        bpm=audio.tempo,
+        duration=duration,
+        fps=fps,
+        sections=[Section(c.start, c.end, str(i)) for i, c in enumerate(cuts)],
+        layers=[Layer(program=name, index=i, gestures=layers[name]) for i, name in enumerate(names)],
+        cuts=cuts,
+        meta={
+            "kind": kind,
+            "source_chroma": source,
+            "clip_chroma": clips,
+            "curve": asdict(curve),
+            "bar": audio.bar_duration,
+            "phrase_bars": audio.phrase_bars,
+            "downbeats": [float(t) for t in audio.downbeats[audio.downbeats < duration]],
+            "bars": [float(t) for t in edges],
+            "drive": [float(v) for v in level],
+            "target": [float(v) for v in target],
+            "intensity": [float(v) for v in shown],
+        },
+    )
 
 
 def plan_automation(
@@ -164,782 +342,29 @@ def plan_automation(
 ) -> dict[int, Automation]:
     """Expand a score to reachable automation per layer; this is what the renderer plays.
 
-    A score carrying a cut plan sends each layer's writes only inside its program's cuts. Each
-    layer's writes then pass its program's gate (default: from the program model), which pairs
-    a write to a dead parameter with the move that makes it live or refuses it.
+    A measured setting is sent whole where the score places it. Other gestures' writes are sent only inside
+    their program's cuts, through its gate (default: the program model's), which pairs or refuses dead writes.
     """
     fps = score.fps if fps is None else fps
+    rate = control_rate(fps)
     out = {}
     for layer in score.layers:
         profile = profiles.get(layer.program)
         if profile is None:
             continue
-        auto = score.render_layer(layer, profile, rate=control_rate(fps))
-        auto = visible(thin(auto, profile, fps=fps), score_spans(score, layer.program))
-        gate = model_gate(layer.program) if gates is None else gates.get(layer.program)
-        out[layer.index] = auto if gate is None else gate(auto)
+        measured = Layer(layer.program, layer.index, [g for g in layer.gestures if g.gesture == SETTING])
+        drawn = Layer(layer.program, layer.index, [g for g in layer.gestures if g.gesture != SETTING])
+        auto = Automation.empty()
+        if drawn.gestures:
+            spans = spans_of(score.cuts, layer.program) if score.cuts else None
+            auto = visible(thin(score.render_layer(drawn, profile, rate=rate), profile, fps=fps), spans)
+            gate = model_gate(layer.program) if gates is None else gates.get(layer.program)
+            auto = auto if gate is None else gate(auto)
+        if measured.gestures:
+            exact = thin(score.render_layer(measured, profile, rate=rate), profile, fps=fps)
+            auto = Automation.concat([auto, exact])
+        out[layer.index] = auto
     return out
-
-
-def _marginal(profile: ProgramProfile, raw: np.ndarray, name: str) -> np.ndarray | None:
-    """Superpose each parameter's measured curve for one metric over the timeline.
-
-    ``ParamSpec.measured`` holds each parameter's first-order marginal, so the prediction at a
-    vector is the sum of their departures from their medians (first-order HDMR); ``None``
-    where nothing measured the metric.
-    """
-    deltas, bases = [], []
-    for spec in profile.params:
-        curve = spec.measured.get(name)
-        if not curve or len(curve) != len(spec.values) or len(curve) < 2:
-            continue
-        values = np.asarray(spec.values, dtype=np.float64)
-        measured = np.asarray(curve, dtype=np.float64)
-        order = np.argsort(values)
-        base = float(np.median(measured))
-        deltas.append(np.interp(raw[:, spec.index - 1], values[order], measured[order]) - base)
-        bases.append(base)
-    if not deltas:
-        return None
-    return np.sum(deltas, axis=0) + float(np.mean(bases))
-
-
-def _cliff_fractions(profile: ProgramProfile, raw: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray]:
-    """Clip and illegal fractions inferred from the cliff atlas, for profiles with no measured curves."""
-    clip, illegal = np.zeros(size), np.zeros(size)
-    for spec in profile.params:
-        for cliff in spec.cliffs:
-            crossed = (raw[:, spec.index - 1] >= cliff.at).astype(np.float64) * cliff.jump
-            if "clip_frac" in cliff.metrics:
-                clip += crossed
-            if "illegal_frac" in cliff.metrics:
-                illegal += crossed
-    n_cliffs = max(1, sum(len(p.cliffs) for p in profile.params))
-    return clip / n_cliffs, illegal / n_cliffs
-
-
-def proxy_render(
-    auto: Automation,
-    profile: ProgramProfile,
-    *,
-    fps: float,
-    duration: float,
-    rng: np.random.Generator,
-    start: float = 0.0,
-    slope_center: float = -1.2,
-    slope_gain: float = 0.8,
-    survival: Mapping[str, kriged.Response] | None = None,
-) -> Trajectory:
-    """Predict per-frame metrics from the measured curves, the cliff atlas and the response.
-
-    Every metric the objective scores is read back from what the probe measured at each setpoint,
-    and each response in ``survival`` is kriged jointly from the archive's records instead. Where a
-    profile predates those curves the older inferences stand in. The frames are those of
-    ``[start, start + duration)``, frame ``n`` at ``n / fps``.
-    """
-    first = int(np.rint(start * fps))
-    times = (first + np.arange(max(2, int(np.rint((start + duration) * fps)) - first))) / fps
-    raw = auto.hold(times)
-    resp = np.zeros_like(raw)
-    weights = np.zeros(raw.shape[1])
-    for spec in profile.params:
-        if spec.kind is ParamKind.UNUSED:
-            continue
-        col = spec.index - 1
-        resp[:, col] = _response(spec, raw[:, col])
-        weights[col] = max(spec.sensitivity, EPS)
-    weights /= weights.sum() + EPS
-    energy = resp * weights
-
-    measured = {name: _marginal(profile, raw, name) for name in METRIC_SPAN}
-    moved = [(m - np.median(m)) / METRIC_SPAN[name] for name, m in measured.items() if m is not None]
-    if moved:
-        activity = np.sqrt(np.mean(np.square(moved), axis=0))
-    else:
-        activity = energy.sum(axis=1)
-
-    if measured["concentration"] is not None:
-        conc = measured["concentration"]
-    else:
-        total = energy.sum(axis=1, keepdims=True) + EPS
-        share = energy / total
-        n_active = max(1, int((weights > EPS).sum()))
-        conc = (np.square(share).sum(axis=1) - 1.0 / n_active) / (1.0 - 1.0 / n_active + EPS)
-
-    slope = measured["spectral_slope"]
-    if slope is None:
-        slope = slope_center + slope_gain * (activity - activity.mean())
-
-    clip, illegal = measured["clip_frac"], measured["illegal_frac"]
-    if clip is None or illegal is None:
-        inferred_clip, inferred_illegal = _cliff_fractions(profile, raw, times.size)
-        clip = inferred_clip if clip is None else clip
-        illegal = inferred_illegal if illegal is None else illegal
-
-    joint = {name: model.at(raw) for name, model in (survival or {}).items() if name in SURVIVAL}
-    kept = {name: joint[name].mean if name in joint else _marginal(profile, raw, name) for name in SURVIVAL}
-    return Trajectory(
-        times=times,
-        state=resp,
-        activity=activity,
-        ic=information_content(activity, rng=rng),
-        concentration=np.clip(conc, 0.0, 1.0),
-        slope=slope,
-        clip_frac=np.clip(clip, 0.0, 1.0),
-        illegal_frac=np.clip(illegal, 0.0, 1.0),
-        si_ratio=None if kept["si_ratio"] is None else np.maximum(kept["si_ratio"], 0.0),
-        ti_ratio=None if kept["ti_ratio"] is None else np.maximum(kept["ti_ratio"], 0.0),
-        follow=None if kept["motion_follow"] is None else np.clip(kept["motion_follow"], -1.0, 1.0),
-        joint=joint,
-        settings=raw,
-    )
-
-
-def _motif_return(traj: Trajectory, sections: Sequence[Section]) -> float:
-    """Contrast between same-label and different-label section-boundary states: visual rhyme."""
-    sections = [sec for sec in sections if traj.times[0] <= sec.start <= traj.times[-1]]
-    if len(sections) < 3:
-        return 0.0
-    idx = np.clip(np.searchsorted(traj.times, [s.start for s in sections]), 0, traj.times.size - 1)
-    s = traj.state[idx]
-    s = s / (np.linalg.norm(s, axis=1, keepdims=True) + EPS)
-    sim = s @ s.T
-    labels = np.array([sec.label for sec in sections])
-    same = (labels[:, None] == labels[None, :]) & ~np.eye(len(sections), dtype=bool)
-    other = (labels[:, None] != labels[None, :]) & ~np.eye(len(sections), dtype=bool)
-    if not same.any() or not other.any():
-        return 0.0
-    return float(sim[same].mean() - sim[other].mean())
-
-
-def _boredom(traj: Trajectory, bar_duration: float, *, floor: float) -> float:
-    """Worst-bar shortfall in activity variance against an absolute floor.
-
-    The floor is fixed rather than a fraction of the trajectory's own spread: a
-    program that never moves has no spread, so a self-normalized floor collapses to
-    zero and scores stasis as perfect.
-    """
-    if bar_duration <= 0:
-        return 0.0
-    index = np.floor(traj.times / bar_duration).astype(np.int64)
-    n = int(index.max()) + 1
-    counts = np.bincount(index, minlength=n).astype(np.float64)
-    mean = np.bincount(index, weights=traj.activity, minlength=n) / np.maximum(counts, 1)
-    sq = np.bincount(index, weights=traj.activity**2, minlength=n) / np.maximum(counts, 1)
-    std = np.sqrt(np.maximum(sq - mean**2, 0.0))[counts > 1]
-    if std.size == 0 or floor <= EPS:
-        return 0.0
-    return float(np.max(np.maximum(floor - std, 0.0)) / floor)
-
-
-def evaluate(
-    traj: Trajectory,
-    features: Features,
-    score: Score,
-    *,
-    weights: ObjectiveWeights = DEFAULT_WEIGHTS,
-    natural_band: tuple[float, float] = NATURAL_SLOPE_BAND,
-    boredom_floor: float = BOREDOM_FLOOR,
-    hit_sigma: float = 1.0,
-    discount: float = 1.0,
-) -> Objective:
-    """Weighted objective over the proxy trajectory; every design 4.5 term contributes."""
-    audio = features.audio
-    onset = np.interp(traj.times, audio.times, audio.onset_strength)
-    terms = {"av_corr": _corr(traj.ic, onset)}
-    if 1 < audio.onset_ic.size <= audio.beats.size:
-        aic = np.interp(traj.times, audio.beats[: audio.onset_ic.size], audio.onset_ic)
-        terms["av_corr"] = 0.5 * (terms["av_corr"] + _corr(traj.ic, aic))
-    hits = onset >= onset.mean() + hit_sigma * onset.std()
-    dev = np.maximum(natural_band[0] - traj.slope, 0.0) + np.maximum(traj.slope - natural_band[1], 0.0)
-    allowed = ~hits if (~hits).any() else np.ones_like(hits)
-    destroy = score.destroy_mask(traj.times)
-    legal = ~destroy if (~destroy).any() else np.ones_like(destroy)
-    terms["mud"] = float(traj.concentration.mean())
-    terms["slope"] = float(dev[allowed].mean())
-    terms["levels"] = float((traj.clip_frac + traj.illegal_frac)[legal].mean())
-    terms["motif"] = _motif_return(traj, score.sections)
-    kept = predict_survival(traj, features)
-    unmeasured: frozenset[tuple[int, ...]] = frozenset()
-    if kept is None:
-        terms["boredom"] = _boredom(traj, audio.bar_duration, floor=boredom_floor)
-        violation = 0.0
-    else:
-        terms["boredom"] = float(np.max(1.0 - np.minimum(kept.ti_ratio, 1.0)))
-        violation = dead_bars_over_budget(kept, score)
-        terms["dead_bars"] = float(kept.dead.sum())
-        unmeasured = kept.unmeasured
-    total = discount * (
-        weights.av_corr * terms["av_corr"]
-        + weights.motif * terms["motif"]
-        - weights.mud * terms["mud"]
-        - weights.slope * terms["slope"]
-        - weights.levels * terms["levels"]
-        - weights.boredom * terms["boredom"]
-    )
-    return Objective(
-        total=float(total), feasible=True, terms=terms, violation=violation, unmeasured=unmeasured
-    )
-
-
-def _bar_grid(audio, section: Section) -> np.ndarray:
-    downs = audio.downbeats[(audio.downbeats >= section.start) & (audio.downbeats < section.end)]
-    if downs.size:
-        return downs
-    return np.arange(section.start, max(section.end, section.start + EPS), audio.bar_duration)
-
-
-def _anchor_times(audio, section: Section, anchor: Anchor) -> np.ndarray:
-    """Candidate arrival times inside a section for one anchor kind."""
-    if anchor is Anchor.SECTION:
-        return np.array([section.end])
-    if anchor is Anchor.ONSET:
-        beats = audio.beats[(audio.beats >= section.start) & (audio.beats < section.end)]
-        return beats if beats.size else _bar_grid(audio, section)
-    grid = _bar_grid(audio, section)
-    if anchor in (Anchor.PHRASE, Anchor.MULTI_BAR):
-        return grid[::4] if grid.size > 4 else grid[-1:]
-    if anchor is Anchor.TWO_BAR:
-        return grid[::2]
-    return grid
-
-
-def _applicable(profile: ProgramProfile, style: Mapping[str, float], rng) -> dict[str, float]:
-    """Style weights restricted to gestures that this profile actually supports."""
-    probe = GestureContext(arrival=1.0, duration=1.0, rate=8.0, intensity=0.5, axis=Axis.UNASSIGNED, rng=rng)
-    return {n: w for n, w in style.items() if w > 0 and len(GESTURES[n](profile, probe))}
-
-
-def _axes(profile: ProgramProfile) -> list[Axis]:
-    found = sorted({p.axis for p in profile.params if p.axis is not Axis.UNASSIGNED}, key=lambda a: a.value)
-    return found or [Axis.UNASSIGNED]
-
-
-def _aim(name: str, profile: ProgramProfile, rng, banned=frozenset()) -> tuple[str, tuple[int, ...]] | None:
-    """The axis and parameter a gesture is aimed at, drawn alike from every parameter it can drive.
-
-    A gesture left to its axis drives only that axis's most sensitive parameter, so every other
-    parameter, and every one assigned no axis, would never move. None when every aim is ``banned``.
-    """
-    pool = [p for p in candidates(profile, name) if (name, (p.index,)) not in banned]
-    if not pool:
-        if candidates(profile, name) or (name, ()) in banned:
-            return None
-        return str(rng.choice(_axes(profile)).value), ()
-    spec = pool[int(rng.integers(len(pool)))]
-    return spec.axis.value, (spec.index,)
-
-
-def _aims(profile: ProgramProfile, names) -> int:
-    """How many distinct aims the gestures ``names`` have: a parameter each, or the gesture itself."""
-    return sum(max(1, len(candidates(profile, name))) for name in names)
-
-
-def _fit_span(inst: GestureInstance, span: Section) -> GestureInstance:
-    """The instance with its approach shortened to start inside ``span``."""
-    return replace(inst, duration=float(np.clip(inst.duration, 0.0, inst.arrival - span.start)))
-
-
-def _sample_instance(
-    name: str, audio, span: Section, profile: ProgramProfile, rng, banned=frozenset()
-) -> GestureInstance | None:
-    """One gesture arriving on its anchor inside ``span``, its approach too; None if every aim is banned.
-
-    It arrives on an anchor its whole approach fits before inside the span, else on the one with the most
-    room, so an approach is cut short only where no anchor leaves it room, never to a step at the start.
-    """
-    aim = _aim(name, profile, rng, banned)
-    if aim is None:
-        return None
-    anchor = GESTURES[name].anchor
-    approach = SPAN_BARS[anchor] * audio.bar_duration
-    times = _anchor_times(audio, span, anchor)
-    times = times[(times >= span.start) & (times < span.end)]
-    room = times - span.start
-    most = room.max(initial=-np.inf)
-    fits = times[room >= approach] if most >= approach else times[room == most]
-    inst = GestureInstance(
-        gesture=name,
-        arrival=float(rng.choice(fits)) if times.size else span.start,
-        duration=approach,
-        axis=aim[0],
-        intensity=float(rng.uniform(0.15, 0.95)),
-        targets=aim[1],
-        seed=int(rng.integers(1 << 30)),
-    )
-    return _fit_span(inst, span)
-
-
-def _draw(weights, audio, span, profile, rng, banned=frozenset()) -> GestureInstance | None:
-    """A gesture drawn by style weight among those with an aim left, or None when none has."""
-    names = [n for n in weights if _aim(n, profile, rng, banned) is not None]
-    if not names:
-        return None
-    prob = np.asarray([weights[n] for n in names], dtype=np.float64)
-    return _sample_instance(str(rng.choice(names, p=prob / prob.sum())), audio, span, profile, rng, banned)
-
-
-def _mutate(gestures, profile, audio, span, weights, rng, *, rate=0.3) -> list[GestureInstance]:
-    """Perturb gesture instances inside one span; the program is fixed and never mutated."""
-    out = []
-    for inst in gestures:
-        if rng.random() > rate:
-            out.append(inst)
-        elif rng.random() < 0.5:
-            out.append(_draw(weights, audio, span, profile, rng) or inst)
-        else:
-            axis, aimed = _aim(inst.gesture, profile, rng)
-            moved = replace(
-                inst,
-                intensity=float(np.clip(inst.intensity + rng.normal(0, 0.15), 0.0, 1.0)),
-                duration=float(inst.duration * np.exp(rng.normal(0, 0.2))),
-                axis=axis,
-                targets=aimed,
-            )
-            out.append(_fit_span(moved, span))
-    return sorted(out, key=lambda g: g.arrival)
-
-
-def _fill(gestures, draw, sent, target: int, aims: int) -> list[GestureInstance]:
-    """Up to ``target`` gestures, each adding a write that is sent inside the span and none past it.
-
-    ``sent`` counts a candidate's writes the gate sends inside the span, and those thinning defers
-    past its end, which land unseen and leave the parameter where the span left it, such as a
-    toggle latched on. A gesture adding no sent write, refused as dead or overwritten, is not
-    chosen, and its aim, a parameter or else the gesture, is not drawn again; with ``aims`` of
-    them, ``target + aims`` draws bound the fill.
-    """
-
-    def adds(more, base) -> bool:
-        (gained, spilled), (had, spill) = sent(more), sent(base)
-        return gained > had and spilled <= spill
-
-    out: list[GestureInstance] = []
-    for inst in gestures:
-        if inst is not None and adds(out + [inst], out):
-            out.append(inst)
-    banned: set = set()
-    for _ in range(target + aims):
-        if len(out) >= target:
-            break
-        inst = draw(frozenset(banned))
-        if inst is None:
-            break
-        if adds(out + [inst], out):
-            out.append(inst)
-        else:
-            banned.add((inst.gesture, inst.targets))
-    return sorted(out, key=lambda g: g.arrival)
-
-
-def _combine(parts: Sequence[tuple[float, Objective]]) -> Objective:
-    """One objective over several spans: totals and terms weighed by span length, dead bars summed."""
-    weights = np.array([w for w, _ in parts], dtype=np.float64)
-    weights = (
-        weights / weights.sum() if weights.sum() > 0 else np.full(weights.size, 1.0 / max(1, weights.size))
-    )
-    keys = dict.fromkeys(k for _, obj in parts for k in obj.terms)
-    terms = {
-        k: float(
-            sum(
-                obj.terms.get(k, 0.0) * (1.0 if k == "dead_bars" else w)
-                for w, (_, obj) in zip(weights, parts)
-            )
-        )
-        for k in keys
-    }
-    return Objective(
-        total=float(sum(w * obj.total for w, (_, obj) in zip(weights, parts))),
-        feasible=all(obj.feasible for _, obj in parts),
-        terms=terms,
-        violation=float(sum(obj.violation for _, obj in parts)),
-        unmeasured=frozenset().union(*(obj.unmeasured for _, obj in parts)),
-    )
-
-
-@dataclass(frozen=True)
-class _Opening:
-    """What a program's committed plan leaves at a cut: its thinning scans, the requests still
-    to come at or after the cut, and the value each parameter holds on screen as the cut opens.
-    """
-
-    scans: dict[int, tuple]
-    tail: Automation
-    held: Automation
-
-
-class _Planned(NamedTuple):
-    """One cut's plan: its objective, gestures, the requests they render, what is sent, and the
-    gate state it leaves."""
-
-    obj: Objective
-    gestures: list[GestureInstance]
-    raw: Automation
-    sent: Automation
-    state: np.ndarray | None
-
-
-@dataclass
-class _Program:
-    """One program being planned: its profile and gate, and the gestures, cuts and sent writes so far.
-
-    ``state`` is the gate's after every write sent so far, from the state the program loads in, and
-    ``survival`` the responses kriged from its archive's records.
-    """
-
-    name: str
-    profile: ProgramProfile
-    weights: dict[str, float]
-    discount: float
-    gate: Any = None
-    survival: Mapping[str, kriged.Response] = field(default_factory=dict)
-    gestures: list[GestureInstance] = field(default_factory=list)
-    raw: Automation = field(default_factory=Automation.empty)
-    spans: list[tuple[float, float]] = field(default_factory=list)
-    sent: Automation = field(default_factory=Automation.empty)
-    state: np.ndarray | None = None
-
-    def __post_init__(self) -> None:
-        if self.state is None and self.gate is not None:
-            self.state = self.gate.start()
-
-    def opening(self, cut: Cut, fps: float) -> _Opening:
-        """Scan every committed request before ``cut``; what a candidate for it continues from."""
-        scans = {}
-        before = self.raw.times < cut.start
-        for idx in np.unique(self.raw.indices[before]).tolist():
-            m = before & (self.raw.indices == idx)
-            _, _, scan = settled(self.raw.times[m], self.raw.values[m], settle_of(self.profile, idx, fps))
-            if scan[2] is not None and scan[0] < cut.start:
-                scan = (scan[0] + settle_of(self.profile, idx, fps), scan[2], None)
-            scans[idx] = scan
-        tail = Automation(self.raw.times[~before], self.raw.indices[~before], self.raw.values[~before])
-        if self.state is not None:
-            params, last = np.arange(1, len(self.state) + 1), np.asarray(self.state)
-        else:
-            params = np.unique(self.sent.indices)
-            last = np.asarray([self.sent.values[self.sent.indices == idx][-1] for idx in params.tolist()])
-        held = Automation(
-            np.full(params.size, cut.start - 1.0), params.astype(np.int32), last.astype(np.int32)
-        )
-        return _Opening(scans, tail, held)
-
-    def send(self, shown: Automation) -> tuple[Automation, np.ndarray | None]:
-        """What the gate sends of a cut's writes from the state the plan holds, and the state after."""
-        if self.gate is None:
-            return shown, self.state
-        gated = gate_automation(shown, self.state, self.gate.live, self.gate.revive)
-        return gated.auto, gated.state
-
-    def commit(self, cut: Cut, planned: _Planned) -> None:
-        """Take on ``cut`` with its plan."""
-        self.gestures += planned.gestures
-        self.raw = Automation.concat([self.raw, planned.raw])
-        self.sent = Automation.concat([self.sent, planned.sent])
-        self.state = planned.state
-        self.spans.append((cut.start, cut.end))
-
-
-def _continued(opening: _Opening, raw: Automation, profile: ProgramProfile, fps: float) -> Automation:
-    """The writes from a cut on: the committed tail and ``raw`` thinned on from the opening scans."""
-    requests = Automation.concat([opening.tail, raw])
-    parts = []
-    for idx in np.unique(np.r_[requests.indices, list(opening.scans)]).astype(np.int32).tolist():
-        m = requests.indices == idx
-        scan = opening.scans.get(idx, (-np.inf, None, None))
-        t, v, scan = settled(requests.times[m], requests.values[m], settle_of(profile, idx, fps), scan)
-        late_t, late_v = flush(scan)
-        parts.append(
-            Automation(
-                np.asarray(t + late_t),
-                np.full(len(t) + len(late_t), idx, np.int32),
-                np.asarray(v + late_v, np.int32),
-            )
-        )
-    return Automation.concat(parts)
-
-
-@dataclass(frozen=True)
-class _Plan:
-    """How one cut is planned: the search's settings and what every candidate is judged against."""
-
-    base: Score
-    features: Features
-    weights: ObjectiveWeights
-    density: float
-    population: int
-    generations: int
-    evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None
-
-    def cut(self, prog: _Program, cut: Cut, rng) -> _Planned:
-        """Evolve ``prog``'s gestures for one cut, judged on that cut's frames alone, as the gate sends them.
-
-        ``density`` gestures a bar are drawn, each adding a write that is sent.
-        """
-        audio, fps = self.features.audio, self.base.fps
-        span = Section(cut.start, cut.end, "")
-        rate = control_rate(fps)
-        opening = prog.opening(cut, fps)
-        target = max(1, int(np.rint(self.density * cut.duration / audio.bar_duration)))
-        aims = _aims(prog.profile, prog.weights)
-        found: dict[tuple, tuple] = {}
-
-        def render(gestures) -> Automation:
-            layer = Layer(prog.name, gestures=list(gestures))
-            return self.base.render_layer(layer, prog.profile, rate=rate, offset=len(prog.gestures))
-
-        def planned(gestures) -> tuple:
-            """The cut's thinned writes, those the gate sends, the state after, and the count past the end."""
-            key = tuple(gestures)
-            if key not in found:
-                after = _continued(opening, render(gestures), prog.profile, fps)
-                shown = after.within(cut.start, cut.end)
-                found[key] = (shown, *prog.send(shown), int((after.times >= cut.end).sum()))
-            return found[key]
-
-        def sent(gestures) -> tuple[int, int]:
-            _, out, _, spilled = planned(gestures)
-            return len(out), spilled
-
-        def draw(banned) -> GestureInstance | None:
-            return _draw(prog.weights, audio, span, prog.profile, rng, banned)
-
-        def fitness(gestures) -> Objective:
-            if self.evaluator is not None:
-                layer = Layer(prog.name, gestures=prog.gestures + list(gestures))
-                return self.evaluator(layer, prog.profile, replace(self.base, cuts=[cut]))
-            shown, out, _, _ = planned(gestures)
-            if not reachable(shown, prog.profile, fps=fps):
-                return Objective(total=-np.inf, feasible=False, violation=np.inf)
-            traj = proxy_render(
-                Automation.concat([opening.held, out]),
-                prog.profile,
-                fps=fps,
-                start=cut.start,
-                duration=cut.duration,
-                rng=np.random.default_rng(program_key(prog.name)),
-                survival=prog.survival,
-            )
-            return evaluate(traj, self.features, self.base, weights=self.weights, discount=prog.discount)
-
-        pop = [_fill([], draw, sent, target, aims) for _ in range(self.population)]
-        ranked = sorted(((fitness(m), m) for m in pop), key=lambda p: p[0].rank)
-        for _ in range(self.generations - 1):
-            elite = [m for _, m in ranked[: max(1, self.population // 2)]]
-            children = [
-                _fill(
-                    _mutate(elite[i % len(elite)], prog.profile, audio, span, prog.weights, rng),
-                    draw,
-                    sent,
-                    target,
-                    aims,
-                )
-                for i in range(self.population - len(elite))
-            ]
-            ranked = sorted(
-                ranked[: len(elite)] + [(fitness(m), m) for m in children], key=lambda p: p[0].rank
-            )
-        obj, gestures = ranked[0]
-        _, out, state, _ = planned(gestures)
-        return _Planned(obj, gestures, render(gestures), out, state)
-
-
-def _standing(plan: _Plan, prog: _Program, sections: Sequence[Section], rng) -> Objective:
-    """How a program fares over the whole piece: one generation of it showing every section."""
-    trial = replace(plan, generations=1)
-    scratch = _Program(prog.name, prog.profile, prog.weights, prog.discount, prog.gate, prog.survival)
-    parts = []
-    for section in sections:
-        cut = Cut(section.start, section.end, prog.name)
-        planned = trial.cut(scratch, cut, rng)
-        scratch.commit(cut, planned)
-        parts.append((cut.duration, planned.obj))
-    return _combine(parts)
-
-
-def _assign(
-    plan: _Plan, cuts: Sequence[Cut], programs: Mapping[str, _Program], rng
-) -> tuple[list[Cut], dict[str, Objective], dict[str, set]]:
-    """Plan every cut in time order on its program, moving a cut predicted dead to one alive there.
-
-    A cut is predicted dead when its bars die beyond the destruction budget; every other
-    program is then planned for it, and the cut goes to the best ranked, its own program first
-    on a tie, so it moves only to a program that keeps more of the picture. Also returns, by program,
-    the settings its own plan or the plan kept showed in dead bars no record decides.
-    """
-    out, parts = [], {name: [] for name in programs}
-    unmeasured: dict[str, set] = {}
-    for cut in track(sorted(cuts, key=lambda c: c.start), desc="cuts", unit="cut"):
-        options = {cut.program: plan.cut(programs[cut.program], cut, rng)}
-        own = options[cut.program].obj
-        if own.violation > 0:
-            options.update(
-                {name: plan.cut(programs[name], cut, rng) for name in programs if name != cut.program}
-            )
-        name = min(options, key=lambda n, found=options: found[n].obj.rank)
-        planned = options[name]
-        for program, found in ((cut.program, own), (name, planned.obj)):
-            if found.unmeasured:
-                unmeasured.setdefault(program, set()).update(found.unmeasured)
-        if name != cut.program:
-            LOG.info(
-                "%7.2f-%7.2fs: %s predicted dead over %g bars, planned on %s",
-                cut.start,
-                cut.end,
-                cut.program,
-                own.violation,
-                name,
-            )
-        elif planned.obj.violation:
-            LOG.warning(
-                "%7.2f-%7.2fs: %s predicted dead over %g bars and no program is alive there",
-                cut.start,
-                cut.end,
-                cut.program,
-                planned.obj.violation,
-            )
-        moved = replace(cut, program=name)
-        programs[name].commit(moved, planned)
-        parts[name].append((cut.duration, planned.obj))
-        out.append(moved)
-    return out, {name: _combine(p) for name, p in parts.items() if p}, unmeasured
-
-
-def _mark_destroy(sections: Sequence[Section], audio, *, enabled: bool) -> list[Section]:
-    """Mark the loudest sections ``destroy`` so illegal levels stop being penalized there."""
-    if not enabled or len(sections) < 2:
-        return list(sections)
-    power = np.array(
-        [
-            audio.onset_strength[slice(*np.searchsorted(audio.times, [s.start, s.end]))].mean()  # noqa: E231
-            for s in sections
-        ]
-    )
-    power = np.nan_to_num(power)
-    hot = power >= power.mean() + power.std()
-    return [replace(s, destroy=bool(h)) for s, h in zip(sections, hot)]
-
-
-def _clip_sections(sections: Sequence[Section], duration: float) -> list[Section]:
-    """Keep only what the render covers: sections past the end go, the last one is truncated."""
-    kept = [replace(s, end=min(s.end, duration)) for s in sections if s.start < duration]
-    return kept or [Section(start=0.0, end=duration, label="A")]
-
-
-def search(
-    profiles: Mapping[str, ProgramProfile],
-    features: Features,
-    *,
-    style: str = "default",
-    rng: np.random.Generator,
-    budget: int = 48,
-    fps: float = 60.0,
-    n_passes: int = 1,
-    population: int = 6,
-    density: float = 0.5,
-    weights: ObjectiveWeights | None = None,
-    evaluator: Callable[[Layer, ProgramProfile, Score], Objective] | None = None,
-    gates: Mapping[str, Any] | None = None,
-    survival: Mapping[str, Mapping[str, kriged.Response]] | None = None,
-) -> Score:
-    """Rank the programs, cut the best ``n_passes`` in rotation, and evolve each cut on its program.
-
-    Each program first shows every section for one generation, which ranks it; the kept ones
-    are cut in rank order over the sections by :func:`~syncsummoner.compose.cut.cut_plan`,
-    and that plan is the score's. Every cut is then evolved on its own frames, from the state
-    its program's earlier cuts leave, with ``density`` gestures a bar on screen, through the
-    gate :func:`plan_automation` sends by (default: from the program model) and at the state it
-    holds, so no gesture is kept that sends nothing; a cut predicted dead moves to a program
-    alive there (:func:`_assign`). Survival is kriged from ``survival`` (default: the records beside the
-    profiles, :func:`~syncsummoner.compose.kriged.from_directory`), and the settings dead bars showed that
-    no record decides are left in the score's ``unmeasured``, by program, to archive. A program whose
-    parameters were never measured to move anything is skipped: a gesture drives a parameter,
-    so a profile with none can only score as the absence of a change, which a passthrough wins.
-    """
-    audio = features.audio
-    if audio is None:
-        raise ValueError("planner.search requires audio features")
-    style_weights = STYLES.get(style, STYLES["default"])
-    duration = features.duration or audio.duration
-    marked = _mark_destroy(audio.sections, audio, enabled=style in DESTROY_STYLES)
-    sections = _clip_sections(list(phrases(marked, audio.downbeats, audio.phrase_bars)), duration)
-    base = Score(
-        seed=int(rng.integers(1 << 30)),
-        bpm=audio.tempo,
-        duration=duration,
-        fps=fps,
-        sections=list(sections),
-        meta={
-            "style": style,
-            "density": density,
-            "bar": audio.bar_duration,
-            "phrase_bars": audio.phrase_bars,
-            "downbeats": [float(t) for t in audio.downbeats[audio.downbeats < duration]],
-        },
-    )
-    if survival is None:
-        survival = kriged.from_directory(getattr(profiles, "directory", None))
-    plan = _Plan(
-        base=base,
-        features=features,
-        weights=STYLE_WEIGHTS.get(style, DEFAULT_WEIGHTS) if weights is None else weights,
-        density=density,
-        population=population,
-        generations=max(1, budget // max(1, population * len(profiles))),
-        evaluator=evaluator,
-    )
-    LOG.info(
-        "composing %.1fs over %d programs: %d %s of %d candidates a cut, %d sections at %.1f bpm",
-        duration,
-        len(profiles),
-        plan.generations,
-        "generation" if plan.generations == 1 else "generations",
-        population,
-        len(sections),
-        audio.tempo,
-    )
-    standing = []
-    for program in track(sorted(profiles), desc="ranking", unit="program"):
-        profile = profiles[program]
-        if not any(spec.sensitivity > 0 for spec in profile.params):
-            continue
-        applicable = _applicable(profile, style_weights, rng)
-        if not applicable:
-            continue
-        gate = model_gate(program) if gates is None else gates.get(program)
-        prog = _Program(
-            program,
-            profile,
-            applicable,
-            SIM_DISCOUNT if profile.source is Source.SIM else 1.0,
-            gate,
-            dict(survival.get(program, {})),
-        )
-        obj = _standing(plan, prog, sections, rng)
-        LOG.debug("%s: standing %.3f", program, obj.total)
-        if "dead_bars" not in obj.terms:
-            LOG.warning("%s: no survival measured, so its picture is unverified; refit from footage", program)
-        standing.append((obj, prog))
-    standing.sort(key=lambda t: t[0].rank)
-    kept = {prog.name: prog for _, prog in standing[:n_passes]}
-    if not kept:
-        return base
-    base.cuts, objectives, unmeasured = _assign(plan, cut_plan(base, list(kept)), kept, rng)
-    base.meta["unmeasured"] = {name: sorted(map(list, found)) for name, found in sorted(unmeasured.items())}
-    for name, found in sorted(unmeasured.items()):
-        LOG.info("%s: %d settings shown dead that no record decides; archive them", name, len(found))
-    shown = [name for name in kept if name in objectives]
-    base.layers = [Layer(program=name, index=i, gestures=kept[name].gestures) for i, name in enumerate(shown)]
-    base.meta["objective"] = [objectives[name].terms for name in shown]
-    for name in shown:
-        LOG.info(
-            "kept %s: score %.3f, %d gestures over %d cuts",
-            name,
-            objectives[name].total,
-            len(kept[name].gestures),
-            len(kept[name].spans),
-        )
-    return base
 
 
 def describe(score: Score) -> dict[str, Any]:
