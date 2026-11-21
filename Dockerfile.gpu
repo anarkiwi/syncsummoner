@@ -3,7 +3,7 @@
 # host without one the same image decodes on the CPU. Dependencies come from pyproject, as
 # the CPU image's do, so the two stay in step.
 # The CUDA base is only NVIDIA's container plumbing on Ubuntu: Vulkan needs no CUDA libraries.
-FROM nvidia/cuda:13.4.3-base-ubuntu26.04 AS nvidia
+FROM nvidia/cuda:13.5.0-base-ubuntu26.04 AS nvidia
 
 # Pinned ffmpeg with the Vulkan FFV1 hwaccel: shaders compile to SPIR-V here, and the Vulkan
 # loader is opened at run time. Built on the runtime's own base so its libraries resolve.
