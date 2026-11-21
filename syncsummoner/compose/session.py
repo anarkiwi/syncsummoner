@@ -162,13 +162,37 @@ def session_frames(
     *,
     dry: bool,
     load_s: float | None = None,
+    reload_s: float | None = None,
 ) -> tuple[int, int]:
-    """A session's lead-in and lead-out frames, for a load of ``load_s``, else the rig's longest timed."""
+    """A session's lead-in and lead-out frames: the lead-in for a load of ``load_s``, else the rig's longest
+    timed, and the lead-out for a Passthru reload of ``reload_s``, else the same load."""
     loads = loadtimes.longest() if load_s is None else load_s
     return (
         lead_in_frames(lead_in, fps, dry=dry, load_s=loads),
-        lead_out_frames(lead_in, fps, dry=dry, load_s=loads),
+        lead_out_frames(lead_in, fps, dry=dry, load_s=loads if reload_s is None else reload_s),
     )
+
+
+def clip_frames(lead_in: LeadIn, fps: float, clip: ClipLayout, *, dry: bool) -> tuple[int, int]:
+    """A session's lead-in and lead-out frames on ``clip``.
+
+    The lead-out holds the longest Passthru reload timed, the only load it holds. Without a dry control the
+    lead-in holds the longest load timed of any program, but no more than ``clip``'s lead-in holds: a load
+    that outlasts it is a :class:`LeadInTimeError` as the session runs, so one slow load on record never
+    sizes every later session past its clip.
+    """
+    lead, tail = session_frames(lead_in, fps, dry=dry, reload_s=loadtimes.longest(program=PASSTHRU))
+    least = lead if dry else lead_in_frames(lead_in, fps, dry=False, load_s=0.0)
+    held = max(min(lead, int(clip.lead)), least)
+    if held < lead:
+        LOG.warning(
+            "the longest load timed needs a %d-frame lead-in and the clip holds %d: a load outlasting "
+            "%d frames will fault the session",
+            lead,
+            held,
+            held,
+        )
+    return held, tail
 
 
 @dataclass(frozen=True)
@@ -264,7 +288,7 @@ def locked_session(
         program,
         takes,
         clip,
-        session_frames(lead_in, fps, dry=dry is not None),
+        clip_frames(lead_in, fps, clip, dry=dry is not None),
     )
     held["lead"] = layout.lead
     plan = np.concatenate([np.zeros(0, PLAN)] + [_shifted(t.plan, o) for t, o in zip(takes, layout.offsets)])

@@ -11,6 +11,7 @@ from syncsummoner.compose import session as SS
 from syncsummoner.compose.timecode import ClipLayout, LayoutError
 from syncsummoner.device import loadtimes, v4l2rec
 from syncsummoner.probe import decoded
+from tests.compose import test_locktake
 from tests.compose.test_locktake import (  # pylint: disable=unused-import
     FPS,
     LEAD_IN,
@@ -93,6 +94,33 @@ def test_a_session_keeps_its_loads_where_a_session_in_another_directory_sizes_by
     assert SS.session_frames(LEAD_IN, FPS, dry=False)[0] == SS.lead_in_frames(
         LEAD_IN, FPS, dry=False, load_s=max(e["load_s"] for e in held)
     )
+
+
+def test_a_clip_holds_a_lead_in_no_longer_than_its_own_and_a_lead_out_for_passthru_alone():
+    """The lead-in holds the longest load, up to the clip's lead-in; the lead-out holds Passthru's reload."""
+    loadtimes.record("Passthru", 0, 1_000_000_000)
+    loadtimes.record("czartroniks/Slow", 0, 100_000_000_000)
+    least = SS.lead_in_frames(LEAD_IN, FPS, dry=False, load_s=0.0)
+    tail = SS.lead_out_frames(LEAD_IN, FPS, dry=False, load_s=1.0)
+    roomy = SS.lead_in_frames(LEAD_IN, FPS, dry=False, load_s=200.0)
+    assert SS.clip_frames(LEAD_IN, FPS, ClipLayout(roomy, 30, 0), dry=False) == (
+        SS.lead_in_frames(LEAD_IN, FPS, dry=False, load_s=100.0),
+        tail,
+    )
+    assert SS.clip_frames(LEAD_IN, FPS, ClipLayout(least + 5, 30, 0), dry=False) == (least + 5, tail)
+    assert SS.clip_frames(LEAD_IN, FPS, ClipLayout(least - 1, 30, 0), dry=False) == (least, tail)
+    dry = SS.session_frames(LEAD_IN, FPS, dry=True)
+    assert SS.clip_frames(LEAD_IN, FPS, ClipLayout(1, 30, 0), dry=True) == dry
+
+
+def test_a_slow_load_on_record_leaves_a_session_on_its_clip(monkeypatch, simulate, tmp_path):
+    """A load longer than the clip's lead-in holds, timed once, does not refuse the sessions after it."""
+    monkeypatch.setattr(
+        test_locktake, "ends_for", lambda dry, _d=None: SS.session_frames(LEAD_IN, FPS, dry=dry, load_s=0.0)
+    )
+    loadtimes.record("czartroniks/Slow", 0, 100_000_000_000)
+    _, _, _, records, found, proofs, _ = run_session(monkeypatch, simulate, tmp_path, dry=None, counts=[30])
+    assert len(records) == 1 and found[0].complete and proofs[0].ok, proofs[0].lines()
 
 
 def run_session(monkeypatch, simulate, tmp_path, *, dry, counts=tuple(COUNTS), plans=None):
