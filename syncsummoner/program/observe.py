@@ -100,12 +100,8 @@ def next_state(cell: Cell, value: Callable[[str], object], q, alg, fire: bool):
     return d
 
 
-#: Bytes of one CUDD node (``DdNode``: index, reference count, next pointer and two children).
-NODE_BYTES = 32
-
-
 class Exhausted(RuntimeError):
-    """A condition outgrew its share of the memory this process may use."""
+    """The BDD manager outgrew the memory its analysis may use."""
 
 
 def memory_limit(
@@ -124,6 +120,18 @@ def memory_limit(
     except (OSError, ValueError):
         pass
     return avail
+
+
+_STATM: dict[int, int] = {}
+
+
+def resident() -> int:
+    """Bytes this process holds in memory now, from ``/proc/self/statm`` kept open per process."""
+    pid = os.getpid()
+    if pid not in _STATM:
+        _STATM.clear()
+        _STATM[pid] = os.open("/proc/self/statm", os.O_RDONLY)
+    return int(os.pread(_STATM[pid], 64, 0).split()[1]) * os.sysconf("SC_PAGE_SIZE")
 
 
 @dataclass
@@ -442,8 +450,8 @@ class Analysis:
         self.circuit = circuit
         self.controls = tuple(controls)
         self.varying = {f"c{k}" for k in varying}
-        nets = len(circuit.gates) + len(circuit.storage) + 1
-        self.nodes = (memory_limit() if limit is None else limit) // (NODE_BYTES * nets)
+        self.limit = memory_limit() if limit is None else limit
+        self.base = resident()
         self.bdd = manager(self.controls)
         self.dom = Domain(self.bdd)
         self.order, looped = circuit.order()
@@ -471,10 +479,14 @@ class Analysis:
         return self.dom.const(b == "1") if b in ("0", "1") else self.dom.top
 
     def check(self, value: Sym) -> Sym:
-        """``value``, unless its conditions outgrow one net's share of memory (:class:`Exhausted`)."""
-        size = sum(c.dag_size for c in value.parts.values())
-        if size > self.nodes:
-            raise Exhausted(f"a condition of {size} BDD nodes exceeds the {self.nodes} each net may hold")
+        """``value``, unless the analysis has grown to ``limit`` bytes (:class:`Exhausted`).
+
+        Conditions share their nodes in one manager, so the memory the process has taken on since the
+        analysis began, not any one condition's size, is what it spends.
+        """
+        used = resident() - self.base
+        if used >= self.limit:
+            raise Exhausted(f"the analysis holds {used} bytes, at least the {self.limit} it may use")
         return value
 
     def gate(self, g: Cell) -> Sym:

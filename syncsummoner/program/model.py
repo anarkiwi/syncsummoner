@@ -145,6 +145,7 @@ class ProgramModel:
         self.method: str | None = None
         #: Bytes the BDDs may use; None for what the process may use when an analysis starts.
         self.memory: int | None = None
+        self._outgrew = False
         self.timings: dict[str, float] = {}
         self._lock = threading.RLock()
         self._recent: OrderedDict[str, hdl.Netlist] = OrderedDict()
@@ -281,8 +282,10 @@ class ProgramModel:
     def _path(self, key: frozenset) -> Path:
         return self.cache / f"observe-{'-'.join(sorted(map(str, key))) or 'tied'}.json"
 
-    def _job(self, key: frozenset) -> tuple:
-        """What one analysis needs, picklable: the circuit, its varying bits, its sources and its file."""
+    def _job(self, key: frozenset, memory: int | None = None) -> tuple:
+        """What one analysis needs, picklable: the circuit, its varying bits, its sources, its file and
+        the bytes it may use (default: :attr:`memory`).
+        """
         circuit = self.circuit
         nets = circuit.controls()
         video = "data_in" if self.source == "rtl" else VIDEO_IN
@@ -291,7 +294,8 @@ class ProgramModel:
         }
         sources[VIDEO] = (None, [b for b, n in circuit.inputs_named().items() if n.startswith(video)])
         varying = sorted(k for p in key for k in (timing_bits() if p == TIMING else field(p).flat))
-        return circuit, varying, sources, self._path(key), self.cache / "observe.exhausted", self.memory
+        budget = self.memory if memory is None else memory
+        return circuit, varying, sources, self._path(key), self.cache / "observe.exhausted", budget
 
     def prepare(self, keys: Iterable[Iterable]) -> None:
         """Build the missing analyses of several freed sets at once, one process per CPU."""
@@ -299,22 +303,32 @@ class ProgramModel:
         if len(todo) < 2 or self._spent():
             return
         start = time.monotonic()
-        jobs = [self._job(k) for k in todo]
+        workers = min(hdl.cpus(), len(todo))
+        jobs = [self._job(k, self._budget() // workers) for k in todo]
         context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=min(hdl.cpus(), len(jobs)), mp_context=context) as pool:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
             list(track(pool.map(_analyse, *zip(*jobs)), total=len(jobs), desc="analyses", unit="set"))
         self.timings["observe"] = self.timings.get("observe", 0.0) + time.monotonic() - start
         self.timings["analyses"] = self.timings.get("analyses", 0) + len(jobs)
 
+    def _budget(self) -> int:
+        """Bytes the BDDs may use now: :attr:`memory`, or what the process may use."""
+        return observe.memory_limit() if self.memory is None else self.memory
+
     def _spent(self) -> bool:
-        """Whether the BDDs do not answer: another method is preferred, or they outgrew memory."""
-        return self.prefer not in (None, "bdd") or (self.cache / "observe.exhausted").exists()
+        """Whether the BDDs do not answer: another method is preferred, or they outgrew a budget at
+        least as large as this one (:func:`outgrown`).
+        """
+        if self.prefer not in (None, "bdd") or self._outgrew:
+            return True
+        return outgrown(self.cache / "observe.exhausted") >= self._budget()
 
     def conditions(self, free: Iterable = ()) -> observe.Conditions | None:
         """Observability conditions over the controls, with those in ``free`` (and ``timing``) varying.
 
         None once this program's BDDs have outgrown memory, so the SAT miter answers, or the ternary
-        simulator where the miter cannot be built (``method``).
+        simulator where the miter cannot be built (``method``); :class:`~.observe.Exhausted` instead
+        when the BDDs alone are to answer.
         """
         key = frozenset(free)
         circuit = self.circuit
@@ -326,9 +340,12 @@ class ProgramModel:
                     _analyse(*self._job(key))
                     self.timings["observe"] = self.timings.get("observe", 0.0) + time.monotonic() - start
                     self.timings["analyses"] = self.timings.get("analyses", 0) + 1
+                    self._outgrew = not path.exists()
                 if path.exists():
                     self._conditions[key] = observe.Conditions.load(path, CONTROL_BITS)
             method = self.method if self.method in ("sat", "ternary") else "bdd"
+            if self._spent() and method == "bdd" and self.prefer == "bdd":
+                raise observe.Exhausted(f"{self.program.name}: the BDDs outgrew {self._budget()} bytes")
             if self._spent() and method == "bdd":
                 method = "ternary" if self.prefer == "ternary" else self._build_exact(circuit)
             if method != self.method:
@@ -694,16 +711,28 @@ def model(
     return chip
 
 
+def outgrown(spent: Path) -> int:
+    """Bytes the BDDs outgrew, from the record :func:`_analyse` leaves; -1 with no such record."""
+    try:
+        return int(json.loads(spent.read_text(encoding="utf-8"))["budget"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return -1
+
+
 def _analyse(
     circuit: observe.Circuit, varying: list, sources: dict, path: Path, spent: Path, memory: int | None
 ) -> None:
-    """One analysis into ``path``, or the reason it outgrew ``memory`` (bytes) into ``spent``."""
+    """One analysis into ``path``, or the budget it outgrew (``memory`` bytes, default what the process
+    may use) and why into ``spent``.
+    """
+    budget = observe.memory_limit() if memory is None else memory
     try:
-        analysis = observe.Analysis(circuit, CONTROL_BITS, LOOSE_BITS, limit=memory, varying=varying)
+        analysis = observe.Analysis(circuit, CONTROL_BITS, LOOSE_BITS, limit=budget, varying=varying)
         found = analysis.observe(sources)
         found.save(path)
     except observe.Exhausted as err:
-        spent.write_text(str(err))
+        if budget > outgrown(spent):
+            spent.write_text(json.dumps({"budget": budget, "reason": str(err)}), encoding="utf-8")
 
 
 def _lanes(ties: Sequence[Mapping[int, int]]) -> np.ndarray:

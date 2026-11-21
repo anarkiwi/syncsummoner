@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from syncsummoner.compose.evidence import LANDED
-from syncsummoner.program import parse_state
+from syncsummoner.program import observe, parse_state
 from syncsummoner.program.model import ProgramModel, model
 from syncsummoner.program.report import rows, table
 
@@ -135,6 +135,29 @@ def test_bdds_beyond_memory_fall_back_to_sat(tiny, tmp_path):
     assert spent.method == "sat" and (spent.cache / "observe.exhausted").exists()
 
 
+def test_an_outgrown_budget_is_retried_only_with_more_memory(tiny, tmp_path):
+    first = ProgramModel(tiny.program, tiny.library, cache=tmp_path / "grow")
+    first.memory = 0
+    first.conditions(())
+    spent = first.cache / "observe.exhausted"
+    assert first.method == "sat" and json.loads(spent.read_text())["budget"] == 0
+    again = ProgramModel(tiny.program, tiny.library, cache=tmp_path / "grow")
+    again.memory = 0
+    assert again.conditions(()) is None and again.method == "sat"
+    more = ProgramModel(tiny.program, tiny.library, cache=tmp_path / "grow")
+    assert more.conditions(()) is not None and more.method == "bdd"
+    spent.write_text("a condition of 9 BDD nodes exceeds the 8 each net may hold")
+    legacy = ProgramModel(tiny.program, tiny.library, cache=tmp_path / "grow")
+    assert legacy.conditions(["timing"]) is not None and legacy.method == "bdd"
+
+
+def test_bdds_alone_raise_once_they_outgrow_memory(tiny, tmp_path):
+    alone = ProgramModel(tiny.program, tiny.library, cache=tmp_path, method="bdd")
+    alone.memory = 0
+    with pytest.raises(observe.Exhausted, match="outgrew 0 bytes"):
+        alone.conditions(())
+
+
 def test_the_ternary_simulator_over_approximates(tiny, tmp_path):
     coarse = ProgramModel(tiny.program, tiny.library, cache=tmp_path, method="ternary")
     found, exact = coarse.live(gates=False), tiny.live(gates=False)
@@ -189,6 +212,21 @@ def test_the_cli_says_when_no_setting_passes(tiny, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out) is None
     assert cli.main(["program", "bypass", "x"]) == 0
     assert "no setting is proven" in capsys.readouterr().out
+
+
+def test_the_cli_surveys_each_programs_analyses(tiny, monkeypatch, capsys, tmp_path):
+    from syncsummoner import cli  # pylint: disable=import-outside-toplevel
+    from syncsummoner.program import Library  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(Library, "default", classmethod(lambda cls: tiny.library))
+    monkeypatch.setattr(tiny.library, "_programs", [tiny.program])
+    monkeypatch.setenv("SYNCSUMMONER_PROGRAM_CACHE", str(tmp_path))
+    monkeypatch.setattr(
+        "syncsummoner.program.predict.build", lambda p, **k: model(p, tiny.library, source="rtl", **k)
+    )
+    assert cli.main(["program", "survey", "all"]) == 0
+    said = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(s["program"], s["outcome"]) for s in said] == [(tiny.program.name, "bdd")]
 
 
 ARCHIVED_BYPASS = (

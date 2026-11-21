@@ -12,6 +12,7 @@ syncsummoner program show czartroniks/Quilt                       # at its decla
 syncsummoner program show Pinwheel --state "Luma Rainbow" --set 11=1023
 syncsummoner program step czartroniks/Quilt 3 512 518 --state 512,512,512,262,512,512,0,0,0,0,0,512
 syncsummoner program cover homegrownvhs/Pigment                  # what makes each parameter live, and the base states that step all
+syncsummoner program survey czartroniks/Ridgeline                # build and time the analyses judging its takes reads
 syncsummoner evidence takes/take-czartroniks_Quilt.mkv --source timecoded.mkv
 ```
 
@@ -154,11 +155,17 @@ for some value of the freed controls with the rest tied. That is one BDD
 restriction per bit. `ProgramModel.revivable` asks the same of a held setting
 of other controls, and the cover search uses it.
 
-**Fallback.** No condition may grow past one net's share of the memory the
-process may use: `MemAvailable` (cut to the cgroup's `memory.max`) over CUDD's
-node size and the net count. `observe.exhausted` in the cache records a program
-that exceeds it, and the SAT miter (`program.sat`) answers it instead, query by
-query, on one incremental CaDiCaL instance (PySAT):
+**Fallback.** An analysis may take on the memory the process may still use
+when it starts: `MemAvailable`, cut to the cgroup's `memory.max`, split evenly
+among analyses run at once. Its bound is the resident memory the process has
+gained since, read from `/proc/self/statm` as each net is evaluated. Conditions
+share their nodes in one CUDD manager, so no one condition's size bounds it.
+`observe.exhausted` in the cache records the budget a program outgrew; a later
+run with a larger budget tries the BDDs again. `program survey NAME... | all
+[--jobs N]` builds every analysis judging a take reads, by BDDs alone, and
+prints one JSON line per program with the seconds and peak memory it took, or
+the budget it outgrew. Past its budget, the SAT miter (`program.sat`) answers
+instead, query by query, on one incremental CaDiCaL instance (PySAT):
 
 - **Miter.** Two copies of the gate-level netlist share every free signal
   (control bit, input bit, storage output) as a pair of variables held equal
