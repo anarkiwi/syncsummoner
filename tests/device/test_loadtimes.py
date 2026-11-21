@@ -24,6 +24,7 @@ def test_loads_are_kept_by_program_and_firmware_and_the_longest_bounds_them():
     LD.record("czartroniks/Quilt", 10, 4_000_000_010, firmware="1.0.2-rc.4")
     LD.record("Passthru", 20, 1_000_000_020, firmware="1.0.1")
     assert LD.longest() == 4.0
+    assert LD.longest(program="Passthru") == 2.5 and LD.longest(program="Teletext") is None
     assert [(e["program"], e["firmware"]) for e in LD.read()] == [
         ("Passthru", "1.0.2-rc.4"),
         ("czartroniks/Quilt", "1.0.2-rc.4"),

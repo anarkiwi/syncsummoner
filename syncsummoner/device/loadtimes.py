@@ -84,9 +84,10 @@ def record(
     return seconds
 
 
-def longest(path: str | Path | None = None) -> float | None:
-    """The longest load on record, any program's and firmware's; None when none is."""
-    loads = [float(e["load_s"]) for e in read(path)]
+def longest(path: str | Path | None = None, *, program: str | None = None) -> float | None:
+    """The longest load on record, of ``program`` if named, else any program's, and any firmware's; None
+    when none is."""
+    loads = [float(e["load_s"]) for e in read(path) if program is None or e.get("program") == program]
     return max(loads) if loads else None
 
 
