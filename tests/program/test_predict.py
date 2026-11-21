@@ -91,3 +91,10 @@ def test_a_survey_builds_every_analysis_a_take_reads(tiny, monkeypatch, tmp_path
         assert (cache / f"observe-{'-'.join(sorted(map(str, [*free, 'timing'])))}.json").exists()
     starved = P.survey(tiny.program, 0, library=tiny.library, source="rtl", cache=tmp_path / "none")
     assert "outgrew" in starved["outcome"] and "seconds" not in starved and starved["peak_bytes"] > 0
+
+
+def test_surveys_run_programs_at_once_each_as_it_finishes(tiny, monkeypatch, tmp_path):
+    monkeypatch.setenv("SYNCSUMMONER_PROGRAM_CACHE", str(tmp_path))
+    first = list(P.surveys([tiny.program], 1, library=tiny.library, source="rtl"))
+    found = list(P.surveys([tiny.program, tiny.program], 2, library=tiny.library, source="rtl"))
+    assert [f["outcome"] for f in first + found] == ["bdd"] * 3

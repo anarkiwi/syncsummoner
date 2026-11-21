@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import multiprocessing
 import resource
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Iterator, Sequence
 
 import numpy as np
@@ -189,18 +188,19 @@ def survey(program, memory: int | None = None, **kwargs) -> dict:
     return out | {"peak_bytes": peak * 1024}
 
 
-def surveys(names: Sequence[str], jobs: int = 1) -> Iterator[dict]:
-    """:func:`survey` of each program in order, ``jobs`` at once in their own processes sharing the
-    memory this one may use.
+def surveys(names: Sequence, jobs: int = 1, **kwargs) -> Iterator[dict]:
+    """:func:`survey` of each program, ``jobs`` at once in their own processes sharing the memory this
+    one may use, each as it finishes; ``kwargs`` go to :func:`~.model.model`.
     """
     jobs = max(1, min(jobs, len(names)))
     memory = observe.memory_limit() // jobs
-    with contextlib.ExitStack() as stack:
-        each = map
-        if jobs > 1:
-            context = multiprocessing.get_context("spawn")
-            each = stack.enter_context(ProcessPoolExecutor(max_workers=jobs, mp_context=context)).map
-        yield from track(each(survey, names, [memory] * len(names)), total=len(names), desc="survey")
+    if jobs == 1:
+        yield from track((survey(n, memory, **kwargs) for n in names), total=len(names), desc="survey")
+        return
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
+        done = as_completed([pool.submit(survey, n, memory, **kwargs) for n in names])
+        yield from track((f.result() for f in done), total=len(names), desc="survey")
 
 
 def add_parser(program_sub) -> None:
