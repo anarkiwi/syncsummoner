@@ -421,7 +421,7 @@ class SimShown:
             out[k] = (t0, t0 + HEARD_NS, frame, 0)
         return out[out["t1_ns"] <= self.sim.now]
 
-    def wait(self, frame, stop=None):  # pylint: disable=unused-argument
+    def wait(self, frame, stop=None, timeout_s=None):  # pylint: disable=unused-argument
         """Advance until the frame is heard shown; one the Pi never plays is never heard."""
         assert frame < self.sim.played, f"waited for frame {frame}, past the {self.sim.played} the Pi plays"
         at = int(np.ceil(T0 + frame * P + HEARD_NS))

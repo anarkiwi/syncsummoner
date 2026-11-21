@@ -198,18 +198,22 @@ class Shown:
                 self._watched.add(stop)
                 threading.Thread(target=wake, daemon=True).start()
 
-    def wait(self, frame: int, stop: threading.Event | None = None) -> int | None:
+    def wait(
+        self, frame: int, stop: threading.Event | None = None, *, timeout_s: float | None = None
+    ) -> int | None:
         """When the host first heard of a frame at or after ``frame``, blocking until it has.
 
-        None once ``stop`` is set or the stream has ended without one.
+        None once ``stop`` is set, the stream has ended without one, or ``timeout_s`` has passed.
         """
         if stop is not None:
             self._watch(stop)
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         with self._cond:
             while (at := bisect.bisect_left(self._frames, frame)) == len(self._frames):
-                if self._ended or (stop is not None and stop.is_set()):
+                left = None if deadline is None else deadline - time.monotonic()
+                if self._ended or (stop is not None and stop.is_set()) or (left is not None and left <= 0):
                     return None
-                self._cond.wait()
+                self._cond.wait(left)
             return self._times[at]
 
     def ask(self) -> None:
