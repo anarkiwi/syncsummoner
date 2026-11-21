@@ -257,6 +257,13 @@ def test_shown_reports_a_frame_only_once_its_whole_record_is_in(feed):
     assert shown.wait(7) == 100 and shown.latest() == 7
 
 
+def test_shown_stops_waiting_for_a_frame_never_heard_once_its_timeout_passes(feed):
+    shown, w, reads = feed
+    os.write(w, record(3))
+    assert reads.get() == po.RECORD.size
+    assert shown.wait(9, timeout_s=0.05) is None and shown.wait(3, timeout_s=0.0) == 100
+
+
 def test_shown_logs_each_distinct_frame_when_first_heard_and_waits_for_one(feed):
     shown, w, _ = feed
     got = []

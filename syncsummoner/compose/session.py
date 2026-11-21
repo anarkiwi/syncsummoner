@@ -49,7 +49,7 @@ from syncsummoner.compose.timecode import ClipLayout, LayoutError
 from syncsummoner.device import loadtimes
 from syncsummoner.device import wire as W
 from syncsummoner.device.profile import PARAM_COUNT, PARAM_MAX, snap_toggles
-from syncsummoner.device.playout import ASKED
+from syncsummoner.device.playout import ASKED, PlayoutError
 from syncsummoner.device.playout import SHOWN as PLAYED
 from syncsummoner.device.wire import Echoes, Poller, Sender, encoder, save_wire
 from syncsummoner.probe.decoded import CALIBRATION_SIZE
@@ -620,6 +620,7 @@ def _run(
     acknowledged before the next goes.
     """
     layout, period = live.layout, 1e9 / float(config.fps)
+    stall = loadtimes.stall_guard(getattr(config, "stall_s", None))
     held["cc_map"], held["shown"] = rig.transport.device.midi.cc_map, shown
     sender.floor = lambda: _session_frame(shown.latest(), layout.lead)
     if dry is None:
@@ -647,15 +648,15 @@ def _run(
     last = layout.lead + layout.count + (0 if dry is None else layout.tail - 1)
     with meter((last - layout.lead) / float(config.fps), desc="session") as progress:
         for k in range(1, len(live.takes)):
-            _roll(live, shown, k, period)
+            _roll(live, shown, k, period, stall)
             progress.to((layout.offsets[k]) / float(config.fps))
-        shown.wait(last)
+        _heard(shown, last, period, stall)
         progress.to((last - layout.lead) / float(config.fps))
     time.sleep(config.tail_s)
     sender.drain(timeout_s=1.0)
     if dry is None:
         _reload_quiet(sender, poller, shell, load)
-        shown.wait(layout.lead + layout.count + layout.tail - 1)
+        _heard(shown, layout.lead + layout.count + layout.tail - 1, period, stall)
         time.sleep(config.tail_s)
 
 
@@ -720,16 +721,28 @@ def _offset(poller: Poller, held: dict, sender: Sender, dry: Any, frames: int, p
                 raise
 
 
-def _roll(live: Live, shown: Any, k: int, period: float) -> None:
+def _heard(shown: Any, frame: int, period: float, stall_s: float) -> int:
+    """When the Pi was heard showing ``frame``, waiting as long as the frames before it take at ``period``
+    nanoseconds a frame, and ``stall_s`` more; a :class:`PlayoutError` once that has passed unheard."""
+    latest = shown.latest()
+    timeout_s = max(frame - max(latest, 0), 0) * period / 1e9 + stall_s
+    heard = shown.wait(frame, timeout_s=timeout_s)
+    if heard is None:
+        raise PlayoutError(
+            f"the Pi was not heard showing frame {frame} within {timeout_s:.1f} s of frame {latest}: "
+            "its player stopped reporting or its stream ended"
+        )
+    return int(heard)
+
+
+def _roll(live: Live, shown: Any, k: int, period: float, stall_s: float) -> None:
     """Roll the recording on to take ``k`` once the Pi is heard showing the frame two before its first.
 
     Both files keep the captures from that report to two frames past the boundary, so the boundary's
     captures are in each whichever card delay holds.
     """
-    boundary = live.layout.lead + int(live.layout.offsets[k])
-    heard = shown.wait(boundary - 2)
-    if heard is not None:
-        live.recorder.roll(live.proc, live.takes[k].out, int(heard), int(heard + 4 * period))
+    heard = _heard(shown, live.layout.lead + int(live.layout.offsets[k]) - 2, period, stall_s)
+    live.recorder.roll(live.proc, live.takes[k].out, heard, int(heard + 4 * period))
 
 
 def _reload_quiet(sender: Sender, poller: Poller, shell: Any, reload: Callable[[str], Any]) -> None:

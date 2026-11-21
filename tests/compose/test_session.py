@@ -123,6 +123,33 @@ def test_a_slow_load_on_record_leaves_a_session_on_its_clip(monkeypatch, simulat
     assert len(records) == 1 and found[0].complete and proofs[0].ok, proofs[0].lines()
 
 
+class Silent:
+    """A Pi heard showing frames up to ``latest``, then nothing more."""
+
+    def __init__(self, latest):
+        self.latest_frame, self.waits = latest, []
+
+    def latest(self):
+        """The last frame heard."""
+        return self.latest_frame
+
+    def wait(self, frame, stop=None, timeout_s=None):  # pylint: disable=unused-argument
+        """A frame heard by now, else nothing however long the wait."""
+        self.waits.append(timeout_s)
+        return 1234 if frame <= self.latest_frame else None
+
+
+def test_a_frame_the_pi_never_reports_faults_the_session_once_its_frames_and_the_stall_guard_pass():
+    """Waiting for the Pi is bounded by the frames left at its rate and the stall guard, then a fault."""
+    shown = Silent(10)
+    assert SS._heard(shown, 10, 1e9 / 30, 2.0) == 1234  # pylint: disable=protected-access
+    with pytest.raises(SS.PlayoutError, match="not heard showing frame 40 within 3.0 s of frame 10"):
+        SS._heard(shown, 40, 1e9 / 30, 2.0)  # pylint: disable=protected-access
+    with pytest.raises(SS.PlayoutError, match="within 2.5 s of frame -1"):
+        SS._heard(Silent(-1), 15, 1e9 / 30, 2.0)  # pylint: disable=protected-access
+    assert shown.waits == [2.0, 3.0]
+
+
 def run_session(monkeypatch, simulate, tmp_path, *, dry, counts=tuple(COUNTS), plans=None):
     """A simulated session of ``counts`` takes, then each take judged from the files it left."""
     info = info_with(dry)
