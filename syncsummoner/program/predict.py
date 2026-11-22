@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import multiprocessing
+import resource
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Iterator, Sequence
+
 import numpy as np
 
 from syncsummoner.progress import track
 
+from . import observe
 from .declared import PARAM_COUNT, field, register_value
-from .model import ProgramModel
+from .library import Library
+from .model import TIMING, ProgramModel
+from .model import model as build
 
 #: Per-write verdicts of :func:`classify`, from no step at all to a step the cone says can show.
 UNSENT, UNCHANGED, DEAD, NOOP, LIVE = "unsent", "unchanged", "dead", "no-op", "live"
@@ -84,13 +94,36 @@ def gating_class(model: ProgramModel, state: np.ndarray, param: int, gated: froz
     A parameter the model found gated by a knob at its reference is queried with every other
     control tied; any other is queried with every knob free, so only the switches tie it.
     """
-    knobs = {d.parameter_id for d in model.params if len(field(d.parameter_id).bits) > 1}
-    tied = [d.parameter_id for d in model.params if d.parameter_id != param]
-    if param not in gated:
-        tied = [q for q in tied if q not in knobs]
+    free = freed(model, param, gated)
+    tied = [d.parameter_id for d in model.params if d.parameter_id not in free]
     held = tuple(int(register_value(model.decl(q), int(state[q - 1]))) for q in tied)
-    free = sorted((set() if param in gated else knobs) | {param})
-    return param, tuple(tied), held, tuple(free)
+    return param, tuple(tied), held, free
+
+
+def freed(model: ProgramModel, param: int, gated: frozenset[int]) -> tuple[int, ...]:
+    """The controls a step of ``param`` is queried with free (:func:`gating_class`)."""
+    knobs = {d.parameter_id for d in model.params if len(field(d.parameter_id).bits) > 1}
+    return tuple(sorted((set() if param in gated else knobs) | {param}))
+
+
+def prepare(model: ProgramModel, timing: int | None = None) -> dict[str, float]:
+    """Every analysis :func:`classify` reads, built ahead of any take; the seconds each stage took.
+
+    Raises :class:`~syncsummoner.program.observe.Exhausted` where a model answering by BDDs alone
+    outgrows its memory.
+    """
+    spent = {}
+    start = time.monotonic()
+    gated = knob_gated(model)
+    spent["gating"] = time.monotonic() - start
+    sets = {freed(model, d.parameter_id, gated) for d in model.params}
+    extra = [] if timing is not None else [TIMING]
+    start = time.monotonic()
+    model.prepare([*s, *extra] for s in sets)
+    for s in track(sorted(sets), desc=f"{model.program.name} gating classes", unit="set"):
+        model.conditions([*s, *extra])
+    spent["classes"] = time.monotonic() - start
+    return spent
 
 
 def knob_gated(model: ProgramModel, reference: np.ndarray | None = None) -> frozenset[int]:
@@ -137,3 +170,51 @@ def classify(
         changed = int(register_value(decl, int(a[i]))) ^ int(register_value(decl, int(b[i])))
         out[i] = LIVE if changed & mask else NOOP
     return out
+
+
+def survey(program, memory: int | None = None, **kwargs) -> dict:
+    """Build the analyses :func:`classify` reads for one program (as :func:`~.model.model` takes it)
+    by BDDs alone, within ``memory`` bytes (default: what the process may use): the seconds each stage
+    took, or why they outgrew it.
+    """
+    found = build(program, method="bdd", **kwargs)
+    found.memory = memory
+    out = {"program": found.program.name, "source": found.source}
+    try:
+        out |= {"seconds": prepare(found), "outcome": "bdd"}
+    except observe.Exhausted as err:
+        out |= {"outcome": str(err)}
+    peak = max(resource.getrusage(w).ru_maxrss for w in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN))
+    return out | {"peak_bytes": peak * 1024}
+
+
+def surveys(names: Sequence, jobs: int = 1, **kwargs) -> Iterator[dict]:
+    """:func:`survey` of each program, ``jobs`` at once in their own processes sharing the memory this
+    one may use, each as it finishes; ``kwargs`` go to :func:`~.model.model`.
+    """
+    jobs = max(1, min(jobs, len(names)))
+    memory = observe.memory_limit() // jobs
+    if jobs == 1:
+        yield from track((survey(n, memory, **kwargs) for n in names), total=len(names), desc="survey")
+        return
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
+        done = as_completed([pool.submit(survey, n, memory, **kwargs) for n in names])
+        yield from track((f.result() for f in done), total=len(names), desc="survey")
+
+
+def add_parser(program_sub) -> None:
+    """The ``program survey`` command."""
+    found = program_sub.add_parser(
+        "survey", help="build and time the BDD analyses judging a take reads, or say why they outgrow memory"
+    )
+    found.add_argument("names", nargs="+", help="device names or program ids, or all")
+    found.add_argument("--jobs", type=int, default=1, help="programs at once, sharing the memory")
+    found.set_defaults(func=_survey_cmd)
+
+
+def _survey_cmd(args) -> int:
+    names = [p.name for p in Library.default().programs] if args.names == ["all"] else args.names
+    for row in surveys(names, args.jobs):
+        print(json.dumps(row), flush=True)
+    return 0

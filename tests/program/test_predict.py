@@ -78,3 +78,23 @@ def test_a_crossfader_bypass_is_a_regime_bit_of_its_own(mixer):
     code, own = P.regimes(mixer, mixer.initial(), rows, 7)
     assert own == {7: 1, 12: 2}
     assert code.tolist() == [0, 1, 3, 3, 1, 0, 0]
+
+
+def test_a_survey_builds_every_analysis_a_take_reads(tiny, monkeypatch, tmp_path):
+    monkeypatch.setenv("SYNCSUMMONER_PROGRAM_CACHE", str(tmp_path))
+    done = P.survey(tiny.program, library=tiny.library, source="rtl")
+    assert done["outcome"] == "bdd" and set(done["seconds"]) == {"gating", "classes"}
+    cache = next(tmp_path.glob("*/rtl-hd_hdmi"))
+    gated = P.knob_gated(tiny)
+    for d in tiny.params:
+        free = P.freed(tiny, d.parameter_id, gated)
+        assert (cache / f"observe-{'-'.join(sorted(map(str, [*free, 'timing'])))}.json").exists()
+    starved = P.survey(tiny.program, 0, library=tiny.library, source="rtl", cache=tmp_path / "none")
+    assert "outgrew" in starved["outcome"] and "seconds" not in starved and starved["peak_bytes"] > 0
+
+
+def test_surveys_run_programs_at_once_each_as_it_finishes(tiny, monkeypatch, tmp_path):
+    monkeypatch.setenv("SYNCSUMMONER_PROGRAM_CACHE", str(tmp_path))
+    first = list(P.surveys([tiny.program], 1, library=tiny.library, source="rtl"))
+    found = list(P.surveys([tiny.program, tiny.program], 2, library=tiny.library, source="rtl"))
+    assert [f["outcome"] for f in first + found] == ["bdd"] * 3

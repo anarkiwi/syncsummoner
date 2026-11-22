@@ -146,6 +146,7 @@ def test_conditions_survive_a_round_trip(tmp_path):
 def test_bdds_beyond_the_memory_limit_are_refused(tmp_path):
     with pytest.raises(observe.Exhausted):
         observe.Analysis(observe.Circuit.read(ALIAS, "top"), CONTROL_BITS, limit=0).observe(sources(ALIAS))
+    assert observe.resident() > 0
     (tmp_path / "meminfo").write_text("MemTotal: 100 kB\nMemAvailable: 64 kB\n")
     (tmp_path / "max").write_text("32768\n")
     assert observe.memory_limit(tmp_path / "meminfo", tmp_path / "max") == 32768
@@ -211,3 +212,18 @@ PAGED = design(
 def test_a_page_select_matters_only_while_the_paged_control_varies():
     assert not conditions(PAGED).live(f"c{S}", {G: 0}) and not conditions(PAGED).live(f"c{S}", {G: 1})
     assert conditions(PAGED, varying=[G]).live(f"c{S}", {})
+
+
+def test_the_memory_an_analysis_takes_on_bounds_it_not_one_conditions_size(monkeypatch):
+    circuit = observe.Circuit.read(ALIAS, "top")
+    held = {"bytes": 0}
+    monkeypatch.setattr(observe, "resident", lambda: held["bytes"])
+    early = observe.Analysis(circuit, CONTROL_BITS, limit=2)
+    held["bytes"] = 1
+    found = early.observe(sources(ALIAS))
+    assert found.observed, "any condition fits while the process has taken on less than the limit"
+    held["bytes"] = 1
+    late = observe.Analysis(circuit, CONTROL_BITS, limit=2)
+    held["bytes"] = 3
+    with pytest.raises(observe.Exhausted, match="2 bytes"):
+        late.observe(sources(ALIAS))
