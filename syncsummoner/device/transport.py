@@ -62,6 +62,11 @@ def _vector(payload: Any, keys: Sequence[str]) -> np.ndarray | None:
     return None
 
 
+def qualified(name: str) -> str:
+    """``author/Name`` for a program name, the device's default author standing for a bare ``Name``."""
+    return name if "/" in name else f"{DEFAULT_AUTHOR}/{name}"
+
+
 class HeldLinkError(RuntimeError):
     """A liveness wait ran while the source link was held down, which no device state can outlast."""
 
