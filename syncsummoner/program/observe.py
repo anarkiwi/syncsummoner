@@ -13,8 +13,8 @@ import itertools
 import os
 import re
 import threading
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -218,6 +218,40 @@ class Circuit:
                     ready.append(j)
         looped = sorted(set(range(len(self.gates))) - set(order))
         return [self.gates[i] for i in order], [self.gates[i] for i in looped]
+
+    def variables(self) -> list[str]:
+        """Controls ``c<flat bit>`` and storage outputs ``r<net>`` in the order a depth-first walk of the
+        fan-in from the outputs first meets them, the deeper input of each gate first.
+
+        Each storage output met queues its next-state inputs as a further root, so the operands of an
+        adder, a comparator or a register's update sit side by side.
+        """
+        ctl = {n: k for k, n in self.controls().items()}
+        storage = {s.outs["Q"][0]: s for s in self.storage}
+        gates, looped = self.order()
+        driver = {b: c for c in (*gates, *looped, *self.boxes) for bits in c.outs.values() for b in bits}
+        depth: dict = {}
+        for g in gates:
+            ins = [b for bits in g.ins.values() for b in bits]
+            depth[next(iter(g.outs.values()))[0]] = 1 + max((depth.get(b, 0) for b in ins), default=0)
+        roots = deque(b for bits in self.outputs.values() for b in bits)
+        seen, out = set(), []
+        while roots:
+            stack = [roots.popleft()]
+            while stack:
+                n = stack.pop()
+                if n in seen or not isinstance(n, int):
+                    continue
+                seen.add(n)
+                if n in ctl:
+                    out.append(f"c{ctl[n]}")
+                elif n in storage:
+                    out.append(f"r{n}")
+                    roots.extend(b for p, bits in storage[n].ins.items() if p != "C" for b in bits)
+                elif n in driver:
+                    ins = [b for bits in driver[n].ins.values() for b in bits]
+                    stack.extend(sorted(ins, key=lambda b: depth.get(b, 0)))
+        return out
 
 
 def manager(controls: Iterable[int]) -> cudd.BDD:
@@ -437,6 +471,20 @@ class Domain:
         return self.combine(_mux, s, b, a)
 
 
+@dataclass
+class Form:
+    """Where one value can differ: ``base``, or where a net in ``weights`` differs within its weight, or
+    where a register variable in ``regs`` that ``value`` reads does; ``seen`` is what was last read of each.
+    """
+
+    base: cudd.Function
+    weights: dict[int, cudd.Function]
+    regs: list[str]
+    value: Sym
+    key: tuple
+    seen: dict = field(default_factory=dict)
+
+
 class Analysis:
     """Symbolic evaluation of one circuit over ``controls``; ``loose`` bits are free, the rest 0.
 
@@ -457,6 +505,7 @@ class Analysis:
         self.limit = memory_limit() if limit is None else limit
         self.base = resident()
         self.bdd = manager(self.controls)
+        self._arrange(circuit.variables())
         self.dom = Domain(self.bdd)
         self.order, looped = circuit.order()
         self.boxes = [*circuit.boxes, *looped]
@@ -464,6 +513,11 @@ class Analysis:
         self.value: dict[int, Sym] = {}
         self.sens: dict[int, dict[int, cudd.Function]] = {}
         self.settled: dict[int, cudd.Function] = {}
+        self._reads: dict[tuple, cudd.Function] = {}
+        self._supports: dict[tuple, set[str]] = {}
+        self._still: dict[tuple, Form] = {}
+        self._transfers: dict[int, tuple[dict, cudd.Function]] = {}
+        self._read: dict[str, list[Cell]] | None = None
         self.registers: set[str] = set()
         loose = set(loose)
         for k, net in circuit.controls().items():
@@ -475,6 +529,18 @@ class Analysis:
         nets = set(circuit.inputs_named()) | {n for k, n in circuit.controls().items() if k in loose}
         for b in sorted(nets | {b for b in held if isinstance(b, int)}):
             self.value[b] = self.dom.leaf(b)
+
+    def _arrange(self, ranked: Sequence[str]) -> None:
+        """Declare every register variable ``ranked`` names and fix the variables in its order, the
+        controls it never meets after them as declared.
+        """
+        known = set(self.bdd.vars)
+        ranked = [v for v in ranked if v in known or v.startswith("r")]
+        self.bdd.declare(*(v for v in ranked if v not in known))
+        placed = set(ranked)
+        rest = sorted((v for v in self.bdd.vars if v not in placed), key=self.bdd.level_of_var)
+        cudd.reorder(self.bdd, {v: i for i, v in enumerate([*ranked, *rest])})
+        self.bdd.configure(reordering=False)
 
     def pin(self, b) -> Sym:
         """Value of a connection bit; undefined bits may be anything."""
@@ -639,52 +705,66 @@ class Analysis:
                         out[b].append(cell)
         return out
 
-    def _cofactors(self, v: Sym, var: str | None) -> tuple[Sym, Sym]:
-        if var is None:
-            return v, v
-        false = self.bdd.false
-        return tuple(
-            Sym(self.dom, {k: u for k, c in v.parts.items() if (u := self.bdd.let({var: b}, c)) != false})
-            for b in (False, True)
-        )
-
-    def _differs(self, pair: tuple[Sym, Sym], diff: Mapping, sens: Mapping) -> cudd.Function:
-        """Where a value can differ: its two cofactors take different leaves, or one leaf that differs.
-
-        A literal differs where its net does; a leaf of any function differs where an input it is
-        sensitised to (``sens``) does.
+    def _form(self, v: Sym, var: str | None, sens: Mapping, key: tuple) -> "Form":
+        """Where ``v`` can differ, as a :class:`Form`: its two cofactors on ``var`` taking different leaves,
+        or one leaf that differs. A literal differs where its net does; a leaf of any function where an
+        input it is sensitised to (``sens``) does; any leaf where a register variable it reads does.
         """
+        if key not in self._supports:
+            self._supports[key] = self._support(v)
+        support = self._supports[key]
+        if var not in support:
+            if key in self._still:
+                return replace(self._still[key], seen={})
+            var = None
         false = self.bdd.false
-        anyin = false
-        for b, c in sens.items():
-            if b in diff:
-                anyin |= diff[b] & c
-        out = false
-        for (a, ca), (b, cb) in itertools.product(pair[0].parts.items(), pair[1].parts.items()):
-            c = ca & cb
+        weights, anyfn = {}, false
+        for a, part in v.parts.items():
+            c = part if var is None else self.bdd.forall({var}, part)
             if c == false:
                 continue
-            if a != b:
-                out |= c
-            elif isinstance(a, int):
-                out |= c & diff.get(abs(a), false)
+            if isinstance(a, int):
+                weights[abs(a)] = weights.get(abs(a), false) | c
             elif a == ANY:
-                out |= c & anyin
+                anyfn |= c
+        if anyfn != false:
+            for b, c in sens.items():
+                if (w := anyfn & c) != false:
+                    weights[b] = weights.get(b, false) | w
+        if var is None:
+            self._still[key] = Form(false, weights, sorted(support & self.registers), v, key)
+            return replace(self._still[key], seen={})
+        return Form(self._apart(v, var), weights, sorted(support & self.registers), v, key)
+
+    def _grown(self, form: "Form", diff: Mapping, moved: Mapping) -> cudd.Function:
+        """The terms of ``form`` whose net or register variable has come to differ in more places since
+        it was last read. Where a register variable changes a value depends on neither, so it is found
+        once per value.
+        """
+        out = form.base if not form.seen else self.bdd.false
+        form.seen.setdefault(None, True)
+        for x, w in form.weights.items():
+            if x in diff and (x not in form.seen or form.seen[x] != diff[x]):
+                out |= w & self._since(form.seen, x, diff[x])
+        for r in form.regs:
+            if r in moved and (r not in form.seen or form.seen[r] != moved[r]):
+                if (form.key, r) not in self._reads:
+                    self._reads[(form.key, r)] = self._apart(form.value, r)
+                out |= self._reads[(form.key, r)] & self._since(form.seen, r, moved[r])
         return out
 
-    def _pairs(self, v: Sym, var: str | None) -> tuple:
-        """Cofactors of ``v`` on ``var``, and on each register variable it depends on."""
-        regs = {r: self._cofactors(v, r) for r in self._support(v) & self.registers}
-        return self._cofactors(v, var), regs
+    def _since(self, seen: dict, x, now: cudd.Function) -> cudd.Function:
+        """What ``now`` holds beyond what ``seen`` last held of ``x``, which becomes ``now``."""
+        grown = now & ~seen[x] if x in seen else now
+        seen[x] = now
+        return grown
 
-    def _changes(self, pairs: tuple, diff: Mapping, sens: Mapping, moved: Mapping) -> cudd.Function:
-        """Where a value can differ, from ``var`` and from every register variable that does."""
-        pair, regs = pairs
-        d = self._differs(pair, diff, sens)
-        for r, rpair in regs.items():
-            if r in moved:
-                d |= moved[r] & self._differs(rpair, {}, {})
-        return d
+    def _apart(self, v: Sym, var: str) -> cudd.Function:
+        """Where flipping ``var`` moves ``v`` to another leaf."""
+        out = self.bdd.false
+        for part in v.parts.values():
+            out |= self.bdd.apply("xor", self.bdd.let({var: False}, part), self.bdd.let({var: True}, part))
+        return out
 
     def _support(self, v: Sym) -> set[str]:
         out: set[str] = set()
@@ -692,8 +772,11 @@ class Analysis:
             out |= self.bdd.support(c)
         return out
 
-    def _change(self, cell: Cell, var: str | None, diff: dict, moved: dict, pairs: dict) -> cudd.Function:
-        """Where one cell's output can change, given what its inputs and register variables do."""
+    def _change(self, cell: Cell, var: str | None, diff: dict, moved: dict, forms: dict) -> cudd.Function:
+        """Where one cell's output, or a storage bit's next state, has come to differ since it was last
+        read, given what its inputs and register variables do. A storage bit's own value takes part only
+        with a source (``var``), as no other difference moves it within the cycle.
+        """
         key = id(cell)
         outs = [b for bits in cell.outs.values() for b in bits if isinstance(b, int)]
         if key in self.boxed:
@@ -702,19 +785,20 @@ class Analysis:
                 for b in bits:
                     d |= diff.get(b, self.bdd.false)
             return d
-        if key not in pairs:
-            step = self.next_state(cell) if cell.code else None
-            pairs[key] = (self._pairs(self.value[outs[0]], var), step and self._pairs(step, var))
         if key not in self.sens:
             self.sens[key] = self.sensitised(cell)
-        (here, step), sens = pairs[key], self.sens[key]
-        d = self._changes(here, diff, sens, moved)
+        if key not in forms:
+            step = self.next_state(cell) if cell.code else None
+            here = None if step is not None and var is None else self.value[outs[0]]
+            forms[key] = (
+                here and self._form(here, var, self.sens[key], (key, False)),
+                step and self._form(step, var, self.sens[key], (key, True)),
+            )
+        here, step = forms[key]
+        d = self._grown(here, diff, moved) if here is not None else self.bdd.false
         if step is not None:
-            q = outs[0]
-            d |= ~self.settled.get(q, self.bdd.false) & self._changes(step, diff, sens, moved)
+            d |= ~self.settled.get(outs[0], self.bdd.false) & self._grown(step, diff, moved)
             d = self._held(d)
-            if f"r{q}" in self.registers:
-                moved[f"r{q}"] = d | moved.get(f"r{q}", self.bdd.false)
         return d
 
     def _held(self, d: cudd.Function) -> cudd.Function:
@@ -724,24 +808,35 @@ class Analysis:
         gone = (self.varying | self.registers) & self.bdd.support(d)
         return self.bdd.exist(gone, d) if gone else d
 
-    def difference(self, nets: Iterable[int], var: str | None, readers: Mapping) -> cudd.Function:
-        """Where flipping ``var`` (or changing the ``nets``, when ``var`` is None) can change an output.
-
-        Forward from the nets to a fixpoint through storage and boxes. A free register differs where its
-        next state does, and a value differs where a register variable it depends on does.
+    def _cycle(
+        self,
+        diff: dict,
+        moved: dict,
+        var: str | None,
+        readers: Mapping,
+        cells: Iterable[Cell] = (),
+    ) -> tuple[dict, cudd.Function]:
+        """Forward within one cycle from the differences ``diff`` (by net) and ``moved`` (by register
+        variable), and from ``cells``, through gates and boxes: where each storage bit it reaches can come
+        to differ, over the held controls, and where an output can, register variables quantified out.
         """
         rank = {id(g): i for i, g in enumerate(self.order)}
         false = self.bdd.false
-        diff: dict[int, cudd.Function] = {n: self.bdd.true for n in nets}
-        moved: dict[str, cudd.Function] = {}
-        pairs: dict[int, tuple] = {}
-        heap = [(rank.get(id(c), -1), id(c), c) for n in diff for c in readers.get(n, ())]
+        forms: dict[int, tuple] = {}
+        reach: dict[int, cudd.Function] = {}
+        start = [*diff, *(int(r[1:]) for r in moved)]
+        heap = [(rank.get(id(c), -1), id(c), c) for n in start for c in readers.get(n, ())]
+        heap += [(rank.get(id(c), -1), id(c), c) for c in cells]
         heapq.heapify(heap)
         queued = {key for _, key, _ in heap}
         while heap:
             _, key, cell = heapq.heappop(heap)
             queued.discard(key)
-            d = self._change(cell, var, diff, moved, pairs)
+            d = self._change(cell, var, diff, moved, forms)
+            if cell.code:
+                q = cell.outs["Q"][0]
+                reach[q] = reach.get(q, false) | d
+                continue
             for o in (b for bits in cell.outs.values() for b in bits if isinstance(b, int)):
                 old = diff.get(o, false)
                 if (old | d) == old:
@@ -756,7 +851,57 @@ class Analysis:
             for b in bits:
                 if isinstance(b, int):
                     out |= diff.get(b, false)
-        return self.bdd.exist(self.registers, out) if self.registers else out
+        return {q: u for q, u in reach.items() if u != false}, (
+            self.bdd.exist(self.registers, out) if self.registers else out
+        )
+
+    def _reading(self, var: str) -> list[Cell]:
+        """Every gate and storage bit whose value or next state reads the variable ``var``."""
+        if self._read is None:
+            self._read = {}
+            for cell in (*self.order, *self.circuit.storage):
+                v = self.value[next(iter(cell.outs.values()))[0]]
+                found = self._support(v) | (self._support(self.next_state(cell)) if cell.code else set())
+                for name in found:
+                    self._read.setdefault(name, []).append(cell)
+        return self._read.get(var, [])
+
+    def _transfer(self, q: int, readers: Mapping) -> tuple[dict, cudd.Function]:
+        """Where a difference held in storage bit ``q`` carries, within the cycle that reads it, into each
+        storage bit's next state and to an output (:meth:`_cycle`); found once per analysis, for every
+        source alike.
+        """
+        if q not in self._transfers:
+            moved = {f"r{q}": self.bdd.true} if f"r{q}" in self.registers else {}
+            self._transfers[q] = self._cycle({q: self.bdd.true}, moved, None, readers)
+        return self._transfers[q]
+
+    def difference(self, nets: Iterable[int], var: str | None, readers: Mapping) -> cudd.Function:
+        """Where flipping ``var`` (or changing the ``nets``, when ``var`` is None) can change an output.
+
+        A difference a storage bit holds is a condition over the held controls alone, so it carries on
+        by each bit's :meth:`_transfer`, to a least fixpoint over the storage bits, and on to the outputs.
+        """
+        cells = self._reading(var) if var is not None else ()
+        held, out = self._cycle({n: self.bdd.true for n in nets}, {}, var, readers, cells)
+        sent: dict[int, cudd.Function] = {}
+        todo = deque(held)
+        queued = set(held)
+        while todo:
+            p = todo.popleft()
+            queued.discard(p)
+            fresh = self._since(sent, p, held[p])
+            for q, t in self._transfer(p, readers)[0].items():
+                old = held.get(q, self.bdd.false)
+                new = old | (t & fresh)
+                if new != old:
+                    held[q] = new
+                    if q not in queued:
+                        queued.add(q)
+                        todo.append(q)
+        for p, u in held.items():
+            out |= self._transfer(p, readers)[1] & u
+        return out
 
     def observe(self, sources: Mapping[str, tuple[str | None, list[int]]]) -> Conditions:
         """Each named source's observability condition, carried into a manager over the controls.
