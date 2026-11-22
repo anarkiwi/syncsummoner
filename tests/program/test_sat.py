@@ -12,7 +12,7 @@ from syncsummoner.program import gates, observe, sat
 from syncsummoner.program.declared import field
 from syncsummoner.program.gates import Gating, Status, cover
 from syncsummoner.program.model import CONTROL_BITS, ProgramModel
-from tests.program.test_observe import ALIAS, PAGED, RECONVERGE, SEQUENTIAL, cell, design
+from tests.program.test_observe import ALIAS, PAGED, RECONVERGE, SEQUENTIAL, TOGGLE, cell, design
 
 S, B, G, M, E, K = (field(p).flat[0] for p in (7, 8, 9, 10, 11, 12))
 
@@ -46,7 +46,9 @@ def every(bits):
 
 
 @pytest.mark.parametrize(
-    "d", [ALIAS, SEQUENTIAL, RECONVERGE, PAGED, CELLS], ids=["alias", "seq", "rec", "paged", "cells"]
+    "d",
+    [ALIAS, SEQUENTIAL, RECONVERGE, PAGED, TOGGLE, CELLS],
+    ids=["alias", "seq", "rec", "paged", "toggle", "cells"],
 )
 def test_the_miter_equals_the_conditions_on_every_tie_set(d):
     circuit = observe.Circuit.read(d, "top")

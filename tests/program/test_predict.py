@@ -5,6 +5,7 @@
 import numpy as np
 
 from syncsummoner.compose.evidence import LANDED
+from syncsummoner.program import observe
 from syncsummoner.program import predict as P
 from syncsummoner.program.model import ProgramModel
 
@@ -116,7 +117,8 @@ def test_a_survey_builds_every_analysis_a_take_reads(tiny, monkeypatch, tmp_path
     gated = P.knob_gated(tiny)
     for d in tiny.params:
         free = P.freed(tiny, d.parameter_id, gated)
-        assert (cache / f"observe-{'-'.join(sorted(map(str, [*free, 'timing'])))}.json").exists()
+        key = "-".join(sorted(map(str, [*free, "timing"])))
+        assert (cache / f"observe-v{observe.RULES}-{key}.json").exists()
     starved = P.survey(tiny.program, 0, library=tiny.library, source="rtl", cache=tmp_path / "none")
     assert "outgrew" in starved["outcome"] and "seconds" not in starved and starved["peak_bytes"] > 0
 

@@ -214,6 +214,28 @@ def test_a_page_select_matters_only_while_the_paged_control_varies():
     assert conditions(PAGED, varying=[G]).live(f"c{S}", {})
 
 
+#: A toggle gates a control into a register, and that register is read while the toggle has moved on.
+TOGGLE = design(
+    [
+        cell("$_NOT_", A=20, Y=21),
+        cell("$_DFF_P_", C=1, D=21, Q=20),
+        cell("$_AND_", A=2, B=20, Y=22),
+        cell("$_DFF_P_", C=1, D=22, Q=23),
+        cell("$_AND_", A=23, B=21, Y=24),
+    ],
+    {S: 2},
+    data=[1],
+    outputs=[24],
+)
+
+
+def test_a_registered_difference_outlives_the_register_values_that_made_it():
+    a = analysis(TOGGLE)
+    a.evaluate()
+    assert {"r20", "r23"} <= a.registers, "both registers are variables"
+    assert conditions(TOGGLE, varying=[S]).live(f"c{S}", {}), "the output is the control a cycle after r20"
+
+
 def test_the_memory_an_analysis_takes_on_bounds_it_not_one_conditions_size(monkeypatch):
     circuit = observe.Circuit.read(ALIAS, "top")
     held = {"bytes": 0}

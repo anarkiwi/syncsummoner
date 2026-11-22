@@ -100,6 +100,10 @@ def next_state(cell: Cell, value: Callable[[str], object], q, alg, fire: bool):
     return d
 
 
+#: Revision of the liveness rules; what was cached under another is not read.
+RULES = 2
+
+
 class Exhausted(RuntimeError):
     """The BDD manager outgrew the memory its analysis may use."""
 
@@ -708,9 +712,17 @@ class Analysis:
         if step is not None:
             q = outs[0]
             d |= ~self.settled.get(q, self.bdd.false) & self._changes(step, diff, sens, moved)
+            d = self._held(d)
             if f"r{q}" in self.registers:
                 moved[f"r{q}"] = d | moved.get(f"r{q}", self.bdd.false)
         return d
+
+    def _held(self, d: cudd.Function) -> cudd.Function:
+        """``d`` over the held controls alone: a difference a storage bit takes on outlives the cycle that
+        made it, while the varying controls move and every register, its variable included, steps on.
+        """
+        gone = (self.varying | self.registers) & self.bdd.support(d)
+        return self.bdd.exist(gone, d) if gone else d
 
     def difference(self, nets: Iterable[int], var: str | None, readers: Mapping) -> cudd.Function:
         """Where flipping ``var`` (or changing the ``nets``, when ``var`` is None) can change an output.
