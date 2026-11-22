@@ -207,15 +207,15 @@ def screen(
     ``full`` and ``space`` are the planes' range and matrix
     (:func:`~syncsummoner.probe.decoded.calibration_colour`) and ``swap`` exchanges the chroma pair,
     as a take that came back exchanged is spliced. The calibration size is an area scaling, which keeps
-    every share of the screen the tests count, and is under :func:`~syncsummoner.aesthetics.flash_risk`'s
-    own, so the tests see what they would at full size.
+    every flashing region larger than its pixels, and is under :func:`~syncsummoner.aesthetics.flash_risk`'s
+    own, so the tests see what they would at that size.
     """
     order = np.array([0, 2, 1] if swap else [0, 1, 2])
     chunks = (
         to_rgb(colour[shown[i : i + decoded.CHUNK]][:, order], full=full, space=space)
         for i in range(0, shown.size, decoded.CHUNK)
     )
-    return aesthetics.series_risk(*aesthetics.flash_series(chunks), fps=fps)
+    return aesthetics.series_risk(*aesthetics.flash_series(chunks, fps=fps), fps=fps)
 
 
 def flashing(
@@ -272,7 +272,7 @@ def gate(path: str | Path, *, strip_px: int = 0, ffmpeg: str = "ffmpeg") -> aest
             with meter(duration, desc=f"screening {Path(path).name}") as progress:
                 pictures = _pictures(proc.stdout, (3, height, width), lambda n: progress.to(n / rate))
                 found = (to_rgb(frames, full=full, space=space) for frames in pictures)
-                risk = aesthetics.series_risk(*aesthetics.flash_series(found), fps=rate)
+                risk = aesthetics.series_risk(*aesthetics.flash_series(found, fps=rate), fps=rate)
             said = proc.stderr.read()
         except BaseException:
             proc.kill()

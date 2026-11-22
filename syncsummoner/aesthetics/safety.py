@@ -1,7 +1,9 @@
 """Hard safety constraints on rendered output.
 
-Vetoes, not scores. The general and red flash tests of ITU-R BT.1702 and WCAG 2.3.1 as EA's IRIS reads
-them, in relative luminance, which stands in for cd/m^2 without a display characterisation.
+Vetoes, not scores. The general and red flash tests of ITU-R BT.1702 and WCAG 2.3.1, in relative luminance,
+which stands in for cd/m^2 without a display characterisation. EA's IRIS tracks transitions of the screen
+mean; here its tracking runs on each pixel, so a flash's area is the area that itself undergoes the
+opposing changes, the standards' "combined area of flashes occurring concurrently".
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ SRGB_KNEE = 0.04045
 LUMINANCE_DELTA, DARK_MAX = 0.1, 0.8
 #: A red flash's least change in ``RED_GAIN * (R - G - B)`` of saturated red, red share ``RED_FRACTION``.
 RED_DELTA, RED_GAIN, RED_FRACTION = 20.0, 320.0, 0.8
-#: More flashes than this in any one second fail, over at least this share of the screen (BT.1702).
+#: More flashes than this in any one second fail, over more than this share of the screen (BT.1702).
 RATE_LIMIT, AREA_LIMIT = 3.0, 0.25
 
 
@@ -77,83 +79,125 @@ def _downsample(frames: np.ndarray, max_side: int) -> np.ndarray:
     return np.stack(small).astype(np.float32)
 
 
+def _same_sign(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Where ``a`` and ``b`` are both at most or both at least zero, as IRIS's ``SameSign``."""
+    return ((a <= 0) & (b <= 0)) | ((a >= 0) & (b >= 0))
+
+
+class _Tracker:
+    """Flash transitions of a plane stream, the transition tracking of EA's IRIS run on each pixel.
+
+    Each pixel's same-signed changes accumulate over at most ``window`` frames, sign resets the run, and the
+    run completes one transition of that pixel when it first reaches ``delta`` with its darker end below
+    ``dark_max``. The screen completes a transition in one direction where the pixels completing one in that
+    direction at once are more than ``area`` of it, the combined area of concurrent flashes, and its
+    transitions alternate in direction, a flash being a pair of opposing ones.
+    """
+
+    def __init__(self, *, window: int, delta: float, dark_max: float, area: float) -> None:
+        self.window, self.delta, self.dark_max, self.area = window, delta, dark_max, area
+        self.frame, self.side = 0, 0
+        self.prev = self.ring = np.zeros(0)
+
+    def _start(self, plane: np.ndarray) -> None:
+        self.prev = plane
+        self.ring = np.zeros((plane.size, self.window), dtype=np.float32)
+
+    def _step(self, plane: np.ndarray) -> tuple[bool, float]:
+        step = plane - self.prev
+        before = self.ring.sum(axis=1)
+        onward = _same_sign(before, step)
+        self.ring[~onward] = 0.0
+        self.ring[:, self.frame % self.window] = step
+        total = self.ring.sum(axis=1)
+        held = _same_sign(before, total) & (np.abs(before) >= self.delta)
+        hit = ~held & (np.abs(total) >= self.delta) & (plane - np.maximum(total, 0.0) < self.dark_max)
+        shares = (float(np.mean(hit & (total > 0))), float(np.mean(hit & (total < 0))))
+        self.prev = plane
+        ready = [(a, side) for a, side in zip(shares, (1, -1)) if a > self.area and side != self.side]
+        if ready:
+            share, self.side = max(ready)
+            return True, share
+        return False, max(shares)
+
+    def feed(self, planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Which of ``planes``, ``(n, H, W)``, complete a transition of the screen, and the largest share of
+        the screen completing one in a direction at each; the stream's first frame completes none."""
+        flat = np.asarray(planes, dtype=np.float32).reshape(planes.shape[0], -1)
+        events, shares = np.zeros(flat.shape[0], dtype=bool), np.zeros(flat.shape[0], dtype=np.float32)
+        for i, plane in enumerate(flat):
+            if self.frame == 0:
+                self._start(plane)
+            else:
+                events[i], shares[i] = self._step(plane)
+            self.frame += 1
+        return events, shares
+
+
 @dataclass(frozen=True)
 class FlashSeries:
-    """One flash quantity over a clip: each frame's screen mean, and the share of the screen each step
-    changed."""
+    """One flash quantity over a clip: which frames complete a transition of the screen
+    (:class:`_Tracker`), and the largest share of the screen completing a transition in one direction at
+    each."""
 
-    mean: np.ndarray
-    changed: np.ndarray
-
-    @classmethod
-    def of(cls, planes: np.ndarray) -> "FlashSeries":
-        """The series of a ``(T, H, W)`` plane stack."""
-        x = np.asarray(planes, dtype=np.float32).reshape(planes.shape[0], -1)
-        return cls(x.mean(axis=1), (np.diff(x, axis=0) != 0).mean(axis=1))
+    events: np.ndarray
+    area: np.ndarray
 
 
-def flash_series(chunks: Iterable[np.ndarray]) -> tuple[FlashSeries, FlashSeries]:
+def _window(fps: float) -> int:
+    return max(1, int(round(fps)))
+
+
+def flash_series(
+    chunks: Iterable[np.ndarray],
+    *,
+    fps: float,
+    luminance_delta: float = LUMINANCE_DELTA,
+    dark_max: float = DARK_MAX,
+    area_threshold: float = AREA_LIMIT,
+) -> tuple[FlashSeries, FlashSeries]:
     """General and red :class:`FlashSeries` of an RGB clip handed over as consecutive ``(n, H, W, 3)`` chunks.
 
-    Each chunk is measured with the last frame of the one before, so the series are the whole clip's
+    Each pixel's transitions carry over from one chunk to the next, so the series are the whole clip's
     however it is split, and only one chunk is ever held.
     """
-    means: list[list[np.ndarray]] = [[], []]
-    changes: list[list[np.ndarray]] = [[], []]
-    last: list[np.ndarray] | None = None
+    window = _window(fps)
+    trackers = (
+        _Tracker(window=window, delta=luminance_delta, dark_max=dark_max, area=area_threshold),
+        _Tracker(window=window, delta=RED_DELTA, dark_max=np.inf, area=area_threshold),
+    )
+    found: list[list[tuple[np.ndarray, np.ndarray]]] = [[], []]
     for chunk in chunks:
         if np.shape(chunk)[0] == 0:
             continue
         lin = linear_rgb(np.asarray(chunk, dtype=np.float32))
-        planes = [(lin * LUMA_709).sum(-1).astype(np.float32), _red(lin)]
-        for i, plane in enumerate(planes):
-            joined = FlashSeries.of(plane if last is None else np.concatenate([last[i], plane]))
-            means[i].append(joined.mean[0 if last is None else 1 :])
-            changes[i].append(joined.changed)
-        last = [plane[-1:] for plane in planes]
-    empty = np.zeros(0, dtype=np.float32)
+        planes = ((lin * LUMA_709).sum(-1).astype(np.float32), _red(lin))
+        for kept, tracker, plane in zip(found, trackers, planes):
+            kept.append(tracker.feed(plane))
     general, red = (
-        FlashSeries(np.concatenate(m) if m else empty, np.concatenate(c) if c else empty)
-        for m, c in zip(means, changes)
+        FlashSeries(
+            np.concatenate([e for e, _ in kept]) if kept else np.zeros(0, dtype=bool),
+            np.concatenate([a for _, a in kept]) if kept else np.zeros(0, dtype=np.float32),
+        )
+        for kept in found
     )
     return general, red
-
-
-def _transitions(
-    series: FlashSeries, *, delta: float, fps: float, dark_max: float = np.inf, area: float = AREA_LIMIT
-) -> tuple[np.ndarray, np.ndarray]:
-    mean = series.mean
-    step = np.where(series.changed >= area, np.diff(mean), 0.0)
-    window = max(1, int(round(fps)))
-    events = np.zeros(mean.size, dtype=bool)
-    run: list[float] = []
-    for t, d in enumerate(step, 1):
-        before = float(np.sum(run))
-        onward = bool(run) and (d == 0 or np.sign(d) == np.sign(before))
-        run = (run[-(window - 1) :] if window > 1 else []) + [float(d)] if onward else [float(d)]
-        total = float(np.sum(run))
-        counted = onward and abs(before) >= delta
-        events[t] = (not counted) and abs(total) >= delta and min(mean[t - 1], mean[t]) < dark_max
-    return events, np.r_[0.0, series.changed]
 
 
 def transitions(
     planes: np.ndarray, *, delta: float, fps: float, dark_max: float = np.inf, area: float = AREA_LIMIT
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Which frames complete a flash transition, and the share of the screen changing at each.
-
-    A frame's change is the screen mean's, counted where at least ``area`` of the screen changed. Same-signed
-    changes over at most a second accumulate; a run becomes one transition when its total first reaches
-    ``delta`` with the darker of the two frames' means below ``dark_max``.
-    """
-    return _transitions(FlashSeries.of(planes), delta=delta, fps=fps, dark_max=dark_max, area=area)
+    """Which frames of a ``(T, H, W)`` plane stack complete a flash transition of the screen, and the
+    largest share of the screen completing a transition in one direction at each (:class:`_Tracker`)."""
+    return _Tracker(window=_window(fps), delta=delta, dark_max=dark_max, area=area).feed(planes)
 
 
 def _flashing(
     events: np.ndarray, area: np.ndarray, window: int, rate_limit: float
 ) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """Peak flashes a second, peak changing area, which windows hold more than ``rate_limit`` flashes,
-    and which frames complete a transition inside one of them."""
+    """Peak flashes a second, peak share of the screen completing a transition in one direction, which
+    windows hold more than ``rate_limit`` flashes, and which frames complete a transition inside one of
+    them."""
     width = min(window, events.size)
     count = np.convolve(events.astype(np.float64), np.ones(width), mode="valid")
     pairs = count / 2.0
@@ -163,33 +207,20 @@ def _flashing(
 
 
 def series_risk(
-    general: FlashSeries,
-    red: FlashSeries,
-    *,
-    fps: float,
-    luminance_delta: float = LUMINANCE_DELTA,
-    dark_max: float = DARK_MAX,
-    area_threshold: float = AREA_LIMIT,
-    rate_limit: float = RATE_LIMIT,
+    general: FlashSeries, red: FlashSeries, *, fps: float, rate_limit: float = RATE_LIMIT
 ) -> FlashRisk:
     """The general and red flash tests on a clip's :func:`flash_series`.
 
-    A flash is a pair of opposing transitions (:func:`transitions`); a clip fails where any second holds
-    more than ``rate_limit`` of them. ``windows`` are the frame spans of the seconds that fail, and
-    ``flashes`` the frames completing a transition within them.
+    A flash is a pair of opposing transitions; a clip fails where any second holds more than
+    ``rate_limit`` of them. ``windows`` are the frame spans of the seconds that fail, and ``flashes`` the
+    frames completing a transition within them.
     """
-    count = general.mean.size
+    count = general.events.size
     if count < 2:
         return FlashRisk(0.0, 0.0, 0.0, (), True)
-    window = max(1, int(round(fps)))
-    rate, area, unsafe, flashes = _flashing(
-        *_transitions(general, delta=luminance_delta, fps=fps, dark_max=dark_max, area=area_threshold),
-        window,
-        rate_limit,
-    )
-    red_rate, red_area, red_unsafe, red_flashes = _flashing(
-        *_transitions(red, delta=RED_DELTA, fps=fps, area=area_threshold), window, rate_limit
-    )
+    window = _window(fps)
+    rate, area, unsafe, flashes = _flashing(general.events, general.area, window, rate_limit)
+    red_rate, red_area, red_unsafe, red_flashes = _flashing(red.events, red.area, window, rate_limit)
     return FlashRisk(
         flashes_per_s=rate,
         area_frac=area,
@@ -215,18 +246,18 @@ def flash_risk(
 ) -> FlashRisk:
     """Screen a clip for photosensitive-seizure risk by the general and red flash tests (:func:`series_risk`).
 
-    Frames are area-scaled to ``max_side`` first, which keeps every share of the screen.
+    Frames are area-scaled to ``max_side`` first, which keeps every flashing region larger than a pixel.
     """
     if frames.shape[0] < 2:
         return FlashRisk(0.0, 0.0, 0.0, (), True)
-    return series_risk(
-        *flash_series([_downsample(frames, max_side)]),
+    series = flash_series(
+        [_downsample(frames, max_side)],
         fps=fps,
         luminance_delta=luminance_delta,
         dark_max=dark_max,
         area_threshold=area_threshold,
-        rate_limit=rate_limit,
     )
+    return series_risk(*series, fps=fps, rate_limit=rate_limit)
 
 
 def _runs(flags: np.ndarray, window: int) -> tuple[tuple[int, int], ...]:

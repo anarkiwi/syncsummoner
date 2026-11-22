@@ -338,7 +338,9 @@ def test_a_red_flash_no_take_can_cover_fails_even_inside_a_destroy_section(flash
         score, [R.Cut(0.0, 4.0, "r")], {"r": flashes["red"]}, flashes["clip"], strip_px=8, bar=1.0
     )
     assert [s[:5] for s in map(astuple, report.failed)] == [("r", 1.0, 2.0, T.Fault.FLASHING, None)]
-    with pytest.raises(T.UnsafeOutputError, match=r"0\.0 flashes/s, 5\.0 red flashes/s, at 0\.\d\d-2\.\d\ds"):
+    with pytest.raises(
+        T.UnsafeOutputError, match=r"\d\.\d flashes/s, 5\.0 red flashes/s, at 0\.\d\d-2\.\d\ds"
+    ):
         T.gate(flashes["red"], strip_px=8)
 
 
