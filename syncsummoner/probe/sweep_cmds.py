@@ -129,7 +129,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     import numpy as np
     from pyvmancer.midi import ParamKind, param_kind
 
-    from syncsummoner.compose.locktake import LeadIn
+    from syncsummoner.compose import relocks
     from syncsummoner.compose.session import session_frames
     from syncsummoner.compose.render import RenderConfig
     from syncsummoner.compose.timecode import clip_layout
@@ -166,7 +166,7 @@ def _sweep_regions_cmd(args: argparse.Namespace) -> int:
     edges = downbeat_frames(args.audio, config.fps)
     guard = guard_frames(int(held["settle"]))
     m = model(args.program)
-    ends = session_frames(LeadIn(), config.fps, dry=m.bypass() is not None)
+    ends = session_frames(relocks.lead_in(args.program), config.fps, dry=m.bypass() is not None)
     overhead_s = sum(ends) / config.fps + config.tail_s
     values = {p: representatives(m, p, bits) for p, bits in m.resolution().items() if bits}
     states = np.asarray(record["states"], dtype=np.int64)

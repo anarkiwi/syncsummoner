@@ -7,6 +7,7 @@ import pytest
 
 from syncsummoner.compose import lock as L
 from syncsummoner.compose import locktake as LT
+from syncsummoner.compose import relocks
 from syncsummoner.compose import session as SS
 from syncsummoner.compose.timecode import ClipLayout, LayoutError
 from syncsummoner.device import loadtimes, v4l2rec
@@ -301,3 +302,38 @@ def test_a_take_judged_against_another_sessions_log_is_refused(monkeypatch, simu
     monkeypatch.setattr(v4l2rec, "read_log", lambda take: shifted)
     with pytest.raises(L.LockError, match="are not the session's"):
         L.attribute_take(takes[1].out, config=config_for(), codes=np.full(shifted.size, -1))
+
+
+def wet_target(take):
+    """The session frame a take's dry control was sent its take value for: its first send off the start."""
+    sends = np.load(f"{take.out}.wire.npz")["sends"]
+    return int(sends["target"][sends["target"] != LT.ev.START][0])
+
+
+def test_a_relock_on_record_moves_the_wet_write_back_to_wait_it_out(monkeypatch, simulate, tmp_path):
+    """A program the card relocks for after its wet write is sent it that much before clip frame 0."""
+    relock_s = LEAD_IN.wet_s + 0.4
+    relocks.record("Teletext", 1, relock_s)
+    held = relocks.lead_in("Teletext", LEAD_IN)
+    monkeypatch.setattr(test_locktake, "ends_for", lambda dry, _d=None: SS.session_frames(held, FPS, dry=dry))
+    _, _, takes, _, found, proofs, _ = run_session(monkeypatch, simulate, tmp_path, dry=1, counts=[30])
+    assert wet_target(takes[0]) == -SS.frames_of(relock_s, FPS) < LT.wet_at(LEAD_IN, FPS)
+    assert int(np.load(L.lock_path(takes[0].out))["lead"]) == SS.lead_in_frames(
+        held, FPS, dry=True, load_s=None
+    )
+    assert found[0].complete and proofs[0].ok, proofs[0].lines()
+
+
+def test_a_program_with_no_relock_on_record_keeps_the_lead_ins_wet_stretch(monkeypatch, simulate, tmp_path):
+    """Another program's relock, or one shorter than the wet stretch, leaves the session as it was; the
+    session's own unbroken relock is kept."""
+    relocks.record("czartroniks/Inferno", 1, LEAD_IN.wet_s + 2.0)
+    relocks.record("Teletext", 2, LEAD_IN.wet_s / 2)
+    _, _, takes, _, found, proofs, _ = run_session(monkeypatch, simulate, tmp_path, dry=1, counts=[30])
+    assert wet_target(takes[0]) == LT.wet_at(LEAD_IN, FPS)
+    assert int(np.load(L.lock_path(takes[0].out))["lead"]) == SS.lead_in_frames(
+        LEAD_IN, FPS, dry=True, load_s=None
+    )
+    assert found[0].complete and proofs[0].ok, proofs[0].lines()
+    kept = [e for e in loadtimes.read(relocks.record_path()) if e["program"] == "Teletext"]
+    assert len(kept) == 2 and kept[-1]["relock_s"] == 0.0
