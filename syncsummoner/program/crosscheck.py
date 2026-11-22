@@ -68,10 +68,10 @@ def verdicts(program, **kwargs) -> dict:
             out[method] = str(err)
         out["seconds"][method] = round(time.monotonic() - start, 1)
     out["disagreements"] = [
-        {"state": name, "free": list(free), "param": p} | {m: answers[m][i][p] for m in answers}
+        {"state": name, "free": list(free), "param": p} | {m: got[i][p] for m, got in answers.items()}
         for i, (name, _, free) in enumerate(asked)
         for p in free
-        if len({tuple(answers[m][i][p]) for m in answers}) > 1
+        if len({tuple(got[i][p]) for got in answers.values()}) > 1
     ]
     exact = answers.get("sat")
     out["faults"] = sorted(
