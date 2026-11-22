@@ -660,11 +660,12 @@ What happens, in order:
    together on the score's cuts into `final.take.mp4`.
 7. Before the takes are spliced together, each is checked against the timecoded
    clip it was fed, frame for frame by its attribution, and every bar is judged `flat` (blank) or `frozen` (static) on what it kept of the
-   same bar of the clip, or `flashing` where the pictures it shows fail the
-   general or red flash test. A dead run inside a cut is covered from another
+   same bar of the clip, `flashing` where the pictures it shows fail the
+   general or red flash test, or `signal lost` where the capture card showed its
+   own pictures for want of the device's signal. A dead run inside a cut is covered from another
    program's take alive across it (`Derez:   42.10-  46.20s frozen, covered by
    Lorenz`); a lone blank or static bar inside a `destroy` section stays, a
-   flashing one never does. Each take's line gives its peak rates
+   flashing or signal-lost one never does. Each take's line gives its peak rates
    (`<program>: aligned by given, peak <n> flashes/s, <n> red`). Compose already moved
    every cut predicted dead, so this is the check of that prediction and the last
    resort: a cover plays a take outside its own cuts, where its layer sends nothing. A run no take
@@ -805,7 +806,7 @@ doing it twice, which is what the audition is for.
 | parameters have no effect | MIDI CC is an offset onto the physical knob, so park the panel first |
 | take looks like plain passthrough | a corrupted MIDI CC map: a slot learned P1's CC and follows it. `syncsummoner device doctor` (`midi.cc_map`) or `vmancer cc-map` shows the map; every load rewrites it, and `vmancer cc-map --restore --yes` repairs it by hand. See [hardware.md](hardware.md#the-midi-cc-map-must-be-checked) |
 | `SpliceError: <program>: no capture shows clip frames ...` | the take ends early, or a fitted take was never aligned; check its `aligned by` line in the take check |
-| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen or flashing, and no other take is alive and safe across it: render another program over it, or recompose with profiles refit from footage |
+| `DeadTakeError: dead picture no take can cover: <program>: <start>-<end>s <fault>, ...` | that span of that program's take is flat, frozen, flashing or signal lost, and no other take is alive and safe across it: render another program over it, or recompose with profiles refit from footage |
 | `UnsafeOutputError: <out> flashes harmfully: ... at <from>-<to>s; kept as <out>.unsafe.mp4` | the mastered clip fails the flash test though every take passed: a splice joined two takes into a flash. Recut, or compose with other changes at those seconds |
 | `no survival measured, so its picture is unverified` at compose | the profile was fitted from a codeframe archive; archive with `probe sweep` and refit |
 | `LostTimecodeError: ... no lock record` | the take was recorded before the locked player, so nothing attributes it exactly; render it again |
