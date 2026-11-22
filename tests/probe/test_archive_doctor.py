@@ -203,6 +203,14 @@ def test_a_drifting_take_fails_the_rate_lock_and_a_multi_segment_one_is_skipped(
     )
 
 
+def test_a_relock_break_leaves_the_capture_period_alone():
+    rows = np.zeros(200, dtype=vr.STORED)
+    rows["sequence"] = np.arange(200)
+    rows["t_ns"] = np.arange(200) * PERIOD + np.where(np.arange(200) >= 80, 45 * PERIOD, 0)
+    assert ad.capture_period(rows) == pytest.approx(PERIOD)
+    assert ad.capture_period(rows[:80]) == pytest.approx(PERIOD)
+
+
 def test_flip_period_counts_only_consecutive_flips():
     flips = np.zeros(5, dtype=FLIP)
     flips["v"] = [0, 1, 3, 4, 5]
