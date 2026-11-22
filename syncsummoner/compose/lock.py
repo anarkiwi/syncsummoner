@@ -16,6 +16,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from syncsummoner.compose import frameline, relock
+from syncsummoner.device.v4l2rec import FLAG_ERROR
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import read_codes
 from syncsummoner.progress import LOG
@@ -27,6 +28,10 @@ class LockError(RuntimeError):
 
 class LostTimecodeError(RuntimeError):
     """A take carries no lock record, so nothing says which capture shows which clip frame."""
+
+
+class SignalLossError(LockError):
+    """Clip frames fell where the card showed its own pictures, not the device's signal."""
 
 
 class AnchorError(LockError):
@@ -237,6 +242,52 @@ def changes(digest: np.ndarray) -> np.ndarray:
     np.add.at(length, edges[::2], edges[1::2] - edges[::2])
     np.subtract.at(length, edges[1::2], edges[1::2] - edges[::2])
     return new & (np.cumsum(length)[:-1] < 3)
+
+
+def signal_lost(log: np.ndarray) -> np.ndarray:
+    """Per capture of a V4L2 frame log, whether the card showed it without the device's signal.
+
+    A break between gap-free runs (:func:`~syncsummoner.compose.frameline.segments`) is the card
+    delivering nothing. The captures running into one carry the driver's error flag, corrupted data;
+    after one, the card's restart pictures differ from the capture before every time until it holds a
+    frame again, since each of the device's frames is captured twice with identical bytes (:func:`changes`).
+    So a break loses its contiguous error-flagged captures before it and its captures from it up to the
+    first repeating the one before, the whole run if none does. The recording's start is no break.
+    """
+    seg = frameline.segments(log["t_ns"], log["sequence"])
+    n = seg.size
+    if not n:
+        return np.zeros(0, dtype=bool)
+    idx = np.arange(n)
+    digest = log["digest"]
+    repeat = np.r_[False, (digest[1:] == digest[:-1]) & (seg[1:] == seg[:-1])]
+    held = np.full(seg[-1] + 1, n, dtype=np.int64)
+    np.minimum.at(held, seg[repeat], idx[repeat])
+    after = (seg > 0) & (idx < held[seg])
+    error = (log["flags"] & FLAG_ERROR) != 0
+    end = np.flatnonzero(np.r_[seg[1:] != seg[:-1], True])[seg]
+    clean = np.maximum.accumulate(np.where(error, -1, idx))
+    return after | (error & (clean[end] < idx) & (seg < seg[-1]))
+
+
+def lost_frames(picked: np.ndarray, log: np.ndarray) -> np.ndarray:
+    """Per clip frame, whether the card lost the device's signal over it.
+
+    ``picked`` is each clip frame's capture in ``log``, -1 for none (:attr:`Attribution.picked`). A
+    picked frame is lost where its capture is :func:`signal_lost`; an unpicked one where the nearest
+    picked frames before and after it lie in different runs, a break between them.
+    """
+    picked = np.asarray(picked, dtype=np.int64)
+    seg = frameline.segments(log["t_ns"], log["sequence"])
+    frame = np.arange(picked.size)
+    has = picked >= 0
+    lost = np.zeros(picked.size, dtype=bool)
+    lost[has] = signal_lost(log)[picked[has]]
+    before = np.maximum.accumulate(np.where(has, frame, -1))
+    after = np.minimum.accumulate(np.where(has, frame, picked.size)[::-1])[::-1]
+    gap = np.flatnonzero(~has & (before >= 0) & (after < picked.size))
+    lost[gap] = seg[picked[before[gap]]] != seg[picked[after[gap]]]
+    return lost
 
 
 def anchors(played: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -761,7 +812,9 @@ def attribute_take(
 
     Strips read as ``codes``, else as the take's :class:`~syncsummoner.probe.decoded.Features` hold them.
     Every clip frame must have a capture, and no strip at a boundary capture nor byte change in the
-    clip may contradict the line; anything less is a :class:`~syncsummoner.compose.lock.LockError`.
+    clip may contradict the line; anything less is a :class:`~syncsummoner.compose.lock.LockError`, a
+    :class:`SignalLossError` where a clip frame no capture shows is one the card lost the signal over
+    (:func:`lost_frames`).
     """
     from syncsummoner.device.v4l2rec import read_log  # pylint: disable=import-outside-toplevel
 
@@ -792,6 +845,15 @@ def attribute_take(
         )
     LOG.info("%s: %s", take, found.summary())
     if not found.complete:
+        lost = lost_frames(found.picked, frames)
+        if (lost & (found.picked < 0)).any():
+            edges = np.flatnonzero(np.diff(np.r_[0, lost.astype(np.int8), 0]))
+            spans = ", ".join(f"{a}-{b - 1}" for a, b in zip(edges[::2], edges[1::2]))
+            breaks = int(frameline.segments(frames["t_ns"], frames["sequence"])[-1])
+            raise SignalLossError(
+                f"{take}: signal loss: the card lost the device's signal over clip frames {spans} "
+                f"at {breaks} breaks in the capture log; {found.summary()}"
+            )
         raise LockError(f"{take}: {found.summary()}")
     if found.faults or found.strays:
         raise LockError(f"{take}: the strips or bytes contradict the frame line: {found.summary()}")

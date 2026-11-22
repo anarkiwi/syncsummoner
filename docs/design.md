@@ -464,8 +464,8 @@ split at every cut, so each cut is judged on the frames it shows alone:
 
 | Fault | Condition |
 | --- | --- |
-| `flat` | at most half the frames span more than one 8-bit code, or SI under the live floor |
-| `flashing` | a transition between two of the bar's frames counts toward a second that fails the general or red flash test (§11.2), on the pictures the take shows, clip frame by clip frame; judged first |
+| `signal lost` | a clip frame of the bar is one the capture card lost the device's signal over (`lock.lost_frames`, read from the take's V4L2 frame log); judged first |
+| `flashing` | a transition between two of the bar's frames counts toward a second that fails the general or red flash test (§11.2), on the pictures the take shows, clip frame by clip frame; judged next |
 | `flat` | at most half the frames span more than one 8-bit code, or SI under the live floor |
 | `frozen` | TI under the live floor, or `recorder.held` cannot tell the bar from one picture under capture noise and its motion does not follow the source (a held picture's TI is capture noise, independent of the source's) |
 
@@ -474,7 +474,7 @@ setting; motion that does not follow the source's is alive. A dead run inside a
 cut is replaced by the take of another program alive across the whole run that
 follows best (highest mean z), a run reaching the cut's edge taking that edge
 itself so no sliver of the cut is left beside it; a lone dead bar inside a
-`destroy` section stays. A `flashing` bar is covered the same way, and never stays.
+`destroy` section stays. A `flashing` or `signal lost` bar is covered the same way, and never stays.
 A run nothing covers raises `DeadTakeError` naming the program and time range.
 On a fitted trace, where a strip reads, its clock stands unless the motion clock makes the
 output's moving frames follow the source better by more than the critical z

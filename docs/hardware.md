@@ -279,6 +279,20 @@ unknown, which every caller treats as no signal.
 - While it holds, every captured frame is the program's own output, so takes are
   judged by structure and motion alone.
 
+Where it dropped, the take's V4L2 frame log is the evidence. The card delivers
+nothing for a while, a break between gap-free runs; the captures running into
+the break carry `V4L2_BUF_FLAG_ERROR`, the driver's mark of corrupted data.
+After it the card first delivers its own restart pictures, each differing from
+the capture before, until it holds a frame again: the device's 30 fps output is
+captured at 60 Hz, so every held frame is captured twice with identical bytes.
+`lock.signal_lost` marks those captures, and `lock.lost_frames` the clip frames
+they or a break between two picked captures cover. The take check judges a bar
+holding one `signal lost` and covers it from another take; `attribute_take`
+refuses a take missing a clip frame at a break with `SignalLossError`
+(`<take>: signal loss: ...`), which `probe sweep collect` reports as it is. The
+*No Signal* slide the card shows after a longer loss is static, so the take
+check already judges it `frozen`.
+
 ## Input status flags are advisory
 
 The firmware has reported `hdmi.connected: false` while passing video perfectly,

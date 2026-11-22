@@ -15,6 +15,8 @@ from syncsummoner.compose import render as R
 from syncsummoner.compose import takecheck as T
 from syncsummoner.compose.score import Score, Section
 from syncsummoner.device import recorder as rec
+from syncsummoner.device.v4l2rec import FRAME
+from syncsummoner.probe import decoded
 from syncsummoner.probe import footage as F
 
 FPS = 30.0
@@ -155,6 +157,14 @@ def test_cover_replaces_a_dead_run_with_the_take_that_follows_best():
     assert "covered by b" in str(spans[0])
 
 
+def test_cover_never_spares_a_bar_the_card_lost_the_signal_over():
+    verdicts = {"a": [verdict(0), verdict(1, T.Fault.SIGNAL), verdict(2)], "b": [verdict(0)] * 3}
+    cuts, spans = T.cover([R.Cut(0.0, 3.0, "a")], verdicts, destroy=lambda _t: True)
+    assert cuts == [R.Cut(0.0, 1.0, "a"), R.Cut(1.0, 2.0, "b"), R.Cut(2.0, 3.0, "a")]
+    assert [s[:5] for s in map(astuple, spans)] == [("a", 1.0, 2.0, T.Fault.SIGNAL, "b")]
+    assert "signal lost" in str(spans[0])
+
+
 def test_cover_spares_one_destroyed_bar_and_reports_what_it_cannot_cover():
     verdicts = {
         "a": [verdict(0, T.Fault.FROZEN), verdict(1), verdict(2, T.Fault.FLAT)],
@@ -236,8 +246,8 @@ def test_takes_are_read_and_checked_from_files(tmp_path):
     ]
     argv += ["-i", "pipe:0", "-c:v", "ffv1", str(clip)]
     subprocess.run(argv, input=(raw * 255).astype(np.uint8).tobytes(), check=True)
-    decoded = F.decode_recording(clip, strip_px=8, bits=16)
-    assert np.array_equal(decoded.codes, np.arange(60)) and decoded.frames.shape[0] == 60
+    read = F.decode_recording(clip, strip_px=8, bits=16)
+    assert np.array_equal(read.codes, np.arange(60)) and read.frames.shape[0] == 60
     score = Score(duration=2.0, fps=FPS, sections=[Section(0.0, 2.0, "A")])
     report = T.check_takes(score, [R.Cut(0.0, 2.0, "p")], {"p": clip}, clip, strip_px=8, bar=0.5)
     assert report.traces["p"].how == "strip" and not report.failed
@@ -355,3 +365,56 @@ def test_a_clip_frame_no_capture_shows_holds_the_one_before():
     picked[30] = -1
     marked, _ = T.flashing(colour, picked, fps=FPS, full=False)
     assert np.flatnonzero(marked).tolist() == sorted(set(range(3, 60, 3)) - {30} | {31})
+
+
+def with_log(path, log):
+    """A take's decoded features, holding ``log`` as its V4L2 frame log."""
+    found = decoded.features(path, decoded.Spec(strip_px=8, bits=16))
+    return decoded.Features(
+        {"times": found.times, "codes": found.codes, "luma": found.luma, "small": found.small, "log": log}, ""
+    )
+
+
+def broken_log(n, at, held):
+    """``n`` captures, the card delivering nothing before ``at`` and its own pictures up to ``held``."""
+    log = np.zeros(n, FRAME)
+    log["sequence"] = np.arange(n)
+    log["t_ns"] = (np.arange(n) + 10 * (np.arange(n) >= at)) * 33_333_333
+    log["digest"] = np.arange(n)
+    log["digest"][held] = log["digest"][held - 1]
+    return log
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_a_bar_the_card_lost_the_signal_over_is_covered_and_one_without_a_log_judged_as_before(flashes):
+    takes = {"a": flashes["plain"], "b": flashes["plain"]}
+    given = {"a": np.arange(120), "b": np.arange(120)}
+    report = T.check_takes(
+        SCORE,
+        [R.Cut(0.0, 4.0, "a")],
+        takes,
+        flashes["clip"],
+        strip_px=8,
+        bar=1.0,
+        attributions=given,
+        features={"a": with_log(takes["a"], broken_log(120, 45, 50))},
+    )
+    assert [s[:5] for s in map(astuple, report.spans)] == [("a", 1.0, 2.0, T.Fault.SIGNAL, "b")]
+    assert [(c.start, c.end, c.program) for c in report.cuts] == [
+        (0.0, 1.0, "a"),
+        (1.0, 2.0, "b"),
+        (2.0, 4.0, "a"),
+    ]
+    assert np.flatnonzero(report.traces["a"].lost).tolist() == list(range(45, 50))
+    assert report.traces["b"].lost is None
+    short = T.check_takes(
+        SCORE,
+        [R.Cut(0.0, 4.0, "a")],
+        {"a": takes["a"]},
+        flashes["clip"],
+        strip_px=8,
+        bar=1.0,
+        attributions=given,
+        features={"a": with_log(takes["a"], broken_log(60, 45, 50))},
+    )
+    assert short.traces["a"].lost is None and not short.spans

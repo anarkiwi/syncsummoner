@@ -3,6 +3,8 @@
 Every capture is attributed to the clip frame it shows, so each bar of each take is judged
 by what it kept of that bar's picture and motion: a flat bar is blank and a frozen bar static,
 either is dead, and a cut that shows one is covered from a take alive there or the render fails.
+A bar is dead too where the capture card showed its own pictures for want of the device's signal
+(:func:`~syncsummoner.compose.lock.lost_frames`), read from the take's V4L2 frame log.
 Whether the output's motion follows the source's is no part of being alive. A bar is also unusable
 where the pictures the take would show there fail the general or red flash test
 (:func:`~syncsummoner.aesthetics.series_risk`), read from the decode's calibration-size colour, and is
@@ -22,6 +24,7 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 
 from syncsummoner import aesthetics
+from syncsummoner.compose import lock
 from syncsummoner.compose.chroma import exchanged
 from syncsummoner.compose.cut import Cut
 from syncsummoner.compose.score import Score
@@ -73,11 +76,18 @@ class UnsafeOutputError(RuntimeError):
 
 
 class Fault(enum.Enum):
-    """Why a bar of output cannot be shown: blank, static, or harmful flashing."""
+    """Why a bar of output cannot be shown: blank, static, harmful flashing, or the card without the
+    device's signal.
+    """
 
+    SIGNAL = "signal lost"
     FLAT = "flat"
     FROZEN = "frozen"
     FLASHING = "flashing"
+
+
+#: Faults :func:`cover` covers even in a lone bar of a destroy-marked section.
+UNSPARED = (Fault.FLASHING, Fault.SIGNAL)
 
 
 @dataclass(frozen=True)
@@ -87,7 +97,8 @@ class Trace:
     ``picked`` indexes ``frames`` and is -1 where no capture of that clip frame was kept;
     ``si`` and ``ti`` are NaN there. ``flashing`` marks the clip frames completing a flash in a second
     that fails the flash test, and ``flash`` is that test's whole verdict (:func:`flashing`); both are
-    None where the take's colour was not screened.
+    None where the take's colour was not screened. ``lost`` marks the clip frames the card lost the
+    device's signal over (:func:`~syncsummoner.compose.lock.lost_frames`), None without a frame log.
     """
 
     picked: np.ndarray
@@ -98,6 +109,7 @@ class Trace:
     how: str
     flashing: np.ndarray | None = None
     flash: aesthetics.FlashRisk | None = None
+    lost: np.ndarray | None = None
 
     @property
     def start(self) -> float | None:
@@ -347,15 +359,18 @@ class Verdict:
 def fault(out: Trace, a: int, b: int, kept: aesthetics.Survival) -> Fault | None:
     """Why clip frames ``a:b`` of a trace cannot be shown, or None while they can.
 
-    Flashing: a frame after the first marked in :attr:`Trace.flashing`, so the transition is between two
-    of the bar's own frames; one across a bar's edge belongs to neither, since covering either changes
-    it and :func:`gate` judges what the splice made of it. Judged first, since a flash between plain
-    fields is also flat. Flat: not mostly frames whose luma spans more than one 8-bit step, or SI
-    under the source's :func:`~syncsummoner.aesthetics.live_floor`; frozen: TI under it, or
+    Signal lost: any frame in :attr:`Trace.lost`, judged first, since the card's own pictures say
+    nothing of the take. Flashing: a frame after the first marked in :attr:`Trace.flashing`, so the
+    transition is between two of the bar's own frames; one across a bar's edge belongs to neither, since
+    covering either changes it and :func:`gate` judges what the splice made of it. Judged next, since a
+    flash between plain fields is also flat. Flat: not mostly frames whose luma spans more than one
+    8-bit step, or SI under the source's :func:`~syncsummoner.aesthetics.live_floor`; frozen: TI under it, or
     :func:`~syncsummoner.device.recorder.held` unable to tell the bar from one picture under
     capture noise while its motion does not follow the source either, since a held picture's TI
     is that noise and independent of the source's.
     """
+    if out.lost is not None and out.lost[a:b].any():
+        return Fault.SIGNAL
     if out.flashing is not None and out.flashing[a + 1 : b].any():
         return Fault.FLASHING
     picked = out.picked[a:b]
@@ -450,7 +465,7 @@ def cover(
     splits them at every cut on the frame grid. A run reaching a cut's edge takes that edge itself, so
     no sliver of the cut is left between the edge and its bar's frame. Destruction is budgeted at one
     bar at a time, so a lone blank or static bar inside a destroy-marked section stays; any other dead
-    run, and any flashing one, is covered.
+    run, and any flashing one or one the card lost the signal over, is covered.
     """
     grid = next(iter(verdicts.values()), [])
     middles = np.array([0.5 * (v.start + v.end) for v in grid])
@@ -462,7 +477,7 @@ def cover(
         cursor = cut.start
         for a, b in _runs(dead):
             run = index[a:b]
-            lone = run.size == 1 and verdicts[cut.program][run[0]].fault is not Fault.FLASHING
+            lone = run.size == 1 and verdicts[cut.program][run[0]].fault not in UNSPARED
             if lone and destroy(0.5 * (grid[run[0]].start + grid[run[0]].end)):
                 continue
             start = cut.start if a == 0 else grid[run[0]].start
@@ -517,7 +532,8 @@ def check_takes(
     meaning of :attr:`Trace.picked`, and ``models`` fixes a recording's clock, as a master's identity
     clock is; any other is fitted. ``features`` and ``source`` are decodes already made of takes and clip.
     Each take is screened for flashing (:func:`flashing`) on the clip frames its trace shows, in the
-    channel order it is spliced in.
+    channel order it is spliced in, and its frame log, where its decode holds one, read for the clip
+    frames the card lost the signal over.
     """
     fps = float(score.fps)
     with_bar = float(bar or score.meta.get("bar") or 4 * 60.0 / score.bpm)
@@ -551,7 +567,12 @@ def check_takes(
         mask, risk = flashing(
             found.small, out.picked, fps=fps, full=full, space=space, swap=exchanged(takes[name])
         )
-        return name, replace(out, flashing=mask, flash=risk)
+        log, lost = found.log, None
+        if log is not None and log.size >= len(out.frames):
+            lost = lock.lost_frames(out.picked, log)
+        elif log is not None:
+            LOG.warning("%s: frame log holds %d of %d captures; not read", name, log.size, len(out.frames))
+        return name, replace(out, flashing=mask, flash=risk, lost=lost)
 
     with ThreadPoolExecutor(max_workers=max(1, len(takes))) as pool:
         traces = dict(track(pool.map(read, list(takes)), desc="takes", total=len(takes), unit="take"))
