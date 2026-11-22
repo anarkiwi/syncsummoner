@@ -482,8 +482,9 @@ output's moving frames follow the source better by more than the critical z
 
 The flash test reads the calibration-size planar YUV (96x54) the decode already
 keeps, so nothing is decoded again for it. That size is an area scaling of the
-picture, and the test counts only screen means and the share of the screen that
-changed, which an area scaling keeps; it is also under the 128-pixel side
+picture, and the test counts the share of the screen whose own luminance
+flashes, which an area scaling keeps for any region larger than its pixels; it
+is also under the 128-pixel side
 `flash_risk` scales to itself. The planes are converted to RGB as a decoder
 shows them: in the range and matrix the decode's own `showinfo` reports for
 that branch (ffmpeg keeps a YUV stream's range and scales RGB to studio swing;
@@ -604,11 +605,15 @@ the short side over 256, rounded (480x268 at 1080p).
 | `flashing` | more than 3 general flashes in any second | ITU-R BT.1702, WCAG 2.3.1, as EA IRIS implements them |
 | `red_flashing` | the same for saturated red | WCAG 2.2 red flash definition |
 
-A flash is a pair of opposing transitions. Each frame's change is the change in the screen's mean
-relative luminance, counted only where at least a quarter of the screen changed; same-signed changes
-within a second accumulate, and a run becomes one transition when it first reaches 0.1 with the darker
-frame below 0.8. The red test runs the same on `320 * (R - G - B)` of linear RGB where red is at least
-0.8 of the sum, with a threshold of 20. A setting is safe when it raises none of the four flags.
+A flash is a pair of opposing transitions, and its area is the area that itself flashes (BT.1702 and
+WCAG's combined area of flashes occurring concurrently). IRIS's transition tracking runs on each pixel's
+relative luminance: same-signed changes within a second accumulate, and a run becomes one transition of
+that pixel when it first reaches 0.1 with its darker end below 0.8. The screen completes a transition
+where more than a quarter of it completes one in the same direction in the same frame, and its
+transitions alternate, so a small region flipping over a moving picture is no flash however much of the
+screen changes slightly, and two halves flashing in opposition are one though the screen mean holds.
+The red test runs the same on `320 * (R - G - B)` of linear RGB where red is at least 0.8 of the sum,
+with a threshold of 20. A setting is safe when it raises none of the four flags.
 SSIM, not MS-SSIM: a contrast-reversed scale has no real fractional power, and clipping it at zero
 saturates a large share of settings at the top of the scale, where ranking matters.
 

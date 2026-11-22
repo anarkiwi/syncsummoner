@@ -4,6 +4,7 @@
 
 import numpy as np
 import pytest
+from scipy.ndimage import gaussian_filter
 
 from syncsummoner.aesthetics import safety
 
@@ -138,23 +139,71 @@ def test_a_change_over_too_little_of_the_screen_is_no_transition():
     assert not events.any() and area.max() < 0.25
 
 
+def moving_texture(n, *, shape=SHAPE, seed=1):
+    """A smooth random texture of mid luminance and low-amplitude noise drifting a pixel a frame."""
+    rng = np.random.default_rng(seed)
+    field = gaussian_filter(rng.random((shape[0], shape[1] + n)), 4.0)
+    field = 0.5 + (field - field.mean()) / (field.max() - field.min()) * 0.4
+    frames = np.stack([field[:, t : t + shape[1]] for t in range(n)])
+    frames += rng.normal(0.0, 0.01, frames.shape)
+    return np.repeat(np.clip(frames, 0.0, 1.0)[..., None], 3, axis=-1).astype(np.float32)
+
+
 def test_a_moving_texture_is_not_a_flash():
-    rng = np.random.default_rng(1)
-    field = rng.random((SHAPE[0], SHAPE[1] + 90))
-    frames = np.stack([field[:, t : t + SHAPE[1]] for t in range(90)])
-    risk = safety.flash_risk(np.repeat(frames[..., None], 3, axis=-1).astype(np.float32), fps=FPS)
-    assert risk.safe and risk.area_frac > 0.25
+    risk = safety.flash_risk(moving_texture(90), fps=FPS)
+    assert risk.safe and risk.flashes_per_s == 0.0 and risk.area_frac < 0.25
+
+
+def test_a_small_region_flipping_over_a_moving_texture_is_not_a_flash():
+    frames = moving_texture(90)
+    frames[1::2, 16:32, 20:44] = 1.0
+    frames[::2, 16:32, 20:44] = 0.0
+    risk = safety.flash_risk(frames, fps=FPS)
+    assert risk.safe and risk.flashes_per_s == 0.0 and 0.0 < risk.area_frac <= 0.25
+
+
+def test_a_full_screen_alternation_over_a_moving_texture_is_a_flash():
+    frames = moving_texture(90)
+    frames[1::2] = np.clip(frames[1::2] + 0.5, 0.0, 1.0)
+    risk = safety.flash_risk(frames, fps=FPS)
+    assert not risk.general_safe and risk.flashes_per_s == pytest.approx(15.0) and risk.area_frac > 0.9
+
+
+@pytest.mark.parametrize(
+    "pixels, flagged", [(SHAPE[0] * SHAPE[1] // 4 + 1, True), (SHAPE[0] * SHAPE[1] // 4, False)]
+)
+def test_a_flash_fails_over_more_than_a_quarter_of_the_screen_alone(pixels, flagged):
+    frames = solid(0.0, 90)
+    region = np.zeros(SHAPE[0] * SHAPE[1], dtype=bool)
+    region[:pixels] = True
+    frames[1::2, region.reshape(SHAPE)] = 1.0
+    assert safety.flash_risk(frames, fps=FPS).general_safe is not flagged
+
+
+def test_opposing_halves_flash_though_the_screen_mean_holds():
+    frames = solid(0.0, 90)
+    frames[::2, : SHAPE[0] // 2] = 1.0
+    frames[1::2, SHAPE[0] // 2 :] = 1.0
+    risk = safety.flash_risk(frames, fps=FPS)
+    assert not risk.general_safe and risk.flashes_per_s == pytest.approx(15.0)
+
+
+def test_a_red_region_flashing_over_a_moving_texture_is_a_red_flash():
+    frames = moving_texture(90)
+    frames[1::2, : SHAPE[0] // 2] = [1.0, 0.0, 0.0]
+    risk = safety.flash_risk(frames, fps=FPS)
+    assert not risk.red_safe and risk.red_flashes_per_s == pytest.approx(15.0)
 
 
 def test_a_clip_measured_in_chunks_is_measured_as_one():
     frames = np.r_[alternating(45, hz=7.5), alternating(45, hz=2.0, lo=0.3)]
     frames[50:60, :, :, 0] = 1.0
-    whole = safety.flash_series([frames])
-    split = safety.flash_series([frames[:7], frames[7:7], frames[7:50], frames[50:]])
+    whole = safety.flash_series([frames], fps=FPS)
+    split = safety.flash_series([frames[:7], frames[7:7], frames[7:50], frames[50:]], fps=FPS)
     for one, other in zip(whole, split):
-        assert np.array_equal(one.mean, other.mean) and np.array_equal(one.changed, other.changed)
+        assert np.array_equal(one.events, other.events) and np.array_equal(one.area, other.area)
     assert safety.series_risk(*split, fps=FPS) == safety.flash_risk(frames, fps=FPS)
-    assert safety.series_risk(*safety.flash_series([]), fps=FPS).safe
+    assert safety.series_risk(*safety.flash_series([], fps=FPS), fps=FPS).safe
 
 
 def test_the_frames_to_blame_are_the_transitions_in_the_failing_seconds_alone():
