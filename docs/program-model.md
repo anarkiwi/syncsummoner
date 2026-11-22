@@ -102,8 +102,14 @@ process per query.
 **Symbolic values.** Each net's value is a partition of the control
 assignments into the leaf the net takes there: 0, 1, a literal (a video or
 other input bit, a register output or a black-box output, or its complement),
-or *any* function. Each part is a BDD (`dd` over CUDD, sifting reorder) over the
-`registers_in` bits of words 0-8, the only symbolic variables. Registers 9-11
+or *any* function. Each part is a BDD (`dd` over CUDD) over the
+`registers_in` bits of words 0-8, the only symbolic variables besides the
+register variables below. Variables are ordered once, from the netlist: a
+depth-first walk of the fan-in from the outputs, deeper input first, each
+storage output met queueing its next-state inputs as a further root. The
+operands of each adder, comparator or register update so sit side by side,
+where an order by register word separates them and their BDDs grow
+exponentially in the word width. Registers 9-11
 are free inputs and words 12-31 are zero. Gates combine leaves exactly where
 they can (`x & 0 = 0`, `x ^ 0 = x`, `s ? x : x = x`, `x & ~x = 0`), so constant
 propagation and the identity of a passed-through bit are both exact over every
@@ -145,6 +151,11 @@ which flipping the source can change it:
   change. A pin is sensitised where its two values give different outputs with
   the others held, each other *any* leaf standing for its own literal;
 - where it depends on a register variable that can change.
+
+Each net's condition is so a fixed part (its cofactors' leaves differing) and a
+union of fixed weights, each ANDed with the condition of one net or register
+variable. The weights are found once per net and source; a net revisited in the
+fixpoint adds only what those conditions have gained since it was last read.
 
 A free register can change where its next state can, for some value of the
 varying controls and register variables: the difference it takes on outlives the

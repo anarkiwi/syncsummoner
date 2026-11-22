@@ -236,6 +236,29 @@ def test_a_registered_difference_outlives_the_register_values_that_made_it():
     assert conditions(TOGGLE, varying=[S]).live(f"c{S}", {}), "the output is the control a cycle after r20"
 
 
+#: Two 2-bit words compared bit by bit, and a register of the result read back beside a third control.
+PAIRS = design(
+    [
+        cell("$_XOR_", A=2, B=4, Y=10),
+        cell("$_XOR_", A=3, B=5, Y=11),
+        cell("$_OR_", A=10, B=11, Y=12),
+        cell("$_DFF_P_", C=1, D=12, Q=13),
+        cell("$_AND_", A=13, B=6, Y=14),
+    ],
+    {S: 2, B: 3, G: 4, M: 5, E: 6},
+    data=[1],
+    outputs=[14],
+)
+
+
+def test_variables_follow_the_fan_in_with_each_gates_operands_side_by_side():
+    order = observe.Circuit.read(PAIRS, "top").variables()
+    assert order == [f"c{E}", "r13", f"c{M}", f"c{B}", f"c{G}", f"c{S}"]
+    a = analysis(PAIRS)
+    assert [a.bdd.var_at_level(i) for i in range(len(order))] == order
+    assert a.bdd.level_of_var(f"c{K}") >= len(order), "a control the outputs never meet comes after"
+
+
 def test_the_memory_an_analysis_takes_on_bounds_it_not_one_conditions_size(monkeypatch):
     circuit = observe.Circuit.read(ALIAS, "top")
     held = {"bytes": 0}
