@@ -280,7 +280,7 @@ class ProgramModel:
         return self._circuit
 
     def _path(self, key: frozenset) -> Path:
-        return self.cache / f"observe-{'-'.join(sorted(map(str, key))) or 'tied'}.json"
+        return self.cache / f"observe-v{observe.RULES}-{'-'.join(sorted(map(str, key))) or 'tied'}.json"
 
     def _job(self, key: frozenset, memory: int | None = None) -> tuple:
         """What one analysis needs, picklable: the circuit, its varying bits, its sources, its file and
@@ -454,7 +454,7 @@ class ProgramModel:
 
     def _key(self, **key) -> dict:
         """``key`` for an analysis cached on disk, marked when the ternary screen alone answers it."""
-        return {**key, **({"coarse": True} if self.prefer == "ternary" else {})}
+        return {**key, "rules": observe.RULES, **({"coarse": True} if self.prefer == "ternary" else {})}
 
     def resolution(self) -> dict[int, tuple[int, ...]]:
         """Bits of each control the program reads at all, every register free."""

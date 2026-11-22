@@ -171,7 +171,7 @@ def test_the_ternary_simulator_over_approximates(tiny, tmp_path):
 def test_conditions_are_cached_per_free_set(tiny):
     first = tiny.conditions({1, "timing"})
     assert tiny.conditions({1, "timing"}) is first
-    assert any(p.name.startswith("observe-1-timing") for p in tiny.cache.iterdir())
+    assert any(p.name.startswith(f"observe-v{observe.RULES}-1-timing") for p in tiny.cache.iterdir())
     assert tiny.reach(tiny.preset("Gain"), [1], timing=0)[1] == [6, 7, 8, 9]
 
 

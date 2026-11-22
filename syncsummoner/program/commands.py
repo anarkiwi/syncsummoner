@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from . import predict
+from . import crosscheck, predict
 
 
 def add_parser(sub) -> None:
@@ -45,6 +45,7 @@ def add_parser(sub) -> None:
         )
     program.set_defaults(func=_program_cmd)
     predict.add_parser(program_sub)
+    crosscheck.add_parser(program_sub)
 
 
 def _program_cmd(args: argparse.Namespace) -> int:

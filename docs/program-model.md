@@ -146,8 +146,11 @@ which flipping the source can change it:
   the others held, each other *any* leaf standing for its own literal;
 - where it depends on a register variable that can change.
 
-A free register can change where its next state can, and a black box (memory,
-iCE40 RAM, a gate on a combinational loop) wherever any input can. The source's
+A free register can change where its next state can, for some value of the
+varying controls and register variables: the difference it takes on outlives the
+cycle that made it, while those move and every register steps on, so only the
+held controls condition it. A black box (memory, iCE40 RAM, a gate on a
+combinational loop) can change wherever any input can. The source's
 condition is the union over the outputs, with register variables quantified
 out. A select whose arms agree is dead there even when the arms are separate
 gates. **Live** bits of a parameter at a state are those whose condition holds
@@ -228,7 +231,16 @@ it. `--method bdd|sat|ternary` on the `program` commands forces one.
 The netlist, `gates.json` and the conditions (`observe.json`) are cached under
 `SYNCSUMMONER_PROGRAM_CACHE` (default `.program-cache/`, gitignored), keyed by
 program id, version, package digest, netlist source and IO configuration. Step
-verdicts are cached there by their exact ties.
+verdicts are cached there by their exact ties. Conditions, resolutions and
+bypasses also carry the revision of the liveness rules (`observe.RULES`), so a
+change to the rules never reads what the old ones derived.
+
+`program crosscheck NAME... | all [--jobs N]` answers each program's queries (the
+initial state and every preset, each declared control freed alone and with every
+knob) by the BDDs, the miter and the ternary simulator, and prints one JSON line
+per program with the seconds each took and every query on which they differ. The
+miter is exact under the rules, so a bit it finds live that another finds dead is
+that method's fault, listed in `faults`; the command exits 1 if any program has one.
 
 ## Bypass
 
