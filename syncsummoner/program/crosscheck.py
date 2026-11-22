@@ -25,19 +25,19 @@ from .model import model as build
 METHODS = ("bdd", "sat", "ternary")
 
 
-def queries(found: ProgramModel) -> list[tuple[str, np.ndarray, tuple[int, ...]]]:
-    """``(state name, state, freed controls)``: the initial state and each preset, with each declared
-    control freed alone and together with every knob, as liveness and judging takes query them.
+def queries(found: ProgramModel, presets: bool = False) -> list[tuple[str, np.ndarray, tuple[int, ...]]]:
+    """``(state name, state, freed controls)``: the initial state, and with ``presets`` each preset, with
+    each declared control freed alone and together with every knob, as liveness and judging takes query them.
     """
     pids = [d.parameter_id for d in found.params]
     knobs = {p for p in pids if len(field(p).bits) > 1}
     frees = sorted({(p,) for p in pids} | {tuple(sorted(knobs | {p})) for p in pids})
     cfg = found.program.package.config
-    states = [("initial", found.initial())] + [(p.name, found.preset(p.name)) for p in cfg.presets]
+    states = [("initial", found.initial())] + [(p.name, found.preset(p.name)) for p in cfg.presets if presets]
     return [(name, state, free) for name, state in states for free in frees]
 
 
-def verdicts(program, **kwargs) -> dict:
+def verdicts(program, presets: bool = False, **kwargs) -> dict:
     """Every :func:`queries` answer by each method for one program (as :func:`~.model.model` takes it):
     the seconds each method took, the queries on which they differ, and the methods at fault.
     """
@@ -53,7 +53,7 @@ def verdicts(program, **kwargs) -> dict:
         )
         for m in METHODS[1:]
     }
-    asked = queries(first)
+    asked = queries(first, presets)
     out = {"program": first.program.name, "source": first.source, "queries": len(asked), "seconds": {}}
     answers: dict[str, list] = {}
     for method, found in models.items():
@@ -80,15 +80,15 @@ def verdicts(program, **kwargs) -> dict:
     return out
 
 
-def crosschecks(names: Sequence, jobs: int = 1, **kwargs) -> Iterator[dict]:
+def crosschecks(names: Sequence, jobs: int = 1, presets: bool = False, **kwargs) -> Iterator[dict]:
     """:func:`verdicts` of each program, ``jobs`` at once in their own processes, each as it finishes."""
     jobs = max(1, min(jobs, len(names)))
     if jobs == 1:
-        yield from track((verdicts(n, **kwargs) for n in names), total=len(names), desc="crosscheck")
+        yield from track((verdicts(n, presets, **kwargs) for n in names), total=len(names), desc="crosscheck")
         return
     context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
-        done = as_completed([pool.submit(verdicts, n, **kwargs) for n in names])
+        done = as_completed([pool.submit(verdicts, n, presets, **kwargs) for n in names])
         yield from track((f.result() for f in done), total=len(names), desc="crosscheck")
 
 
@@ -99,13 +99,14 @@ def add_parser(program_sub) -> None:
     )
     found.add_argument("names", nargs="+", help="device names or program ids, or all")
     found.add_argument("--jobs", type=int, default=1, help="programs at once")
+    found.add_argument("--presets", action="store_true", help="query every preset too, not only the initial state")
     found.set_defaults(func=_crosscheck_cmd)
 
 
 def _crosscheck_cmd(args) -> int:
     names = [p.name for p in Library.default().programs] if args.names == ["all"] else args.names
     faults = 0
-    for row in crosschecks(names, args.jobs):
+    for row in crosschecks(names, args.jobs, args.presets):
         print(json.dumps(row), flush=True)
         faults += bool(row["faults"])
     return int(faults > 0)

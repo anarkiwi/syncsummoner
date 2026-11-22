@@ -517,7 +517,7 @@ class Analysis:
         self._reads: dict[tuple, cudd.Function] = {}
         self._supports: dict[tuple, set[str]] = {}
         self._still: dict[tuple, Form] = {}
-        self._transfers: dict[int, tuple[dict, cudd.Function]] = {}
+        self._transfers: dict[int, dict[int, cudd.Function]] = {}
         self._read: dict[str, list[Cell]] | None = None
         self.registers: set[str] = set()
         loose = set(loose)
@@ -810,11 +810,19 @@ class Analysis:
         return self.bdd.exist(gone, d) if gone else d
 
     def _cycle(
-        self, diff: dict, moved: dict, var: str | None, readers: Mapping, cells: Iterable[Cell] = ()
+        self,
+        diff: dict,
+        moved: dict,
+        var: str | None,
+        readers: Mapping,
+        cells: Iterable[Cell] = (),
+        outputs: bool = True,
+        onward: bool = True,
     ) -> tuple[dict, cudd.Function]:
         """Forward within one cycle from the differences ``diff`` (by net) and ``moved`` (by register
         variable), and from ``cells``, through gates and boxes: where each storage bit it reaches can come
-        to differ, over the held controls, and where an output can, register variables quantified out.
+        to differ, over the held controls (with ``onward``), and where an output can, register variables
+        quantified out (with ``outputs``).
         """
         rank = {id(g): i for i, g in enumerate(self.order)}
         false = self.bdd.false
@@ -828,6 +836,8 @@ class Analysis:
         while heap:
             _, key, cell = heapq.heappop(heap)
             queued.discard(key)
+            if cell.code and not onward:
+                continue
             d = self._change(cell, var, diff, moved, forms)
             if cell.code:
                 q = cell.outs["Q"][0]
@@ -843,7 +853,7 @@ class Analysis:
                         queued.add(id(r))
                         heapq.heappush(heap, (rank.get(id(r), -1), id(r), r))
         out = false
-        for bits in self.circuit.outputs.values():
+        for bits in self.circuit.outputs.values() if outputs else ():
             for b in bits:
                 if isinstance(b, int):
                     out |= diff.get(b, false)
@@ -862,36 +872,41 @@ class Analysis:
                     self._read.setdefault(name, []).append(cell)
         return self._read.get(var, [])
 
-    def _transfer(self, q: int, readers: Mapping) -> tuple[dict, cudd.Function]:
+    def _transfer(self, q: int, readers: Mapping) -> dict[int, cudd.Function]:
         """Where a difference held in storage bit ``q`` carries, within the cycle that reads it, into each
-        storage bit's next state and to an output (:meth:`_cycle`); found once per analysis, for every
-        source alike.
+        storage bit's next state (:meth:`_cycle`); found once per analysis, for every source alike.
         """
         if q not in self._transfers:
             moved = {f"r{q}": self.bdd.true} if f"r{q}" in self.registers else {}
-            self._transfers[q] = self._cycle({q: self.bdd.true}, moved, None, readers)
+            self._transfers[q] = self._cycle({q: self.bdd.true}, moved, None, readers, outputs=False)[0]
         return self._transfers[q]
 
     def difference(self, nets: Iterable[int], var: str | None, readers: Mapping) -> cudd.Function:
         """Where flipping ``var`` (or changing the ``nets``, when ``var`` is None) can change an output.
 
         A difference a storage bit holds is a condition over the held controls alone, so it carries on
-        by each bit's :meth:`_transfer`, to a least fixpoint over the storage bits.
+        by each bit's :meth:`_transfer`, to a least fixpoint over the storage bits, and then to the outputs
+        in one cycle from all of them.
         """
         cells = self._reading(var) if var is not None else ()
         held, out = self._cycle({n: self.bdd.true for n in nets}, {}, var, readers, cells)
-        todo = list(held)
+        sent: dict[int, cudd.Function] = {}
+        todo = deque(held)
+        queued = set(held)
         while todo:
-            p = todo.pop()
-            onward, shown = self._transfer(p, readers)
-            out |= shown & held[p]
-            for q, t in onward.items():
+            p = todo.popleft()
+            queued.discard(p)
+            fresh = self._since(sent, p, held[p])
+            for q, t in self._transfer(p, readers).items():
                 old = held.get(q, self.bdd.false)
-                new = old | (t & held[p])
+                new = old | (t & fresh)
                 if new != old:
                     held[q] = new
-                    todo.append(q)
-        return out
+                    if q not in queued:
+                        queued.add(q)
+                        todo.append(q)
+        registers = {f"r{q}": u for q, u in held.items() if f"r{q}" in self.registers}
+        return out | self._cycle(dict(held), registers, None, readers, onward=False)[1]
 
     def observe(self, sources: Mapping[str, tuple[str | None, list[int]]]) -> Conditions:
         """Each named source's observability condition, carried into a manager over the controls.

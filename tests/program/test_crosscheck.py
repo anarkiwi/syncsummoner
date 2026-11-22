@@ -14,12 +14,13 @@ def build(tiny):
 
 def test_the_tiny_designs_methods_agree_on_every_query(tiny, monkeypatch):
     monkeypatch.setattr(crosscheck, "build", build(tiny))
-    asked = crosscheck.queries(tiny)
+    asked = crosscheck.queries(tiny, presets=True)
     pids = [d.parameter_id for d in tiny.params]
     assert {free for _, _, free in asked} >= {(p,) for p in pids}
     presets = tiny.program.package.config.presets
     assert {name for name, _, _ in asked} == {"initial", *(p.name for p in presets)}
-    found = crosscheck.verdicts(tiny.program)
+    assert {name for name, _, _ in crosscheck.queries(tiny)} == {"initial"}
+    found = crosscheck.verdicts(tiny.program, presets=True)
     assert found["queries"] == len(asked) and set(found["seconds"]) == set(crosscheck.METHODS)
     assert not found["faults"]
     assert all(set(d["sat"]) <= set(d["ternary"]) for d in found["disagreements"])
