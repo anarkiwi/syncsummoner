@@ -139,7 +139,8 @@ def classify(
     """Each landed write's step as the model's observability predicts it from the state it was taken in.
 
     ``dead`` when no bit of the parameter reaches the video, ``no-op`` when the step changes only dead
-    bits, ``live`` otherwise. One query per gating class (:func:`gating_class`).
+    bits, ``live`` otherwise. One query per gating class (:func:`gating_class`), their analyses built
+    together first.
     """
     pre, a, b = pre_states(start, rows)
     out = np.full(len(rows), UNSENT, dtype=object)
@@ -159,6 +160,8 @@ def classify(
             return ()
         return tuple(model.reach(pre[first[key]], free, timing)[param])
 
+    extra = [] if timing is not None else [TIMING]
+    model.prepare([*k[3], *extra] for k in first if model.decl(k[0]) is not None and read.get(k[0]))
     live = {key: query(key) for key in track(list(first), desc=f"{model.program.name} classes", unit="class")}
     for i, key in track(list(zip(todo, keys)), desc=f"{model.program.name} steps", unit="step"):
         p, bits = int(rows["param"][i]), live[key]

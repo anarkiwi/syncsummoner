@@ -6,6 +6,7 @@ import numpy as np
 
 from syncsummoner.compose.evidence import LANDED
 from syncsummoner.program import predict as P
+from syncsummoner.program.model import ProgramModel
 
 
 def rows_of(*writes):
@@ -39,6 +40,33 @@ def test_the_tiny_design_judges_each_step(tiny):
     assert P.knob_gated(tiny) == frozenset({8}), "Bypass is revived by Bias's far bit"
     dry = rows_of((1, 8, 1023), (2, 8, 0), (3, 2, 700), (4, 8, 1023))
     assert P.classify(tiny, tiny.initial(), dry).tolist() == [P.DEAD, P.DEAD, P.LIVE, P.LIVE]
+
+
+def test_a_takes_gating_classes_are_analysed_together_first(tiny, monkeypatch, tmp_path):
+    fresh = ProgramModel(tiny.program, tiny.library, cache=tmp_path)
+    together, alone = [], []
+    real_prepare, real_conditions = ProgramModel.prepare, ProgramModel.conditions
+
+    def prepare(self, keys):
+        keys = [frozenset(k) for k in keys]
+        together.extend(keys)
+        return real_prepare(self, keys)
+
+    def conditions(self, free=()):
+        if not self._path(frozenset(free)).exists():  # pylint: disable=protected-access
+            alone.append(frozenset(free))
+        return real_conditions(self, free)
+
+    monkeypatch.setattr(ProgramModel, "prepare", prepare)
+    monkeypatch.setattr(ProgramModel, "conditions", conditions)
+    rows = rows_of((1, 1, 256), (3, 7, 1023), (4, 1, 900), (5, 2, 101))
+    assert (
+        P.classify(fresh, fresh.initial(), rows).tolist() == P.classify(tiny, tiny.initial(), rows).tolist()
+    )
+    gated = P.knob_gated(fresh)
+    classes = {frozenset([*P.freed(fresh, p, gated), "timing"]) for p in (1, 7, 2)}
+    assert classes <= set(together)
+    assert not classes & set(alone), "every class's analysis was built ahead of its query"
 
 
 def test_a_take_of_an_unknown_program_gets_no_verdicts(monkeypatch, tmp_path):
