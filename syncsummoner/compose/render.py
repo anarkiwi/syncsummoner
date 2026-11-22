@@ -21,6 +21,7 @@ from pyvmancer.const import ROUTE_HDMI_IN
 
 from syncsummoner.device.profile import ProgramProfile
 from syncsummoner.device.stored import captures
+from syncsummoner.device.transport import qualified
 from syncsummoner.device.recorder import (
     BlankTakeError,
     TakeReport,
@@ -457,12 +458,13 @@ def unknown_programs(programs: Sequence[str], available: Sequence[str] | None) -
     A program is loaded only when its turn comes and a pass costs minutes, so a name
     that can never load is worth catching before the first one. Firmware moves under
     an archive: a profile set fitted on an older release can name a program the
-    device has since dropped. ``None`` checks nothing, for a caller with no device.
+    device has since dropped. A bare name and its default author's ``author/Name`` are one program,
+    as loading takes them. ``None`` checks nothing, for a caller with no device.
     """
     if available is None:
         return []
-    offered = set(available)
-    return [name for name in dict.fromkeys(programs) if name not in offered]
+    offered = {qualified(name) for name in available}
+    return [name for name in dict.fromkeys(programs) if qualified(name) not in offered]
 
 
 def ensure_clip(

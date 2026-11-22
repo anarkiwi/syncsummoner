@@ -547,6 +547,18 @@ def test_unknown_programs_reports_what_the_device_will_not_load():
     assert R.unknown_programs(["b", "b"], ["a"]) == ["b"]
 
 
+def test_unknown_programs_takes_a_bare_name_as_the_default_authors():
+    from pyvmancer.shell import DEFAULT_AUTHOR
+
+    assert (
+        R.unknown_programs(
+            [f"{DEFAULT_AUTHOR}/Reagent", "Pinwheel"], ["Reagent", f"{DEFAULT_AUTHOR}/Pinwheel"]
+        )
+        == []
+    )
+    assert R.unknown_programs(["other/Reagent"], ["Reagent"]) == ["other/Reagent"]
+
+
 def test_a_program_the_device_dropped_costs_no_rig_time():
     """Firmware moves under an archive; the pass must not be the thing that finds out."""
     score = Score(duration=4.0, fps=30.0, sections=[Section(0.0, 4.0, "A")])
