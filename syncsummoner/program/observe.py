@@ -219,7 +219,6 @@ class Circuit:
         looped = sorted(set(range(len(self.gates))) - set(order))
         return [self.gates[i] for i in order], [self.gates[i] for i in looped]
 
-
     def variables(self) -> list[str]:
         """Controls ``c<flat bit>`` and storage outputs ``r<net>`` in the order a depth-first walk of the
         fan-in from the outputs first meets them, the deeper input of each gate first.

@@ -99,7 +99,9 @@ def add_parser(program_sub) -> None:
     )
     found.add_argument("names", nargs="+", help="device names or program ids, or all")
     found.add_argument("--jobs", type=int, default=1, help="programs at once")
-    found.add_argument("--presets", action="store_true", help="query every preset too, not only the initial state")
+    found.add_argument(
+        "--presets", action="store_true", help="query every preset too, not just the initial state"
+    )
     found.set_defaults(func=_crosscheck_cmd)
 
 
