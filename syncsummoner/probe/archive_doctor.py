@@ -15,6 +15,7 @@ from typing import Iterable, Sequence
 import numpy as np
 from pyvmancer.diagnose import Finding, format_finding, report
 
+from syncsummoner.compose import frameline
 from syncsummoner.device.kmsplay import SEGMENT
 from syncsummoner.device.v4l2rec import read_sidecar, sidecar
 from syncsummoner.probe.archive import ARCHIVE_FPS
@@ -220,8 +221,11 @@ def take_faults(messages: Sequence[str]) -> Finding:
 
 
 def capture_period(rows: np.ndarray) -> float:
-    """Nanoseconds between captures: the slope of capture time over driver sequence."""
-    return float(np.polyfit(rows["sequence"] - rows["sequence"][0], rows["t_ns"] - rows["t_ns"][0], 1)[0])
+    """Nanoseconds between captures: the slope of capture time over driver sequence common to every gap-free
+    run, so a relock's break, which delays captures without skipping a sequence number, leaves it alone."""
+    return frameline.capture_line(
+        rows["t_ns"], rows["sequence"], frameline.segments(rows["t_ns"], rows["sequence"])
+    )[0]
 
 
 def flip_period(flips: np.ndarray) -> float:

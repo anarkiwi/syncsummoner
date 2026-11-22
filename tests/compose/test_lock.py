@@ -11,7 +11,7 @@ import pytest
 
 from syncsummoner.compose import evidence as ev
 from syncsummoner.compose import lock as L
-from syncsummoner.device.v4l2rec import sidecar
+from syncsummoner.device.v4l2rec import FLAG_ERROR, FRAME, sidecar
 from syncsummoner.device.wire import TICK, READ, RECEIPT, SEND
 from syncsummoner.probe import decoded
 from syncsummoner.probe.patterns import burn_timecode, read_timecode
@@ -120,6 +120,23 @@ def test_a_strip_less_run_is_numbered_though_the_relock_moved_its_lag(moved_ns):
     )
     found = attribute(played)
     assert found.runs == 2 and found.shown.tolist() == played.shown().tolist()
+    assert played.shows(found.picked)
+
+
+@pytest.mark.parametrize("moved_ns", [8_000_000, -8_000_000])
+def test_a_lead_in_run_keeps_its_strips_though_the_relock_moved_the_lag_of_the_lead_out_run(moved_ns):
+    """A relock moves the Pi's lag by under half a frame, so strips either side of it number their runs."""
+    played = take(
+        ((0, 199, 0.2), (400, 23999, 0.7, 50)),
+        ppm=-50.0,
+        jitter_ns=500_000,
+        wet=(300, 11700),
+        tail=150,
+        kink=(190, moved_ns),
+        **FULL,
+    )
+    found = attribute(played)
+    assert found.anchored and found.shown.tolist() == played.shown().tolist()
     assert played.shows(found.picked)
 
 
@@ -258,6 +275,61 @@ def test_an_inexact_take_is_refused_and_nothing_kept(tmp_path, runs, count, code
     with pytest.raises(L.LockError, match=match):
         L.attribute_take(path, config=CONFIG, codes=played.codes)
     assert not L.picked_path(path).exists()
+
+
+def card_log(n, *, breaks=(), errors=(), digest=None):
+    """``n`` captures at 60 Hz, the card delivering nothing before each of ``breaks``, sequence unbroken."""
+    log = np.zeros(n, FRAME)
+    log["sequence"] = np.arange(n)
+    log["t_ns"] = np.arange(n) * VBLANK_NS + np.searchsorted(np.asarray(breaks), np.arange(n), "right") * (
+        20 * VBLANK_NS
+    )
+    log["flags"][list(errors)] = FLAG_ERROR
+    log["digest"] = np.arange(n) // 2 + 1 if digest is None else digest
+    return log
+
+
+def lossy_log():
+    """Restart pictures at the recording's start, before a break at 10 and through one at 20."""
+    digest = np.arange(30) // 2 + 1
+    digest[:3] = [100, 101, 102]
+    digest[10:13] = [200, 201, 202]
+    digest[13] = 202
+    digest[20:] = 300 + np.arange(10)
+    return card_log(30, breaks=(10, 20), errors=(2, 5, 7, 8, 9), digest=digest)
+
+
+def test_the_card_is_without_the_signal_into_a_break_and_until_it_holds_a_frame_after():
+    lost = L.signal_lost(lossy_log())
+    assert np.flatnonzero(lost).tolist() == [7, 8, 9, 10, 11, 12, *range(20, 30)]
+
+
+def test_a_log_without_a_break_loses_nothing():
+    log = card_log(12, errors=(3, 11), digest=np.arange(12))
+    assert not L.signal_lost(log).any() and L.signal_lost(log[:0]).size == 0
+
+
+def test_clip_frames_are_lost_across_a_break_or_on_a_lost_capture():
+    picked = np.array([-1, 2, -1, 4, -1, -1, 11, 14, -1])
+    assert L.lost_frames(picked, lossy_log()).tolist() == [0, 0, 0, 0, 1, 1, 1, 0, 0]
+
+
+def test_a_take_missing_clip_frames_at_a_break_is_signal_loss(tmp_path):
+    played = take(((0, 19, 0.0), (26, 39, 0.3)), count=10)
+    path = saved(tmp_path, played)
+    with pytest.raises(
+        L.SignalLossError,
+        match=r": signal loss: .* clip frames 2-4 at 1 breaks .*; 7/10 clip frames attributed",
+    ):
+        L.attribute_take(path, config=CONFIG, codes=played.codes)
+    assert not L.picked_path(path).exists()
+
+
+def test_a_take_short_of_its_last_frames_is_no_signal_loss(tmp_path):
+    played = take(CLEAN, count=8)
+    with pytest.raises(L.LockError) as err:
+        L.attribute_take(saved(tmp_path, played), config=CONFIG, codes=played.codes)
+    assert not isinstance(err.value, L.SignalLossError) and "signal loss" not in str(err.value)
 
 
 def test_the_anchor_rests_on_the_lead_in_when_the_clip_misreads_its_strips():

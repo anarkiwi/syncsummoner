@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import numpy as np
 
 from syncsummoner.compose import evidence as ev
+from syncsummoner.compose import relocks
 from syncsummoner.compose.lock import (
     ANCHOR_FRAMES,
     read_live,
@@ -262,6 +263,7 @@ def locked_session(
     fps = float(config.fps)
     booted = boot_count(shell)
     dry = dry_state(program, bypass)
+    lead_in = relocks.lead_in(program, lead_in)
     park = np.asarray(rig.session.park_values, dtype=np.int64)
     played: list[dict] = []
 
@@ -274,12 +276,7 @@ def locked_session(
             played.append({"program": name, "t0_ns": began, "t1_ns": ended})
         return said
 
-    held: dict[str, Any] = {
-        "recording": False,
-        "loaded": None,
-        "dry": dry,
-    }
-    held["info"] = None
+    held: dict[str, Any] = {"recording": False, "loaded": None, "dry": dry, "info": None}
     if dry is None:
         timed(PASSTHRU)
     else:
@@ -341,13 +338,31 @@ def locked_session(
                 )
                 hold = int(player.status().get("hold", 1))
         wire = _session_wire(held, sender, poller, played, dry)
-        _save_locks(takes, layout, session, rig.playout.flips(), hold, wire, held, config)
+        _keep_relock(
+            program,
+            dry,
+            _save_locks(takes, layout, session, rig.playout.flips(), hold, wire, held, config),
+            wire["sends"],
+            _firmware(rig),
+        )
     finally:
         wire = _session_wire(held, sender, poller, played, dry)
         for index, take in enumerate(takes):
             _save_take_wire(take, index, layout, wire, held, program=program, park=park, session=session)
         _leave(shell, held, booted, program)
     return [_take_record(index, layout, wire, held, park) for index in range(len(takes))]
+
+
+def _keep_relock(program: str, dry: Any, log: np.ndarray, sends: np.ndarray, firmware: str | None) -> None:
+    """Keep the card's relock after a dry session's wet write on the rig's record, saying a long one."""
+    found = None if dry is None else relocks.measure(log, sends)
+    if found is None:
+        return
+    relocks.record(program, found[0], found[1], firmware=firmware)
+    if found[1] > LeadIn().wet_s:
+        LOG.warning(
+            "%s: the card relocked %.3f s after the wet write; its sessions wait it out", program, found[1]
+        )
 
 
 def _firmware(rig: Any) -> str | None:
@@ -533,8 +548,11 @@ def _save_locks(
     wire: dict,
     held: dict,
     config: Any,
-) -> None:
-    """Each take's lock record: the session's frames, its capture log, the strips read, when processed."""
+) -> np.ndarray:
+    """Each take's lock record: the session's frames, its capture log, the strips read, when processed.
+
+    Returns the session's capture log.
+    """
     from syncsummoner.compose.lock import _written_span  # pylint: disable=import-outside-toplevel
 
     log = session_log([_read_sidecar(t.out) for t in takes])
@@ -562,6 +580,7 @@ def _save_locks(
             wet=True,
             **session_record(said, log, codes, span),
         )
+    return log
 
 
 def _await_starts(live: Live, since_ns: int, frames: int, period_ns: float) -> None:
