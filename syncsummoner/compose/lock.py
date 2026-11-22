@@ -377,7 +377,8 @@ def _lines(
 
     The run with most strip-named frames fixes the period an outage leaves alone and the lag from the
     Pi showing a frame to its start; another run keeps its strips only if their largest group spans two
-    frames and keeps that lag too, and is otherwise numbered by the lag.
+    frames and keeps that lag too, or misses it by under half a frame, as a relock moves it (:func:`_bridge`),
+    and is otherwise numbered by the lag.
     """
     named, group = anchored
     jitter, resolution = error
@@ -418,6 +419,8 @@ def _lines(
         mine = _lag(lines[s], shown_at, rate)
         if max(lag[0], mine[0]) <= min(lag[1], mine[1]):
             lag = (max(lag[0], mine[0]), min(lag[1], mine[1]))
+            continue
+        if max(mine[0] - lag[1], lag[0] - mine[1]) < lines[s].period / 2:
             continue
         if between:
             LOG.warning(

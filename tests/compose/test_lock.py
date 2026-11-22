@@ -123,6 +123,23 @@ def test_a_strip_less_run_is_numbered_though_the_relock_moved_its_lag(moved_ns):
     assert played.shows(found.picked)
 
 
+@pytest.mark.parametrize("moved_ns", [8_000_000, -8_000_000])
+def test_a_lead_in_run_keeps_its_strips_though_the_relock_moved_the_lag_of_the_lead_out_run(moved_ns):
+    """A relock moves the Pi's lag by under half a frame, so strips either side of it number their runs."""
+    played = take(
+        ((0, 199, 0.2), (400, 23999, 0.7, 50)),
+        ppm=-50.0,
+        jitter_ns=500_000,
+        wet=(300, 11700),
+        tail=150,
+        kink=(190, moved_ns),
+        **FULL,
+    )
+    found = attribute(played)
+    assert found.anchored and found.shown.tolist() == played.shown().tolist()
+    assert played.shows(found.picked)
+
+
 def test_strips_a_program_delays_off_the_pis_lag_do_not_number_their_run():
     played = take(((0, 299, 0.2), (400, 23999, 0.7, 50)), ppm=-50.0, wet=(300, 11700), **FULL)
     codes = played.codes.copy()
