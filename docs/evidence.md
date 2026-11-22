@@ -85,7 +85,8 @@ failed take is recaptured alone, as a session of one, which loads again.
    `j - 1` (`Poller.wait_count`), its floor the frame the Pi was last heard showing. The take runs
    with a short interpreter switch interval so the sending thread wakes promptly; each send records
    when it was due, and the report gives the worst wake-up.
-4. Two seconds before clip frame 0 the dry control is set to its take value; the last readback
+4. The wet stretch before clip frame 0, `LeadIn.wet_s` or the program's longest relock on record when
+   longer (`compose.relocks`), the dry control is set to its take value; the last readback
    before frame 0 was heard shown must equal frame 0's planned parameters, and `fpga status` must
    name the program (`locktake.loaded_before`). A later take's last readback before its frame 0
    must equal the state the take before left.
@@ -109,6 +110,16 @@ the anchor. A load past the lead-in fails `loaded_before`, and a clip whose lead
 shorter than the session's is refused before anything plays. Device waits fail as stalled once
 they see nothing for longer than the longest load timed (`render.open_rig`), unless `--stall` says
 otherwise; with no load on record and no `--stall`, a rig is not opened at all.
+
+A program whose output restarts as it leaves its bypass setting stops the transmitter, and the card
+delivers nothing until it relocks. Each dry session measures that relock from its own capture log
+(`relocks.measure`): from the wet write's send, over every break in the capture log begun before the
+next frame's writes, to the first capture after the last of them repeating the bytes of the one
+before, since the device's frames are each captured twice and the card's restart pictures differ every
+capture. It goes into `relocks.jsonl` beside the load record (`SYNCSUMMONER_RELOCKS` overrides it), and
+the program's later sessions, plans and renders hold a wet stretch at least as long as its longest, so
+the card has relocked and holds a picture before clip frame 0; a clip whose lead-in cannot hold it is a
+`LayoutError`. `python -m syncsummoner.compose.relocks captures/` seeds it from the sessions on disk.
 
 Every load a session times goes into one record per rig, `loads.jsonl` beside the program cache
 (`SYNCSUMMONER_LOADS` overrides it), keyed by program and firmware and appended under an exclusive

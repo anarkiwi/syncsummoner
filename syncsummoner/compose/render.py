@@ -479,10 +479,10 @@ def ensure_clip(
 
     One too short is timecoded again, never shorter than it was; a ``prepared`` one is only checked.
     """
-    from syncsummoner.compose import locktake, session  # pylint: disable=import-outside-toplevel
+    from syncsummoner.compose import locktake, relocks, session  # pylint: disable=import-outside-toplevel
 
     dry = locktake.dry_state(program, locktake.declared_bypass) is not None
-    lead, tail = session.session_frames(locktake.LeadIn(), config.fps, dry=dry)
+    lead, tail = session.session_frames(relocks.lead_in(program), config.fps, dry=dry)
     try:
         have = timecode.clip_layout(scratch) if Path(scratch).is_file() else None
     except timecode.LayoutError:

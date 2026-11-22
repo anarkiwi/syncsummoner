@@ -14,10 +14,11 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from syncsummoner.compose.evidence import START
 from syncsummoner.compose.lock import ANCHOR_FRAMES, signed
 from syncsummoner.compose.locktake import LeadIn, wet_at
 from syncsummoner.device.v4l2rec import read_log
-from syncsummoner.device.wire import load_wire
+from syncsummoner.device.wire import SEND, load_wire
 from syncsummoner.probe import decoded
 from syncsummoner.probe.chroma import SWAP, ChromaOrder, order_of
 
@@ -33,11 +34,16 @@ SLACK_NS = 500_000_000
 def dry_codes(wire: Mapping[str, np.ndarray], fps: float, lead_in: LeadIn = LeadIn()) -> np.ndarray:
     """The clip codes a take's lead-in showed dry, from its wire record.
 
-    With a dry control, the ``bound_s`` before the wet stretch, once the start state has settled; else the
-    :data:`~syncsummoner.compose.lock.ANCHOR_FRAMES` shown under Passthru before the program's load began.
+    With a dry control, the ``bound_s`` before the wet write's session frame, the first send leaving the
+    start state, else ``lead_in``'s; without, the :data:`~syncsummoner.compose.lock.ANCHOR_FRAMES` shown
+    under Passthru before the program's load began.
     """
     if json.loads(str(wire["dry"])) is not None:
-        wet = wet_at(lead_in, fps)
+        sends = wire["sends"] if "sends" in wire else np.zeros(0, SEND)
+        moved = sends["target"][sends["target"] != START]
+        said = json.loads(str(wire["session"])) if "session" in wire else {}
+        offset = said["offsets"][said["index"]] if "offsets" in said else 0
+        wet = int(moved[0]) + offset if moved.size else wet_at(lead_in, fps)
         return np.arange(wet - int(round(lead_in.bound_s * fps)), wet)
     loads = json.loads(str(wire["loads"]))
     shown = wire["shown"]

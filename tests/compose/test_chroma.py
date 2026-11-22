@@ -10,8 +10,10 @@ import pytest
 
 from syncsummoner.compose import chroma as C
 from syncsummoner.compose import timecode
+from syncsummoner.compose.evidence import START
 from syncsummoner.compose.locktake import LeadIn
 from syncsummoner.device.playout import SHOWN
+from syncsummoner.device.wire import SEND
 from syncsummoner.probe.chroma import AS_PLAYED, ORDERS, variants
 from syncsummoner.probe.decoded import Spec
 
@@ -39,6 +41,15 @@ def test_a_dry_take_is_judged_on_the_bound_before_its_wet_stretch():
     lead_in = LeadIn()
     wet = -round(lead_in.wet_s * FPS)
     assert codes.tolist() == list(range(wet - round(lead_in.bound_s * FPS), wet))
+
+
+def test_a_dry_take_is_judged_on_the_bound_before_the_wet_write_it_sent():
+    said = wire(dry={"11": 1023})
+    said["sends"] = np.zeros(3, dtype=SEND)
+    said["sends"]["target"] = [START, -84 - 30, 0 - 30]
+    said["session"] = np.array(json.dumps({"offsets": [0, 30], "index": 1}))
+    bound = round(LeadIn().bound_s * FPS)
+    assert C.dry_codes(said, FPS).tolist() == list(range(-84 - bound, -84))
 
 
 def test_a_take_with_no_dry_control_is_judged_on_passthru_before_its_load():
