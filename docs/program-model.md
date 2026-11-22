@@ -258,7 +258,11 @@ queries (the initial state, and every preset with `--presets`, each declared
 control freed alone and with every knob) by the BDDs, the miter and the ternary simulator, and prints one JSON line
 per program with the seconds each took and every query on which they differ. The
 miter is exact under the rules, so a bit it finds live that another finds dead is
-that method's fault, listed in `faults`; the command exits 1 if any program has one.
+that method's fault, listed in `faults`; the command exits 1 if any program has one. With
+`--faults` the miter answers only the queries where the BDDs call dead a bit the
+ternary simulator leaves live. A bit both call dead is proven dead by the
+simulator, so no fault of the BDDs is missed; their over-approximations are not
+counted, and the simulator itself is not checked.
 
 ## Bypass
 

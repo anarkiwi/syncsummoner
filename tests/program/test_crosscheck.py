@@ -45,3 +45,21 @@ def test_a_method_that_loses_a_live_bit_is_at_fault(tiny, monkeypatch, capsys):
     row = json.loads(capsys.readouterr().out)
     assert row["faults"] == ["ternary"] and row["disagreements"]
     assert all(d["ternary"] == [] and d["sat"] for d in row["disagreements"])
+
+
+def test_with_faults_the_miter_answers_only_where_the_bdds_drop_a_bit_the_simulator_keeps(tiny, monkeypatch):
+    monkeypatch.setattr(crosscheck, "build", build(tiny))
+    whole = crosscheck.verdicts(tiny.program)
+    dropped = {
+        (d["state"], tuple(d["free"])) for d in whole["disagreements"] if set(d["ternary"]) - set(d["bdd"])
+    }
+    assert crosscheck.verdicts(tiny.program, faults=True)["asked"]["sat"] == len(dropped)
+    reach = ProgramModel.reach
+
+    def lossy(self, state, free, timing=None):
+        found = reach(self, state, free, timing)
+        return {p: [] for p in found} if self.prefer == "bdd" else found
+
+    monkeypatch.setattr(ProgramModel, "reach", lossy)
+    found = crosscheck.verdicts(tiny.program, faults=True)
+    assert found["faults"] == ["bdd"] and 0 < found["asked"]["sat"] <= whole["asked"]["sat"]
